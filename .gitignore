@@ -1,0 +1,31 @@
+# sajni-api — Go backend, deployed to Cloud Run.
+
+# Built binary (locally produced via `go build` / `make build`).
+/sajni
+*.exe
+*.test
+*.out
+
+# Local blob storage. Production uses GCS — see DEPLOY.md.
+/data/
+
+# Environment files. Only .env.example is ever committed.
+.env
+.env.*
+!.env.example
+*.local
+
+# Editor / OS noise.
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Optional: Go modules vendor dir if you ever vendor.
+/vendor/
+
+# Coverage artifacts.
+coverage.out
+*.cover

@@ -1,0 +1,128 @@
+name: Deploy (Cloud Run)
+
+# Pushed-tag triggered. Use:
+#   git tag sga/release/v0.1.0
+#   git push origin sga/release/v0.1.0
+# 'sga' = sajni-api. The '/' in the tag is fine — git supports it.
+on:
+  push:
+    tags:
+      - 'sga/release/v*'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION }}
+  SERVICE_NAME: sajni-api
+  REGISTRY: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/sajni
+
+jobs:
+  verify:
+    name: Lint, vet, build, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: |
+          unformatted="$(gofmt -l .)"
+          [ -z "$unformatted" ] || { echo "::error::gofmt: $unformatted"; exit 1; }
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+
+  deploy:
+    name: Build image & roll out
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Workload Identity Federation
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+
+      # Tag pattern is sga/release/vX.Y.Z — the '/' chars aren't valid
+      # in OCI image tags, so flatten to vX.Y.Z for the image label.
+      - name: Compute image tag
+        id: tag
+        run: |
+          REF="${GITHUB_REF_NAME:-manual}"
+          IMAGE_TAG="${REF##*/}"           # vX.Y.Z (or 'manual')
+          IMAGE_TAG="${IMAGE_TAG:-manual-${GITHUB_SHA::8}}"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        run: |
+          IMAGE="${REGISTRY}/${SERVICE_NAME}:${{ steps.tag.outputs.image_tag }}"
+          LATEST="${REGISTRY}/${SERVICE_NAME}:latest"
+          docker build -t "$IMAGE" -t "$LATEST" .
+          docker push "$IMAGE"
+          docker push "$LATEST"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE_NAME }}
+          region: ${{ env.GCP_REGION }}
+          image: ${{ env.IMAGE }}
+          # Non-secret runtime config. CORS_ORIGIN must match the
+          # frontend origin exactly (scheme + host).
+          env_vars: |
+            STORAGE_BACKEND=gcs
+            GCS_BUCKET=${{ vars.GCS_BUCKET }}
+            CORS_ORIGIN=${{ vars.CORS_ORIGIN }}
+            GEMINI_MODEL=gemini-2.5-flash
+          secrets: |
+            DATABASE_URL=sajni-database-url:latest
+            JWT_SECRET=sajni-jwt-secret:latest
+            TMDB_API_KEY=sajni-tmdb-key:latest
+            GEMINI_API_KEY=sajni-gemini-key:latest
+          # Cheapest viable Cloud Run config:
+          # - min-instances=0     → no idle cost (~1–2s cold start)
+          # - max-instances=2     → caps blast radius if traffic spikes
+          # - cpu=1, memory=512Mi → smallest tier that handles Go + GCS
+          # - concurrency=80      → 80 reqs per instance keeps fleet small
+          # - cpu-throttling default-on → only billed during requests
+          # - cpu-boost           → free during cold starts, faster wake
+          flags: |
+            --allow-unauthenticated
+            --port=8080
+            --cpu=1
+            --memory=512Mi
+            --min-instances=0
+            --max-instances=2
+            --concurrency=80
+            --timeout=60
+            --cpu-boost
+
+      - name: Smoke-test /healthz
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region ${{ env.GCP_REGION }} --format='value(status.url)')
+          echo "Deployed: $URL"
+          for i in 1 2 3 4 5; do
+            if curl --fail --silent --max-time 10 "$URL/healthz"; then
+              echo "✓ healthy"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Service did not become healthy"
+          exit 1

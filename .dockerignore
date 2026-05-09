@@ -1,0 +1,18 @@
+# Build context lives at sajni-api/. Anything not strictly required to
+# compile the Go binary should be excluded — keeps image layers small
+# and Cloud Build uploads fast.
+.git
+.gitignore
+.idea
+.vscode
+.DS_Store
+
+# Local dev artifacts.
+data/
+*.env
+*.local
+*.local.*
+
+# Go binary builds from local `go build`.
+sajni
+*.exe
