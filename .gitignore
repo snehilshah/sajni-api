@@ -29,3 +29,6 @@
 # Coverage artifacts.
 coverage.out
 *.cover
+
+# Google
+.firebase
