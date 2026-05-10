@@ -191,7 +191,7 @@ The workflow:
 ```sh
 # Re-deploy a previous image tag in <30s.
 gcloud run deploy sajni-api --region asia-south1 \
-  --image=asia-south1-docker.pkg.dev/ohmysajni/sajni/sajni-api:v0.0.9
+  --image=asia-south1-docker.pkg.dev/ohmysajni/sajni-api/sajni-api:v0.0.9
 ```
 
 Or instantly route 100% of traffic to a previous revision:
