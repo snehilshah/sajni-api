@@ -1,5 +1,5 @@
 # Backend-only image. The React bundle is hosted on Vercel; this
-# container serves /api/* and /healthz, nothing else.
+# container serves /api/* plus health probes, nothing else.
 #
 # Build context expected to be `sajni-api/`. From repo root:
 #   docker build -t sajni-api -f sajni-api/Dockerfile sajni-api
@@ -16,5 +16,5 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata
 COPY --from=build /out/sajni /usr/local/bin/sajni
 EXPOSE 8080
-# No --frontend flag — backend serves only /api/* + /healthz now.
+# No --frontend flag — backend serves only /api/* + health probes now.
 ENTRYPOINT ["sajni"]

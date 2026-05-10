@@ -58,9 +58,9 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	root.Handle("/api/auth/logout", authMux)
 	root.Handle("/api/", protected)
 
-	// Liveness/readiness probe — unauthenticated, pings the DB so Cloud Run
+	// Liveness/readiness probes — unauthenticated, ping the DB so deploys
 	// can fail fast if Postgres is unreachable.
-	root.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	healthHandler := func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 		if err := deps.DB.PingContext(ctx); err != nil {
@@ -69,7 +69,9 @@ func Router(deps Deps, frontendDir string) http.Handler {
 		}
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write([]byte("ok"))
-	})
+	}
+	root.HandleFunc("/healthz", healthHandler)
+	root.HandleFunc("/readyz", healthHandler)
 
 	if frontendDir != "" {
 		fs := http.FileServer(http.Dir(frontendDir))

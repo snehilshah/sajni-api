@@ -14,7 +14,7 @@ hobby usage entirely.
 ```
 push to main           ─►  CI: gofmt · vet · build · test
 push tag sga/release/v*─►  CI gate → docker build → Artifact Registry
-                            ─►  Cloud Run deploy + /healthz smoke test
+                            ─►  Cloud Run deploy + /readyz smoke test
 ```
 
 The frontend is a separate repo (`ohmysajni/sajni-web`) — it deploys
@@ -166,7 +166,7 @@ The workflow:
 2. Builds the Dockerfile here, pushes to
    `…/sajni-api:v0.1.0` and `…/sajni-api:latest` in Artifact Registry.
 3. Deploys to Cloud Run with the cheapest sane flags.
-4. Hits `/healthz` on the new revision; fails the workflow if it
+4. Hits `/readyz` on the new revision; fails the workflow if it
    doesn't come up in ~25s.
 
 ### Rollback

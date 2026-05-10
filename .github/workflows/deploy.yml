@@ -115,13 +115,13 @@ jobs:
             --concurrency=80
             --timeout=60
             --cpu-boost
-      - name: Smoke-test /healthz
+      - name: Smoke-test /readyz
         run: |
           URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
             --region ${{ env.GCP_REGION }} --format='value(status.url)')
           echo "Deployed: $URL"
           for i in 1 2 3 4 5; do
-            if curl --fail --silent --max-time 10 "$URL/healthz"; then
+            if curl --fail --silent --max-time 10 "$URL/readyz"; then
               echo "✓ healthy"; exit 0
             fi
             sleep 5
