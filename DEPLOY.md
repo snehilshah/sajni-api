@@ -150,23 +150,6 @@ add these as **Variables** (not Secrets — they're identifiers, not credentials
 | `GCS_BUCKET`          | `sajni-blobs`                                                                                    |
 | `CORS_ORIGIN`         | `https://ohmysajni.com` (the frontend's production origin)                                       |
 
-### Custom domain (`api.ohmysajni.com`)
-
-Cloud Run domain mappings are free (no Cloud Load Balancer needed,
-no TLS cert to renew yourself).
-
-```sh
-gcloud beta run domain-mappings create \
-  --service=sajni-api --domain=api.ohmysajni.com --region=asia-south1
-```
-
-`gcloud` will print a `CNAME` record to add at your DNS provider for
-`api.ohmysajni.com`. Once DNS resolves (usually <10 min), the
-mapping completes and HTTPS is automatic.
-
-After the domain is live, update `CORS_ORIGIN` in repo Variables to
-the actual frontend URL (`https://ohmysajni.com`) and re-deploy.
-
 ---
 
 ## Releasing
