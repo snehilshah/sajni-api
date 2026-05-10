@@ -7,7 +7,7 @@ name: Deploy (Cloud Run)
 on:
   push:
     tags:
-      - 'sga/release/v*'
+      - "sga/release/v*"
   workflow_dispatch:
 
 concurrency:
@@ -104,6 +104,9 @@ jobs:
           # - cpu-boost           → free during cold starts, faster wake
           flags: |
             --allow-unauthenticated
+            --ingress=all
+            --default-url
+            --no-use-http2
             --port=8080
             --cpu=1
             --memory=512Mi
@@ -112,7 +115,6 @@ jobs:
             --concurrency=80
             --timeout=60
             --cpu-boost
-
       - name: Smoke-test /healthz
         run: |
           URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
