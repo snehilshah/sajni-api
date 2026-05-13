@@ -264,18 +264,41 @@ func createTask(deps Deps) http.HandlerFunc {
 			}
 		}
 
+		// Empty-string due_date from the form is "no date", not "1970-01-01".
+		// Postgres rejects '' as a DATE — coerce to NULL up front.
+		var dueArg any
+		if body.DueDate != nil && strings.TrimSpace(*body.DueDate) != "" {
+			dueArg = *body.DueDate
+		}
+
+		// Compute the next sort_order in a separate query. Inlining it
+		// inside the INSERT made Postgres unable to infer the type of the
+		// nullable bigint placeholders, throwing 500 on empty payloads.
+		var nextSort int
+		listScope, parentScope := int64(0), int64(0)
+		if body.ListID != nil {
+			listScope = *body.ListID
+		}
+		if body.ParentTaskID != nil {
+			parentScope = *body.ParentTaskID
+		}
+		d.QueryRow(`
+			SELECT COALESCE(MAX(sort_order)+1, 0)
+			  FROM tasks
+			 WHERE user_id = $1
+			   AND COALESCE(list_id, 0)        = $2
+			   AND COALESCE(parent_task_id, 0) = $3`,
+			uid, listScope, parentScope,
+		).Scan(&nextSort)
+
 		var id int64
 		err := d.QueryRow(`
 			INSERT INTO tasks (user_id, title, description, priority, status, due_date,
-			                   list_id, parent_task_id, important, steps,
-			                   sort_order)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb,
-			        COALESCE((SELECT MAX(sort_order)+1 FROM tasks WHERE user_id=$1 AND
-			                  COALESCE(list_id, 0) = COALESCE($7, 0) AND
-			                  COALESCE(parent_task_id, 0) = COALESCE($8, 0)), 0))
+			                   list_id, parent_task_id, important, steps, sort_order)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)
 			RETURNING id`,
-			uid, body.Title, body.Description, body.Priority, body.Status, body.DueDate,
-			body.ListID, body.ParentTaskID, body.Important, stepsJSON,
+			uid, body.Title, body.Description, body.Priority, body.Status, dueArg,
+			body.ListID, body.ParentTaskID, body.Important, stepsJSON, nextSort,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())

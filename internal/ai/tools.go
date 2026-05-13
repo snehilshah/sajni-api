@@ -228,6 +228,14 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "media_taste",
+			Description: "Returns the user's taste profile: top-rated titles, favourite genres (weighted by rating), completion vs. drop ratio per type, and most-recently completed entries. Call this once BEFORE tmdb_search when recommending anything so the suggestion is personalised, not generic.",
+			Schema:      obj(map[string]*genai.Schema{}),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return mediaTasteTool(ctx, d, uid)
+			},
+		},
+		{
 			Name:        "list_finance_accounts",
 			Description: "List finance accounts with current computed balance.",
 			Schema:      obj(map[string]*genai.Schema{}),
@@ -742,6 +750,136 @@ func listMemosTool(ctx context.Context, d *db.DB, uid int64, args map[string]any
 		out = append(out, map[string]any{"id": id, "content": content, "pinned": pinned, "created_at": created})
 	}
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
+}
+
+// mediaTasteTool digests the library into a small taste profile so the
+// model can recommend in the user's voice instead of pulling from
+// generic popularity. Cheap enough to call on every recommendation
+// turn (a handful of small queries).
+func mediaTasteTool(ctx context.Context, d *db.DB, uid int64) (any, map[string]any, error) {
+	out := map[string]any{}
+
+	// Top-rated finished titles (weighted "what they loved").
+	rows, err := d.QueryContext(ctx, `
+		SELECT title, type, COALESCE(genre,''), COALESCE(rating,0), COALESCE(year,0)
+		  FROM media
+		 WHERE user_id=$1 AND rating IS NOT NULL AND rating >= 4
+		 ORDER BY rating DESC, updated_at DESC LIMIT 12`, uid)
+	favs := []map[string]any{}
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var title, mtype, genre string
+			var rating, year int
+			rows.Scan(&title, &mtype, &genre, &rating, &year)
+			favs = append(favs, map[string]any{"title": title, "type": mtype, "genre": genre, "rating": rating, "year": year})
+		}
+	}
+	out["favourites"] = favs
+
+	// Genre affinity: sum of ratings per genre token (cheap weighting).
+	genreScore := map[string]int{}
+	genreCount := map[string]int{}
+	grows, err := d.QueryContext(ctx, `
+		SELECT COALESCE(genre,''), COALESCE(rating,0), status
+		  FROM media WHERE user_id=$1`, uid)
+	if err == nil {
+		defer grows.Close()
+		for grows.Next() {
+			var genre, status string
+			var rating int
+			grows.Scan(&genre, &rating, &status)
+			if genre == "" {
+				continue
+			}
+			for _, g := range strings.Split(genre, ",") {
+				g = strings.TrimSpace(g)
+				if g == "" {
+					continue
+				}
+				w := rating
+				if w == 0 {
+					if status == "complete" {
+						w = 3 // completion implies some signal
+					} else {
+						continue
+					}
+				}
+				genreScore[g] += w
+				genreCount[g]++
+			}
+		}
+	}
+	type gentry struct {
+		Name  string `json:"genre"`
+		Score int    `json:"weight"`
+		Count int    `json:"count"`
+	}
+	gtop := []gentry{}
+	for g, s := range genreScore {
+		gtop = append(gtop, gentry{g, s, genreCount[g]})
+	}
+	// Insertion sort by score desc (small list).
+	for i := 1; i < len(gtop); i++ {
+		for j := i; j > 0 && gtop[j].Score > gtop[j-1].Score; j-- {
+			gtop[j], gtop[j-1] = gtop[j-1], gtop[j]
+		}
+	}
+	if len(gtop) > 8 {
+		gtop = gtop[:8]
+	}
+	out["top_genres"] = gtop
+
+	// Completion vs. drop ratio per type — a coarse "how do they
+	// engage" signal.
+	stats := map[string]any{}
+	srows, err := d.QueryContext(ctx, `
+		SELECT type,
+		       COUNT(*) FILTER (WHERE status='complete') AS completed,
+		       COUNT(*) FILTER (WHERE status='dropped' OR status='scratched') AS dropped,
+		       COUNT(*) FILTER (WHERE status='in_progress') AS in_progress,
+		       COUNT(*) AS total
+		  FROM media WHERE user_id=$1 GROUP BY type`, uid)
+	if err == nil {
+		defer srows.Close()
+		for srows.Next() {
+			var mtype string
+			var done, dropped, inProg, total int
+			srows.Scan(&mtype, &done, &dropped, &inProg, &total)
+			stats[mtype] = map[string]any{
+				"completed": done, "dropped": dropped, "in_progress": inProg, "total": total,
+			}
+		}
+	}
+	out["engagement"] = stats
+
+	// Last 5 completed — fresh "context for what they just enjoyed".
+	rrows, err := d.QueryContext(ctx, `
+		SELECT m.title, m.type, COALESCE(m.genre,''), COALESCE(m.rating,0), e.created_at::text
+		  FROM media m
+		  JOIN media_events e ON e.media_id=m.id AND e.user_id=m.user_id AND e.kind='completed'
+		 WHERE m.user_id=$1
+		 ORDER BY e.created_at DESC LIMIT 5`, uid)
+	recent := []map[string]any{}
+	if err == nil {
+		defer rrows.Close()
+		for rrows.Next() {
+			var title, mtype, genre, when string
+			var rating int
+			rrows.Scan(&title, &mtype, &genre, &rating, &when)
+			recent = append(recent, map[string]any{
+				"title": title, "type": mtype, "genre": genre, "rating": rating, "completed_at": when,
+			})
+		}
+	}
+	out["recently_completed"] = recent
+
+	// Library size — also tells the model how much signal we have.
+	var libSize int
+	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM media WHERE user_id=$1`, uid).Scan(&libSize)
+	out["library_size"] = libSize
+
+	return out, nil, nil
 }
 
 func listMediaTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
