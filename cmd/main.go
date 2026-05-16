@@ -46,6 +46,7 @@ func loadDotEnv(path string) {
 
 func main() {
 	loadDotEnv(".env")
+	logger.Init()
 
 	port := flag.Int("port", 8080, "HTTP server port")
 	frontendDir := flag.String("frontend", "", "Path to built frontend directory (optional)")
