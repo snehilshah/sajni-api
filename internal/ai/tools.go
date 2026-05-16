@@ -449,6 +449,31 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "create_note",
+			Description: "Create a markdown note in the user's notes. Optional folder path (e.g. 'work/q2'). If title is empty, it's derived from the first content line.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"title":   str("Optional. If empty, derived from first content line."),
+				"content": str("Markdown body."),
+				"folder":  str("Optional. Folder path like 'work/q2'."),
+				"tags":    arrayOf(str(""), "Optional tag list."),
+			}, "content"),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return createNoteTool(ctx, d, store, uid, args)
+			},
+		},
+		{
+			Name:        "create_folder",
+			Description: "Create a folder under the user's notes tree. Path uses '/' separators (e.g. 'work/q2').",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"path": str("Required. Folder path like 'work/q2'."),
+			}, "path"),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return createFolderTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "add_media",
 			Description: "Add a movie / show / book to the user's library. If you have an external_id from tmdb_search, pass it along with poster_url, year, etc. so the entry is fully populated.",
 			Mutating:    true,
@@ -1309,6 +1334,90 @@ func createJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid
 	}
 	return map[string]any{"id": id, "date": date},
 		map[string]any{"kind": "journal_created", "id": id, "title": date, "route": "/journal?date=" + date}, nil
+}
+
+func normalizeAINoteFolder(p string) string {
+	p = strings.Trim(p, "/")
+	if p == "" {
+		return ""
+	}
+	parts := strings.Split(p, "/")
+	out := make([]string, 0, len(parts))
+	for _, seg := range parts {
+		seg = strings.TrimSpace(seg)
+		if seg == "" || seg == "." || seg == ".." {
+			continue
+		}
+		seg = strings.ReplaceAll(seg, "\\", "_")
+		out = append(out, seg)
+	}
+	return strings.Join(out, "/")
+}
+
+func deriveNoteTitle(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimLeft(line, "#")
+		line = strings.TrimSpace(line)
+		if line != "" {
+			if len(line) > 80 {
+				line = line[:80]
+			}
+			return line
+		}
+	}
+	return "Untitled"
+}
+
+func createNoteTool(ctx context.Context, d *db.DB, store storage.Storage, uid int64, args map[string]any) (any, map[string]any, error) {
+	content := argStr(args, "content")
+	title := strings.TrimSpace(argStr(args, "title"))
+	if title == "" {
+		title = deriveNoteTitle(content)
+	}
+	folder := normalizeAINoteFolder(argStr(args, "folder"))
+
+	safe := strings.ReplaceAll(title, "/", "_")
+	safe = strings.ReplaceAll(safe, "\\", "_")
+	if safe == "" {
+		safe = "untitled"
+	}
+	parts := []string{fmt.Sprintf("user_%d", uid), "notes"}
+	if folder != "" {
+		parts = append(parts, folder)
+	}
+	parts = append(parts, safe+".md")
+	blobKey := strings.Join(parts, "/")
+
+	if err := store.Put(ctx, blobKey, []byte(content), "text/markdown"); err != nil {
+		return nil, nil, err
+	}
+	var id int64
+	err := d.QueryRowContext(ctx,
+		`INSERT INTO notes (user_id, title, blob_key, folder) VALUES ($1,$2,$3,$4) RETURNING id`,
+		uid, title, blobKey, folder).Scan(&id)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, tag := range argStrSlice(args, "tags") {
+		d.ExecContext(ctx, `INSERT INTO tags (user_id, entity_type, entity_id, tag) VALUES ($1,'note',$2,$3)`, uid, id, tag)
+	}
+	return map[string]any{"id": id, "title": title, "folder": folder},
+		map[string]any{"kind": "note_created", "id": id, "title": title, "route": fmt.Sprintf("/notes?id=%d", id)}, nil
+}
+
+func createFolderTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+	path := normalizeAINoteFolder(argStr(args, "path"))
+	if path == "" {
+		return nil, nil, fmt.Errorf("missing path")
+	}
+	_, err := d.ExecContext(ctx,
+		`INSERT INTO note_folders (user_id, path) VALUES ($1, $2) ON CONFLICT DO NOTHING`, uid, path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"path": path},
+		map[string]any{"kind": "folder_created", "title": path, "route": "/notes"}, nil
 }
 
 func addMediaTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
