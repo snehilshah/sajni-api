@@ -5,15 +5,17 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/rs/zerolog/log"
 
 	"sajni/internal/ai"
 	"sajni/internal/api"
 	"sajni/internal/auth"
 	"sajni/internal/db"
+	"sajni/internal/logger"
 	"sajni/internal/storage"
 )
 
@@ -54,35 +56,46 @@ func main() {
 
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Fatal("DATABASE_URL is required (e.g. postgres://user:pass@localhost:5432/sajni?sslmode=disable)")
+		log.Fatal().Msg("DATABASE_URL is required")
 	}
 
 	database, err := db.New(dsn)
 	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
+		log.Fatal().Err(err).Msg("failed to initialize database")
 	}
 	defer database.Close()
 
 	ctx := context.Background()
 	store, err := storage.New(ctx)
 	if err != nil {
-		log.Fatalf("Failed to initialize storage: %v", err)
+		log.Fatal().Err(err).Msg("failed to initialize storage")
 	}
 
 	authSvc, err := auth.NewService(database)
 	if err != nil {
-		log.Fatalf("Failed to initialize auth: %v", err)
+		log.Fatal().Err(err).Msg("failed to initialize auth")
 	}
 
 	aiSvc, err := ai.NewService(ctx, database, store)
 	if err != nil {
-		log.Fatalf("Failed to initialize AI service: %v", err)
+		log.Fatal().Err(err).Msg("failed to initialize AI service")
 	}
-	if aiSvc == nil {
-		log.Printf("Note: GEMINI_API_KEY not set — AI features disabled")
+
+	// Log startup state once — not on each request.
+	backend := os.Getenv("STORAGE_BACKEND")
+	if backend == "" {
+		backend = "local"
+	}
+	evt := log.Info().Int("port", *port).Str("storage", backend)
+	if aiSvc != nil {
+		evt = evt.Str("model", aiSvc.Model())
 	} else {
-		log.Printf("AI enabled (model: %s)", aiSvc.Model())
+		evt = evt.Bool("ai_enabled", false)
 	}
+	if os.Getenv("TMDB_API_KEY") == "" {
+		evt = evt.Bool("tmdb", false)
+	}
+	evt.Msg("sajni started")
 
 	handler := api.Router(api.Deps{
 		DB:      database,
@@ -92,16 +105,7 @@ func main() {
 	}, *frontendDir)
 
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("Sajni is running at http://localhost%s", addr)
-	if backend := os.Getenv("STORAGE_BACKEND"); backend != "" {
-		log.Printf("Storage backend: %s", backend)
-	} else {
-		log.Printf("Storage backend: local")
-	}
-	if os.Getenv("TMDB_API_KEY") == "" {
-		log.Printf("Note: TMDB_API_KEY not set — movie/show search will be empty")
-	}
 	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatalf("Server error: %v", err)
+		log.Fatal().Err(err).Msg("server error")
 	}
 }
