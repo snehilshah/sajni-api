@@ -475,17 +475,18 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
-			Name:        "add_media",
-			Description: "Add a movie / show / book to the user's library. If you have an external_id from tmdb_search, pass it along with poster_url, year, etc. so the entry is fully populated.",
+			Name: "add_media",
+			Description: "Add a movie / show / book to the user's library. Call this whenever the user mentions a title they have consumed, are consuming, or plan to consume. Status mapping: 'done' for past-tense (\"I watched\", \"already saw\", \"finished\", \"just read\"), 'watching' for in-progress (\"halfway through\", \"on episode 4\"), 'pending' for intent (\"want to watch\", \"need to read\"). If you have an external_id from tmdb_search, pass it along with poster_url, year, genre to fully populate the entry.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"title":       str("Required."),
+				"title":       str("Required. Exact title."),
 				"type":        str("'movie' | 'show' | 'book'."),
-				"status":      str("'pending' | 'watching' | 'done'. Default 'pending'."),
+				"status":      str("'pending' | 'watching' | 'done'. Pick based on the user's wording — past tense ⇒ 'done'. Default 'pending' only when unclear."),
 				"external_id": str("Optional TMDB external id from tmdb_search."),
 				"year":        intg("Optional release year."),
 				"genre":       str("Optional."),
 				"poster_url":  str("Optional."),
+				"rating":      intg("Optional 1–5 star rating, only when user expressed one."),
 			}, "title", "type"),
 			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
 				return addMediaTool(ctx, d, uid, args)
@@ -1538,12 +1539,36 @@ func addMediaTool(ctx context.Context, d *db.DB, uid int64, args map[string]any)
 	if year > 0 {
 		yearArg = year
 	}
+	rating := argInt(args, "rating", 0)
+	var ratingArg any
+	if rating >= 1 && rating <= 5 {
+		ratingArg = rating
+	}
+	// Dedupe — if the user already has the same title+type, update its
+	// status instead of inserting a duplicate. Lite tier sometimes
+	// triggers add_media twice for the same title in one round.
+	var existingID int64
+	d.QueryRowContext(ctx,
+		`SELECT id FROM media WHERE user_id=$1 AND LOWER(title)=LOWER($2) AND type=$3 LIMIT 1`,
+		uid, title, mtype).Scan(&existingID)
+	if existingID > 0 {
+		_, err := d.ExecContext(ctx,
+			`UPDATE media SET status=$1, rating=COALESCE($2, rating), updated_at=NOW()
+			 WHERE id=$3 AND user_id=$4`,
+			status, ratingArg, existingID, uid)
+		if err != nil {
+			return nil, nil, err
+		}
+		return map[string]any{"id": existingID, "title": title, "updated": true},
+			map[string]any{"kind": "media_added", "id": existingID, "title": title, "route": "/media"}, nil
+	}
+
 	var id int64
 	err := d.QueryRowContext(ctx, `
-		INSERT INTO media (user_id, title, type, status, external_id, year, genre, poster_url)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+		INSERT INTO media (user_id, title, type, status, external_id, year, genre, poster_url, rating)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
 		uid, title, mtype, status,
-		argStr(args, "external_id"), yearArg, argStr(args, "genre"), argStr(args, "poster_url")).Scan(&id)
+		argStr(args, "external_id"), yearArg, argStr(args, "genre"), argStr(args, "poster_url"), ratingArg).Scan(&id)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -14,11 +14,23 @@ import (
 	"os"
 	"strings"
 
+	"github.com/rs/zerolog/log"
 	"google.golang.org/genai"
 
 	"sajni/internal/db"
 	"sajni/internal/storage"
 )
+
+// functionCallKey is a stable fingerprint of a FunctionCall for dedup.
+// Gemini's stream occasionally re-emits the same call; using name +
+// JSON-encoded args catches near-duplicates regardless of map order.
+func functionCallKey(fc *genai.FunctionCall) string {
+	if fc == nil {
+		return ""
+	}
+	b, _ := json.Marshal(fc.Args)
+	return fc.Name + "|" + string(b)
+}
 
 const (
 	// gemini-3.1-flash-lite is the active cost-tier; the 3.x family
@@ -27,10 +39,12 @@ const (
 	// if you want to A/B against gemini-3.1-flash.
 	defaultModel = "gemini-3.1-flash-lite"
 	// Tool budget. A typical palette answer needs: get_current_context →
-	// list_* → maybe cross-check → final text. Bumping these to 8/6 cuts
-	// the "exceeded max tool rounds" rate on multi-step palette asks
-	// without changing per-request cost meaningfully.
-	maxToolRounds   = 8
+	// list_* → maybe cross-check → final text. Chat is bumped to 10 so a
+	// "I watched X, recommend another" style request has room for
+	// add_media + tmdb_search + media_taste + list_media + final text
+	// without tripping the round limit on the lite tier (which tends to
+	// split steps across more rounds than the full flash model).
+	maxToolRounds   = 10
 	paletteRounds   = 6
 	maxOutputTokens = 1024
 	temperature     = 0.4
@@ -212,7 +226,16 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		SystemInstruction: &genai.Content{
 			Parts: []*genai.Part{{Text: sysPrompt}},
 		},
-		Tools:           []*genai.Tool{{FunctionDeclarations: decls}},
+		Tools: []*genai.Tool{{FunctionDeclarations: decls}},
+		// Explicit AUTO mode — lite-tier defaults sometimes lean toward
+		// NONE when the prompt looks conversational, which silently
+		// suppresses tool calls (e.g. "I watched X, recommend another"
+		// gets a recommendation but no add_media).
+		ToolConfig: &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				Mode: genai.FunctionCallingConfigModeAuto,
+			},
+		},
 		MaxOutputTokens: maxOutputTokens,
 		Temperature:     &temp,
 	}
@@ -232,6 +255,10 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			streamErr error
 		)
 
+		// Dedupe identical FunctionCall parts. Gemini sometimes emits the
+		// same call twice across stream chunks; without this guard we'd
+		// dispatch the tool twice and pollute history with two responses.
+		seenCalls := map[string]bool{}
 		for resp, err := range s.client.Models.GenerateContentStream(ctx, s.model, contents, cfg) {
 			if err != nil {
 				streamErr = err
@@ -246,6 +273,11 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 					send("delta", map[string]string{"text": p.Text})
 				}
 				if p.FunctionCall != nil {
+					key := functionCallKey(p.FunctionCall)
+					if seenCalls[key] {
+						continue
+					}
+					seenCalls[key] = true
 					calls = append(calls, p.FunctionCall)
 				}
 				modelPart = append(modelPart, p)
@@ -274,6 +306,13 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		for _, fc := range calls {
 			send("tool_call", map[string]any{"name": fc.Name, "args": fc.Args})
 			data, meta, err := s.dispatch(ctx, req.UserID, fc.Name, fc.Args)
+			if err != nil {
+				log.Warn().Err(err).
+					Str("tool", fc.Name).
+					Int64("uid", req.UserID).
+					Interface("args", fc.Args).
+					Msg("ai tool dispatch failed")
+			}
 			res := map[string]any{"name": fc.Name, "ok": err == nil}
 			if err != nil {
 				res["error"] = err.Error()
