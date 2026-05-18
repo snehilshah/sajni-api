@@ -52,6 +52,9 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	registerTagRoutes(apiMux, deps)
 	registerAnalyticsRoutes(apiMux, deps)
 	registerFinanceRoutes(apiMux, deps)
+	registerBillerRoutes(apiMux, deps)
+	registerInsightRoutes(apiMux, deps)
+	registerThemeRoutes(apiMux, deps)
 	registerSearchRoutes(apiMux, deps)
 	registerAIRoutes(apiMux, deps, deps.AI)
 	registerTakeoutRoutes(apiMux, deps)
@@ -81,6 +84,10 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	}
 	root.HandleFunc("/healthz", healthHandler)
 	root.HandleFunc("/readyz", healthHandler)
+
+	// Cron webhook for the insights engine. Auth is by a shared secret
+	// header (INSIGHT_CRON_SECRET); the handler 401s without it.
+	RegisterInsightCronHandler(root, deps)
 
 	if frontendDir != "" {
 		fs := http.FileServer(http.Dir(frontendDir))

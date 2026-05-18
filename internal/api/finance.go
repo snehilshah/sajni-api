@@ -1422,6 +1422,35 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			urows.Close()
 		}
 
+		// Upcoming billers — next 14d, plus any past-due rows still pending.
+		type UpcomingBill struct {
+			ID             int64   `json:"id"`
+			Name           string  `json:"name"`
+			Amount         float64 `json:"amount"`
+			DueDate        string  `json:"due_date"`
+			AccountName    *string `json:"account_name"`
+			IsSubscription bool    `json:"is_subscription"`
+			AutoRenew      bool    `json:"auto_renew"`
+		}
+		var upcomingBills []UpcomingBill
+		brows, _ := d.Query(`SELECT b.id, b.name, b.amount, b.next_due_date::text, a.name,
+			b.is_subscription, b.auto_renew
+			FROM fin_billers b LEFT JOIN fin_accounts a ON a.id = b.account_id
+			WHERE b.user_id = $1 AND b.archived = FALSE
+			  AND b.next_due_date <= (CURRENT_DATE + INTERVAL '14 days')
+			ORDER BY b.next_due_date ASC LIMIT 8`, uid)
+		if brows != nil {
+			for brows.Next() {
+				var u UpcomingBill
+				brows.Scan(&u.ID, &u.Name, &u.Amount, &u.DueDate, &u.AccountName, &u.IsSubscription, &u.AutoRenew)
+				upcomingBills = append(upcomingBills, u)
+			}
+			brows.Close()
+		}
+		if upcomingBills == nil {
+			upcomingBills = []UpcomingBill{}
+		}
+
 		// Investments distribution
 		type InvBreak struct {
 			Type   string  `json:"type"`
@@ -1471,6 +1500,7 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			"top_expense_categories": topCats,
 			"daily_trend":            trend,
 			"upcoming_dues":          upcoming,
+			"upcoming_bills":         upcomingBills,
 			"investments_breakdown":  invBreak,
 		})
 	}

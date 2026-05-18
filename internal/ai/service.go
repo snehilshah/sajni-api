@@ -21,12 +21,11 @@ import (
 )
 
 const (
-	// gemini-2.5-flash is the cheapest tier that *reliably* continues
-	// after function calls. The -lite tier is ~3× cheaper but tends to
-	// stop silently after a tool round, which makes the agent loop
-	// useless. Override with GEMINI_MODEL if you find a cheaper model
-	// that handles function calling well.
-	defaultModel = "gemini-2.5-flash"
+	// gemini-3.1-flash-lite is the active cost-tier; the 3.x family
+	// fixed the silent-stop-after-tool behaviour that made earlier -lite
+	// models unusable for the agent loop. Override with GEMINI_MODEL
+	// if you want to A/B against gemini-3.1-flash.
+	defaultModel = "gemini-3.1-flash-lite"
 	// Tool budget. A typical palette answer needs: get_current_context →
 	// list_* → maybe cross-check → final text. Bumping these to 8/6 cuts
 	// the "exceeded max tool rounds" rate on multi-step palette asks
@@ -96,6 +95,63 @@ func NewService(ctx context.Context, database *db.DB, store storage.Storage) (*S
 
 // Model returns the active model id (for debug/logging).
 func (s *Service) Model() string { return s.model }
+
+// friendlyAIError rewrites the most common Gemini wire errors into a
+// short user-facing string. Falls back to the original message for
+// anything we don't recognise.
+func friendlyAIError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	low := strings.ToLower(msg)
+	switch {
+	case strings.Contains(low, "resource_exhausted"),
+		strings.Contains(low, "rate limit"),
+		strings.Contains(low, "quota"),
+		strings.Contains(low, "429"):
+		return "Sajni's hit a rate limit. Wait a moment and try again."
+	case strings.Contains(low, "function response turn comes immediately after a function call turn"):
+		return "Conversation went out of sync. Start a new chat to clear it."
+	case strings.Contains(low, "deadline exceeded"),
+		strings.Contains(low, "context canceled"):
+		return "Sajni took too long. Try a shorter prompt."
+	case strings.Contains(low, "permission_denied"),
+		strings.Contains(low, "unauthenticated"):
+		return "AI key is misconfigured. Contact admin."
+	}
+	return msg
+}
+
+// QuickGenerate runs a single non-tool, non-streaming completion. Used
+// by background workers (insights narration) where we want a short
+// deterministic answer without the chat-loop overhead.
+func (s *Service) QuickGenerate(ctx context.Context, system, user string) (string, error) {
+	temp := float32(0.3)
+	maxOut := int32(300)
+	thinkBudget := int32(0)
+	cfg := &genai.GenerateContentConfig{
+		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: system}}},
+		Temperature:       &temp,
+		MaxOutputTokens:   maxOut,
+		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
+	}
+	resp, err := s.client.Models.GenerateContent(ctx, s.model, []*genai.Content{
+		{Role: "user", Parts: []*genai.Part{{Text: user}}},
+	}, cfg)
+	if err != nil {
+		return "", err
+	}
+	var out strings.Builder
+	if resp != nil && len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
+		for _, p := range resp.Candidates[0].Content.Parts {
+			if p.Text != "" && !p.Thought {
+				out.WriteString(p.Text)
+			}
+		}
+	}
+	return strings.TrimSpace(out.String()), nil
+}
 
 // ChatRequest is the input for one user turn.
 type ChatRequest struct {
@@ -196,7 +252,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			}
 		}
 		if streamErr != nil {
-			send("error", map[string]string{"message": streamErr.Error()})
+			send("error", map[string]string{"message": friendlyAIError(streamErr)})
 			return
 		}
 

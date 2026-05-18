@@ -363,6 +363,118 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_networth_user ON fin_networth_snapshots(user_id);
 
+	-- Billers / Subscriptions ----------------------------------------------
+	-- Recurring bill or subscription. auto_renew=true lets the nightly
+	-- cron post a transaction automatically on/after next_due_date.
+	-- alert_days is the lead time for the upcoming-bill notice.
+	CREATE TABLE IF NOT EXISTS fin_billers (
+		id              BIGSERIAL   PRIMARY KEY,
+		user_id         BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		name            TEXT        NOT NULL DEFAULT '',
+		amount          NUMERIC(14,2) NOT NULL DEFAULT 0,
+		frequency       TEXT        NOT NULL DEFAULT 'monthly',
+		next_due_date   DATE        NOT NULL,
+		account_id      BIGINT      REFERENCES fin_accounts(id) ON DELETE SET NULL,
+		category_id     BIGINT      REFERENCES fin_categories(id) ON DELETE SET NULL,
+		is_subscription BOOLEAN     NOT NULL DEFAULT FALSE,
+		auto_renew      BOOLEAN     NOT NULL DEFAULT FALSE,
+		alert_days      INTEGER     NOT NULL DEFAULT 3,
+		color           TEXT        NOT NULL DEFAULT '#2D5A4F',
+		notes           TEXT        NOT NULL DEFAULT '',
+		archived        BOOLEAN     NOT NULL DEFAULT FALSE,
+		last_run_at     TIMESTAMPTZ,
+		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_billers_user ON fin_billers(user_id);
+	CREATE INDEX IF NOT EXISTS idx_fin_billers_due ON fin_billers(user_id, next_due_date) WHERE archived = FALSE;
+
+	CREATE TABLE IF NOT EXISTS fin_biller_payments (
+		id          BIGSERIAL   PRIMARY KEY,
+		user_id     BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		biller_id   BIGINT      NOT NULL REFERENCES fin_billers(id) ON DELETE CASCADE,
+		txn_id      BIGINT      REFERENCES fin_transactions(id) ON DELETE SET NULL,
+		due_date    DATE        NOT NULL,
+		paid_date   DATE        NOT NULL,
+		amount      NUMERIC(14,2) NOT NULL DEFAULT 0,
+		auto        BOOLEAN     NOT NULL DEFAULT FALSE,
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		UNIQUE(biller_id, due_date)
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_biller_payments_user ON fin_biller_payments(user_id);
+
+	-- Lightweight notice queue surfaced on the Finance overview.
+	CREATE TABLE IF NOT EXISTS fin_biller_alerts (
+		id          BIGSERIAL   PRIMARY KEY,
+		user_id     BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		biller_id   BIGINT      NOT NULL REFERENCES fin_billers(id) ON DELETE CASCADE,
+		kind        TEXT        NOT NULL,
+		due_date    DATE        NOT NULL,
+		seen        BOOLEAN     NOT NULL DEFAULT FALSE,
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		UNIQUE(biller_id, kind, due_date)
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_biller_alerts_user ON fin_biller_alerts(user_id, seen);
+
+	-- Journal location + attachments ---------------------------------------
+	-- Short label like "Cinepolis, Vashi" plus optional precise coords for
+	-- time-travel / correlation queries. attachments is a JSON array of
+	-- {url, kind, w, h} entries kept alongside the markdown blob.
+	ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS location_label TEXT NOT NULL DEFAULT '';
+	ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS location_lat   NUMERIC(9,6);
+	ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS location_lon   NUMERIC(9,6);
+	ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS attachments    JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+	-- Cross-module insights -------------------------------------------------
+	-- One row per surfaced pattern. evidence carries the raw numbers so
+	-- the frontend can render a tooltip / chart and the user can audit.
+	CREATE TABLE IF NOT EXISTS insights (
+		id           BIGSERIAL   PRIMARY KEY,
+		user_id      BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		window_key   TEXT        NOT NULL,
+		kind         TEXT        NOT NULL,
+		title        TEXT        NOT NULL DEFAULT '',
+		body         TEXT        NOT NULL DEFAULT '',
+		score        NUMERIC(8,4) NOT NULL DEFAULT 0,
+		evidence     JSONB       NOT NULL DEFAULT '{}'::jsonb,
+		pinned       BOOLEAN     NOT NULL DEFAULT FALSE,
+		dismissed_at TIMESTAMPTZ,
+		generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_insights_user ON insights(user_id, generated_at DESC);
+
+	CREATE TABLE IF NOT EXISTS insight_runs (
+		id        BIGSERIAL   PRIMARY KEY,
+		user_id   BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		window_key TEXT       NOT NULL,
+		status    TEXT        NOT NULL DEFAULT 'ok',
+		notes     TEXT        NOT NULL DEFAULT '',
+		run_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_insight_runs_user ON insight_runs(user_id, window_key, run_at DESC);
+
+	-- User themes -----------------------------------------------------
+	-- A theme stores three M3 seed colors (primary / secondary / tertiary)
+	-- and an optional neutral. The frontend feeds these into Googles
+	-- material-color-utilities to derive the full light + dark palette,
+	-- so we never store the 30+ derived tokens here. source distinguishes
+	-- AI-generated, hand-tweaked, and built-in presets.
+	CREATE TABLE IF NOT EXISTS user_themes (
+		id         BIGSERIAL   PRIMARY KEY,
+		user_id    BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		name       TEXT        NOT NULL DEFAULT '',
+		source     TEXT        NOT NULL DEFAULT 'ai',
+		seeds      JSONB       NOT NULL DEFAULT '{}'::jsonb,
+		prompt     TEXT        NOT NULL DEFAULT '',
+		mode_pref  TEXT        NOT NULL DEFAULT 'auto',
+		is_active  BOOLEAN     NOT NULL DEFAULT FALSE,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_user_themes_user ON user_themes(user_id);
+	-- At most one active theme per user.
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_user_active_theme
+		ON user_themes(user_id) WHERE is_active = TRUE;
+
 	-- AI ----------------------------------------------------------------
 	-- One row per chat conversation. messages is the full history as a
 	-- JSON array of {role, parts: [...]} entries (mirrors genai.Content).

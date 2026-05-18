@@ -96,6 +96,9 @@ func SaveSessionMessages(ctx context.Context, d *db.DB, uid, sid int64, messages
 	if len(trimmed) > historyWindow*2 {
 		trimmed = trimmed[len(trimmed)-historyWindow*2:]
 	}
+	// SanitizeHistory drops orphan tool-call / tool-response pairs so the
+	// next chat round never starts with a malformed history.
+	trimmed = SanitizeHistory(trimmed)
 	raw, err := json.Marshal(trimmed)
 	if err != nil {
 		return err
@@ -118,12 +121,78 @@ func DeleteSession(ctx context.Context, d *db.DB, uid, sid int64) error {
 }
 
 // TrimHistory returns the last 2*historyWindow entries — keeps the
-// agent's working context bounded.
+// agent's working context bounded. The result is then run through
+// SanitizeHistory so we never hand Gemini a slice that starts with an
+// orphan function-response or ends with a dangling function-call,
+// which is what triggers
+//
+//	"Please ensure that function response turn comes immediately
+//	 after a function call turn."
 func TrimHistory(history []*genai.Content) []*genai.Content {
-	if len(history) <= historyWindow*2 {
+	out := history
+	if len(out) > historyWindow*2 {
+		out = out[len(out)-historyWindow*2:]
+	}
+	return SanitizeHistory(out)
+}
+
+// SanitizeHistory walks the conversation and strips orphan tool turns:
+//
+//  1. A leading user-turn whose parts include any function_response.
+//     This happens after TrimHistory slices in the middle of a
+//     model(function_call) → user(function_response) pair.
+//  2. A trailing model-turn that has any function_call but no matching
+//     user(function_response) immediately after.
+//
+// The remaining turns satisfy Gemini's strict tool-pair contract.
+func SanitizeHistory(history []*genai.Content) []*genai.Content {
+	if len(history) == 0 {
 		return history
 	}
-	return history[len(history)-historyWindow*2:]
+	// (1) skip orphan function-response turns at the head.
+	start := 0
+	for start < len(history) {
+		c := history[start]
+		if c == nil {
+			start++
+			continue
+		}
+		hasFnResp := false
+		for _, p := range c.Parts {
+			if p != nil && p.FunctionResponse != nil {
+				hasFnResp = true
+				break
+			}
+		}
+		if c.Role == "user" && hasFnResp {
+			start++
+			continue
+		}
+		break
+	}
+	out := history[start:]
+
+	// (2) drop trailing dangling function-call turn.
+	for len(out) > 0 {
+		last := out[len(out)-1]
+		if last == nil {
+			out = out[:len(out)-1]
+			continue
+		}
+		hasFnCall := false
+		for _, p := range last.Parts {
+			if p != nil && p.FunctionCall != nil {
+				hasFnCall = true
+				break
+			}
+		}
+		if last.Role == "model" && hasFnCall {
+			out = out[:len(out)-1]
+			continue
+		}
+		break
+	}
+	return out
 }
 
 // deriveTitle picks the first 8 words of the first user-text message

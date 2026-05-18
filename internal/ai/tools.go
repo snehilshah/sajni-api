@@ -437,12 +437,13 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "create_journal_entry",
-			Description: "Create or replace a journal entry for the given date. Content is stored as a markdown blob.",
+			Description: "Create or replace a journal entry for the given date. Content is stored as a markdown blob; optional location_label (short, e.g. 'Cinepolis, Vashi') powers the location pill.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"date":    str("ISO date. Defaults to today."),
-				"mood":    str("e.g. 'happy', 'focused', 'tired'."),
-				"content": str("The entry body in markdown."),
+				"date":           str("ISO date. Defaults to today."),
+				"mood":           str("e.g. 'happy', 'focused', 'tired'."),
+				"content":        str("The entry body in markdown."),
+				"location_label": str("Optional short place label like 'Cinepolis, Vashi'."),
 			}, "content"),
 			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
 				return createJournalTool(ctx, d, store, uid, args)
@@ -488,6 +489,106 @@ func (s *Service) buildTools() []Tool {
 			}, "title", "type"),
 			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
 				return addMediaTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "list_billers",
+			Description: "List the user's billers / subscriptions with next due date, amount, account, and auto-renew flag. Use this to answer 'what bills are coming up?' or before creating a transaction the user might be paying via a biller.",
+			Schema: obj(map[string]*genai.Schema{
+				"include_archived": boolean("Include archived rows."),
+			}),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return listBillersTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "create_biller",
+			Description: "Create a recurring bill or subscription. Resolve frequency to one of weekly | fortnightly | monthly | bimonthly. If auto_renew=true an account_id is required; the cron will post the expense automatically each cycle.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"name":            str("Required. e.g. 'Netflix' or 'Electricity'."),
+				"amount":          num("Required positive amount."),
+				"frequency":       str("weekly | fortnightly | monthly | bimonthly. Default monthly."),
+				"next_due_date":   str("ISO date for the next charge. Defaults to today."),
+				"account_id":      intg("Account that pays this. Required when auto_renew=true."),
+				"category_id":     intg("Optional expense category."),
+				"is_subscription": boolean("True for streaming-type recurring services."),
+				"auto_renew":      boolean("If true, cron posts the expense automatically on/after due date."),
+				"alert_days":      intg("Days before due_date to alert (default 3)."),
+				"notes":           str("Optional."),
+			}, "name", "amount"),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return createBillerTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "pay_biller",
+			Description: "Mark a biller as paid for its current cycle: posts an expense transaction against the biller's account and rolls next_due_date forward by one period. Idempotent per (biller, due_date).",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"biller_id": intg("Required."),
+				"amount":    num("Override the biller's amount for this cycle."),
+				"paid_date": str("ISO date. Defaults to today."),
+			}, "biller_id"),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return payBillerTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "time_travel",
+			Description: "Semantic event lookup across journals, memos, notes, transactions, media, and journal location pills. Use for 'when did I last X?', 'how long since I met Y?', 'what was that place I went to in March?'. Returns ranked matches with date + a short context excerpt.",
+			Schema: obj(map[string]*genai.Schema{
+				"query":     str("Required. Natural language query e.g. 'last time I met Jay'."),
+				"types":     arrayOf(str(""), "Optional whitelist: journal, memo, note, transaction, media, location."),
+				"date_from": str("Optional ISO lower bound."),
+				"date_to":   str("Optional ISO upper bound."),
+				"limit":     intg("Default 10."),
+			}, "query"),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return timeTravelTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "generate_theme",
+			Description: "Generate a new Material 3 color theme from a natural-language prompt (e.g. 'dusty rose calm dark-leaning' or 'forest morning'). Picks primary, secondary, tertiary, and neutral seed colors. Saves the theme to the user's profile; pass activate=true to make it the active one immediately.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"prompt":    str("Required. Free-form description of the mood, vibe, or palette."),
+				"activate":  boolean("If true, switch to this theme right away. Default false."),
+				"mode_pref": str("'auto' | 'light' | 'dark'. Default 'auto'."),
+			}, "prompt"),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return generateThemeTool(ctx, s, uid, args)
+			},
+		},
+		{
+			Name:        "list_themes",
+			Description: "List the user's saved color themes (built-ins, AI-generated, and manual). Useful before activating a theme by name.",
+			Schema:      obj(map[string]*genai.Schema{}),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return listThemesTool(ctx, d, uid)
+			},
+		},
+		{
+			Name:        "activate_theme",
+			Description: "Switch the user to a saved theme by id. Use list_themes first to find the id.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"id": intg("Theme id."),
+			}, "id"),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return activateThemeTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "list_insights",
+			Description: "List the user's generated cross-module insights (mood vs task completion, spending spikes, habit streak correlations, etc). Optionally filter by window.",
+			Schema: obj(map[string]*genai.Schema{
+				"window": str("Optional: 1w | 2w | 1m | 6m | 1y."),
+				"limit":  intg("Default 10."),
+			}),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return listInsightsTool(ctx, d, uid, args)
 			},
 		},
 		{
@@ -1320,15 +1421,17 @@ func createJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid
 		date = time.Now().Format("2006-01-02")
 	}
 	mood := argStr(args, "mood")
+	locLabel := argStr(args, "location_label")
 	blobKey := fmt.Sprintf("user_%d/journal/%s.md", uid, date)
 	if err := store.Put(ctx, blobKey, []byte(content), "text/markdown"); err != nil {
 		return nil, nil, err
 	}
 	var id int64
 	err := d.QueryRowContext(ctx, `
-		INSERT INTO journal_entries (user_id, date, blob_key, mood) VALUES ($1,$2,$3,$4)
-		ON CONFLICT (user_id, date) DO UPDATE SET blob_key=EXCLUDED.blob_key, mood=EXCLUDED.mood, updated_at=NOW()
-		RETURNING id`, uid, date, blobKey, nullableStr(mood)).Scan(&id)
+		INSERT INTO journal_entries (user_id, date, blob_key, mood, location_label) VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (user_id, date) DO UPDATE SET blob_key=EXCLUDED.blob_key, mood=EXCLUDED.mood,
+		  location_label=EXCLUDED.location_label, updated_at=NOW()
+		RETURNING id`, uid, date, blobKey, nullableStr(mood), locLabel).Scan(&id)
 	if err != nil {
 		return nil, nil, err
 	}

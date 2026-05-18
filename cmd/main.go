@@ -106,24 +106,44 @@ func main() {
 	}
 	handler := api.Router(deps, *frontendDir)
 
-	// Background purge — wipes users that have been soft-deleted past the
-	// 7-day grace window. Runs hourly; one missed tick (e.g. during a
-	// deploy) is harmless because the SQL is idempotent.
+	// Background ticks. All work below is idempotent so missed ticks during
+	// deploys are harmless; the next tick catches up.
+	//
+	//   hourly  — purge soft-deleted users past the 7d window
+	//           — process billers (post auto-renew txns, raise upcoming alerts)
+	//   daily   — generate per-window insights (1w / 2w / 1m / 6m / 1y)
 	go func() {
-		// Run once at boot so a long downtime doesn't leave stale rows.
+		// Run a pass at boot so a long downtime doesn't leave the queue stale.
 		if n, err := api.PurgeExpiredDeletedUsers(context.Background(), deps); err == nil && n > 0 {
 			log.Info().Int64("users_purged", n).Msg("expired accounts purged at boot")
 		}
-		ticker := time.NewTicker(time.Hour)
-		defer ticker.Stop()
-		for range ticker.C {
-			n, err := api.PurgeExpiredDeletedUsers(context.Background(), deps)
-			if err != nil {
-				log.Warn().Err(err).Msg("purge expired accounts failed")
-				continue
-			}
-			if n > 0 {
-				log.Info().Int64("users_purged", n).Msg("expired accounts purged")
+		if posted, alerts, err := api.ProcessBillerCron(context.Background(), deps); err == nil && (posted+alerts) > 0 {
+			log.Info().Int("auto_posted", posted).Int("upcoming", alerts).Msg("billers processed at boot")
+		}
+
+		hourly := time.NewTicker(time.Hour)
+		daily := time.NewTicker(24 * time.Hour)
+		defer hourly.Stop()
+		defer daily.Stop()
+		for {
+			select {
+			case <-hourly.C:
+				if n, err := api.PurgeExpiredDeletedUsers(context.Background(), deps); err != nil {
+					log.Warn().Err(err).Msg("purge expired accounts failed")
+				} else if n > 0 {
+					log.Info().Int64("users_purged", n).Msg("expired accounts purged")
+				}
+				if posted, alerts, err := api.ProcessBillerCron(context.Background(), deps); err != nil {
+					log.Warn().Err(err).Msg("biller cron failed")
+				} else if posted+alerts > 0 {
+					log.Info().Int("auto_posted", posted).Int("upcoming", alerts).Msg("billers processed")
+				}
+			case <-daily.C:
+				if n, err := api.RunDailyInsightCron(context.Background(), deps); err != nil {
+					log.Warn().Err(err).Msg("insight cron failed")
+				} else if n > 0 {
+					log.Info().Int("insights", n).Msg("insights generated")
+				}
 			}
 		}
 	}()
