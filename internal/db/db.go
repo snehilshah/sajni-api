@@ -376,6 +376,12 @@ func (d *DB) migrate() error {
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_ai_sessions_user ON ai_sessions(user_id, updated_at DESC);
+
+	-- Soft-delete: users.deleted_at is set when a user requests account
+	-- deletion. A background purge removes their data after 7 days so
+	-- mistakes are recoverable via /auth/cancel-delete inside the window.
+	ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+	CREATE INDEX IF NOT EXISTS idx_users_deleted_at ON users(deleted_at) WHERE deleted_at IS NOT NULL;
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err
