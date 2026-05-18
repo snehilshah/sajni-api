@@ -24,12 +24,18 @@ type Deps struct {
 	Auth    *auth.Service
 	Storage storage.Storage
 	AI      *ai.Service // nil when GEMINI_API_KEY is unset
+	// AILimiter is shared across all AI endpoints (chat, palette,
+	// categorize, …) so a single per-user budget governs total spend.
+	AILimiter *aiLimiter
 }
 
 // Router builds the top-level HTTP handler. Auth routes are mounted
 // outside of the protected zone; everything else requires a valid
 // access token via auth.Middleware.
 func Router(deps Deps, frontendDir string) http.Handler {
+	if deps.AILimiter == nil {
+		deps.AILimiter = newAILimiter()
+	}
 	authMux := http.NewServeMux()
 	deps.Auth.RegisterRoutes(authMux)
 
@@ -48,6 +54,7 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	registerFinanceRoutes(apiMux, deps)
 	registerSearchRoutes(apiMux, deps)
 	registerAIRoutes(apiMux, deps, deps.AI)
+	registerTakeoutRoutes(apiMux, deps)
 
 	protected := deps.Auth.Middleware(apiMux)
 

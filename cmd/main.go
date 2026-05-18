@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog/log"
 
@@ -97,12 +98,35 @@ func main() {
 	}
 	evt.Msg("sajni started")
 
-	handler := api.Router(api.Deps{
+	deps := api.Deps{
 		DB:      database,
 		Auth:    authSvc,
 		Storage: store,
 		AI:      aiSvc,
-	}, *frontendDir)
+	}
+	handler := api.Router(deps, *frontendDir)
+
+	// Background purge — wipes users that have been soft-deleted past the
+	// 7-day grace window. Runs hourly; one missed tick (e.g. during a
+	// deploy) is harmless because the SQL is idempotent.
+	go func() {
+		// Run once at boot so a long downtime doesn't leave stale rows.
+		if n, err := api.PurgeExpiredDeletedUsers(context.Background(), deps); err == nil && n > 0 {
+			log.Info().Int64("users_purged", n).Msg("expired accounts purged at boot")
+		}
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			n, err := api.PurgeExpiredDeletedUsers(context.Background(), deps)
+			if err != nil {
+				log.Warn().Err(err).Msg("purge expired accounts failed")
+				continue
+			}
+			if n > 0 {
+				log.Info().Int64("users_purged", n).Msg("expired accounts purged")
+			}
+		}
+	}()
 
 	addr := fmt.Sprintf(":%d", *port)
 	if err := http.ListenAndServe(addr, handler); err != nil {
