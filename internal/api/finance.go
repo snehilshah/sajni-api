@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"encoding/csv"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -61,6 +63,9 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/finance/export/transactions.csv", exportTransactionsCSV(deps))
 	mux.HandleFunc("GET /api/finance/export/budgets.csv", exportBudgetsCSV(deps))
 	mux.HandleFunc("GET /api/finance/export/networth.csv", exportNetworthCSV(deps))
+
+	// AI-assisted category inference for transaction titles.
+	mux.HandleFunc("POST /api/finance/categorize", categorizeTransaction(deps))
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -1644,5 +1649,117 @@ func exportNetworthCSV(deps Deps) http.HandlerFunc {
 			}
 			rows.Close()
 		}
+	}
+}
+
+// categorizeTransaction asks the AI service to map a short expense
+// (or income) title to one of the user's existing categories. Returns
+// {category_id, category_name}. category_id is null when no match (the
+// user gets "Others" client-side and can override).
+//
+// Sits behind the shared AI limiter — categorize counts toward the
+// same hourly budget as chat/palette, so it can't be used to siphon
+// quota away from the assistant.
+func categorizeTransaction(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		if deps.AI == nil {
+			errJSON(w, http.StatusServiceUnavailable, "AI is not configured on this server")
+			return
+		}
+		uid := userID(r.Context())
+
+		var body struct {
+			Title string `json:"title"`
+			Kind  string `json:"kind"` // "expense" or "income"
+		}
+		if err := readJSON(r, &body); err != nil {
+			errJSON(w, 400, "invalid json")
+			return
+		}
+		title := strings.TrimSpace(body.Title)
+		if title == "" {
+			errJSON(w, 400, "missing title")
+			return
+		}
+		// Defensive input cap — service will trim again, but this
+		// keeps obviously-abusive bodies out of the AI path entirely.
+		if len(title) > 200 {
+			title = title[:200]
+		}
+		kind := body.Kind
+		if kind != "income" {
+			kind = "expense"
+		}
+
+		// Rate-limit before touching the model.
+		if ok, retryAfter := deps.AILimiter.check(uid); !ok {
+			secs := int(math.Ceil(retryAfter.Seconds()))
+			if secs < 1 {
+				secs = 1
+			}
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
+			errJSON(w, 429, "AI hourly limit reached — try again later")
+			return
+		}
+
+		// Pull the user's category names for the requested kind.
+		rows, err := d.Query(
+			`SELECT id, name FROM fin_categories WHERE user_id = $1 AND kind = $2 ORDER BY name`,
+			uid, kind,
+		)
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		defer rows.Close()
+		type cat struct {
+			id   int64
+			name string
+		}
+		var cats []cat
+		names := make([]string, 0, 16)
+		for rows.Next() {
+			var c cat
+			if err := rows.Scan(&c.id, &c.name); err == nil {
+				cats = append(cats, c)
+				names = append(names, c.name)
+			}
+		}
+
+		// Hard 5s ceiling — categorize is meant to feel typing-paced.
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		picked, tokens, err := deps.AI.CategorizeExpense(ctx, title, kind, names)
+		if err != nil {
+			// Don't 500 — fall back to Others so the form still works.
+			picked = "Others"
+		}
+		// Record usage regardless of outcome so failed calls still count
+		// against quota (prevents retry loops from bypassing the cap).
+		if tokens <= 0 {
+			tokens = 50 // conservative floor for cap accounting
+		}
+		deps.AILimiter.record(uid, tokens)
+
+		// Look up the id for the matched category. If the user has no
+		// explicit "Others", id stays null and the client shows the
+		// label without a binding.
+		var matchedID *int64
+		var matchedName = picked
+		for _, c := range cats {
+			if strings.EqualFold(c.name, picked) {
+				id := c.id
+				matchedID = &id
+				matchedName = c.name
+				break
+			}
+		}
+
+		writeJSON(w, 200, map[string]any{
+			"category_id":   matchedID,
+			"category_name": matchedName,
+		})
 	}
 }
