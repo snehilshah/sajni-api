@@ -355,10 +355,14 @@ func placesAutocomplete(deps Deps) http.HandlerFunc {
 		var parsed struct {
 			Suggestions []struct {
 				PlacePrediction struct {
-					PlaceID         string `json:"placeId"`
+					PlaceID          string `json:"placeId"`
 					StructuredFormat struct {
-						MainText      struct{ Text string `json:"text"` } `json:"mainText"`
-						SecondaryText struct{ Text string `json:"text"` } `json:"secondaryText"`
+						MainText struct {
+							Text string `json:"text"`
+						} `json:"mainText"`
+						SecondaryText struct {
+							Text string `json:"text"`
+						} `json:"secondaryText"`
 					} `json:"structuredFormat"`
 				} `json:"placePrediction"`
 			} `json:"suggestions"`

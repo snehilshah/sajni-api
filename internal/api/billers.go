@@ -27,24 +27,24 @@ func registerBillerRoutes(mux *http.ServeMux, deps Deps) {
 }
 
 type billerResp struct {
-	ID             int64    `json:"id"`
-	Name           string   `json:"name"`
-	Amount         float64  `json:"amount"`
-	Frequency      string   `json:"frequency"`
-	NextDueDate    string   `json:"next_due_date"`
-	AccountID      *int64   `json:"account_id"`
-	AccountName    *string  `json:"account_name"`
-	CategoryID     *int64   `json:"category_id"`
-	CategoryName   *string  `json:"category_name"`
-	CategoryColor  *string  `json:"category_color"`
-	IsSubscription bool     `json:"is_subscription"`
-	AutoRenew      bool     `json:"auto_renew"`
-	AlertDays      int      `json:"alert_days"`
-	Color          string   `json:"color"`
-	Notes          string   `json:"notes"`
-	Archived       bool     `json:"archived"`
-	LastPaidDate   *string  `json:"last_paid_date"`
-	CreatedAt      string   `json:"created_at"`
+	ID             int64   `json:"id"`
+	Name           string  `json:"name"`
+	Amount         float64 `json:"amount"`
+	Frequency      string  `json:"frequency"`
+	NextDueDate    string  `json:"next_due_date"`
+	AccountID      *int64  `json:"account_id"`
+	AccountName    *string `json:"account_name"`
+	CategoryID     *int64  `json:"category_id"`
+	CategoryName   *string `json:"category_name"`
+	CategoryColor  *string `json:"category_color"`
+	IsSubscription bool    `json:"is_subscription"`
+	AutoRenew      bool    `json:"auto_renew"`
+	AlertDays      int     `json:"alert_days"`
+	Color          string  `json:"color"`
+	Notes          string  `json:"notes"`
+	Archived       bool    `json:"archived"`
+	LastPaidDate   *string `json:"last_paid_date"`
+	CreatedAt      string  `json:"created_at"`
 }
 
 // validFrequency keeps the schema strict (we lean on this in advanceDueDate).
@@ -442,12 +442,12 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 	defer rows.Close()
 
 	type bill struct {
-		id, userID                int64
-		name, freq, dueDate       string
-		amount                    float64
-		accountID, categoryID     sql.NullInt64
-		autoRenew                 bool
-		alertDays                 int
+		id, userID            int64
+		name, freq, dueDate   string
+		amount                float64
+		accountID, categoryID sql.NullInt64
+		autoRenew             bool
+		alertDays             int
 	}
 	var bills []bill
 	for rows.Next() {
