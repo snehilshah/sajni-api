@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/crypto/bcrypt"
@@ -27,8 +28,9 @@ type authBody struct {
 }
 
 type userResponse struct {
-	ID    int64  `json:"id"`
-	Email string `json:"email"`
+	ID        int64   `json:"id"`
+	Email     string  `json:"email"`
+	DeletedAt *string `json:"deleted_at,omitempty"`
 }
 
 type authResponse struct {
@@ -201,6 +203,9 @@ func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleMe is a protected handler that returns the current user.
+// The optional deleted_at field signals that the account is in its
+// 7-day soft-delete grace period; the frontend uses it to surface
+// "your account is scheduled for deletion" + a cancel CTA.
 func (s *Service) HandleMe(w http.ResponseWriter, r *http.Request) {
 	id, ok := UserIDFromContext(r.Context())
 	if !ok {
@@ -208,9 +213,15 @@ func (s *Service) HandleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var email string
-	if err := s.DB.QueryRow("SELECT email FROM users WHERE id = $1", id).Scan(&email); err != nil {
+	var deletedAt sql.NullTime
+	if err := s.DB.QueryRow("SELECT email, deleted_at FROM users WHERE id = $1", id).Scan(&email, &deletedAt); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, userResponse{ID: id, Email: email})
+	resp := userResponse{ID: id, Email: email}
+	if deletedAt.Valid {
+		s := deletedAt.Time.UTC().Format(time.RFC3339)
+		resp.DeletedAt = &s
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
