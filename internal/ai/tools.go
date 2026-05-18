@@ -475,7 +475,7 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
-			Name: "add_media",
+			Name:        "add_media",
 			Description: "Add a movie / show / book to the user's library. Call this whenever the user mentions a title they have consumed, are consuming, or plan to consume. Status mapping: 'done' for past-tense (\"I watched\", \"already saw\", \"finished\", \"just read\"), 'watching' for in-progress (\"halfway through\", \"on episode 4\"), 'pending' for intent (\"want to watch\", \"need to read\"). If you have an external_id from tmdb_search, pass it along with poster_url, year, genre to fully populate the entry.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
