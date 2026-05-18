@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
-	"sync"
 	"time"
 
 	"google.golang.org/genai"
@@ -17,7 +17,7 @@ import (
 // service is nil (no GEMINI_API_KEY configured), every endpoint
 // responds with 503 so the frontend can hide the affordance gracefully.
 func registerAIRoutes(mux *http.ServeMux, deps Deps, svc *ai.Service) {
-	limiter := newAILimiter()
+	limiter := deps.AILimiter
 
 	disabled := func(w http.ResponseWriter) {
 		errJSON(w, http.StatusServiceUnavailable, "AI is not configured on this server")
@@ -129,8 +129,13 @@ func registerAIRoutes(mux *http.ServeMux, deps Deps, svc *ai.Service) {
 			return
 		}
 		uid := userID(r.Context())
-		if !limiter.allow(uid) {
-			errJSON(w, 429, "rate limit exceeded")
+		if ok, retryAfter := limiter.check(uid); !ok {
+			secs := int(math.Ceil(retryAfter.Seconds()))
+			if secs < 1 {
+				secs = 1
+			}
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
+			errJSON(w, 429, "AI hourly limit reached — try again later")
 			return
 		}
 
@@ -182,7 +187,10 @@ func registerAIRoutes(mux *http.ServeMux, deps Deps, svc *ai.Service) {
 			History: ai.TrimHistory(prior),
 		}
 
-		var finalHistory []*genai.Content
+		var (
+			finalHistory []*genai.Content
+			finalText    string
+		)
 		for ev := range svc.Chat(ctx, req) {
 			if ev.Type == "done" {
 				var raw struct {
@@ -191,12 +199,19 @@ func registerAIRoutes(mux *http.ServeMux, deps Deps, svc *ai.Service) {
 				}
 				_ = json.Unmarshal(ev.Data, &raw)
 				finalHistory = raw.History
+				finalText = raw.Text
 			}
 			if err := writeSSE(w, ev.Type, ev.Data); err != nil {
 				return
 			}
 			flusher.Flush()
 		}
+
+		// Estimate token cost (no usage metadata on the streaming path)
+		// at ~4 chars/token plus a 300-token floor for system prompt +
+		// tool schemas. Conservative; favours over-counting heavy chats.
+		est := 300 + (len(body.Message)+len(finalText))/4
+		limiter.record(uid, est)
 
 		// Persist whenever a session id is supplied, regardless of mode.
 		// Background ctx because request ctx may be cancelled at stream end.
@@ -221,45 +236,4 @@ func writeSSE(w http.ResponseWriter, event string, data json.RawMessage) error {
 	return nil
 }
 
-// ----- per-user rate limiter -----
-
-type aiLimiter struct {
-	mu     sync.Mutex
-	bucket map[int64]*aiBucket
-}
-
-type aiBucket struct {
-	tokens   int
-	last     time.Time
-	capacity int
-	rate     time.Duration
-}
-
-func newAILimiter() *aiLimiter {
-	return &aiLimiter{bucket: map[int64]*aiBucket{}}
-}
-
-// allow returns true if the user has tokens to spend. ~10 req/min/user.
-func (l *aiLimiter) allow(uid int64) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	b, ok := l.bucket[uid]
-	if !ok {
-		b = &aiBucket{tokens: 10, capacity: 10, rate: 6 * time.Second, last: time.Now()}
-		l.bucket[uid] = b
-	}
-	now := time.Now()
-	add := int(now.Sub(b.last) / b.rate)
-	if add > 0 {
-		b.tokens += add
-		if b.tokens > b.capacity {
-			b.tokens = b.capacity
-		}
-		b.last = now
-	}
-	if b.tokens <= 0 {
-		return false
-	}
-	b.tokens--
-	return true
-}
+// Limiter impl lives in ailimit.go (shared with finance categorize).
