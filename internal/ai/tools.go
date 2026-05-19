@@ -1714,7 +1714,7 @@ func listBudgetsTool(ctx context.Context, d *db.DB, uid int64, args map[string]a
 		var name, period, startDate, endDate string
 		var totalAmount float64
 		rows.Scan(&id, &name, &period, &startDate, &endDate, &totalAmount)
-		
+
 		// Fetch items breakdown
 		items := []map[string]any{}
 		itemRows, _ := d.QueryContext(ctx, `
