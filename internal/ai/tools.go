@@ -245,7 +245,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_finance_transactions",
-			Description: "List finance transactions with filters.",
+			Description: "List finance transactions with filters. Each transaction includes its category_id and category_name.",
 			Schema: obj(map[string]*genai.Schema{
 				"account_id": intg("Filter by account."),
 				"date_from":  str("ISO date."),
@@ -257,11 +257,31 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "list_finance_categories",
+			Description: "List the user's finance categories (such as 'Food & Dining', 'Rent', 'Utilities', 'Salary', etc.) with their kind ('expense' or 'income').",
+			Schema: obj(map[string]*genai.Schema{
+				"kind": str("Optional filter: 'expense' | 'income'."),
+			}),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return listCategoriesTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "list_finance_budgets",
+			Description: "List the user's budgets with their period, start and end dates, total budget amount, total actual spent, and category breakdown (target vs spent). Use this to see if the user is over budget or analyzing spending.",
+			Schema: obj(map[string]*genai.Schema{
+				"limit": intg("Maximum budgets to return (default 10)."),
+			}),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return listBudgetsTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "search",
-			Description: "Free-text search across memos, tasks, notes, journals, habits, media. Use for 'find anything about X' style questions.",
+			Description: "Free-text search across memos, tasks, notes, journals, habits, media, and transactions. Use for 'find anything about X' style questions.",
 			Schema: obj(map[string]*genai.Schema{
 				"q":     str("Search query."),
-				"types": arrayOf(str(""), "Optional whitelist of types: memo, task, note, journal, habit, media."),
+				"types": arrayOf(str(""), "Optional whitelist of types: memo, task, note, journal, habit, media, transaction."),
 			}, "q"),
 			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
 				return runSearchTool(ctx, d, uid, args)
@@ -594,14 +614,16 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "create_transaction",
-			Description: "Record a finance transaction against an existing account. Use list_finance_accounts first to get account_id.",
+			Description: "Record a finance transaction against an existing account and assign a category. Use list_finance_accounts to get account_id. Specify either category_id or category_name; if category_name is specified, the backend will auto-match it to the closest existing category.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"account_id":  intg("Required."),
-				"type":        str("'expense' | 'income'. Default 'expense'."),
-				"amount":      num("Positive amount."),
-				"description": str("What it was for."),
-				"date":        str("ISO date. Defaults to today."),
+				"account_id":    intg("Required. The target account ID."),
+				"category_id":   intg("Optional category identifier."),
+				"category_name": str("Optional category name (e.g. 'Food', 'Groceries', 'Rent') to auto-match on backend."),
+				"type":          str("'expense' | 'income'. Default 'expense'."),
+				"amount":        num("Positive amount."),
+				"description":   str("What it was for."),
+				"date":          str("ISO date. Defaults to today."),
 			}, "account_id", "amount"),
 			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
 				return createTxnTool(ctx, d, uid, args)
@@ -1062,24 +1084,26 @@ func listAccountsTool(ctx context.Context, d *db.DB, uid int64) (any, map[string
 }
 
 func listTxnsTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
-	clauses := []string{"user_id=$1"}
+	clauses := []string{"t.user_id=$1"}
 	vals := []any{uid}
 	if a := argInt(args, "account_id", 0); a > 0 {
-		clauses = append(clauses, fmt.Sprintf("account_id=$%d", len(vals)+1))
+		clauses = append(clauses, fmt.Sprintf("t.account_id=$%d", len(vals)+1))
 		vals = append(vals, a)
 	}
 	if df := argStr(args, "date_from"); df != "" {
-		clauses = append(clauses, fmt.Sprintf("txn_date >= $%d", len(vals)+1))
+		clauses = append(clauses, fmt.Sprintf("t.txn_date >= $%d", len(vals)+1))
 		vals = append(vals, df)
 	}
 	if dt := argStr(args, "date_to"); dt != "" {
-		clauses = append(clauses, fmt.Sprintf("txn_date <= $%d", len(vals)+1))
+		clauses = append(clauses, fmt.Sprintf("t.txn_date <= $%d", len(vals)+1))
 		vals = append(vals, dt)
 	}
 	limit := argInt(args, "limit", 50)
-	q := `SELECT id, account_id, type, amount, description, txn_date::text FROM fin_transactions WHERE ` +
-		strings.Join(clauses, " AND ") +
-		fmt.Sprintf(` ORDER BY txn_date DESC LIMIT %d`, limit)
+	q := `SELECT t.id, t.account_id, t.type, t.amount, t.description, t.txn_date::text, t.category_id, COALESCE(c.name, '') 
+	      FROM fin_transactions t 
+	      LEFT JOIN fin_categories c ON c.id = t.category_id 
+	      WHERE ` + strings.Join(clauses, " AND ") +
+		fmt.Sprintf(` ORDER BY t.txn_date DESC LIMIT %d`, limit)
 	rows, err := d.QueryContext(ctx, q, vals...)
 	if err != nil {
 		return nil, nil, err
@@ -1090,8 +1114,17 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid int64, args map[string]any)
 		var id, acct int64
 		var ttype, desc, date string
 		var amount float64
-		rows.Scan(&id, &acct, &ttype, &amount, &desc, &date)
-		out = append(out, map[string]any{"id": id, "account_id": acct, "type": ttype, "amount": amount, "description": desc, "date": date})
+		var catID sql.NullInt64
+		var catName string
+		rows.Scan(&id, &acct, &ttype, &amount, &desc, &date, &catID, &catName)
+		row := map[string]any{
+			"id": id, "account_id": acct, "type": ttype, "amount": amount,
+			"description": desc, "date": date, "category_name": catName,
+		}
+		if catID.Valid {
+			row["category_id"] = catID.Int64
+		}
+		out = append(out, row)
 	}
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
@@ -1139,6 +1172,16 @@ func runSearchTool(ctx context.Context, d *db.DB, uid int64, args map[string]any
 	}
 	if want("media") {
 		add("media", `SELECT id, title, type FROM media WHERE user_id=$1 AND ($2='' OR title ILIKE $3 OR genre ILIKE $3) ORDER BY updated_at DESC LIMIT 10`)
+	}
+	if want("transaction") {
+		add("transaction", `
+			SELECT t.id, 
+			       t.description || ' - ' || t.txn_date::text AS title, 
+			       a.currency || ' ' || t.amount::text AS subtitle 
+			FROM fin_transactions t 
+			JOIN fin_accounts a ON a.id = t.account_id 
+			WHERE t.user_id=$1 AND ($2='' OR t.description ILIKE $3) 
+			ORDER BY t.txn_date DESC LIMIT 10`)
 	}
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
@@ -1594,14 +1637,125 @@ func createTxnTool(ctx context.Context, d *db.DB, uid int64, args map[string]any
 	if date == "" {
 		date = time.Now().Format("2006-01-02")
 	}
+
+	// Resolve Category
+	var catID int64 = argInt(args, "category_id", 0)
+	catName := strings.TrimSpace(argStr(args, "category_name"))
+
+	if catID == 0 && catName != "" {
+		// 1. Try exact case-insensitive match
+		err := d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1`, uid, catName).Scan(&catID)
+		if err != nil || catID == 0 {
+			// 2. Try substring match
+			d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND name ILIKE $2 LIMIT 1`, uid, "%"+catName+"%").Scan(&catID)
+		}
+		if catID == 0 {
+			// 3. Fallback to default "Other" or "Others"
+			d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND (LOWER(name) = 'other' OR LOWER(name) = 'others') LIMIT 1`, uid).Scan(&catID)
+		}
+	}
+
+	var catArg any = nil
+	if catID > 0 {
+		catArg = catID
+	}
+
 	var id int64
 	err := d.QueryRowContext(ctx, `
-		INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_date)
-		VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-		uid, acct, ttype, amount, desc, date).Scan(&id)
+		INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_date)
+		VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+		uid, acct, catArg, ttype, amount, desc, date).Scan(&id)
 	if err != nil {
 		return nil, nil, err
 	}
 	return map[string]any{"id": id, "amount": amount, "type": ttype},
 		map[string]any{"kind": "transaction_created", "id": id, "title": fmt.Sprintf("%s %.2f", ttype, amount), "route": "/finance/transactions"}, nil
+}
+
+func listCategoriesTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+	kind := argStr(args, "kind")
+	clauses := []string{"user_id=$1"}
+	vals := []any{uid}
+	if kind != "" {
+		clauses = append(clauses, "kind=$2")
+		vals = append(vals, kind)
+	}
+	q := `SELECT id, name, kind, color, icon FROM fin_categories WHERE ` +
+		strings.Join(clauses, " AND ") + ` ORDER BY kind, name`
+	rows, err := d.QueryContext(ctx, q, vals...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id int64
+		var name, k, color, icon string
+		rows.Scan(&id, &name, &k, &color, &icon)
+		out = append(out, map[string]any{
+			"id": id, "name": name, "kind": k, "color": color, "icon": icon,
+		})
+	}
+	return map[string]any{"items": out, "count": len(out)}, nil, nil
+}
+
+func listBudgetsTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+	limit := argInt(args, "limit", 10)
+	rows, err := d.QueryContext(ctx, `SELECT id, name, period, start_date::text, end_date::text, total_amount 
+		FROM fin_budgets WHERE user_id = $1 ORDER BY start_date DESC LIMIT $2`, uid, limit)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	out := []map[string]any{}
+	for rows.Next() {
+		var id int64
+		var name, period, startDate, endDate string
+		var totalAmount float64
+		rows.Scan(&id, &name, &period, &startDate, &endDate, &totalAmount)
+		
+		// Fetch items breakdown
+		items := []map[string]any{}
+		itemRows, _ := d.QueryContext(ctx, `
+			SELECT i.id, i.category_id, i.amount, COALESCE(c.name, 'Other')
+			FROM fin_budget_items i
+			LEFT JOIN fin_categories c ON c.id = i.category_id
+			WHERE i.budget_id = $1`, id)
+		if itemRows != nil {
+			for itemRows.Next() {
+				var itemID int64
+				var catID sql.NullInt64
+				var amt float64
+				var catName string
+				itemRows.Scan(&itemID, &catID, &amt, &catName)
+				var spent float64
+				if catID.Valid {
+					d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions 
+						WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND txn_date BETWEEN $3 AND $4`,
+						uid, catID.Int64, startDate, endDate).Scan(&spent)
+				}
+				item := map[string]any{
+					"id": itemID, "category_name": catName, "amount": amt, "spent": spent,
+				}
+				if catID.Valid {
+					item["category_id"] = catID.Int64
+				}
+				items = append(items, item)
+			}
+			itemRows.Close()
+		}
+
+		var totalSpent float64
+		d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions 
+			WHERE user_id = $1 AND type = 'expense' AND txn_date BETWEEN $2 AND $3`,
+			uid, startDate, endDate).Scan(&totalSpent)
+
+		out = append(out, map[string]any{
+			"id": id, "name": name, "period": period, "start_date": startDate,
+			"end_date": endDate, "total_amount": totalAmount, "spent": totalSpent,
+			"items": items,
+		})
+	}
+	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
