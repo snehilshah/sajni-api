@@ -46,7 +46,7 @@ const (
 	// split steps across more rounds than the full flash model).
 	maxToolRounds   = 10
 	paletteRounds   = 6
-	maxOutputTokens = 1024
+	maxOutputTokens = 2048
 	temperature     = 0.4
 )
 
