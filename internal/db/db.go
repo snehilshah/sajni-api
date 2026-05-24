@@ -489,6 +489,38 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_ai_sessions_user ON ai_sessions(user_id, updated_at DESC);
 
+	-- Thinking ---------------------------------------------------------
+	-- Projects + typed cards for the "Thinking" mode. Cards belong to
+	-- one project; AI enriches each card with summary/connections/
+	-- implications/questions_raised using sibling-card context. Synthesis
+	-- writes thesis + gap_questions back onto the project.
+	CREATE TABLE IF NOT EXISTS thinking_projects (
+		id            BIGSERIAL   PRIMARY KEY,
+		user_id       BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		title         TEXT        NOT NULL DEFAULT '',
+		description   TEXT        NOT NULL DEFAULT '',
+		thesis        TEXT        NOT NULL DEFAULT '',
+		gap_questions JSONB       NOT NULL DEFAULT '[]'::jsonb,
+		synthesized_at TIMESTAMPTZ,
+		created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_thinking_projects_user ON thinking_projects(user_id, updated_at DESC);
+
+	CREATE TABLE IF NOT EXISTS thinking_cards (
+		id             BIGSERIAL   PRIMARY KEY,
+		project_id     BIGINT      NOT NULL REFERENCES thinking_projects(id) ON DELETE CASCADE,
+		user_id        BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		kind           TEXT        NOT NULL DEFAULT 'note',
+		content        TEXT        NOT NULL DEFAULT '',
+		ai_enrichment  JSONB       NOT NULL DEFAULT '{}'::jsonb,
+		enriched_at    TIMESTAMPTZ,
+		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_thinking_cards_project ON thinking_cards(project_id, created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_thinking_cards_user ON thinking_cards(user_id);
+
 	-- Soft-delete: users.deleted_at is set when a user requests account
 	-- deletion. A background purge removes their data after 7 days so
 	-- mistakes are recoverable via /auth/cancel-delete inside the window.
