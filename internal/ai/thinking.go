@@ -22,10 +22,10 @@ type ThinkingCard struct {
 // (summary + connections) into a new card's enrichment call so the model
 // builds on the existing graph instead of starting blank each time.
 type ThinkingCardWithEnrichment struct {
-	ID          int64               `json:"id"`
-	Kind        string              `json:"kind"`
-	Content     string              `json:"content"`
-	Summary     string              `json:"summary,omitempty"`
+	ID          int64                `json:"id"`
+	Kind        string               `json:"kind"`
+	Content     string               `json:"content"`
+	Summary     string               `json:"summary,omitempty"`
 	Connections []ThinkingConnection `json:"connections,omitempty"`
 }
 
