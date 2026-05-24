@@ -613,6 +613,49 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "list_thinking_projects",
+			Description: "List the user's Thinking projects (containers of typed thought-cards). Use to find an existing project before adding a thought, or to summarize what the user is currently thinking about.",
+			Schema:      obj(map[string]*genai.Schema{}),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return listThinkingProjectsTool(ctx, d, uid)
+			},
+		},
+		{
+			Name:        "get_thinking_project",
+			Description: "Read one Thinking project with all its cards. Use when the user references a project by name and you need its current cards before answering or adding a thought.",
+			Schema: obj(map[string]*genai.Schema{
+				"id": intg("Project id."),
+			}, "id"),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return getThinkingProjectAITool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "create_thinking_project",
+			Description: "Start a new Thinking project. Use when the user asks to 'start thinking about X' or 'open a project for Y'. Returns the new project id so you can immediately add_thought cards to it.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"title":       str("Required. Short title for the project."),
+				"description": str("Optional one-line description."),
+			}, "title"),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return createThinkingProjectAITool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "add_thought",
+			Description: "Add a typed thought-card to a Thinking project. Pick the most fitting kind: 'note' (fallback), 'entity', 'question', 'idea', 'reflection', 'claim', 'fact', 'hypothesis', 'evidence', 'contradiction', 'decision', 'todo'. The backend asynchronously enriches the card with meaning + connections to other cards.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"project_id": intg("Required. The Thinking project id (use list_thinking_projects)."),
+				"kind":       str("One of: note | entity | question | idea | reflection | claim | fact | hypothesis | evidence | contradiction | decision | todo. Default 'note'."),
+				"content":    str("Required. The thought body (markdown ok)."),
+			}, "project_id", "content"),
+			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+				return addThoughtTool(ctx, s, uid, args)
+			},
+		},
+		{
 			Name:        "create_transaction",
 			Description: "Record a finance transaction against an existing account and assign a category. Use list_finance_accounts to get account_id. Specify either category_id or category_name; if category_name is specified, the backend will auto-match it to the closest existing category.",
 			Mutating:    true,
