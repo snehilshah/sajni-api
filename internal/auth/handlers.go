@@ -28,20 +28,21 @@ import (
 // before /callback runs, so the cookie compare always fails with
 // `state mismatch`.
 //
-// Instead we encode the state as `<nonce>.<expUnix>.<hmac>` where the
-// HMAC is computed with JWT_SECRET over the first two segments. The
-// callback verifies the signature and the expiry — no server-side
-// storage, no cookie. The state is single-use *per OAuth flow* because
-// Google won't replay an authorization code, and replay of the state
-// alone gets us nothing without the matching code.
-func (s *Service) makeOAuthState() (string, error) {
+// Instead we encode the state as `<nonce>.<expUnix>.<base>.<hmac>` where
+// base is base64url(APP_URL-or-API_BASE_URL) and the HMAC is computed
+// with JWT_SECRET over the first three segments. The callback uses the
+// signed base for the token exchange redirect_uri, so a proxy header
+// mismatch between /start and /callback cannot invalidate the OAuth
+// code. No server-side storage, no cookie.
+func (s *Service) makeOAuthState(base string) (string, error) {
 	raw := make([]byte, 18)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
 	nonce := base64.RawURLEncoding.EncodeToString(raw)
 	exp := strconv.FormatInt(time.Now().Add(10*time.Minute).Unix(), 10)
-	body := nonce + "." + exp
+	basePart := base64.RawURLEncoding.EncodeToString([]byte(strings.TrimRight(base, "/")))
+	body := nonce + "." + exp + "." + basePart
 	h := hmac.New(sha256.New, s.JWTSecret)
 	h.Write([]byte(body))
 	sig := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
@@ -49,28 +50,39 @@ func (s *Service) makeOAuthState() (string, error) {
 }
 
 // verifyOAuthState checks the signature and expiry of a state value
-// produced by makeOAuthState. Returns nil iff the value is authentic
-// and unexpired.
-func (s *Service) verifyOAuthState(state string) error {
+// produced by makeOAuthState. Returns the signed redirect base iff the
+// value is authentic and unexpired.
+func (s *Service) verifyOAuthState(state string) (string, error) {
 	parts := strings.Split(state, ".")
-	if len(parts) != 3 {
-		return errors.New("bad state format")
+	if len(parts) != 3 && len(parts) != 4 {
+		return "", errors.New("bad state format")
 	}
-	body := parts[0] + "." + parts[1]
+	body := strings.Join(parts[:len(parts)-1], ".")
 	h := hmac.New(sha256.New, s.JWTSecret)
 	h.Write([]byte(body))
 	want := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
-	if !hmac.Equal([]byte(want), []byte(parts[2])) {
-		return errors.New("state signature mismatch")
+	if !hmac.Equal([]byte(want), []byte(parts[len(parts)-1])) {
+		return "", errors.New("state signature mismatch")
 	}
 	exp, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
-		return errors.New("bad state expiry")
+		return "", errors.New("bad state expiry")
 	}
 	if time.Now().Unix() > exp {
-		return errors.New("state expired")
+		return "", errors.New("state expired")
 	}
-	return nil
+	if len(parts) == 3 {
+		return "", nil
+	}
+	baseRaw, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return "", errors.New("bad state base")
+	}
+	base := string(baseRaw)
+	if !sameOrigin(base, s.AppURL) && !sameOrigin(base, s.APIBase) {
+		return "", errors.New("state base not allowed")
+	}
+	return strings.TrimRight(base, "/"), nil
 }
 
 // RegisterRoutes attaches all unauthenticated auth endpoints to the
@@ -174,8 +186,91 @@ func (s *Service) issueSession(ctx context.Context, w http.ResponseWriter, userI
 
 // ─── OAuth ────────────────────────────────────────────────────────────
 
-func (s *Service) provider(name string) providers.Provider {
-	redirect := s.APIBase + "/api/auth/" + name + "/callback"
+func (s *Service) oauthBaseForRequest(r *http.Request) string {
+	for _, candidate := range requestOrigins(r, s.CookieInsecure) {
+		if sameOrigin(candidate, s.AppURL) {
+			return strings.TrimRight(s.AppURL, "/")
+		}
+		if sameOrigin(candidate, s.APIBase) {
+			return strings.TrimRight(s.APIBase, "/")
+		}
+	}
+	return strings.TrimRight(s.APIBase, "/")
+}
+
+func requestOrigins(r *http.Request, insecure bool) []string {
+	origins := []string{}
+	if host := firstHeaderValue(r.Header.Get("X-Forwarded-Host")); host != "" {
+		proto := firstHeaderValue(r.Header.Get("X-Forwarded-Proto"))
+		if proto == "" {
+			proto = "https"
+			if insecure {
+				proto = "http"
+			}
+		}
+		origins = append(origins, proto+"://"+host)
+	}
+	if host := forwardedHost(r.Header.Get("Forwarded")); host != "" {
+		proto := forwardedProto(r.Header.Get("Forwarded"))
+		if proto == "" {
+			proto = "https"
+			if insecure {
+				proto = "http"
+			}
+		}
+		origins = append(origins, proto+"://"+host)
+	}
+	if r.Host != "" {
+		proto := "https"
+		if r.TLS == nil && insecure {
+			proto = "http"
+		}
+		origins = append(origins, proto+"://"+r.Host)
+	}
+	return origins
+}
+
+func firstHeaderValue(v string) string {
+	if i := strings.Index(v, ","); i >= 0 {
+		v = v[:i]
+	}
+	return strings.TrimSpace(v)
+}
+
+func forwardedHost(v string) string {
+	return forwardedParam(v, "host")
+}
+
+func forwardedProto(v string) string {
+	return forwardedParam(v, "proto")
+}
+
+func forwardedParam(v, key string) string {
+	v = firstHeaderValue(v)
+	for part := range strings.SplitSeq(v, ";") {
+		k, val, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok || !strings.EqualFold(k, key) {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(val), `"`)
+	}
+	return ""
+}
+
+func sameOrigin(a, b string) bool {
+	au, err := url.Parse(strings.TrimRight(a, "/"))
+	if err != nil || au.Scheme == "" || au.Host == "" {
+		return false
+	}
+	bu, err := url.Parse(strings.TrimRight(b, "/"))
+	if err != nil || bu.Scheme == "" || bu.Host == "" {
+		return false
+	}
+	return strings.EqualFold(au.Scheme, bu.Scheme) && strings.EqualFold(au.Host, bu.Host)
+}
+
+func (s *Service) provider(name, base string) providers.Provider {
+	redirect := strings.TrimRight(base, "/") + "/api/auth/" + name + "/callback"
 	switch name {
 	case "google":
 		return &providers.Google{
@@ -194,12 +289,13 @@ func (s *Service) provider(name string) providers.Provider {
 // on makeOAuthState for the rationale.
 func (s *Service) oauthStart(name string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		p := s.provider(name)
+		base := s.oauthBaseForRequest(r)
+		p := s.provider(name, base)
 		if p == nil {
 			writeErr(w, http.StatusBadRequest, "unknown provider")
 			return
 		}
-		state, err := s.makeOAuthState()
+		state, err := s.makeOAuthState(base)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -213,15 +309,19 @@ func (s *Service) oauthStart(name string) http.HandlerFunc {
 // the access token in the fragment so it never hits server logs.
 func (s *Service) oauthCallback(name string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		p := s.provider(name)
+		p := s.provider(name, s.oauthBaseForRequest(r))
 		if p == nil {
 			writeErr(w, http.StatusBadRequest, "unknown provider")
 			return
 		}
 		state := r.URL.Query().Get("state")
-		if err := s.verifyOAuthState(state); err != nil {
+		stateBase, err := s.verifyOAuthState(state)
+		if err != nil {
 			writeErr(w, http.StatusBadRequest, "state mismatch: "+err.Error())
 			return
+		}
+		if stateBase != "" {
+			p = s.provider(name, stateBase)
 		}
 
 		code := r.URL.Query().Get("code")
