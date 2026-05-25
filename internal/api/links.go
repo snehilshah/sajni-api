@@ -62,6 +62,13 @@ func syncBacklinks(d *db.DB, userID string, sourceType string, sourceID int64, c
 		if ref == "" || seen[ref] {
 			continue
 		}
+		// `[[task:NN]]` is the TaskChip serialization — it's NOT a
+		// wikilink target, so don't store it as a backlink (otherwise the
+		// target_ref index fills up with task pointers that no resolver
+		// knows how to render).
+		if strings.HasPrefix(ref, "task:") {
+			continue
+		}
 		seen[ref] = true
 		if _, err := d.Exec(
 			"INSERT INTO backlinks (user_id, source_type, source_id, target_ref) VALUES ($1, $2, $3, $4)",
