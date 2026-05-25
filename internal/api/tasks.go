@@ -17,8 +17,67 @@ func registerTaskRoutes(mux *http.ServeMux, deps Deps) {
 
 	mux.HandleFunc("GET /api/tasks", listTasks(deps))
 	mux.HandleFunc("POST /api/tasks", createTask(deps))
+	mux.HandleFunc("GET /api/tasks/{id}", getTask(deps))
 	mux.HandleFunc("PUT /api/tasks/{id}", updateTask(deps))
 	mux.HandleFunc("DELETE /api/tasks/{id}", deleteTask(deps))
+}
+
+// getTask returns a single task by id. Used by the global task detail
+// popup so any chip/row click can open the same dialog without first
+// pulling the whole list and filtering.
+func getTask(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		var t taskRow
+		var stepsRaw []byte
+		err = d.QueryRow(`
+			SELECT t.id, t.title, t.description, t.status, t.priority,
+			       t.due_date::text, t.scheduled_at::text,
+			       t.list_id, t.parent_task_id, t.important, t.steps,
+			       COALESCE(t.sort_order, 0),
+			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
+			       t.created_at, t.updated_at
+			FROM tasks t
+			LEFT JOIN (
+				SELECT parent_task_id,
+				       COUNT(*) AS cnt,
+				       COUNT(*) FILTER (WHERE status = 'done') AS done
+				FROM tasks
+				WHERE parent_task_id IS NOT NULL
+				GROUP BY parent_task_id
+			) c ON c.parent_task_id = t.id
+			WHERE t.user_id = $1 AND t.id = $2`, uid, id).Scan(
+			&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority,
+			&t.DueDate, &t.ScheduledAt,
+			&t.ListID, &t.ParentTaskID, &t.Important, &stepsRaw,
+			&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
+			&t.CreatedAt, &t.UpdatedAt,
+		)
+		if err != nil {
+			errJSON(w, 404, "not found")
+			return
+		}
+		t.Steps = decodeSteps(stepsRaw)
+		tagRows, err := d.Query("SELECT tag FROM tags WHERE user_id = $1 AND entity_type = 'task' AND entity_id = $2", uid, t.ID)
+		if err == nil {
+			for tagRows.Next() {
+				var tag string
+				tagRows.Scan(&tag)
+				t.Tags = append(t.Tags, tag)
+			}
+			tagRows.Close()
+		}
+		if t.Tags == nil {
+			t.Tags = []string{}
+		}
+		writeJSON(w, 200, t)
+	}
 }
 
 // taskRow is the wire shape returned to clients. Tasks v2 adds list_id,
