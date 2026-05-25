@@ -234,6 +234,22 @@ func (d *DB) migrate() error {
 		UNIQUE(user_id, date)
 	);
 
+	-- Weekly journal entry. Same pattern as journal_entries but keyed by
+	-- ISO week-year + week number (so 2024-W52 / 2025-W01 stay distinct).
+	-- Content lives in object storage under journal/weekly/<key>.md.
+	CREATE TABLE IF NOT EXISTS journal_weekly (
+		id         BIGSERIAL   PRIMARY KEY,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		iso_year   INTEGER     NOT NULL,
+		iso_week   INTEGER     NOT NULL,
+		blob_key   TEXT        NOT NULL DEFAULT '',
+		mood       TEXT,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		UNIQUE(user_id, iso_year, iso_week)
+	);
+	CREATE INDEX IF NOT EXISTS idx_journal_weekly_user ON journal_weekly(user_id, iso_year DESC, iso_week DESC);
+
 	CREATE TABLE IF NOT EXISTS notes (
 		id         BIGSERIAL   PRIMARY KEY,
 		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
