@@ -384,7 +384,12 @@ func (s *Service) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	userID, err := s.consumeRefreshToken(cookie.Value)
 	if err != nil {
-		s.clearRefreshCookie(w)
+		// Don't clear the cookie here. A single failed consume can happen
+		// during a benign race (two tabs, StrictMode double-mount, a
+		// network hiccup that retries), and nuking the cookie permanently
+		// logs the user out for no good reason. Only /auth/logout clears
+		// the cookie explicitly. On the next user-initiated sign-in a
+		// fresh cookie is issued anyway.
 		writeErr(w, http.StatusUnauthorized, err.Error())
 		return
 	}
