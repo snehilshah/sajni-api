@@ -83,18 +83,38 @@ jobs:
           service: ${{ env.SERVICE_NAME }}
           region: ${{ env.GCP_REGION }}
           image: ${{ env.IMAGE }}
-          # Non-secret runtime config. CORS_ORIGIN must match the
-          # frontend origin exactly (scheme + host).
+          # Plain runtime config (not sensitive). GCS_BUCKET comes from
+          # a GitHub repo Variable so it can rotate without a secret
+          # rewrite. GEMINI_MODEL is pinned in code-config because
+          # changes need a deploy anyway.
           env_vars: |
             STORAGE_BACKEND=gcs
             GCS_BUCKET=${{ vars.GCS_BUCKET }}
-            CORS_ORIGIN=${{ vars.CORS_ORIGIN }}
             GEMINI_MODEL=gemini-2.5-flash
+          # Everything sensitive (or treated as sensitive) is mounted
+          # from Google Secret Manager at start-up. Names on the left
+          # are the env vars the Go app reads; names on the right
+          # (before `:latest`) are the Secret Manager secret names —
+          # they must match what `gcloud secrets list` shows.
+          #
+          # CORS_ORIGIN / APP_URL / API_BASE_URL / EMAIL_FROM live in
+          # Secret Manager too so all runtime config has one home,
+          # even though they aren't strictly secret.
           secrets: |
             DATABASE_URL=sajni-database-url:latest
             JWT_SECRET=sajni-jwt-secret:latest
             TMDB_API_KEY=sajni-tmdb-key:latest
             GEMINI_API_KEY=sajni-gemini-key:latest
+            LOG_LEVEL=LOG_LEVEL:latest
+            CORS_ORIGIN=CORS_ORIGIN:latest
+            APP_URL=APP_URL:latest
+            API_BASE_URL=API_BASE_URL:latest
+            EMAIL_FROM=EMAIL_FROM:latest
+            GOOGLE_OAUTH_CLIENT_ID=GOOGLE_OAUTH_CLIENT_ID:latest
+            GOOGLE_OAUTH_CLIENT_SECRET=GOOGLE_OAUTH_CLIENT_SECRET:latest
+            GITHUB_OAUTH_CLIENT_ID=GITHUB_OAUTH_CLIENT_ID:latest
+            GITHUB_OAUTH_CLIENT_SECRET=GITHUB_OAUTH_CLIENT_SECRET:latest
+            RESEND_API_KEY=RESEND_API_KEY:latest
           # Cheapest viable Cloud Run config:
           # - min-instances=0     → no idle cost (~1–2s cold start)
           # - max-instances=2     → caps blast radius if traffic spikes
