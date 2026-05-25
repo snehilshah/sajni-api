@@ -3,8 +3,10 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"os"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/rs/zerolog/log"
 )
 
 // DB wraps the sql.DB connection to Postgres.
@@ -15,6 +17,11 @@ type DB struct {
 // New opens a Postgres connection using the provided DSN
 // (e.g. "postgres://user:pass@host:5432/dbname?sslmode=disable")
 // and ensures the schema is up to date.
+//
+// Setting DROP_AND_RESEED=1 wipes the public schema before re-running
+// migrations. Used once when switching the schema (e.g. the auth
+// rework that flipped users.id to UUID). Flip the flag back off after
+// the next successful boot.
 func New(dsn string) (*DB, error) {
 	if dsn == "" {
 		return nil, fmt.Errorf("empty DATABASE_URL")
@@ -29,6 +36,14 @@ func New(dsn string) (*DB, error) {
 	}
 
 	d := &DB{DB: conn}
+
+	if os.Getenv("DROP_AND_RESEED") == "1" {
+		log.Warn().Msg("DROP_AND_RESEED=1 — wiping public schema before migrate")
+		if _, err := d.Exec(`DROP SCHEMA public CASCADE; CREATE SCHEMA public;`); err != nil {
+			return nil, fmt.Errorf("drop schema: %w", err)
+		}
+	}
+
 	if err := d.migrate(); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -37,25 +52,75 @@ func New(dsn string) (*DB, error) {
 
 func (d *DB) migrate() error {
 	schema := `
+	CREATE EXTENSION IF NOT EXISTS citext;
+
+	-- ─── Auth ─────────────────────────────────────────────────────────
+	-- users.id is a UUIDv7 (time-sortable) minted in Go, never DEFAULT.
+	-- email is CITEXT so case differences (Alice@x vs alice@x) collide.
+	-- name + email are mandatory; password_hash is gone (auth is now
+	-- OAuth + email-TOTP).
 	CREATE TABLE IF NOT EXISTS users (
-		id            BIGSERIAL    PRIMARY KEY,
-		email         TEXT         NOT NULL UNIQUE,
-		password_hash TEXT         NOT NULL,
+		id            UUID         PRIMARY KEY,
+		email         CITEXT       NOT NULL UNIQUE,
+		name          TEXT         NOT NULL DEFAULT '',
+		onboarded_at  TIMESTAMPTZ,
+		created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+		deleted_at    TIMESTAMPTZ
+	);
+	CREATE INDEX IF NOT EXISTS idx_users_deleted_at ON users(deleted_at) WHERE deleted_at IS NOT NULL;
+
+	-- One row per (provider, provider_subject) — Google sub, GitHub user
+	-- id, or the email itself for the 'email' provider. Multiple
+	-- identities can point at the same user — that's the account-linking
+	-- story: log in via any of the three with the same verified email
+	-- and you land on the same row.
+	CREATE TABLE IF NOT EXISTS auth_identities (
+		id               UUID         PRIMARY KEY,
+		user_id          UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		provider         TEXT         NOT NULL,
+		provider_subject TEXT         NOT NULL,
+		email            CITEXT       NOT NULL,
+		created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+		last_used_at     TIMESTAMPTZ,
+		UNIQUE(provider, provider_subject)
+	);
+	CREATE INDEX IF NOT EXISTS idx_auth_identities_user ON auth_identities(user_id);
+
+	-- Single-use codes for email-TOTP login AND for the "verify before
+	-- linking" challenge when an OAuth provider asserts an unverified
+	-- email collision. code_hash is SHA-256 of the 6-digit code.
+	CREATE TABLE IF NOT EXISTS email_codes (
+		id            UUID         PRIMARY KEY,
+		email         CITEXT       NOT NULL,
+		code_hash     BYTEA        NOT NULL,
+		purpose       TEXT         NOT NULL DEFAULT 'login',
+		link_user_id  UUID         REFERENCES users(id) ON DELETE CASCADE,
+		link_provider TEXT,
+		link_subject  TEXT,
+		link_name     TEXT,
+		attempts      INTEGER      NOT NULL DEFAULT 0,
+		expires_at    TIMESTAMPTZ  NOT NULL,
+		consumed_at   TIMESTAMPTZ,
 		created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 	);
+	CREATE INDEX IF NOT EXISTS idx_email_codes_email_active ON email_codes(email, expires_at) WHERE consumed_at IS NULL;
 
+	-- Refresh tokens are now looked up by SHA-256 hash (BYTEA, UNIQUE)
+	-- — one indexed lookup per refresh, no bcrypt sweep. Hot path went
+	-- from O(N) bcrypt to O(1) index seek.
 	CREATE TABLE IF NOT EXISTS refresh_tokens (
-		id          BIGSERIAL   PRIMARY KEY,
-		user_id     BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		token_hash  TEXT        NOT NULL,
-		expires_at  TIMESTAMPTZ NOT NULL,
-		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		id          UUID         PRIMARY KEY,
+		user_id     UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		token_hash  BYTEA        NOT NULL UNIQUE,
+		expires_at  TIMESTAMPTZ  NOT NULL,
+		created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
 
+	-- ─── Content (BIGSERIAL row PK; user_id is UUID) ──────────────────
 	CREATE TABLE IF NOT EXISTS memos (
 		id         BIGSERIAL   PRIMARY KEY,
-		user_id    BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		content    TEXT        NOT NULL DEFAULT '',
 		pinned     BOOLEAN     NOT NULL DEFAULT FALSE,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -63,32 +128,9 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_memos_user ON memos(user_id);
 
-	CREATE TABLE IF NOT EXISTS tasks (
-		id          BIGSERIAL   PRIMARY KEY,
-		user_id     BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		title       TEXT        NOT NULL DEFAULT '',
-		description TEXT        NOT NULL DEFAULT '',
-		status      TEXT        NOT NULL DEFAULT 'todo',
-		priority    TEXT        NOT NULL DEFAULT 'medium',
-		due_date    DATE,
-		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);
-	-- scheduled_at lets the agent answer "find a free 1-hour slot" by joining
-	-- against actual time blocks. Nullable so existing tasks stay valid.
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ;
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 30;
-	-- Tasks v2 — list-first redesign (Microsoft Todo inspired).
-	-- list_id groups tasks under a custom list (e.g. "Work", "Home").
-	-- parent_task_id allows nested subtasks.
-	-- steps is an inline checklist embedded in the task itself
-	--   (shape: [{"id":string,"text":string,"done":bool}]).
-	-- important is the starred flag for the smart "Important" list.
-	-- sort_order lets users hand-order tasks within a list.
 	CREATE TABLE IF NOT EXISTS task_lists (
 		id         BIGSERIAL   PRIMARY KEY,
-		user_id    BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name       TEXT        NOT NULL DEFAULT '',
 		color      TEXT        NOT NULL DEFAULT '#2D5A4F',
 		icon       TEXT        NOT NULL DEFAULT 'list',
@@ -97,17 +139,32 @@ func (d *DB) migrate() error {
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_task_lists_user ON task_lists(user_id);
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS list_id BIGINT REFERENCES task_lists(id) ON DELETE SET NULL;
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_task_id BIGINT REFERENCES tasks(id) ON DELETE CASCADE;
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS steps JSONB NOT NULL DEFAULT '[]'::jsonb;
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS important BOOLEAN NOT NULL DEFAULT FALSE;
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0;
+
+	CREATE TABLE IF NOT EXISTS tasks (
+		id               BIGSERIAL   PRIMARY KEY,
+		user_id          UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		title            TEXT        NOT NULL DEFAULT '',
+		description      TEXT        NOT NULL DEFAULT '',
+		status           TEXT        NOT NULL DEFAULT 'todo',
+		priority         TEXT        NOT NULL DEFAULT 'medium',
+		due_date         DATE,
+		scheduled_at     TIMESTAMPTZ,
+		duration_minutes INTEGER     NOT NULL DEFAULT 30,
+		list_id          BIGINT      REFERENCES task_lists(id) ON DELETE SET NULL,
+		parent_task_id   BIGINT      REFERENCES tasks(id) ON DELETE CASCADE,
+		steps            JSONB       NOT NULL DEFAULT '[]'::jsonb,
+		important        BOOLEAN     NOT NULL DEFAULT FALSE,
+		sort_order       INTEGER     NOT NULL DEFAULT 0,
+		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_list ON tasks(list_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
 
 	CREATE TABLE IF NOT EXISTS habits (
 		id         BIGSERIAL   PRIMARY KEY,
-		user_id    BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name       TEXT        NOT NULL DEFAULT '',
 		frequency  TEXT        NOT NULL DEFAULT 'daily',
 		color      TEXT        NOT NULL DEFAULT '#2D5A4F',
@@ -117,7 +174,7 @@ func (d *DB) migrate() error {
 
 	CREATE TABLE IF NOT EXISTS habit_logs (
 		id          BIGSERIAL PRIMARY KEY,
-		user_id     BIGINT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id     UUID      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		habit_id    BIGINT    NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
 		logged_date DATE      NOT NULL,
 		UNIQUE(user_id, habit_id, logged_date)
@@ -126,7 +183,7 @@ func (d *DB) migrate() error {
 
 	CREATE TABLE IF NOT EXISTS media (
 		id               BIGSERIAL   PRIMARY KEY,
-		user_id          BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id          UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		title            TEXT        NOT NULL DEFAULT '',
 		type             TEXT        NOT NULL DEFAULT 'movie',
 		status           TEXT        NOT NULL DEFAULT 'pending',
@@ -141,29 +198,18 @@ func (d *DB) migrate() error {
 		episodes_total   INTEGER     NOT NULL DEFAULT 0,
 		seasons_watched  INTEGER     NOT NULL DEFAULT 0,
 		seasons_total    INTEGER     NOT NULL DEFAULT 0,
+		season_episodes  JSONB       NOT NULL DEFAULT '[]'::jsonb,
+		collection_id    TEXT        NOT NULL DEFAULT '',
+		collection_name  TEXT        NOT NULL DEFAULT '',
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_media_user ON media(user_id);
-	-- Show progress: per-season episode counts (e.g. [10,12,8]) so the UI
-	-- can ask for current_season + current_episode and derive the rest
-	-- without making the user track totals manually. Filled in on add via
-	-- TMDB; old rows stay valid (empty array means "no per-season data").
-	ALTER TABLE media ADD COLUMN IF NOT EXISTS season_episodes JSONB NOT NULL DEFAULT '[]'::jsonb;
-	-- Movie collection — TMDB's "belongs_to_collection" (Mission
-	-- Impossible Collection, Marvel Phase X, etc.). Lets us group movies
-	-- and show "X of N watched" per series.
-	ALTER TABLE media ADD COLUMN IF NOT EXISTS collection_id   TEXT NOT NULL DEFAULT '';
-	ALTER TABLE media ADD COLUMN IF NOT EXISTS collection_name TEXT NOT NULL DEFAULT '';
 	CREATE INDEX IF NOT EXISTS idx_media_collection ON media(user_id, collection_id) WHERE collection_id <> '';
-	-- Watch-history timeline. Auto-written on add/update so the user
-	-- can see "added Apr 12 / finished S2 May 4 / completed Jun 2" for
-	-- any title. kind is one of: added, started, progress, completed,
-	-- rating, dropped, restarted. meta carries per-event detail
-	-- (season/episode for shows, page for books).
+
 	CREATE TABLE IF NOT EXISTS media_events (
 		id         BIGSERIAL   PRIMARY KEY,
-		user_id    BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		media_id   BIGINT      NOT NULL REFERENCES media(id) ON DELETE CASCADE,
 		kind       TEXT        NOT NULL,
 		meta       JSONB       NOT NULL DEFAULT '{}'::jsonb,
@@ -174,19 +220,23 @@ func (d *DB) migrate() error {
 		WHERE kind = 'completed';
 
 	CREATE TABLE IF NOT EXISTS journal_entries (
-		id         BIGSERIAL   PRIMARY KEY,
-		user_id    BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		date       DATE        NOT NULL,
-		blob_key   TEXT        NOT NULL DEFAULT '',
-		mood       TEXT,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		id             BIGSERIAL   PRIMARY KEY,
+		user_id        UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		date           DATE        NOT NULL,
+		blob_key       TEXT        NOT NULL DEFAULT '',
+		mood           TEXT,
+		location_label TEXT        NOT NULL DEFAULT '',
+		location_lat   NUMERIC(9,6),
+		location_lon   NUMERIC(9,6),
+		attachments    JSONB       NOT NULL DEFAULT '[]'::jsonb,
+		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		UNIQUE(user_id, date)
 	);
 
 	CREATE TABLE IF NOT EXISTS notes (
 		id         BIGSERIAL   PRIMARY KEY,
-		user_id    BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		title      TEXT        NOT NULL DEFAULT '',
 		blob_key   TEXT        NOT NULL DEFAULT '',
 		folder     TEXT        NOT NULL DEFAULT '',
@@ -196,7 +246,7 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id);
 
 	CREATE TABLE IF NOT EXISTS note_folders (
-		user_id    BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		path       TEXT        NOT NULL,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		PRIMARY KEY (user_id, path)
@@ -204,7 +254,7 @@ func (d *DB) migrate() error {
 
 	CREATE TABLE IF NOT EXISTS task_due_history (
 		id          BIGSERIAL   PRIMARY KEY,
-		user_id     BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		task_id     BIGINT      NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
 		due_date    DATE        NOT NULL,
 		outcome     TEXT        NOT NULL DEFAULT 'missed',
@@ -216,7 +266,7 @@ func (d *DB) migrate() error {
 
 	CREATE TABLE IF NOT EXISTS tags (
 		id          BIGSERIAL PRIMARY KEY,
-		user_id     BIGINT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id     UUID      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		entity_type TEXT      NOT NULL,
 		entity_id   BIGINT    NOT NULL,
 		tag         TEXT      NOT NULL
@@ -227,7 +277,7 @@ func (d *DB) migrate() error {
 
 	CREATE TABLE IF NOT EXISTS backlinks (
 		id          BIGSERIAL PRIMARY KEY,
-		user_id     BIGINT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id     UUID      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		source_type TEXT      NOT NULL,
 		source_id   BIGINT    NOT NULL,
 		target_ref  TEXT      NOT NULL DEFAULT ''
@@ -236,10 +286,10 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_backlinks_ref ON backlinks(user_id, target_ref);
 	CREATE INDEX IF NOT EXISTS idx_backlinks_source ON backlinks(user_id, source_type, source_id);
 
-	-- Finance ---------------------------------------------------------------
+	-- ─── Finance ─────────────────────────────────────────────────────
 	CREATE TABLE IF NOT EXISTS fin_accounts (
 		id              BIGSERIAL   PRIMARY KEY,
-		user_id         BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name            TEXT        NOT NULL DEFAULT '',
 		type            TEXT        NOT NULL DEFAULT 'savings',
 		institution     TEXT        NOT NULL DEFAULT '',
@@ -258,19 +308,19 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_fin_accounts_user ON fin_accounts(user_id);
 
 	CREATE TABLE IF NOT EXISTS fin_categories (
-		id        BIGSERIAL PRIMARY KEY,
-		user_id   BIGINT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		name      TEXT      NOT NULL DEFAULT '',
-		kind      TEXT      NOT NULL DEFAULT 'expense',
-		color     TEXT      NOT NULL DEFAULT '#6B7280',
-		icon      TEXT      NOT NULL DEFAULT '',
+		id         BIGSERIAL PRIMARY KEY,
+		user_id    UUID      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		name       TEXT      NOT NULL DEFAULT '',
+		kind       TEXT      NOT NULL DEFAULT 'expense',
+		color      TEXT      NOT NULL DEFAULT '#6B7280',
+		icon       TEXT      NOT NULL DEFAULT '',
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_categories_user ON fin_categories(user_id);
 
 	CREATE TABLE IF NOT EXISTS fin_transactions (
 		id              BIGSERIAL   PRIMARY KEY,
-		user_id         BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		account_id      BIGINT      NOT NULL REFERENCES fin_accounts(id) ON DELETE CASCADE,
 		category_id     BIGINT      REFERENCES fin_categories(id) ON DELETE SET NULL,
 		type            TEXT        NOT NULL DEFAULT 'expense',
@@ -288,7 +338,7 @@ func (d *DB) migrate() error {
 
 	CREATE TABLE IF NOT EXISTS fin_budgets (
 		id          BIGSERIAL   PRIMARY KEY,
-		user_id     BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name        TEXT        NOT NULL DEFAULT '',
 		period      TEXT        NOT NULL DEFAULT 'monthly',
 		start_date  DATE        NOT NULL,
@@ -308,7 +358,7 @@ func (d *DB) migrate() error {
 
 	CREATE TABLE IF NOT EXISTS fin_investments (
 		id              BIGSERIAL   PRIMARY KEY,
-		user_id         BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name            TEXT        NOT NULL DEFAULT '',
 		type            TEXT        NOT NULL DEFAULT 'sip',
 		account_id      BIGINT      REFERENCES fin_accounts(id) ON DELETE SET NULL,
@@ -326,50 +376,46 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_fin_investments_user ON fin_investments(user_id);
 
 	CREATE TABLE IF NOT EXISTS fin_virtual_savings (
-		id           BIGSERIAL   PRIMARY KEY,
-		user_id      BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		account_id   BIGINT      NOT NULL REFERENCES fin_accounts(id) ON DELETE CASCADE,
-		name         TEXT        NOT NULL DEFAULT '',
-		target_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+		id             BIGSERIAL   PRIMARY KEY,
+		user_id        UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		account_id     BIGINT      NOT NULL REFERENCES fin_accounts(id) ON DELETE CASCADE,
+		name           TEXT        NOT NULL DEFAULT '',
+		target_amount  NUMERIC(14,2) NOT NULL DEFAULT 0,
 		current_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
-		color        TEXT        NOT NULL DEFAULT '#2D5A4F',
-		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		color          TEXT        NOT NULL DEFAULT '#2D5A4F',
+		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_virtual_savings_user ON fin_virtual_savings(user_id);
 
 	CREATE TABLE IF NOT EXISTS fin_cc_statements (
-		id             BIGSERIAL   PRIMARY KEY,
-		user_id        BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		account_id     BIGINT      NOT NULL REFERENCES fin_accounts(id) ON DELETE CASCADE,
-		statement_date DATE        NOT NULL,
-		due_date       DATE        NOT NULL,
-		amount_due     NUMERIC(14,2) NOT NULL DEFAULT 0,
+		id              BIGSERIAL   PRIMARY KEY,
+		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		account_id      BIGINT      NOT NULL REFERENCES fin_accounts(id) ON DELETE CASCADE,
+		statement_date  DATE        NOT NULL,
+		due_date        DATE        NOT NULL,
+		amount_due      NUMERIC(14,2) NOT NULL DEFAULT 0,
 		cashback_earned NUMERIC(14,2) NOT NULL DEFAULT 0,
-		paid           BOOLEAN     NOT NULL DEFAULT FALSE,
-		paid_at        TIMESTAMPTZ,
-		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		paid            BOOLEAN     NOT NULL DEFAULT FALSE,
+		paid_at         TIMESTAMPTZ,
+		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_cc_statements_user ON fin_cc_statements(user_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_cc_statements_account ON fin_cc_statements(account_id);
 
 	CREATE TABLE IF NOT EXISTS fin_networth_snapshots (
-		id          BIGSERIAL PRIMARY KEY,
-		user_id     BIGINT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		snapshot_date DATE    NOT NULL,
-		assets      NUMERIC(14,2) NOT NULL DEFAULT 0,
-		liabilities NUMERIC(14,2) NOT NULL DEFAULT 0,
-		net_worth   NUMERIC(14,2) NOT NULL DEFAULT 0,
+		id            BIGSERIAL PRIMARY KEY,
+		user_id       UUID      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		snapshot_date DATE      NOT NULL,
+		assets        NUMERIC(14,2) NOT NULL DEFAULT 0,
+		liabilities   NUMERIC(14,2) NOT NULL DEFAULT 0,
+		net_worth     NUMERIC(14,2) NOT NULL DEFAULT 0,
 		UNIQUE(user_id, snapshot_date)
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_networth_user ON fin_networth_snapshots(user_id);
 
-	-- Billers / Subscriptions ----------------------------------------------
-	-- Recurring bill or subscription. auto_renew=true lets the nightly
-	-- cron post a transaction automatically on/after next_due_date.
-	-- alert_days is the lead time for the upcoming-bill notice.
 	CREATE TABLE IF NOT EXISTS fin_billers (
 		id              BIGSERIAL   PRIMARY KEY,
-		user_id         BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name            TEXT        NOT NULL DEFAULT '',
 		amount          NUMERIC(14,2) NOT NULL DEFAULT 0,
 		frequency       TEXT        NOT NULL DEFAULT 'monthly',
@@ -391,7 +437,7 @@ func (d *DB) migrate() error {
 
 	CREATE TABLE IF NOT EXISTS fin_biller_payments (
 		id          BIGSERIAL   PRIMARY KEY,
-		user_id     BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		biller_id   BIGINT      NOT NULL REFERENCES fin_billers(id) ON DELETE CASCADE,
 		txn_id      BIGINT      REFERENCES fin_transactions(id) ON DELETE SET NULL,
 		due_date    DATE        NOT NULL,
@@ -403,10 +449,9 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_biller_payments_user ON fin_biller_payments(user_id);
 
-	-- Lightweight notice queue surfaced on the Finance overview.
 	CREATE TABLE IF NOT EXISTS fin_biller_alerts (
 		id          BIGSERIAL   PRIMARY KEY,
-		user_id     BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		biller_id   BIGINT      NOT NULL REFERENCES fin_billers(id) ON DELETE CASCADE,
 		kind        TEXT        NOT NULL,
 		due_date    DATE        NOT NULL,
@@ -416,21 +461,10 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_biller_alerts_user ON fin_biller_alerts(user_id, seen);
 
-	-- Journal location + attachments ---------------------------------------
-	-- Short label like "Cinepolis, Vashi" plus optional precise coords for
-	-- time-travel / correlation queries. attachments is a JSON array of
-	-- {url, kind, w, h} entries kept alongside the markdown blob.
-	ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS location_label TEXT NOT NULL DEFAULT '';
-	ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS location_lat   NUMERIC(9,6);
-	ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS location_lon   NUMERIC(9,6);
-	ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS attachments    JSONB NOT NULL DEFAULT '[]'::jsonb;
-
-	-- Cross-module insights -------------------------------------------------
-	-- One row per surfaced pattern. evidence carries the raw numbers so
-	-- the frontend can render a tooltip / chart and the user can audit.
+	-- ─── Insights / Themes / AI ───────────────────────────────────────
 	CREATE TABLE IF NOT EXISTS insights (
 		id           BIGSERIAL   PRIMARY KEY,
-		user_id      BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id      UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		window_key   TEXT        NOT NULL,
 		kind         TEXT        NOT NULL,
 		title        TEXT        NOT NULL DEFAULT '',
@@ -445,7 +479,7 @@ func (d *DB) migrate() error {
 
 	CREATE TABLE IF NOT EXISTS insight_runs (
 		id        BIGSERIAL   PRIMARY KEY,
-		user_id   BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id   UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		window_key TEXT       NOT NULL,
 		status    TEXT        NOT NULL DEFAULT 'ok',
 		notes     TEXT        NOT NULL DEFAULT '',
@@ -453,15 +487,9 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_insight_runs_user ON insight_runs(user_id, window_key, run_at DESC);
 
-	-- User themes -----------------------------------------------------
-	-- A theme stores three M3 seed colors (primary / secondary / tertiary)
-	-- and an optional neutral. The frontend feeds these into Googles
-	-- material-color-utilities to derive the full light + dark palette,
-	-- so we never store the 30+ derived tokens here. source distinguishes
-	-- AI-generated, hand-tweaked, and built-in presets.
 	CREATE TABLE IF NOT EXISTS user_themes (
 		id         BIGSERIAL   PRIMARY KEY,
-		user_id    BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name       TEXT        NOT NULL DEFAULT '',
 		source     TEXT        NOT NULL DEFAULT 'ai',
 		seeds      JSONB       NOT NULL DEFAULT '{}'::jsonb,
@@ -471,17 +499,12 @@ func (d *DB) migrate() error {
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_user_themes_user ON user_themes(user_id);
-	-- At most one active theme per user.
 	CREATE UNIQUE INDEX IF NOT EXISTS uniq_user_active_theme
 		ON user_themes(user_id) WHERE is_active = TRUE;
 
-	-- AI ----------------------------------------------------------------
-	-- One row per chat conversation. messages is the full history as a
-	-- JSON array of {role, parts: [...]} entries (mirrors genai.Content).
-	-- Trimmed to the last N entries before being sent to the model.
 	CREATE TABLE IF NOT EXISTS ai_sessions (
 		id         BIGSERIAL   PRIMARY KEY,
-		user_id    BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		title      TEXT        NOT NULL DEFAULT '',
 		messages   JSONB       NOT NULL DEFAULT '[]'::jsonb,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -489,43 +512,32 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_ai_sessions_user ON ai_sessions(user_id, updated_at DESC);
 
-	-- Thinking ---------------------------------------------------------
-	-- Projects + typed cards for the "Thinking" mode. Cards belong to
-	-- one project; AI enriches each card with summary/connections/
-	-- implications/questions_raised using sibling-card context. Synthesis
-	-- writes thesis + gap_questions back onto the project.
 	CREATE TABLE IF NOT EXISTS thinking_projects (
-		id            BIGSERIAL   PRIMARY KEY,
-		user_id       BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		title         TEXT        NOT NULL DEFAULT '',
-		description   TEXT        NOT NULL DEFAULT '',
-		thesis        TEXT        NOT NULL DEFAULT '',
-		gap_questions JSONB       NOT NULL DEFAULT '[]'::jsonb,
+		id             BIGSERIAL   PRIMARY KEY,
+		user_id        UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		title          TEXT        NOT NULL DEFAULT '',
+		description    TEXT        NOT NULL DEFAULT '',
+		thesis         TEXT        NOT NULL DEFAULT '',
+		gap_questions  JSONB       NOT NULL DEFAULT '[]'::jsonb,
 		synthesized_at TIMESTAMPTZ,
-		created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_thinking_projects_user ON thinking_projects(user_id, updated_at DESC);
 
 	CREATE TABLE IF NOT EXISTS thinking_cards (
-		id             BIGSERIAL   PRIMARY KEY,
-		project_id     BIGINT      NOT NULL REFERENCES thinking_projects(id) ON DELETE CASCADE,
-		user_id        BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		kind           TEXT        NOT NULL DEFAULT 'note',
-		content        TEXT        NOT NULL DEFAULT '',
-		ai_enrichment  JSONB       NOT NULL DEFAULT '{}'::jsonb,
-		enriched_at    TIMESTAMPTZ,
-		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		id            BIGSERIAL   PRIMARY KEY,
+		project_id    BIGINT      NOT NULL REFERENCES thinking_projects(id) ON DELETE CASCADE,
+		user_id       UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		kind          TEXT        NOT NULL DEFAULT 'note',
+		content       TEXT        NOT NULL DEFAULT '',
+		ai_enrichment JSONB       NOT NULL DEFAULT '{}'::jsonb,
+		enriched_at   TIMESTAMPTZ,
+		created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_thinking_cards_project ON thinking_cards(project_id, created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_thinking_cards_user ON thinking_cards(user_id);
-
-	-- Soft-delete: users.deleted_at is set when a user requests account
-	-- deletion. A background purge removes their data after 7 days so
-	-- mistakes are recoverable via /auth/cancel-delete inside the window.
-	ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-	CREATE INDEX IF NOT EXISTS idx_users_deleted_at ON users(deleted_at) WHERE deleted_at IS NOT NULL;
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err

@@ -41,6 +41,8 @@ func Router(deps Deps, frontendDir string) http.Handler {
 
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("GET /api/auth/me", deps.Auth.HandleMe)
+	apiMux.HandleFunc("POST /api/auth/profile", deps.Auth.HandleUpdateProfile)
+	apiMux.HandleFunc("POST /api/auth/onboarded", deps.Auth.HandleOnboarded)
 	registerMemoRoutes(apiMux, deps)
 	registerTaskRoutes(apiMux, deps)
 	registerTaskListRoutes(apiMux, deps)
@@ -62,11 +64,16 @@ func Router(deps Deps, frontendDir string) http.Handler {
 
 	protected := deps.Auth.Middleware(apiMux)
 
-	// Top-level dispatcher: route auth endpoints first (no token), then
-	// fall through to the protected mux for everything else.
+	// Top-level dispatcher: route the unauthenticated auth endpoints
+	// directly to authMux, fall through to the protected mux for
+	// everything else (including /api/auth/me + /api/auth/onboarded).
 	root := http.NewServeMux()
-	root.Handle("/api/auth/register", authMux)
-	root.Handle("/api/auth/login", authMux)
+	root.Handle("/api/auth/google/start", authMux)
+	root.Handle("/api/auth/google/callback", authMux)
+	root.Handle("/api/auth/github/start", authMux)
+	root.Handle("/api/auth/github/callback", authMux)
+	root.Handle("/api/auth/email/start", authMux)
+	root.Handle("/api/auth/email/verify", authMux)
 	root.Handle("/api/auth/refresh", authMux)
 	root.Handle("/api/auth/logout", authMux)
 	root.Handle("/api/", protected)
@@ -213,6 +220,9 @@ func intParam(r *http.Request, name string) (int64, error) {
 	return n, err
 }
 
-func userID(ctx context.Context) int64 {
+// userID returns the authenticated UUID (string) for the request, or
+// panics if auth middleware did not run. Centralizes the type so every
+// handler keeps using `userID(ctx)` regardless of the underlying type.
+func userID(ctx context.Context) string {
 	return auth.MustUserID(ctx)
 }

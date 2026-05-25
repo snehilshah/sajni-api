@@ -180,9 +180,9 @@ func RunDailyInsightCron(ctx context.Context, deps Deps) (int, error) {
 		return 0, err
 	}
 	defer rows.Close()
-	var uids []int64
+	var uids []string
 	for rows.Next() {
-		var id int64
+		var id string
 		rows.Scan(&id)
 		uids = append(uids, id)
 	}
@@ -198,7 +198,7 @@ func RunDailyInsightCron(ctx context.Context, deps Deps) (int, error) {
 			}
 			n, err := RunInsightsForUser(ctx, deps, uid, win)
 			if err != nil {
-				log.Warn().Err(err).Int64("uid", uid).Str("window", win).Msg("insights run failed")
+				log.Warn().Err(err).Str("uid", uid).Str("window", win).Msg("insights run failed")
 				continue
 			}
 			total += n
@@ -211,7 +211,7 @@ func RunDailyInsightCron(ctx context.Context, deps Deps) (int, error) {
 // detectors for the given window and persists them. The AI service, if
 // present, polishes the body lines into a single warm sentence; without
 // it the raw detector text is used as-is.
-func RunInsightsForUser(ctx context.Context, deps Deps, uid int64, window string) (int, error) {
+func RunInsightsForUser(ctx context.Context, deps Deps, uid string, window string) (int, error) {
 	days, ok := windowDays[window]
 	if !ok {
 		return 0, fmt.Errorf("bad window")
@@ -275,7 +275,7 @@ func RunInsightsForUser(ctx context.Context, deps Deps, uid int64, window string
 	return len(out), nil
 }
 
-func detectHabitStreaks(ctx context.Context, d *db.DB, uid int64, cutoff string, days int) []detected {
+func detectHabitStreaks(ctx context.Context, d *db.DB, uid string, cutoff string, days int) []detected {
 	rows, err := d.QueryContext(ctx, `SELECT h.name,
 		COUNT(*) FILTER (WHERE l.logged_date >= $2) AS done
 		FROM habits h LEFT JOIN habit_logs l
@@ -307,7 +307,7 @@ func detectHabitStreaks(ctx context.Context, d *db.DB, uid int64, cutoff string,
 	return out
 }
 
-func detectSpendingSpikes(ctx context.Context, d *db.DB, uid int64, cutoff string, days int) []detected {
+func detectSpendingSpikes(ctx context.Context, d *db.DB, uid string, cutoff string, days int) []detected {
 	rows, err := d.QueryContext(ctx, `WITH recent AS (
 		SELECT category_id, SUM(amount) AS amt
 		FROM fin_transactions WHERE user_id=$1 AND type='expense' AND txn_date >= $2
@@ -353,7 +353,7 @@ func detectSpendingSpikes(ctx context.Context, d *db.DB, uid int64, cutoff strin
 	return out
 }
 
-func detectJournalCadence(ctx context.Context, d *db.DB, uid int64, cutoff string, days int) []detected {
+func detectJournalCadence(ctx context.Context, d *db.DB, uid string, cutoff string, days int) []detected {
 	if days < 14 {
 		return nil
 	}
@@ -539,7 +539,7 @@ func trunc(s string, n int) string {
 // a journal entry with a non-empty mood exists. Mood string maps to a
 // 1..5 numeric scale so we can compute Pearson r against the daily task
 // completion rate.
-func dailyMoodTaskSeries(ctx context.Context, d *db.DB, uid int64, cutoff string) ([][2]float64, error) {
+func dailyMoodTaskSeries(ctx context.Context, d *db.DB, uid string, cutoff string) ([][2]float64, error) {
 	moodMap := map[string]float64{
 		"great": 5, "happy": 5, "excited": 5, "energized": 5,
 		"good": 4, "focused": 4, "calm": 4,

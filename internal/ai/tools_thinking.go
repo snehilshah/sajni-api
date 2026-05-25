@@ -8,7 +8,7 @@ import (
 	"sajni/internal/db"
 )
 
-func listThinkingProjectsTool(ctx context.Context, d *db.DB, uid int64) (any, map[string]any, error) {
+func listThinkingProjectsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
 	rows, err := d.QueryContext(ctx, `
 		SELECT p.id, p.title, p.description, COALESCE(p.thesis,''),
 		       COALESCE(c.cnt,0)::int, p.updated_at::text
@@ -35,7 +35,7 @@ func listThinkingProjectsTool(ctx context.Context, d *db.DB, uid int64) (any, ma
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
 
-func getThinkingProjectAITool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func getThinkingProjectAITool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	id := argInt(args, "id", 0)
 	if id == 0 {
 		return nil, nil, fmt.Errorf("missing id")
@@ -68,7 +68,7 @@ func getThinkingProjectAITool(ctx context.Context, d *db.DB, uid int64, args map
 	}, nil, nil
 }
 
-func createThinkingProjectAITool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func createThinkingProjectAITool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	title := argStr(args, "title")
 	if title == "" {
 		return nil, nil, fmt.Errorf("missing title")
@@ -83,7 +83,7 @@ func createThinkingProjectAITool(ctx context.Context, d *db.DB, uid int64, args 
 		map[string]any{"kind": "thinking_project_created", "id": id, "title": title, "route": fmt.Sprintf("/thinking/%d", id)}, nil
 }
 
-func addThoughtTool(ctx context.Context, s *Service, uid int64, args map[string]any) (any, map[string]any, error) {
+func addThoughtTool(ctx context.Context, s *Service, uid string, args map[string]any) (any, map[string]any, error) {
 	d := s.db
 	pid := argInt(args, "project_id", 0)
 	content := argStr(args, "content")
@@ -106,7 +106,8 @@ func addThoughtTool(ctx context.Context, s *Service, uid int64, args map[string]
 	d.ExecContext(ctx, `UPDATE thinking_projects SET updated_at=NOW() WHERE id=$1`, pid)
 
 	// Async enrichment using sibling context (with prior enrichments).
-	go func(cardID, projID, userID int64) {
+	// userID is a UUID string; project + card ids stay int64 (BIGSERIAL).
+	go func(cardID, projID int64, userID string) {
 		s.EnrichCardWithContext(context.Background(), userID, projID, cardID)
 	}(id, pid, uid)
 
@@ -118,7 +119,7 @@ func addThoughtTool(ctx context.Context, s *Service, uid int64, args map[string]
 // their prior enrichments) and runs EnrichThinkingCard against it.
 // Used by both the AI tool path (add_thought) and the HTTP path
 // (api/thinking.go) — shared so we don't drift.
-func (s *Service) EnrichCardWithContext(ctx context.Context, uid, projectID, cardID int64) error {
+func (s *Service) EnrichCardWithContext(ctx context.Context, uid string, projectID, cardID int64) error {
 	var target ThinkingCard
 	if err := s.db.QueryRowContext(ctx, `SELECT id, kind, content FROM thinking_cards WHERE id=$1 AND user_id=$2`, cardID, uid).
 		Scan(&target.ID, &target.Kind, &target.Content); err != nil {

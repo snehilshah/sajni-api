@@ -333,7 +333,7 @@ func payBiller(deps Deps) http.HandlerFunc {
 // postBillerTxn inserts the transaction row, links it to the biller via
 // fin_biller_payments, and is idempotent on (biller_id, due_date). Returns
 // the txn id (0 if a duplicate payment row already existed).
-func postBillerTxn(ctx context.Context, deps Deps, uid, billerID, accountID int64,
+func postBillerTxn(ctx context.Context, deps Deps, uid string, billerID, accountID int64,
 	categoryID sql.NullInt64, name string, amount float64, paidDate, dueDate string, auto bool,
 ) (int64, error) {
 	d := deps.DB
@@ -442,7 +442,8 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 	defer rows.Close()
 
 	type bill struct {
-		id, userID            int64
+		id                    int64
+		userID                string
 		name, freq, dueDate   string
 		amount                float64
 		accountID, categoryID sql.NullInt64

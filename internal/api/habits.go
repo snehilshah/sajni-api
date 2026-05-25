@@ -61,7 +61,7 @@ func listHabits(deps Deps) http.HandlerFunc {
 	}
 }
 
-func calcStreak(d *db.DB, uid, habitID int64) int {
+func calcStreak(d *db.DB, uid string, habitID int64) int {
 	rows, err := d.Query("SELECT logged_date::text FROM habit_logs WHERE user_id = $1 AND habit_id = $2 ORDER BY logged_date DESC", uid, habitID)
 	if err != nil {
 		return 0
@@ -200,7 +200,7 @@ func toggleHabitLogForDate(deps Deps) http.HandlerFunc {
 }
 
 // toggleLog flips today's log row for habit/user; returns logged: bool.
-func toggleLog(d *db.DB, uid, habitID int64, date string, w http.ResponseWriter) {
+func toggleLog(d *db.DB, uid string, habitID int64, date string, w http.ResponseWriter) {
 	// Verify the habit belongs to the user.
 	var owns int
 	d.QueryRow("SELECT COUNT(*) FROM habits WHERE id = $1 AND user_id = $2", habitID, uid).Scan(&owns)

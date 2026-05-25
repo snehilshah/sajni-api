@@ -29,7 +29,7 @@ func NormalizeRef(s string) string {
 }
 
 // syncTags deletes old tags for an entity and inserts fresh ones parsed from content.
-func syncTags(d *db.DB, userID int64, entityType string, entityID int64, content string) error {
+func syncTags(d *db.DB, userID string, entityType string, entityID int64, content string) error {
 	if _, err := d.Exec("DELETE FROM tags WHERE user_id = $1 AND entity_type = $2 AND entity_id = $3", userID, entityType, entityID); err != nil {
 		return err
 	}
@@ -52,7 +52,7 @@ func syncTags(d *db.DB, userID int64, entityType string, entityID int64, content
 }
 
 // syncBacklinks stores raw normalized refs for a source. Resolution happens at read time.
-func syncBacklinks(d *db.DB, userID int64, sourceType string, sourceID int64, content string) error {
+func syncBacklinks(d *db.DB, userID string, sourceType string, sourceID int64, content string) error {
 	if _, err := d.Exec("DELETE FROM backlinks WHERE user_id = $1 AND source_type = $2 AND source_id = $3", userID, sourceType, sourceID); err != nil {
 		return err
 	}

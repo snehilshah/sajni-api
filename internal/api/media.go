@@ -39,7 +39,7 @@ type MediaEvent struct {
 // logMediaEvent writes one event row. Errors are best-effort — a
 // failed audit insert shouldn't break the user's actual add/update
 // action. Callers can pass meta=nil for events with no detail.
-func logMediaEvent(d *db.DB, uid, mediaID int64, kind string, meta map[string]any) {
+func logMediaEvent(d *db.DB, uid string, mediaID int64, kind string, meta map[string]any) {
 	raw := []byte("{}")
 	if meta != nil {
 		if b, err := json.Marshal(meta); err == nil {

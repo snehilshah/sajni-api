@@ -9,7 +9,7 @@ import (
 	"sajni/internal/theme"
 )
 
-func generateThemeTool(ctx context.Context, s *Service, uid int64, args map[string]any) (any, map[string]any, error) {
+func generateThemeTool(ctx context.Context, s *Service, uid string, args map[string]any) (any, map[string]any, error) {
 	prompt := argStr(args, "prompt")
 	if prompt == "" {
 		return nil, nil, fmt.Errorf("missing prompt")
@@ -30,7 +30,7 @@ func generateThemeTool(ctx context.Context, s *Service, uid int64, args map[stri
 		map[string]any{"kind": "theme_created", "id": t.ID, "title": t.Name, "route": "/settings#themes", "activated": activate}, nil
 }
 
-func listThemesTool(ctx context.Context, d *db.DB, uid int64) (any, map[string]any, error) {
+func listThemesTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
 	rows, err := d.QueryContext(ctx, `SELECT id, name, source, seeds, is_active, created_at::text
 		FROM user_themes WHERE user_id = $1 ORDER BY is_active DESC, created_at DESC`, uid)
 	if err != nil {
@@ -54,7 +54,7 @@ func listThemesTool(ctx context.Context, d *db.DB, uid int64) (any, map[string]a
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
 
-func activateThemeTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func activateThemeTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	id := argInt(args, "id", 0)
 	if id == 0 {
 		return nil, nil, fmt.Errorf("missing id")

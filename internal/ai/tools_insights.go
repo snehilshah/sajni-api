@@ -8,7 +8,7 @@ import (
 	"sajni/internal/db"
 )
 
-func listInsightsTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func listInsightsTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	window := argStr(args, "window")
 	limit := argInt(args, "limit", 10)
 	q := `SELECT id, window_key, kind, title, body, score, generated_at::text
@@ -44,7 +44,7 @@ func listInsightsTool(ctx context.Context, d *db.DB, uid int64, args map[string]
 // memos, notes, transactions, media titles, and journal location pills.
 // Results are merged by descending date and trimmed. Cheap: every leg is
 // indexed and capped to its own row budget.
-func timeTravelTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func timeTravelTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	q := strings.TrimSpace(argStr(args, "query"))
 	if q == "" {
 		return nil, nil, errMissingQuery

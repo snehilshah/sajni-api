@@ -129,7 +129,7 @@ func sanitizePrompt(p string) string {
 // becomes the user's active theme atomically.
 func Generate(
 	ctx context.Context, ai QuickGen, d *db.DB,
-	uid int64, prompt, modePref string, activate bool,
+	uid string, prompt, modePref string, activate bool,
 ) (*Theme, error) {
 	if ai == nil {
 		return nil, errors.New("AI not configured")
@@ -173,7 +173,7 @@ func Generate(
 // Insert writes a row to user_themes; if activate is true it also flips
 // is_active in a single transaction.
 func Insert(
-	ctx context.Context, d *db.DB, uid int64,
+	ctx context.Context, d *db.DB, uid string,
 	name, source, prompt, modePref string, seeds Seeds, activate bool,
 ) (int64, error) {
 	seedsRaw, _ := json.Marshal(seeds)
@@ -195,7 +195,7 @@ func Insert(
 // Activate atomically swaps the user's active theme. Wrapped in a
 // transaction so the partial UNIQUE index on (user_id) WHERE is_active
 // = TRUE never fires.
-func Activate(ctx context.Context, d *db.DB, uid, id int64) error {
+func Activate(ctx context.Context, d *db.DB, uid string, id int64) error {
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -212,7 +212,7 @@ func Activate(ctx context.Context, d *db.DB, uid, id int64) error {
 
 // Load fetches a single theme by id (scoped by uid). Useful for tools
 // that need to echo the row back to the user.
-func Load(ctx context.Context, d *db.DB, uid, id int64) (*Theme, error) {
+func Load(ctx context.Context, d *db.DB, uid string, id int64) (*Theme, error) {
 	var t Theme
 	var seedsRaw []byte
 	err := d.QueryRowContext(ctx, `SELECT id, name, source, seeds, prompt, mode_pref, is_active, created_at::text

@@ -50,7 +50,7 @@ func safeFileName(title string) string {
 }
 
 // noteKey produces the storage object key for a given note.
-func noteKey(uid int64, folder, title string) string {
+func noteKey(uid string, folder, title string) string {
 	parts := []string{"notes"}
 	if folder != "" {
 		parts = append(parts, folder)

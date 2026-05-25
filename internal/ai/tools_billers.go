@@ -9,7 +9,7 @@ import (
 	"sajni/internal/db"
 )
 
-func listBillersTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func listBillersTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	includeArchived := argBool(args, "include_archived", false)
 	q := `SELECT b.id, b.name, b.amount, b.frequency, b.next_due_date::text,
 		a.name, b.is_subscription, b.auto_renew, b.alert_days
@@ -46,7 +46,7 @@ func listBillersTool(ctx context.Context, d *db.DB, uid int64, args map[string]a
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
 
-func createBillerTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func createBillerTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	name := argStr(args, "name")
 	if name == "" {
 		return nil, nil, fmt.Errorf("missing name")
@@ -98,7 +98,7 @@ func createBillerTool(ctx context.Context, d *db.DB, uid int64, args map[string]
 		map[string]any{"kind": "biller_created", "id": id, "title": name, "route": "/finance/billers"}, nil
 }
 
-func payBillerTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func payBillerTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	id := argInt(args, "biller_id", 0)
 	if id == 0 {
 		return nil, nil, fmt.Errorf("missing biller_id")

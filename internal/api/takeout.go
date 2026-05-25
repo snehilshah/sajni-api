@@ -42,7 +42,7 @@ func takeoutExport(deps Deps) http.HandlerFunc {
 		defer zw.Close()
 
 		ctx := r.Context()
-		exporters := []func(context.Context, *zip.Writer, Deps, int64) error{
+		exporters := []func(context.Context, *zip.Writer, Deps, string) error{
 			exportReadme,
 			exportMemos,
 			exportTasks,
@@ -77,7 +77,7 @@ func writeZipText(zw *zip.Writer, name, body string) {
 	io.WriteString(f, body)
 }
 
-func exportReadme(_ context.Context, zw *zip.Writer, _ Deps, _ int64) error {
+func exportReadme(_ context.Context, zw *zip.Writer, _ Deps, _ string) error {
 	body := `# Sajni Takeout
 
 This archive contains all your Sajni data.
@@ -101,7 +101,7 @@ To restore: POST this same .zip to /api/takeout/import or use the
 	return nil
 }
 
-func exportMemos(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportMemos(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx,
 		`SELECT id, content, pinned, created_at FROM memos WHERE user_id = $1 ORDER BY created_at`, uid)
 	if err != nil {
@@ -127,7 +127,7 @@ func exportMemos(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) erro
 	return nil
 }
 
-func exportTasks(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportTasks(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx, `
 		SELECT id, title, COALESCE(description,''), status, priority, due_date,
 		       COALESCE(list_id,0), important, created_at, updated_at
@@ -162,7 +162,7 @@ func exportTasks(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) erro
 	return cw.Error()
 }
 
-func exportTaskLists(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportTaskLists(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx, `SELECT id, name, color, icon, sort_order, created_at FROM task_lists WHERE user_id = $1 ORDER BY sort_order`, uid)
 	if err != nil {
 		return err
@@ -183,7 +183,7 @@ func exportTaskLists(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) 
 		})
 }
 
-func exportHabits(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportHabits(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx,
 		`SELECT id, name, frequency, color, created_at FROM habits WHERE user_id = $1 ORDER BY created_at`, uid)
 	if err != nil {
@@ -204,7 +204,7 @@ func exportHabits(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) err
 		})
 }
 
-func exportHabitLogs(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportHabitLogs(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx,
 		`SELECT habit_id, logged_date FROM habit_logs WHERE user_id = $1 ORDER BY habit_id, logged_date`, uid)
 	if err != nil {
@@ -222,7 +222,7 @@ func exportHabitLogs(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) 
 	})
 }
 
-func exportMedia(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportMedia(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx, `
 		SELECT id, title, type, status, COALESCE(rating,0), notes, platform, poster_url,
 		       COALESCE(year,0), genre, external_id, episodes_watched, episodes_total,
@@ -256,7 +256,7 @@ func exportMedia(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) erro
 		})
 }
 
-func exportJournal(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportJournal(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx,
 		`SELECT date, blob_key, COALESCE(mood,'') FROM journal_entries WHERE user_id = $1 ORDER BY date`, uid)
 	if err != nil {
@@ -303,7 +303,7 @@ func safeName(s string) string {
 	return s
 }
 
-func exportNotes(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportNotes(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx,
 		`SELECT id, title, blob_key, folder, created_at, updated_at FROM notes WHERE user_id = $1 ORDER BY updated_at DESC`, uid)
 	if err != nil {
@@ -342,7 +342,7 @@ func exportNotes(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) erro
 	return nil
 }
 
-func exportTags(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportTags(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx,
 		`SELECT entity_type, entity_id, tag FROM tags WHERE user_id = $1 ORDER BY entity_type, entity_id`, uid)
 	if err != nil {
@@ -361,7 +361,7 @@ func exportTags(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error
 	})
 }
 
-func exportFinanceAccounts(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportFinanceAccounts(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx, `
 		SELECT id, name, type, institution, currency, opening_balance, COALESCE(credit_limit,0),
 		       COALESCE(statement_day,0), COALESCE(due_day,0), cashback_type, cashback_value,
@@ -397,7 +397,7 @@ func exportFinanceAccounts(ctx context.Context, zw *zip.Writer, deps Deps, uid i
 		})
 }
 
-func exportFinanceCategories(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportFinanceCategories(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx, `SELECT id, name, kind, color, icon FROM fin_categories WHERE user_id = $1 ORDER BY id`, uid)
 	if err != nil {
 		return err
@@ -416,7 +416,7 @@ func exportFinanceCategories(ctx context.Context, zw *zip.Writer, deps Deps, uid
 		})
 }
 
-func exportFinanceTransactions(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportFinanceTransactions(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx, `
 		SELECT id, account_id, COALESCE(category_id,0), type, amount, description, txn_date,
 		       COALESCE(linked_account,0), created_at
@@ -446,7 +446,7 @@ func exportFinanceTransactions(ctx context.Context, zw *zip.Writer, deps Deps, u
 		})
 }
 
-func exportFinanceBudgets(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportFinanceBudgets(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx, `SELECT id, name, period, start_date, end_date, total_amount FROM fin_budgets WHERE user_id = $1 ORDER BY start_date`, uid)
 	if err != nil {
 		return err
@@ -471,7 +471,7 @@ func exportFinanceBudgets(ctx context.Context, zw *zip.Writer, deps Deps, uid in
 		})
 }
 
-func exportFinanceInvestments(ctx context.Context, zw *zip.Writer, deps Deps, uid int64) error {
+func exportFinanceInvestments(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx, `
 		SELECT id, name, type, COALESCE(account_id,0), invested_amount
 		FROM fin_investments WHERE user_id = $1 ORDER BY id`, uid)
@@ -610,7 +610,7 @@ func takeoutImport(deps Deps) http.HandlerFunc {
 	}
 }
 
-func importMemos(ctx context.Context, deps Deps, uid int64, body []byte) int {
+func importMemos(ctx context.Context, deps Deps, uid string, body []byte) int {
 	parts := strings.Split(string(body), "\n---\n")
 	n := 0
 	for _, p := range parts {
@@ -635,7 +635,7 @@ func importMemos(ctx context.Context, deps Deps, uid int64, body []byte) int {
 	return n
 }
 
-func importTasks(ctx context.Context, deps Deps, uid int64, body []byte) int {
+func importTasks(ctx context.Context, deps Deps, uid string, body []byte) int {
 	rows, err := parseCSV(body)
 	if err != nil {
 		return 0
@@ -666,7 +666,7 @@ func importTasks(ctx context.Context, deps Deps, uid int64, body []byte) int {
 	return n
 }
 
-func importHabits(ctx context.Context, deps Deps, uid int64, body []byte) (int, map[int64]int64) {
+func importHabits(ctx context.Context, deps Deps, uid string, body []byte) (int, map[int64]int64) {
 	idMap := map[int64]int64{}
 	rows, err := parseCSV(body)
 	if err != nil {
@@ -690,7 +690,7 @@ func importHabits(ctx context.Context, deps Deps, uid int64, body []byte) (int, 
 	return n, idMap
 }
 
-func importHabitLogs(ctx context.Context, deps Deps, uid int64, body []byte, idMap map[int64]int64) int {
+func importHabitLogs(ctx context.Context, deps Deps, uid string, body []byte, idMap map[int64]int64) int {
 	rows, err := parseCSV(body)
 	if err != nil {
 		return 0
@@ -715,7 +715,7 @@ func importHabitLogs(ctx context.Context, deps Deps, uid int64, body []byte, idM
 	return n
 }
 
-func importMedia(ctx context.Context, deps Deps, uid int64, body []byte) int {
+func importMedia(ctx context.Context, deps Deps, uid string, body []byte) int {
 	rows, err := parseCSV(body)
 	if err != nil {
 		return 0
@@ -755,7 +755,7 @@ func importMedia(ctx context.Context, deps Deps, uid int64, body []byte) int {
 	return n
 }
 
-func importFinAccounts(ctx context.Context, deps Deps, uid int64, body []byte) (int, map[int64]int64) {
+func importFinAccounts(ctx context.Context, deps Deps, uid string, body []byte) (int, map[int64]int64) {
 	idMap := map[int64]int64{}
 	rows, err := parseCSV(body)
 	if err != nil {
@@ -792,7 +792,7 @@ func importFinAccounts(ctx context.Context, deps Deps, uid int64, body []byte) (
 	return n, idMap
 }
 
-func importFinCategories(ctx context.Context, deps Deps, uid int64, body []byte) (int, map[int64]int64) {
+func importFinCategories(ctx context.Context, deps Deps, uid string, body []byte) (int, map[int64]int64) {
 	idMap := map[int64]int64{}
 	rows, err := parseCSV(body)
 	if err != nil {
@@ -817,7 +817,7 @@ func importFinCategories(ctx context.Context, deps Deps, uid int64, body []byte)
 	return n, idMap
 }
 
-func importFinTransactions(ctx context.Context, deps Deps, uid int64, body []byte, acctMap, catMap map[int64]int64) int {
+func importFinTransactions(ctx context.Context, deps Deps, uid string, body []byte, acctMap, catMap map[int64]int64) int {
 	rows, err := parseCSV(body)
 	if err != nil {
 		return 0
@@ -859,7 +859,7 @@ func importFinTransactions(ctx context.Context, deps Deps, uid int64, body []byt
 
 var noteFrontRe = regexp.MustCompile(`(?s)^---\n(.*?)\n---\n+`)
 
-func importNote(ctx context.Context, deps Deps, uid int64, body []byte) bool {
+func importNote(ctx context.Context, deps Deps, uid string, body []byte) bool {
 	s := string(body)
 	title := ""
 	folder := ""
@@ -888,7 +888,7 @@ func importNote(ctx context.Context, deps Deps, uid int64, body []byte) bool {
 	return err == nil
 }
 
-func importJournal(ctx context.Context, deps Deps, uid int64, name string, body []byte) bool {
+func importJournal(ctx context.Context, deps Deps, uid string, name string, body []byte) bool {
 	// Extract YYYY-MM-DD from filename `journal/<date>.md`.
 	base := strings.TrimSuffix(strings.TrimPrefix(name, "journal/"), ".md")
 	if _, err := time.Parse("2006-01-02", base); err != nil {

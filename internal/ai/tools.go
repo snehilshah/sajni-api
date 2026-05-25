@@ -32,12 +32,12 @@ type Tool struct {
 	Description string
 	Schema      *genai.Schema
 	Mutating    bool
-	Handler     func(ctx context.Context, uid int64, args map[string]any) (data any, meta map[string]any, err error)
+	Handler     func(ctx context.Context, uid string, args map[string]any) (data any, meta map[string]any, err error)
 }
 
 // dispatch looks up a tool by name and invokes it. Unknown tools and
 // bad-arg errors come back as structured errors so the model can recover.
-func (s *Service) dispatch(ctx context.Context, uid int64, name string, args map[string]any) (any, map[string]any, error) {
+func (s *Service) dispatch(ctx context.Context, uid string, name string, args map[string]any) (any, map[string]any, error) {
 	for _, t := range s.tools {
 		if t.Name == name {
 			return t.Handler(ctx, uid, args)
@@ -144,7 +144,7 @@ func (s *Service) buildTools() []Tool {
 			Name:        "get_current_context",
 			Description: "Returns today's date in ISO format, the current weekday, and a quick summary of the user's day (open task count, habits done/pending, recent memo count). Call this first when the user asks about 'today', 'tomorrow', 'this week', etc.",
 			Schema:      obj(map[string]*genai.Schema{}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return getCurrentContextTool(ctx, d, uid)
 			},
 		},
@@ -162,7 +162,7 @@ func (s *Service) buildTools() []Tool {
 				"important": boolean("Restrict to starred tasks."),
 				"limit":     intg("Maximum tasks to return (default 50)."),
 			}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listTasksTool(ctx, d, uid, args)
 			},
 		},
@@ -170,7 +170,7 @@ func (s *Service) buildTools() []Tool {
 			Name:        "list_task_lists",
 			Description: "List the user's custom task lists (groupings) with their open-task counts. Use to disambiguate when a request mentions a list by name (e.g. 'add to my Work list').",
 			Schema:      obj(map[string]*genai.Schema{}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listTaskListsTool(ctx, d, uid)
 			},
 		},
@@ -178,7 +178,7 @@ func (s *Service) buildTools() []Tool {
 			Name:        "list_habits",
 			Description: "List the user's habits with done-today flag and total log count.",
 			Schema:      obj(map[string]*genai.Schema{}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listHabitsTool(ctx, d, uid)
 			},
 		},
@@ -190,7 +190,7 @@ func (s *Service) buildTools() []Tool {
 				"date_to":   str("Upper bound ISO date."),
 				"limit":     intg("Default 20."),
 			}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listJournalTool(ctx, d, uid, args)
 			},
 		},
@@ -200,7 +200,7 @@ func (s *Service) buildTools() []Tool {
 			Schema: obj(map[string]*genai.Schema{
 				"date": str("ISO date YYYY-MM-DD."),
 			}, "date"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return getJournalTool(ctx, d, store, uid, argStr(args, "date"))
 			},
 		},
@@ -211,7 +211,7 @@ func (s *Service) buildTools() []Tool {
 				"limit": intg("Default 20."),
 				"query": str("Optional ILIKE substring."),
 			}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listMemosTool(ctx, d, uid, args)
 			},
 		},
@@ -223,7 +223,7 @@ func (s *Service) buildTools() []Tool {
 				"type":   str("'movie', 'show', 'book'."),
 				"limit":  intg("Default 30."),
 			}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listMediaTool(ctx, d, uid, args)
 			},
 		},
@@ -231,7 +231,7 @@ func (s *Service) buildTools() []Tool {
 			Name:        "media_taste",
 			Description: "Returns the user's taste profile: top-rated titles, favourite genres (weighted by rating), completion vs. drop ratio per type, and most-recently completed entries. Call this once BEFORE tmdb_search when recommending anything so the suggestion is personalised, not generic.",
 			Schema:      obj(map[string]*genai.Schema{}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return mediaTasteTool(ctx, d, uid)
 			},
 		},
@@ -239,7 +239,7 @@ func (s *Service) buildTools() []Tool {
 			Name:        "list_finance_accounts",
 			Description: "List finance accounts with current computed balance.",
 			Schema:      obj(map[string]*genai.Schema{}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listAccountsTool(ctx, d, uid)
 			},
 		},
@@ -252,7 +252,7 @@ func (s *Service) buildTools() []Tool {
 				"date_to":    str("ISO date."),
 				"limit":      intg("Default 50."),
 			}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listTxnsTool(ctx, d, uid, args)
 			},
 		},
@@ -262,7 +262,7 @@ func (s *Service) buildTools() []Tool {
 			Schema: obj(map[string]*genai.Schema{
 				"kind": str("Optional filter: 'expense' | 'income'."),
 			}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listCategoriesTool(ctx, d, uid, args)
 			},
 		},
@@ -272,7 +272,7 @@ func (s *Service) buildTools() []Tool {
 			Schema: obj(map[string]*genai.Schema{
 				"limit": intg("Maximum budgets to return (default 10)."),
 			}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listBudgetsTool(ctx, d, uid, args)
 			},
 		},
@@ -283,7 +283,7 @@ func (s *Service) buildTools() []Tool {
 				"q":     str("Search query."),
 				"types": arrayOf(str(""), "Optional whitelist of types: memo, task, note, journal, habit, media, transaction."),
 			}, "q"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return runSearchTool(ctx, d, uid, args)
 			},
 		},
@@ -294,7 +294,7 @@ func (s *Service) buildTools() []Tool {
 				"q":    str("Movie or show title to search."),
 				"type": str("'movie' or 'show'. Defaults to movie."),
 			}, "q"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return tmdbSearchTool(ctx, argStr(args, "q"), argStr(args, "type"))
 			},
 		},
@@ -307,7 +307,7 @@ func (s *Service) buildTools() []Tool {
 				"earliest":     str("HH:MM lower bound (default 09:00)."),
 				"latest":       str("HH:MM upper bound (default 21:00)."),
 			}, "date"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return findFreeSlotsTool(ctx, d, uid, args)
 			},
 		},
@@ -330,7 +330,7 @@ func (s *Service) buildTools() []Tool {
 				"steps":            arrayOf(str(""), "Optional inline checklist (array of step text strings)."),
 				"tags":             arrayOf(str(""), "Optional tag list."),
 			}, "title"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createTaskTool(ctx, d, uid, args)
 			},
 		},
@@ -343,7 +343,7 @@ func (s *Service) buildTools() []Tool {
 				"color": str("Optional hex like '#2D5A4F'."),
 				"icon":  str("Optional icon hint (free-form, frontend may map)."),
 			}, "name"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createTaskListTool(ctx, d, uid, args)
 			},
 		},
@@ -355,7 +355,7 @@ func (s *Service) buildTools() []Tool {
 				"id":        intg("Task id."),
 				"important": boolean("true to star, false to unstar."),
 			}, "id", "important"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				id := argInt(args, "id", 0)
 				if id == 0 {
 					return nil, nil, fmt.Errorf("missing id")
@@ -373,7 +373,7 @@ func (s *Service) buildTools() []Tool {
 			Description: "Mark a task as done.",
 			Mutating:    true,
 			Schema:      obj(map[string]*genai.Schema{"id": intg("Task id.")}, "id"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				id := argInt(args, "id", 0)
 				if id == 0 {
 					return nil, nil, fmt.Errorf("missing id")
@@ -391,7 +391,7 @@ func (s *Service) buildTools() []Tool {
 			Description: "Delete a task permanently.",
 			Mutating:    true,
 			Schema:      obj(map[string]*genai.Schema{"id": intg("Task id.")}, "id"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				id := argInt(args, "id", 0)
 				if id == 0 {
 					return nil, nil, fmt.Errorf("missing id")
@@ -413,7 +413,7 @@ func (s *Service) buildTools() []Tool {
 				"frequency": str("'daily' | 'weekly'. Default 'daily'."),
 				"color":     str("Hex like '#2D5A4F'."),
 			}, "name"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createHabitTool(ctx, d, uid, args)
 			},
 		},
@@ -425,7 +425,7 @@ func (s *Service) buildTools() []Tool {
 				"habit_id": intg("Habit id."),
 				"date":     str("ISO date. Defaults to today."),
 			}, "habit_id"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				hid := argInt(args, "habit_id", 0)
 				if hid == 0 {
 					return nil, nil, fmt.Errorf("missing habit_id")
@@ -451,7 +451,7 @@ func (s *Service) buildTools() []Tool {
 				"pinned":  boolean("Pin to top."),
 				"tags":    arrayOf(str(""), "Optional tags."),
 			}, "content"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createMemoTool(ctx, d, uid, args)
 			},
 		},
@@ -465,7 +465,7 @@ func (s *Service) buildTools() []Tool {
 				"content":        str("The entry body in markdown."),
 				"location_label": str("Optional short place label like 'Cinepolis, Vashi'."),
 			}, "content"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createJournalTool(ctx, d, store, uid, args)
 			},
 		},
@@ -479,7 +479,7 @@ func (s *Service) buildTools() []Tool {
 				"folder":  str("Optional. Folder path like 'work/q2'."),
 				"tags":    arrayOf(str(""), "Optional tag list."),
 			}, "content"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createNoteTool(ctx, d, store, uid, args)
 			},
 		},
@@ -490,7 +490,7 @@ func (s *Service) buildTools() []Tool {
 			Schema: obj(map[string]*genai.Schema{
 				"path": str("Required. Folder path like 'work/q2'."),
 			}, "path"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createFolderTool(ctx, d, uid, args)
 			},
 		},
@@ -508,7 +508,7 @@ func (s *Service) buildTools() []Tool {
 				"poster_url":  str("Optional."),
 				"rating":      intg("Optional 1–5 star rating, only when user expressed one."),
 			}, "title", "type"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return addMediaTool(ctx, d, uid, args)
 			},
 		},
@@ -518,7 +518,7 @@ func (s *Service) buildTools() []Tool {
 			Schema: obj(map[string]*genai.Schema{
 				"include_archived": boolean("Include archived rows."),
 			}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listBillersTool(ctx, d, uid, args)
 			},
 		},
@@ -538,7 +538,7 @@ func (s *Service) buildTools() []Tool {
 				"alert_days":      intg("Days before due_date to alert (default 3)."),
 				"notes":           str("Optional."),
 			}, "name", "amount"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createBillerTool(ctx, d, uid, args)
 			},
 		},
@@ -551,7 +551,7 @@ func (s *Service) buildTools() []Tool {
 				"amount":    num("Override the biller's amount for this cycle."),
 				"paid_date": str("ISO date. Defaults to today."),
 			}, "biller_id"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return payBillerTool(ctx, d, uid, args)
 			},
 		},
@@ -565,7 +565,7 @@ func (s *Service) buildTools() []Tool {
 				"date_to":   str("Optional ISO upper bound."),
 				"limit":     intg("Default 10."),
 			}, "query"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return timeTravelTool(ctx, d, uid, args)
 			},
 		},
@@ -578,7 +578,7 @@ func (s *Service) buildTools() []Tool {
 				"activate":  boolean("If true, switch to this theme right away. Default false."),
 				"mode_pref": str("'auto' | 'light' | 'dark'. Default 'auto'."),
 			}, "prompt"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return generateThemeTool(ctx, s, uid, args)
 			},
 		},
@@ -586,7 +586,7 @@ func (s *Service) buildTools() []Tool {
 			Name:        "list_themes",
 			Description: "List the user's saved color themes (built-ins, AI-generated, and manual). Useful before activating a theme by name.",
 			Schema:      obj(map[string]*genai.Schema{}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listThemesTool(ctx, d, uid)
 			},
 		},
@@ -597,7 +597,7 @@ func (s *Service) buildTools() []Tool {
 			Schema: obj(map[string]*genai.Schema{
 				"id": intg("Theme id."),
 			}, "id"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return activateThemeTool(ctx, d, uid, args)
 			},
 		},
@@ -608,7 +608,7 @@ func (s *Service) buildTools() []Tool {
 				"window": str("Optional: 1w | 2w | 1m | 6m | 1y."),
 				"limit":  intg("Default 10."),
 			}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listInsightsTool(ctx, d, uid, args)
 			},
 		},
@@ -616,7 +616,7 @@ func (s *Service) buildTools() []Tool {
 			Name:        "list_thinking_projects",
 			Description: "List the user's Thinking projects (containers of typed thought-cards). Use to find an existing project before adding a thought, or to summarize what the user is currently thinking about.",
 			Schema:      obj(map[string]*genai.Schema{}),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listThinkingProjectsTool(ctx, d, uid)
 			},
 		},
@@ -626,7 +626,7 @@ func (s *Service) buildTools() []Tool {
 			Schema: obj(map[string]*genai.Schema{
 				"id": intg("Project id."),
 			}, "id"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return getThinkingProjectAITool(ctx, d, uid, args)
 			},
 		},
@@ -638,7 +638,7 @@ func (s *Service) buildTools() []Tool {
 				"title":       str("Required. Short title for the project."),
 				"description": str("Optional one-line description."),
 			}, "title"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createThinkingProjectAITool(ctx, d, uid, args)
 			},
 		},
@@ -651,7 +651,7 @@ func (s *Service) buildTools() []Tool {
 				"kind":       str("One of: note | entity | question | idea | reflection | claim | fact | hypothesis | evidence | contradiction | decision | todo. Default 'note'."),
 				"content":    str("Required. The thought body (markdown ok)."),
 			}, "project_id", "content"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return addThoughtTool(ctx, s, uid, args)
 			},
 		},
@@ -668,7 +668,7 @@ func (s *Service) buildTools() []Tool {
 				"description":   str("What it was for."),
 				"date":          str("ISO date. Defaults to today."),
 			}, "account_id", "amount"),
-			Handler: func(ctx context.Context, uid int64, args map[string]any) (any, map[string]any, error) {
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createTxnTool(ctx, d, uid, args)
 			},
 		},
@@ -677,7 +677,7 @@ func (s *Service) buildTools() []Tool {
 
 // ----- handler implementations -----
 
-func getCurrentContextTool(ctx context.Context, d *db.DB, uid int64) (any, map[string]any, error) {
+func getCurrentContextTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
 	now := time.Now()
 	today := now.Format("2006-01-02")
 	out := map[string]any{
@@ -698,7 +698,7 @@ func getCurrentContextTool(ctx context.Context, d *db.DB, uid int64) (any, map[s
 	return out, nil, nil
 }
 
-func listTasksTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	clauses := []string{"user_id=$1"}
 	vals := []any{uid}
 
@@ -788,7 +788,7 @@ func listTasksTool(ctx context.Context, d *db.DB, uid int64, args map[string]any
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
 
-func listTaskListsTool(ctx context.Context, d *db.DB, uid int64) (any, map[string]any, error) {
+func listTaskListsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
 	rows, err := d.QueryContext(ctx, `
 		SELECT l.id, l.name, l.color, l.icon,
 		       COALESCE(c.cnt, 0)
@@ -817,7 +817,7 @@ func listTaskListsTool(ctx context.Context, d *db.DB, uid int64) (any, map[strin
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
 
-func createTaskListTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func createTaskListTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	name := argStr(args, "name")
 	if name == "" {
 		return nil, nil, fmt.Errorf("missing name")
@@ -842,7 +842,7 @@ func createTaskListTool(ctx context.Context, d *db.DB, uid int64, args map[strin
 		map[string]any{"kind": "task_list_created", "id": id, "title": name, "route": "/tasks"}, nil
 }
 
-func listHabitsTool(ctx context.Context, d *db.DB, uid int64) (any, map[string]any, error) {
+func listHabitsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
 	today := time.Now().Format("2006-01-02")
 	rows, err := d.QueryContext(ctx, `
 		SELECT h.id, h.name, h.frequency,
@@ -867,7 +867,7 @@ func listHabitsTool(ctx context.Context, d *db.DB, uid int64) (any, map[string]a
 	return map[string]any{"items": out, "count": len(out), "today": today}, nil, nil
 }
 
-func listJournalTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func listJournalTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	clauses := []string{"user_id=$1"}
 	vals := []any{uid}
 	if df := argStr(args, "date_from"); df != "" {
@@ -897,7 +897,7 @@ func listJournalTool(ctx context.Context, d *db.DB, uid int64, args map[string]a
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
 
-func getJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid int64, date string) (any, map[string]any, error) {
+func getJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid string, date string) (any, map[string]any, error) {
 	if date == "" {
 		return nil, nil, fmt.Errorf("missing date")
 	}
@@ -921,7 +921,7 @@ func getJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid in
 	return map[string]any{"id": id, "date": date, "mood": mood, "content": content}, nil, nil
 }
 
-func listMemosTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func listMemosTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	limit := argInt(args, "limit", 20)
 	q := argStr(args, "query")
 	rows, err := d.QueryContext(ctx, `
@@ -948,7 +948,7 @@ func listMemosTool(ctx context.Context, d *db.DB, uid int64, args map[string]any
 // model can recommend in the user's voice instead of pulling from
 // generic popularity. Cheap enough to call on every recommendation
 // turn (a handful of small queries).
-func mediaTasteTool(ctx context.Context, d *db.DB, uid int64) (any, map[string]any, error) {
+func mediaTasteTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
 	out := map[string]any{}
 
 	// Top-rated finished titles (weighted "what they loved").
@@ -1074,7 +1074,7 @@ func mediaTasteTool(ctx context.Context, d *db.DB, uid int64) (any, map[string]a
 	return out, nil, nil
 }
 
-func listMediaTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func listMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	clauses := []string{"user_id=$1"}
 	vals := []any{uid}
 	if s := argStr(args, "status"); s != "" {
@@ -1105,7 +1105,7 @@ func listMediaTool(ctx context.Context, d *db.DB, uid int64, args map[string]any
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
 
-func listAccountsTool(ctx context.Context, d *db.DB, uid int64) (any, map[string]any, error) {
+func listAccountsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
 	rows, err := d.QueryContext(ctx, `
 		SELECT a.id, a.name, a.type, a.institution, a.currency,
 		       a.opening_balance + COALESCE((SELECT SUM(CASE WHEN t.type='income' THEN t.amount ELSE -t.amount END)
@@ -1126,7 +1126,7 @@ func listAccountsTool(ctx context.Context, d *db.DB, uid int64) (any, map[string
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
 
-func listTxnsTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	clauses := []string{"t.user_id=$1"}
 	vals := []any{uid}
 	if a := argInt(args, "account_id", 0); a > 0 {
@@ -1172,7 +1172,7 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid int64, args map[string]any)
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
 
-func runSearchTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func runSearchTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	q := argStr(args, "q")
 	types := argStrSlice(args, "types")
 	want := func(t string) bool {
@@ -1288,7 +1288,7 @@ func tmdbSearchTool(ctx context.Context, query, mediaType string) (any, map[stri
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
 
-func findFreeSlotsTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func findFreeSlotsTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	date := argStr(args, "date")
 	if date == "" {
 		return nil, nil, fmt.Errorf("missing date")
@@ -1358,7 +1358,7 @@ func findFreeSlotsTool(ctx context.Context, d *db.DB, uid int64, args map[string
 
 // ----- write handlers -----
 
-func createTaskTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	title := argStr(args, "title")
 	if title == "" {
 		return nil, nil, fmt.Errorf("missing title")
@@ -1452,7 +1452,7 @@ func createTaskTool(ctx context.Context, d *db.DB, uid int64, args map[string]an
 		map[string]any{"kind": "task_created", "id": id, "title": title, "route": "/tasks"}, nil
 }
 
-func createHabitTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func createHabitTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	name := argStr(args, "name")
 	if name == "" {
 		return nil, nil, fmt.Errorf("missing name")
@@ -1475,7 +1475,7 @@ func createHabitTool(ctx context.Context, d *db.DB, uid int64, args map[string]a
 		map[string]any{"kind": "habit_created", "id": id, "title": name, "route": "/habits"}, nil
 }
 
-func createMemoTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func createMemoTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	content := argStr(args, "content")
 	if content == "" {
 		return nil, nil, fmt.Errorf("missing content")
@@ -1498,7 +1498,7 @@ func createMemoTool(ctx context.Context, d *db.DB, uid int64, args map[string]an
 		map[string]any{"kind": "memo_created", "id": id, "title": preview, "route": "/"}, nil
 }
 
-func createJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid int64, args map[string]any) (any, map[string]any, error) {
+func createJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid string, args map[string]any) (any, map[string]any, error) {
 	content := argStr(args, "content")
 	if content == "" {
 		return nil, nil, fmt.Errorf("missing content")
@@ -1509,7 +1509,7 @@ func createJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid
 	}
 	mood := argStr(args, "mood")
 	locLabel := argStr(args, "location_label")
-	blobKey := fmt.Sprintf("user_%d/journal/%s.md", uid, date)
+	blobKey := fmt.Sprintf("user_%s/journal/%s.md", uid, date)
 	if err := store.Put(ctx, blobKey, []byte(content), "text/markdown"); err != nil {
 		return nil, nil, err
 	}
@@ -1559,7 +1559,7 @@ func deriveNoteTitle(content string) string {
 	return "Untitled"
 }
 
-func createNoteTool(ctx context.Context, d *db.DB, store storage.Storage, uid int64, args map[string]any) (any, map[string]any, error) {
+func createNoteTool(ctx context.Context, d *db.DB, store storage.Storage, uid string, args map[string]any) (any, map[string]any, error) {
 	content := argStr(args, "content")
 	title := strings.TrimSpace(argStr(args, "title"))
 	if title == "" {
@@ -1596,7 +1596,7 @@ func createNoteTool(ctx context.Context, d *db.DB, store storage.Storage, uid in
 		map[string]any{"kind": "note_created", "id": id, "title": title, "route": fmt.Sprintf("/notes?id=%d", id)}, nil
 }
 
-func createFolderTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func createFolderTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	path := normalizeAINoteFolder(argStr(args, "path"))
 	if path == "" {
 		return nil, nil, fmt.Errorf("missing path")
@@ -1610,7 +1610,7 @@ func createFolderTool(ctx context.Context, d *db.DB, uid int64, args map[string]
 		map[string]any{"kind": "folder_created", "title": path, "route": "/notes"}, nil
 }
 
-func addMediaTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	title := argStr(args, "title")
 	mtype := argStr(args, "type")
 	if title == "" || mtype == "" {
@@ -1662,7 +1662,7 @@ func addMediaTool(ctx context.Context, d *db.DB, uid int64, args map[string]any)
 		map[string]any{"kind": "media_added", "id": id, "title": title, "route": "/media"}, nil
 }
 
-func createTxnTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	acct := argInt(args, "account_id", 0)
 	if acct == 0 {
 		return nil, nil, fmt.Errorf("missing account_id")
@@ -1715,7 +1715,7 @@ func createTxnTool(ctx context.Context, d *db.DB, uid int64, args map[string]any
 		map[string]any{"kind": "transaction_created", "id": id, "title": fmt.Sprintf("%s %.2f", ttype, amount), "route": "/finance/transactions"}, nil
 }
 
-func listCategoriesTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func listCategoriesTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	kind := argStr(args, "kind")
 	clauses := []string{"user_id=$1"}
 	vals := []any{uid}
@@ -1742,7 +1742,7 @@ func listCategoriesTool(ctx context.Context, d *db.DB, uid int64, args map[strin
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
 
-func listBudgetsTool(ctx context.Context, d *db.DB, uid int64, args map[string]any) (any, map[string]any, error) {
+func listBudgetsTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	limit := argInt(args, "limit", 10)
 	rows, err := d.QueryContext(ctx, `SELECT id, name, period, start_date::text, end_date::text, total_amount 
 		FROM fin_budgets WHERE user_id = $1 ORDER BY start_date DESC LIMIT $2`, uid, limit)

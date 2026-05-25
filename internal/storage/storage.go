@@ -49,9 +49,11 @@ func New(ctx context.Context) (Storage, error) {
 
 // UserKey returns a tenant-scoped object key.
 //
-//	UserKey(7, "uploads", "abc.png") -> "user_7/uploads/abc.png"
-func UserKey(userID int64, parts ...string) string {
-	out := fmt.Sprintf("user_%d", userID)
+//	UserKey("018f…", "uploads", "abc.png") -> "user_018f…/uploads/abc.png"
+//
+// userID is the UUIDv7 string form of users.id.
+func UserKey(userID string, parts ...string) string {
+	out := "user_" + userID
 	for _, p := range parts {
 		p = strings.Trim(p, "/")
 		if p == "" {

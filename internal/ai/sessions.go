@@ -34,7 +34,7 @@ type SessionMeta struct {
 const historyWindow = 20
 
 // LoadSession reads the full history for a session, scoped to the user.
-func LoadSession(ctx context.Context, d *db.DB, uid, sid int64) (*Session, error) {
+func LoadSession(ctx context.Context, d *db.DB, uid string, sid int64) (*Session, error) {
 	var s Session
 	var raw []byte
 	err := d.QueryRowContext(ctx, `
@@ -59,7 +59,7 @@ func LoadSession(ctx context.Context, d *db.DB, uid, sid int64) (*Session, error
 }
 
 // ListSessions returns recent sessions (metadata only).
-func ListSessions(ctx context.Context, d *db.DB, uid int64) ([]SessionMeta, error) {
+func ListSessions(ctx context.Context, d *db.DB, uid string) ([]SessionMeta, error) {
 	rows, err := d.QueryContext(ctx, `
 		SELECT id, title, created_at, updated_at FROM ai_sessions
 		WHERE user_id=$1 ORDER BY updated_at DESC LIMIT 50`, uid)
@@ -78,7 +78,7 @@ func ListSessions(ctx context.Context, d *db.DB, uid int64) ([]SessionMeta, erro
 }
 
 // CreateSession inserts an empty session and returns its id.
-func CreateSession(ctx context.Context, d *db.DB, uid int64, title string) (int64, error) {
+func CreateSession(ctx context.Context, d *db.DB, uid string, title string) (int64, error) {
 	if title == "" {
 		title = "New chat"
 	}
@@ -91,7 +91,7 @@ func CreateSession(ctx context.Context, d *db.DB, uid int64, title string) (int6
 
 // SaveSessionMessages persists the trimmed history. Auto-titles the
 // session from the first user message if it's still "New chat".
-func SaveSessionMessages(ctx context.Context, d *db.DB, uid, sid int64, messages []*genai.Content) error {
+func SaveSessionMessages(ctx context.Context, d *db.DB, uid string, sid int64, messages []*genai.Content) error {
 	trimmed := messages
 	if len(trimmed) > historyWindow*2 {
 		trimmed = trimmed[len(trimmed)-historyWindow*2:]
@@ -115,7 +115,7 @@ func SaveSessionMessages(ctx context.Context, d *db.DB, uid, sid int64, messages
 }
 
 // DeleteSession removes a conversation.
-func DeleteSession(ctx context.Context, d *db.DB, uid, sid int64) error {
+func DeleteSession(ctx context.Context, d *db.DB, uid string, sid int64) error {
 	_, err := d.ExecContext(ctx, `DELETE FROM ai_sessions WHERE id=$1 AND user_id=$2`, sid, uid)
 	return err
 }

@@ -28,7 +28,7 @@ const (
 
 type aiLimiter struct {
 	mu  sync.Mutex
-	log map[int64][]aiEvent
+	log map[string][]aiEvent
 }
 
 type aiEvent struct {
@@ -37,13 +37,13 @@ type aiEvent struct {
 }
 
 func newAILimiter() *aiLimiter {
-	return &aiLimiter{log: map[int64][]aiEvent{}}
+	return &aiLimiter{log: map[string][]aiEvent{}}
 }
 
 // check reports whether the user has budget left in the current window.
 // retryAfter is the time until the oldest in-window event ages out
 // (0 when allowed).
-func (l *aiLimiter) check(uid int64) (allowed bool, retryAfter time.Duration) {
+func (l *aiLimiter) check(uid string) (allowed bool, retryAfter time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	events := l.prune(uid)
@@ -61,7 +61,7 @@ func (l *aiLimiter) check(uid int64) (allowed bool, retryAfter time.Duration) {
 // record adds usage AFTER a successful AI call. tokens may be the
 // usage reported by the model, or a conservative estimate when usage
 // metadata is unavailable.
-func (l *aiLimiter) record(uid int64, tokens int) {
+func (l *aiLimiter) record(uid string, tokens int) {
 	if tokens < 0 {
 		tokens = 0
 	}
@@ -72,7 +72,7 @@ func (l *aiLimiter) record(uid int64, tokens int) {
 }
 
 // prune drops events older than the window. Caller must hold l.mu.
-func (l *aiLimiter) prune(uid int64) []aiEvent {
+func (l *aiLimiter) prune(uid string) []aiEvent {
 	cutoff := time.Now().Add(-aiWindow)
 	events := l.log[uid]
 	i := 0

@@ -150,7 +150,7 @@ func getAnalytics(deps Deps) http.HandlerFunc {
 	}
 }
 
-func calcLongestStreak(d *db.DB, uid, habitID int64) int {
+func calcLongestStreak(d *db.DB, uid string, habitID int64) int {
 	rows, err := d.Query("SELECT logged_date::text FROM habit_logs WHERE user_id = $1 AND habit_id = $2 ORDER BY logged_date ASC", uid, habitID)
 	if err != nil {
 		return 0

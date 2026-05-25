@@ -27,7 +27,7 @@ func registerJournalRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/places/details", placesDetails(deps))
 }
 
-func journalKey(uid int64, date string) string {
+func journalKey(uid string, date string) string {
 	return storage.UserKey(uid, "journal", date+".md")
 }
 
@@ -142,7 +142,7 @@ type BacklinkInfo struct {
 }
 
 // getIncomingBacklinks resolves all refs that match this entity's natural key.
-func getIncomingBacklinks(d *db.DB, uid int64, targetType string, targetID int64) []BacklinkInfo {
+func getIncomingBacklinks(d *db.DB, uid string, targetType string, targetID int64) []BacklinkInfo {
 	var ref string
 	switch targetType {
 	case "note":

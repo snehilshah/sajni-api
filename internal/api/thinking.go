@@ -316,11 +316,11 @@ func createThinkingCard(deps Deps) http.HandlerFunc {
 		d.Exec(`UPDATE thinking_projects SET updated_at=NOW() WHERE id=$1`, pid)
 
 		if deps.AI != nil {
-			go func(cardID, projID, userID int64) {
+			// userID stays string (UUID); project + card ids are int64
+			// (BIGSERIAL).
+			go func(cardID, projID int64, userID string) {
 				bg := context.Background()
 				if err := runEnrichment(bg, deps, userID, projID, cardID); err == nil {
-					// Re-enrich neighbors so they can pick up the new
-					// card as a connection target.
 					reEnrichNeighbors(deps, userID, projID, cardID)
 				}
 			}(id, pid, uid)
@@ -436,7 +436,7 @@ func synthesizeThinkingProject(deps Deps) http.HandlerFunc {
 
 // runEnrichment is a thin shim around the AI service helper so both
 // the HTTP path and the agent-tool path go through the same logic.
-func runEnrichment(ctx context.Context, deps Deps, uid, projectID, cardID int64) error {
+func runEnrichment(ctx context.Context, deps Deps, uid string, projectID, cardID int64) error {
 	return deps.AI.EnrichCardWithContext(ctx, uid, projectID, cardID)
 }
 
@@ -444,7 +444,7 @@ func runEnrichment(ctx context.Context, deps Deps, uid, projectID, cardID int64)
 // and re-runs enrichment on each so they can discover the freshly
 // added card as a connection target. Runs in the background; failure
 // per-card is logged-and-swallowed.
-func reEnrichNeighbors(deps Deps, uid, projectID, justAddedCardID int64) {
+func reEnrichNeighbors(deps Deps, uid string, projectID, justAddedCardID int64) {
 	d := deps.DB
 	rows, err := d.Query(`
 		SELECT id FROM thinking_cards
@@ -467,7 +467,7 @@ func reEnrichNeighbors(deps Deps, uid, projectID, justAddedCardID int64) {
 	}
 }
 
-func loadProjectCardRows(d *db.DB, uid, pid int64) ([]thinkingCardRow, error) {
+func loadProjectCardRows(d *db.DB, uid string, pid int64) ([]thinkingCardRow, error) {
 	rows, err := d.Query(`
 		SELECT id, project_id, kind, content, ai_enrichment,
 		       COALESCE(enriched_at::text,''), created_at, updated_at
@@ -496,7 +496,7 @@ func loadProjectCardRows(d *db.DB, uid, pid int64) ([]thinkingCardRow, error) {
 // enrichment fields (summary + outbound connections) so the AI can
 // build on the existing graph instead of reinterpreting from raw text
 // every time. Pass excludeID > 0 to drop a specific card (the target).
-func loadProjectCardsWithEnrichment(d *db.DB, uid, pid, excludeID int64) ([]ai.ThinkingCardWithEnrichment, error) {
+func loadProjectCardsWithEnrichment(d *db.DB, uid string, pid, excludeID int64) ([]ai.ThinkingCardWithEnrichment, error) {
 	rows, err := d.Query(`
 		SELECT id, kind, content, ai_enrichment
 		FROM thinking_cards

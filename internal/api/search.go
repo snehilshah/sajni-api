@@ -230,7 +230,7 @@ func appendQuery(
 	},
 	_ string,
 	sqlText string,
-	uid int64, q string, like string,
+	uid string, q string, like string,
 	mapper func(*sql.Rows) (SearchHit, bool),
 ) []SearchHit {
 	rows, err := d.Query(sqlText, uid, q, like)

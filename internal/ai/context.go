@@ -51,7 +51,7 @@ Today's snapshot:
 // buildSystemInstruction renders the prompt with a tiny live snapshot
 // of the user's day. Lets the model answer trivial date/count
 // questions in one round.
-func (s *Service) buildSystemInstruction(ctx context.Context, uid int64) string {
+func (s *Service) buildSystemInstruction(ctx context.Context, uid string) string {
 	now := time.Now()
 	parts := []string{
 		fmt.Sprintf("- Date: %s (%s)", now.Format("2006-01-02"), now.Weekday()),

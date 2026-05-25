@@ -102,7 +102,7 @@ var defaultIncomeCategories = []struct {
 	{"Other", "#6B7280", "circle"},
 }
 
-func seedDefaultCategoriesIfEmpty(deps Deps, uid int64) {
+func seedDefaultCategoriesIfEmpty(deps Deps, uid string) {
 	d := deps.DB
 	var cnt int
 	d.QueryRow("SELECT COUNT(*) FROM fin_categories WHERE user_id = $1", uid).Scan(&cnt)
@@ -120,7 +120,7 @@ func seedDefaultCategoriesIfEmpty(deps Deps, uid int64) {
 // computeBalance returns the current signed balance of an account based on
 // opening_balance + income - expense + transfer_in - transfer_out.
 // For credit cards this comes out negative when money is owed.
-func computeBalance(deps Deps, uid, accountID int64) float64 {
+func computeBalance(deps Deps, uid string, accountID int64) float64 {
 	d := deps.DB
 	var opening float64
 	d.QueryRow("SELECT opening_balance FROM fin_accounts WHERE id = $1 AND user_id = $2", accountID, uid).Scan(&opening)

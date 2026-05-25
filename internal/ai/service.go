@@ -169,7 +169,7 @@ func (s *Service) QuickGenerate(ctx context.Context, system, user string) (strin
 
 // ChatRequest is the input for one user turn.
 type ChatRequest struct {
-	UserID  int64
+	UserID  string
 	Mode    string // "palette" or "chat"
 	Message string
 	// History is the trimmed conversation prior to this turn. May be nil.
@@ -309,7 +309,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			if err != nil {
 				log.Warn().Err(err).
 					Str("tool", fc.Name).
-					Int64("uid", req.UserID).
+					Str("uid", req.UserID).
 					Interface("args", fc.Args).
 					Msg("ai tool dispatch failed")
 			}

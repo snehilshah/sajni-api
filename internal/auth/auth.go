@@ -1,10 +1,13 @@
-// Package auth implements email/password authentication with JWT
-// access tokens and rotating refresh tokens stored as bcrypt hashes.
+// Package auth implements Sajni's authentication: three sign-in
+// methods (Google OAuth, GitHub OAuth, email + Resend-delivered TOTP)
+// linked by verified email, JWT access tokens, and SHA-256-hashed
+// rotating refresh tokens stored by indexed lookup (no bcrypt sweep).
 package auth
 
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -14,16 +17,19 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"golang.org/x/crypto/bcrypt"
+	"github.com/google/uuid"
 
 	"sajni/internal/db"
 )
 
-// ContextKey is the type used to store the user ID in request contexts.
+// ContextKey is the type used to store the user ID (UUID string) in
+// request contexts.
 type ContextKey struct{}
 
 const (
-	accessTokenTTL  = 15 * time.Minute
+	// 30 minutes — bumped from 15. Halves refresh churn while still
+	// short enough to expire stolen tokens quickly.
+	accessTokenTTL  = 30 * time.Minute
 	refreshTokenTTL = 7 * 24 * time.Hour
 	refreshCookie   = "sajni_refresh"
 )
@@ -35,29 +41,63 @@ type Service struct {
 	// CookieInsecure tells the service to issue refresh cookies without
 	// the Secure flag and with SameSite=Lax (for HTTP localhost dev).
 	CookieInsecure bool
+	// AppURL is the public origin of the web frontend (e.g.
+	// "https://ohmysajni.com"). Used for OAuth callback redirects.
+	AppURL string
+	// APIBase is the public origin of this API (e.g.
+	// "https://api.ohmysajni.com"). Used to construct OAuth callback URLs.
+	APIBase string
+
+	// OAuth credentials
+	GoogleClientID     string
+	GoogleClientSecret string
+	GithubClientID     string
+	GithubClientSecret string
+
+	// Resend
+	ResendAPIKey string
+	EmailFrom    string
 }
 
-// NewService reads JWT_SECRET / COOKIE_INSECURE from the environment.
-// Returns an error if no JWT_SECRET is configured.
+// NewService reads required env, returns an error if anything load-bearing
+// is missing.
 func NewService(database *db.DB) (*Service, error) {
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
 		return nil, errors.New("JWT_SECRET is required")
 	}
-	insecure := os.Getenv("COOKIE_INSECURE") == "1"
-	return &Service{DB: database, JWTSecret: []byte(secret), CookieInsecure: insecure}, nil
+	appURL := strings.TrimRight(os.Getenv("APP_URL"), "/")
+	if appURL == "" {
+		appURL = "http://localhost:5173"
+	}
+	apiBase := strings.TrimRight(os.Getenv("API_BASE_URL"), "/")
+	if apiBase == "" {
+		apiBase = "http://localhost:8080"
+	}
+	return &Service{
+		DB:                 database,
+		JWTSecret:          []byte(secret),
+		CookieInsecure:     os.Getenv("COOKIE_INSECURE") == "1",
+		AppURL:             appURL,
+		APIBase:            apiBase,
+		GoogleClientID:     os.Getenv("GOOGLE_OAUTH_CLIENT_ID"),
+		GoogleClientSecret: os.Getenv("GOOGLE_OAUTH_CLIENT_SECRET"),
+		GithubClientID:     os.Getenv("GITHUB_OAUTH_CLIENT_ID"),
+		GithubClientSecret: os.Getenv("GITHUB_OAUTH_CLIENT_SECRET"),
+		ResendAPIKey:       os.Getenv("RESEND_API_KEY"),
+		EmailFrom:          os.Getenv("EMAIL_FROM"),
+	}, nil
 }
 
-// UserIDFromContext extracts the authenticated user id, if any.
-func UserIDFromContext(ctx context.Context) (int64, bool) {
-	id, ok := ctx.Value(ContextKey{}).(int64)
+// UserIDFromContext extracts the authenticated user id (UUID string), if any.
+func UserIDFromContext(ctx context.Context) (string, bool) {
+	id, ok := ctx.Value(ContextKey{}).(string)
 	return id, ok
 }
 
-// MustUserID is a convenience for handlers that have already passed
-// through Middleware — it panics if the id isn't present, which would
-// indicate a routing bug.
-func MustUserID(ctx context.Context) int64 {
+// MustUserID panics if no user id is in context — indicates a routing
+// bug, since auth middleware should have run.
+func MustUserID(ctx context.Context) string {
 	id, ok := UserIDFromContext(ctx)
 	if !ok {
 		panic("auth: user id missing from context")
@@ -69,11 +109,11 @@ type accessClaims struct {
 	jwt.RegisteredClaims
 }
 
-func (s *Service) issueAccessToken(userID int64) (string, error) {
+func (s *Service) issueAccessToken(userID string) (string, error) {
 	now := time.Now()
 	claims := accessClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   fmt.Sprint(userID),
+			Subject:   userID,
 			ExpiresAt: jwt.NewNumericDate(now.Add(accessTokenTTL)),
 			IssuedAt:  jwt.NewNumericDate(now),
 		},
@@ -82,7 +122,7 @@ func (s *Service) issueAccessToken(userID int64) (string, error) {
 	return tok.SignedString(s.JWTSecret)
 }
 
-func (s *Service) parseAccessToken(raw string) (int64, error) {
+func (s *Service) parseAccessToken(raw string) (string, error) {
 	tok, err := jwt.ParseWithClaims(raw, &accessClaims{}, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
@@ -90,17 +130,16 @@ func (s *Service) parseAccessToken(raw string) (int64, error) {
 		return s.JWTSecret, nil
 	})
 	if err != nil {
-		return 0, err
+		return "", err
 	}
 	c, ok := tok.Claims.(*accessClaims)
 	if !ok || !tok.Valid {
-		return 0, errors.New("invalid token")
+		return "", errors.New("invalid token")
 	}
-	var id int64
-	if _, err := fmt.Sscanf(c.Subject, "%d", &id); err != nil {
-		return 0, fmt.Errorf("bad subject: %w", err)
+	if _, err := uuid.Parse(c.Subject); err != nil {
+		return "", fmt.Errorf("bad subject: %w", err)
 	}
-	return id, nil
+	return c.Subject, nil
 }
 
 // Random URL-safe token for refresh cookies.
@@ -112,55 +151,48 @@ func randomToken(n int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// issueRefreshToken creates a new refresh token, stores its bcrypt hash,
-// and returns the raw token string the client should receive in a cookie.
-func (s *Service) issueRefreshToken(userID int64) (string, error) {
+// hashToken returns the SHA-256 digest of a refresh token. Stored as
+// BYTEA with a UNIQUE index for O(1) lookup on the refresh hot path.
+func hashToken(raw string) []byte {
+	h := sha256.Sum256([]byte(raw))
+	return h[:]
+}
+
+// issueRefreshToken creates a new refresh token, stores its SHA-256 hash
+// in a UUID-PK row, and returns the raw token for the cookie.
+func (s *Service) issueRefreshToken(userID string) (string, error) {
 	raw, err := randomToken(32)
 	if err != nil {
 		return "", err
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(raw), bcrypt.DefaultCost)
-	if err != nil {
-		return "", err
-	}
 	if _, err := s.DB.Exec(
-		"INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
-		userID, string(hash), time.Now().Add(refreshTokenTTL),
+		"INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
+		NewID(), userID, hashToken(raw), time.Now().Add(refreshTokenTTL),
 	); err != nil {
 		return "", err
 	}
 	return raw, nil
 }
 
-// consumeRefreshToken finds the (user, token row) pair matching the raw
-// token, deletes the row (rotation), and returns the user id. Expired or
-// missing tokens yield an error.
-func (s *Service) consumeRefreshToken(raw string) (int64, error) {
+// consumeRefreshToken atomically deletes the matching row (by SHA-256
+// hash + non-expired) and returns the user id. One indexed lookup, no
+// bcrypt — the previous implementation bcrypt-compared every active
+// row, which is what made /refresh slow.
+func (s *Service) consumeRefreshToken(raw string) (string, error) {
 	if raw == "" {
-		return 0, errors.New("missing refresh token")
+		return "", errors.New("missing refresh token")
 	}
-	rows, err := s.DB.Query(
-		"SELECT id, user_id, token_hash, expires_at FROM refresh_tokens WHERE expires_at > NOW()",
-	)
+	var userID string
+	err := s.DB.QueryRow(
+		`DELETE FROM refresh_tokens
+		 WHERE token_hash = $1 AND expires_at > NOW()
+		 RETURNING user_id`,
+		hashToken(raw),
+	).Scan(&userID)
 	if err != nil {
-		return 0, err
+		return "", errors.New("invalid refresh token")
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var id, userID int64
-		var hash string
-		var exp time.Time
-		if err := rows.Scan(&id, &userID, &hash, &exp); err != nil {
-			return 0, err
-		}
-		if bcrypt.CompareHashAndPassword([]byte(hash), []byte(raw)) == nil {
-			if _, err := s.DB.Exec("DELETE FROM refresh_tokens WHERE id = $1", id); err != nil {
-				return 0, err
-			}
-			return userID, nil
-		}
-	}
-	return 0, errors.New("invalid refresh token")
+	return userID, nil
 }
 
 // Middleware wraps an HTTP handler and rejects requests that don't carry
@@ -169,8 +201,8 @@ func (s *Service) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		header := r.Header.Get("Authorization")
 		if !strings.HasPrefix(header, "Bearer ") {
-			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			w.Header().Set("Content-Type", "application/json")
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
 		token := strings.TrimPrefix(header, "Bearer ")
