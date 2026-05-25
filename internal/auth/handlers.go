@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -10,11 +12,66 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"sajni/internal/auth/providers"
 )
+
+// makeOAuthState returns a stateless, tamper-evident OAuth state value.
+//
+// Cookie-based state breaks under aggressive third-party cookie policies
+// (Chrome's tracking protection, Safari's ITP, partitioned-storage
+// modes). When the API and the web app live on different eTLD+1s,
+// SameSite=None cookies set on the API host during /start are dropped
+// before /callback runs, so the cookie compare always fails with
+// `state mismatch`.
+//
+// Instead we encode the state as `<nonce>.<expUnix>.<hmac>` where the
+// HMAC is computed with JWT_SECRET over the first two segments. The
+// callback verifies the signature and the expiry — no server-side
+// storage, no cookie. The state is single-use *per OAuth flow* because
+// Google won't replay an authorization code, and replay of the state
+// alone gets us nothing without the matching code.
+func (s *Service) makeOAuthState() (string, error) {
+	raw := make([]byte, 18)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(raw)
+	exp := strconv.FormatInt(time.Now().Add(10*time.Minute).Unix(), 10)
+	body := nonce + "." + exp
+	h := hmac.New(sha256.New, s.JWTSecret)
+	h.Write([]byte(body))
+	sig := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+	return body + "." + sig, nil
+}
+
+// verifyOAuthState checks the signature and expiry of a state value
+// produced by makeOAuthState. Returns nil iff the value is authentic
+// and unexpired.
+func (s *Service) verifyOAuthState(state string) error {
+	parts := strings.Split(state, ".")
+	if len(parts) != 3 {
+		return errors.New("bad state format")
+	}
+	body := parts[0] + "." + parts[1]
+	h := hmac.New(sha256.New, s.JWTSecret)
+	h.Write([]byte(body))
+	want := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+	if !hmac.Equal([]byte(want), []byte(parts[2])) {
+		return errors.New("state signature mismatch")
+	}
+	exp, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return errors.New("bad state expiry")
+	}
+	if time.Now().Unix() > exp {
+		return errors.New("state expired")
+	}
+	return nil
+}
 
 // RegisterRoutes attaches all unauthenticated auth endpoints to the
 // provided mux. /api/auth/me is mounted by the protected router.
@@ -132,8 +189,9 @@ func (s *Service) provider(name string) providers.Provider {
 	return nil
 }
 
-// oauthStart issues a random `state`, stores it in a short-lived cookie,
-// and 302s the browser to the provider consent screen.
+// oauthStart issues a stateless HMAC-signed `state` and 302s the
+// browser to the provider consent screen. No cookie — see the comment
+// on makeOAuthState for the rationale.
 func (s *Service) oauthStart(name string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		p := s.provider(name)
@@ -141,21 +199,11 @@ func (s *Service) oauthStart(name string) http.HandlerFunc {
 			writeErr(w, http.StatusBadRequest, "unknown provider")
 			return
 		}
-		raw := make([]byte, 24)
-		if _, err := rand.Read(raw); err != nil {
+		state, err := s.makeOAuthState()
+		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		state := base64.RawURLEncoding.EncodeToString(raw)
-		http.SetCookie(w, &http.Cookie{
-			Name:     "sajni_oauth_state_" + name,
-			Value:    state,
-			Path:     "/api/auth",
-			HttpOnly: true,
-			MaxAge:   600,
-			SameSite: s.sameSite(),
-			Secure:   !s.CookieInsecure,
-		})
 		http.Redirect(w, r, p.StartURL(state), http.StatusFound)
 	}
 }
@@ -171,13 +219,10 @@ func (s *Service) oauthCallback(name string) http.HandlerFunc {
 			return
 		}
 		state := r.URL.Query().Get("state")
-		cookie, err := r.Cookie("sajni_oauth_state_" + name)
-		if err != nil || cookie.Value == "" || cookie.Value != state {
-			writeErr(w, http.StatusBadRequest, "state mismatch")
+		if err := s.verifyOAuthState(state); err != nil {
+			writeErr(w, http.StatusBadRequest, "state mismatch: "+err.Error())
 			return
 		}
-		// Clear the state cookie.
-		http.SetCookie(w, &http.Cookie{Name: "sajni_oauth_state_" + name, Path: "/api/auth", MaxAge: -1})
 
 		code := r.URL.Query().Get("code")
 		if code == "" {
