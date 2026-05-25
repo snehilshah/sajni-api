@@ -1572,7 +1572,7 @@ func createNoteTool(ctx context.Context, d *db.DB, store storage.Storage, uid st
 	if safe == "" {
 		safe = "untitled"
 	}
-	parts := []string{fmt.Sprintf("user_%d", uid), "notes"}
+	parts := []string{fmt.Sprintf("user_%s", uid), "notes"}
 	if folder != "" {
 		parts = append(parts, folder)
 	}
