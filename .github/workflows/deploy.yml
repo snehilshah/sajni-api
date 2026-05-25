@@ -123,6 +123,7 @@ jobs:
           # - cpu-throttling default-on → only billed during requests
           # - cpu-boost           → free during cold starts, faster wake
           flags: |
+            --remove-env-vars=CORS_ORIGIN
             --allow-unauthenticated
             --ingress=all
             --default-url
