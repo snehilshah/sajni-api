@@ -408,9 +408,9 @@ func updateTask(deps Deps) http.HandlerFunc {
 		// any field with a non-nil pointer is updated. due_date/list_id/parent
 		// also accept the JSON literal null to clear the column.
 		var body struct {
-			Title        *string `json:"title"`
-			Description  *string `json:"description"`
-			Status       *string `json:"status"`
+			Title          *string `json:"title"`
+			Description    *string `json:"description"`
+			Status         *string `json:"status"`
 			Priority       *string `json:"priority"`
 			DueDate        *string `json:"due_date"`
 			ScheduledAt    *string `json:"scheduled_at"`
