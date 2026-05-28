@@ -62,6 +62,7 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	registerAIRoutes(apiMux, deps, deps.AI)
 	registerThinkingRoutes(apiMux, deps)
 	registerTakeoutRoutes(apiMux, deps)
+	registerLinkRoutes(apiMux, deps)
 
 	protected := deps.Auth.Middleware(apiMux)
 
