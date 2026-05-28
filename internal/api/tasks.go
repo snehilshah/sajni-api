@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"sajni/internal/db"
 )
 
 func registerTaskRoutes(mux *http.ServeMux, deps Deps) {
@@ -13,6 +15,7 @@ func registerTaskRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/tasks/missed", listMissedTasks(deps))
 	mux.HandleFunc("PUT /api/tasks/reorder", reorderTasks(deps))
 	mux.HandleFunc("GET /api/tasks/{id}/history", getTaskHistory(deps))
+	mux.HandleFunc("GET /api/tasks/{id}/events", getTaskEvents(deps))
 	mux.HandleFunc("GET /api/tasks/{id}/subtasks", listSubtasks(deps))
 
 	mux.HandleFunc("GET /api/tasks", listTasks(deps))
@@ -183,6 +186,18 @@ func listTasks(deps Deps) http.HandlerFunc {
 			ph++
 		}
 
+		// My Day is a derived view (not manually drag-ordered), so it leads
+		// with priority then the day's clock time. Explicit lists keep their
+		// sort_order drag-ordering.
+		orderBy := `ORDER BY t.sort_order ASC,
+			         CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+			         t.created_at DESC`
+		if queryParam(r, "smart") == "my_day" {
+			orderBy = `ORDER BY CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+			         t.scheduled_at ASC NULLS LAST,
+			         t.created_at DESC`
+		}
+
 		q := `
 			SELECT t.id, t.title, t.description, t.status, t.priority,
 			       t.due_date::text, t.scheduled_at::text,
@@ -201,9 +216,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 				GROUP BY parent_task_id
 			) c ON c.parent_task_id = t.id
 			WHERE ` + strings.Join(clauses, " AND ") + `
-			ORDER BY t.sort_order ASC,
-			         CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
-			         t.created_at DESC`
+			` + orderBy
 
 		rows, err := d.Query(q, args...)
 		if err != nil {
@@ -219,6 +232,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 			if err := rows.Scan(
 				&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority,
 				&t.DueDate, &t.ScheduledAt,
+				&t.Remind, &t.RemindedAt,
 				&t.ListID, &t.ParentTaskID, &t.Important, &stepsRaw,
 				&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
 				&t.CreatedAt, &t.UpdatedAt,
@@ -391,6 +405,8 @@ func createTask(deps Deps) http.HandlerFunc {
 		syncTags(d, uid, "task", id, contentForTags)
 		syncBacklinks(d, uid, "task", id, contentForTags)
 
+		logTaskEvent(d, uid, id, "created", "", body.Title)
+
 		writeJSON(w, 201, map[string]int64{"id": id})
 	}
 }
@@ -429,17 +445,23 @@ func updateTask(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		// Lifecycle snapshot for due-date misses.
+		// Lifecycle snapshot: due-date misses + audit-trail diffing.
 		var (
 			currentDueDate *string
 			currentStatus  string
+			currentTitle   string
+			currentListID  sql.NullInt64
 		)
-		d.QueryRow("SELECT due_date::text, status FROM tasks WHERE id = $1 AND user_id = $2", id, uid).Scan(&currentDueDate, &currentStatus)
+		d.QueryRow("SELECT due_date::text, status, title, list_id FROM tasks WHERE id = $1 AND user_id = $2", id, uid).
+			Scan(&currentDueDate, &currentStatus, &currentTitle, &currentListID)
 
 		var contentForTags string
 		if body.Title != nil {
 			d.Exec("UPDATE tasks SET title = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Title, id, uid)
 			contentForTags += *body.Title + " "
+			if *body.Title != currentTitle {
+				logTaskEvent(d, uid, id, "title", currentTitle, *body.Title)
+			}
 		} else {
 			var t string
 			d.QueryRow("SELECT title FROM tasks WHERE id = $1 AND user_id = $2", id, uid).Scan(&t)
@@ -460,6 +482,9 @@ func updateTask(deps Deps) http.HandlerFunc {
 
 		if body.Status != nil {
 			d.Exec("UPDATE tasks SET status = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Status, id, uid)
+			if *body.Status != currentStatus {
+				logTaskEvent(d, uid, id, "status", currentStatus, *body.Status)
+			}
 		}
 		if body.Priority != nil {
 			d.Exec("UPDATE tasks SET priority = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Priority, id, uid)
@@ -496,6 +521,9 @@ func updateTask(deps Deps) http.HandlerFunc {
 				}
 			}
 			d.Exec("UPDATE tasks SET list_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
+			if v.Int64 != currentListID.Int64 || v.Valid != currentListID.Valid {
+				logTaskEvent(d, uid, id, "list", listLabel(d, uid, currentListID), listLabel(d, uid, v))
+			}
 		}
 		if body.ParentTaskID != nil || body.ClearParent {
 			var v sql.NullInt64
@@ -698,6 +726,62 @@ func getTaskHistory(deps Deps) http.HandlerFunc {
 			entries = []Entry{}
 		}
 		writeJSON(w, 200, entries)
+	}
+}
+
+// logTaskEvent appends one audit-trail row. Best-effort: a failure here
+// must never block the mutation it records, so the error is swallowed.
+func logTaskEvent(d *db.DB, uid string, taskID int64, kind, from, to string) {
+	d.Exec(`INSERT INTO task_events (user_id, task_id, kind, from_val, to_val)
+	        VALUES ($1,$2,$3,$4,$5)`, uid, taskID, kind, from, to)
+}
+
+// listLabel resolves a nullable list_id to a human label for the audit
+// trail — "Inbox" when unfiled or the list can't be found.
+func listLabel(d *db.DB, uid string, v sql.NullInt64) string {
+	if !v.Valid {
+		return "Inbox"
+	}
+	var name string
+	d.QueryRow("SELECT name FROM task_lists WHERE id=$1 AND user_id=$2", v.Int64, uid).Scan(&name)
+	if name == "" {
+		return "Inbox"
+	}
+	return name
+}
+
+// getTaskEvents returns the audit timeline (oldest-first) for one task —
+// the GitHub-style feed the detail drawer renders.
+func getTaskEvents(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		rows, err := d.Query(
+			`SELECT kind, from_val, to_val, created_at FROM task_events
+			 WHERE user_id=$1 AND task_id=$2 ORDER BY created_at ASC, id ASC`, uid, id)
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		defer rows.Close()
+		type Event struct {
+			Kind      string `json:"kind"`
+			From      string `json:"from"`
+			To        string `json:"to"`
+			CreatedAt string `json:"created_at"`
+		}
+		out := []Event{}
+		for rows.Next() {
+			var e Event
+			rows.Scan(&e.Kind, &e.From, &e.To, &e.CreatedAt)
+			out = append(out, e)
+		}
+		writeJSON(w, 200, out)
 	}
 }
 

@@ -674,6 +674,23 @@ func (s *Service) buildTools() []Tool {
 				return createTxnTool(ctx, d, uid, args)
 			},
 		},
+		{
+			Name:        "update_transaction",
+			Description: "Update an existing finance transaction by id — change its category, amount, type, description, or date. To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. Use list_finance_transactions to find the id first.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"id":            intg("Required. Transaction id to update."),
+				"category_id":   intg("Optional category id."),
+				"category_name": str("Optional category name to auto-match (e.g. 'Groceries', 'Rent')."),
+				"type":          str("Optional 'expense' | 'income'."),
+				"amount":        num("Optional positive amount."),
+				"description":   str("Optional new description."),
+				"date":          str("Optional ISO date YYYY-MM-DD."),
+			}, "id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return updateTxnTool(ctx, d, uid, args)
+			},
+		},
 	}
 }
 
@@ -1652,12 +1669,44 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 			map[string]any{"kind": "media_added", "id": existingID, "title": title, "route": "/media"}, nil
 	}
 
+	// Metadata: when the model didn't supply an external_id, route through
+	// the same enrichment the manual Add flow uses (TMDB / Open Library) so
+	// AI-added titles get poster, year, genre, and (for shows) season data.
+	extID := argStr(args, "external_id")
+	genre := argStr(args, "genre")
+	poster := argStr(args, "poster_url")
+	var seasonsTotal, episodesTotal int
+	var seasonEpisodes []int
+	if extID == "" {
+		meta := enrichMediaMeta(ctx, title, mtype)
+		extID = meta.ExternalID
+		if poster == "" {
+			poster = meta.PosterURL
+		}
+		if genre == "" {
+			genre = meta.Genre
+		}
+		if year == 0 && meta.Year > 0 {
+			year = int64(meta.Year)
+			yearArg = year
+		}
+		seasonsTotal, episodesTotal, seasonEpisodes = meta.SeasonsTotal, meta.EpisodesTotal, meta.SeasonEpisodes
+	}
+	seJSON := []byte("[]")
+	if len(seasonEpisodes) > 0 {
+		if b, err := json.Marshal(seasonEpisodes); err == nil {
+			seJSON = b
+		}
+	}
+
 	var id int64
 	err := d.QueryRowContext(ctx, `
-		INSERT INTO media (user_id, title, type, status, external_id, year, genre, poster_url, rating)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+		INSERT INTO media (user_id, title, type, status, external_id, year, genre, poster_url, rating,
+		                   seasons_total, episodes_total, season_episodes)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb) RETURNING id`,
 		uid, title, mtype, status,
-		argStr(args, "external_id"), yearArg, argStr(args, "genre"), argStr(args, "poster_url"), ratingArg).Scan(&id)
+		extID, yearArg, genre, poster, ratingArg,
+		seasonsTotal, episodesTotal, string(seJSON)).Scan(&id)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1716,6 +1765,77 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	}
 	return map[string]any{"id": id, "amount": amount, "type": ttype},
 		map[string]any{"kind": "transaction_created", "id": id, "title": fmt.Sprintf("%s %.2f", ttype, amount), "route": "/finance/transactions"}, nil
+}
+
+// resolveCategoryID maps a category_name to an existing category id using
+// the same exact→substring→Other fallback as createTxnTool. Returns 0 when
+// nothing matches and no Other category exists.
+func resolveCategoryID(ctx context.Context, d *db.DB, uid, name string) int64 {
+	var catID int64
+	if err := d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1`, uid, name).Scan(&catID); err != nil || catID == 0 {
+		d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND name ILIKE $2 LIMIT 1`, uid, "%"+name+"%").Scan(&catID)
+	}
+	if catID == 0 {
+		d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND (LOWER(name) = 'other' OR LOWER(name) = 'others') LIMIT 1`, uid).Scan(&catID)
+	}
+	return catID
+}
+
+// updateTxnTool mutates an existing transaction. Only the fields the model
+// passes are touched; category_name is resolved to an id server-side.
+func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	id := argInt(args, "id", 0)
+	if id == 0 {
+		return nil, nil, fmt.Errorf("missing id")
+	}
+	var owned int
+	d.QueryRowContext(ctx, `SELECT 1 FROM fin_transactions WHERE id=$1 AND user_id=$2`, id, uid).Scan(&owned)
+	if owned != 1 {
+		return nil, nil, fmt.Errorf("transaction not found")
+	}
+
+	sets := []string{"updated_at = NOW()"}
+	vals := []any{}
+	ph := 1
+	add := func(col string, v any) {
+		sets = append(sets, fmt.Sprintf("%s = $%d", col, ph))
+		vals = append(vals, v)
+		ph++
+	}
+
+	catID := argInt(args, "category_id", 0)
+	if catID == 0 {
+		if catName := strings.TrimSpace(argStr(args, "category_name")); catName != "" {
+			catID = resolveCategoryID(ctx, d, uid, catName)
+		}
+	}
+	if catID > 0 {
+		add("category_id", catID)
+	}
+	if t := argStr(args, "type"); t == "expense" || t == "income" {
+		add("type", t)
+	}
+	if amt := argFloat(args, "amount"); amt > 0 {
+		add("amount", amt)
+	}
+	if v, ok := args["description"]; ok && v != nil {
+		add("description", argStr(args, "description"))
+	}
+	if dt := argStr(args, "date"); dt != "" {
+		add("txn_date", dt)
+	}
+	if len(sets) == 1 {
+		return nil, nil, fmt.Errorf("nothing to update")
+	}
+
+	vals = append(vals, id, uid)
+	q := "UPDATE fin_transactions SET " + strings.Join(sets, ", ") +
+		fmt.Sprintf(" WHERE id=$%d AND user_id=$%d", ph, ph+1)
+	if _, err := d.ExecContext(ctx, q, vals...); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"id": id, "updated": true},
+		map[string]any{"kind": "transaction_updated", "id": id, "route": "/finance/transactions"}, nil
 }
 
 func listCategoriesTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {

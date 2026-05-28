@@ -571,6 +571,22 @@ func (d *DB) migrate() error {
 	-- Hot path for the reminder cron: only the un-sent, remind-on rows.
 	CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(scheduled_at)
 		WHERE remind = TRUE AND reminded_at IS NULL;
+
+	-- ─── Task audit trail ─────────────────────────────────────────────
+	-- One row per tracked mutation, surfaced as a GitHub-style timeline in
+	-- the task detail drawer. kind ∈ created|status|title|list. Note/body
+	-- edits are deliberately NOT tracked. Distinct from task_due_history,
+	-- which records due-date misses with different semantics.
+	CREATE TABLE IF NOT EXISTS task_events (
+		id         BIGSERIAL   PRIMARY KEY,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		task_id    BIGINT      NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+		kind       TEXT        NOT NULL,
+		from_val   TEXT        NOT NULL DEFAULT '',
+		to_val     TEXT        NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err

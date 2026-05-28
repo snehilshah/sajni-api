@@ -261,6 +261,20 @@ func upsertJournalEntry(deps Deps) http.HandlerFunc {
 			return
 		}
 
+		// Emptying the text removes the whole day — row, blob, tags, and
+		// backlinks — so the calendar dot disappears completely.
+		if strings.TrimSpace(body.Content) == "" {
+			var id int64
+			if d.QueryRow("SELECT id FROM journal_entries WHERE user_id = $1 AND date = $2", uid, date).Scan(&id) == nil {
+				d.Exec("DELETE FROM tags WHERE user_id=$1 AND entity_type='journal' AND entity_id=$2", uid, id)
+				d.Exec("DELETE FROM backlinks WHERE user_id=$1 AND source_type='journal' AND source_id=$2", uid, id)
+				d.Exec("DELETE FROM journal_entries WHERE id=$1 AND user_id=$2", id, uid)
+			}
+			deps.Storage.Delete(r.Context(), journalKey(uid, date))
+			writeJSON(w, 200, map[string]any{"deleted": true})
+			return
+		}
+
 		key := journalKey(uid, date)
 		if err := deps.Storage.Put(r.Context(), key, []byte(body.Content), "text/markdown"); err != nil {
 			errJSON(w, 500, "store entry: "+err.Error())
