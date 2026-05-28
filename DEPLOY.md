@@ -18,7 +18,8 @@ push tag sga/release/v*─►  CI gate → docker build → Artifact Registry
 ```
 
 The frontend is a separate repo (`ohmysajni/sajni-web`) — it deploys
-to Vercel and calls this service over HTTPS at `api.ohmysajni.com`.
+to Vercel and calls this service through same-origin `/api/*` rewrites
+to the Cloud Run default URL.
 
 ---
 
@@ -81,6 +82,23 @@ gcloud storage buckets create "gs://sajni-blobs" \
 
 ### Secrets
 
+> **Why Secret Manager and not GitHub Actions secrets?** GitHub
+> Actions secrets are only available *during* the workflow run — the
+> built container never sees them. Cloud Run reads its runtime env
+> from either plain values in the service spec (`env_vars:`) or from
+> GCP Secret Manager references (`secrets:`). The workflow stitches
+> the two together at deploy time. Anything sensitive (API keys, DB
+> URL, JWT key, OAuth client secrets, the OAuth client *ids* by
+> convention) lives in Secret Manager. Anything non-sensitive (URLs,
+> bucket names, model names) lives in `env_vars:` and is sourced from
+> GitHub repo Variables.
+
+All runtime config — including URL-ish things that aren't strictly
+sensitive — lives in Secret Manager so there's a single source of
+truth. The secret name on the left becomes the `secrets:` reference
+in `.github/workflows/deploy.yml`, which Cloud Run mounts as the
+matching env var at boot.
+
 ```sh
 echo -n "postgres://USER:PASS@HOST:5432/sajni?sslmode=require" \
   | gcloud secrets create sajni-database-url --data-file=-
@@ -89,13 +107,54 @@ openssl rand -hex 32 \
   | gcloud secrets create sajni-jwt-secret --data-file=-
 
 # Optional integrations. Create the secret even if empty — the
-# deploy workflow references all four unconditionally.
+# deploy workflow references all of these unconditionally.
 echo -n "your-tmdb-key"   | gcloud secrets create sajni-tmdb-key   --data-file=-
 echo -n "your-gemini-key" | gcloud secrets create sajni-gemini-key --data-file=-
+
+# Auth: OAuth client credentials + Resend API key (added with the
+# auth rework). Names use the same SCREAMING_SNAKE_CASE that the env
+# var has — easier to grep, no `sajni-` prefix needed.
+echo -n "GOOGLE_CLIENT_ID"      | gcloud secrets create GOOGLE_OAUTH_CLIENT_ID     --data-file=-
+echo -n "GOOGLE_CLIENT_SECRET"  | gcloud secrets create GOOGLE_OAUTH_CLIENT_SECRET --data-file=-
+echo -n "GITHUB_CLIENT_ID"      | gcloud secrets create GITHUB_OAUTH_CLIENT_ID     --data-file=-
+echo -n "GITHUB_CLIENT_SECRET"  | gcloud secrets create GITHUB_OAUTH_CLIENT_SECRET --data-file=-
+echo -n "re_xxxxx_resendkey"    | gcloud secrets create RESEND_API_KEY             --data-file=-
+
+# Plain runtime config promoted into Secret Manager for consistency.
+echo -n "https://www.ohmysajni.com"    | gcloud secrets create APP_URL        --data-file=-
+echo -n "https://www.ohmysajni.com"    | gcloud secrets create CORS_ORIGIN    --data-file=-
+echo -n "https://sajni-api-REGION-HASH.a.run.app" | gcloud secrets create API_BASE_URL --data-file=-
+echo -n "Sajni <hello@ohmysajni.com>"  | gcloud secrets create EMAIL_FROM     --data-file=-
+echo -n "info"                         | gcloud secrets create LOG_LEVEL      --data-file=-
 ```
+
+For OAuth providers, register the same-origin callback URLs that hit
+Vercel first:
+
+```text
+https://www.ohmysajni.com/api/auth/google/callback
+https://www.ohmysajni.com/api/auth/github/callback
+```
+
+Keep the Cloud Run callback URLs registered only as fallback/debug
+URLs. The same-origin callback matters: the refresh cookie must be set
+on the frontend host so `/api/auth/refresh` still has it after browser
+reload.
+
+Use the canonical frontend host here. Current DNS redirects
+`ohmysajni.com` to `www.ohmysajni.com`, so `www.ohmysajni.com` is the
+host that should appear in `APP_URL` and OAuth callback URLs.
 
 Rotate later with `gcloud secrets versions add NAME --data-file=-`.
 The deploy uses `:latest` so a fresh revision picks up rotations.
+
+To rotate a key without rebuilding the image:
+
+```sh
+echo -n "NEW_VALUE" | gcloud secrets versions add sajni-google-oauth-client-id --data-file=-
+# Roll the service so it picks up the new version. No image rebuild.
+gcloud run services update sajni-api --region asia-south1
+```
 
 ### Service account + Workload Identity Federation
 
@@ -141,14 +200,18 @@ echo "projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github/p
 In **Settings → Secrets and variables → Actions** of `ohmysajni/sajni-api`,
 add these as **Variables** (not Secrets — they're identifiers, not credentials):
 
+GitHub repo Variables hold the values the *workflow itself* needs to
+deploy — they're never seen by the running container, and they aren't
+sensitive (project ids, region names, the WIF provider path). Runtime
+config lives in Secret Manager (above).
+
 | Variable              | Value                                                                                            |
 | --------------------- | ------------------------------------------------------------------------------------------------ |
 | `GCP_PROJECT_ID`      | `ohmysajni`                                                                                      |
 | `GCP_REGION`          | `asia-south1`                                                                                    |
 | `GCP_SERVICE_ACCOUNT` | `sajni-deployer@ohmysajni.iam.gserviceaccount.com`                                               |
 | `GCP_WIF_PROVIDER`    | the line you `echo`d at the end of the IAM block                                                 |
-| `GCS_BUCKET`          | `sajni-blobs`                                                                                    |
-| `CORS_ORIGIN`         | `https://ohmysajni.com` (the frontend's production origin)                                       |
+| `GCS_BUCKET`          | e.g. `ohmysajni-sajni-blobs`                                                                     |
 
 ---
 

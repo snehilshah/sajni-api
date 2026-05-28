@@ -109,9 +109,8 @@ func (s *Service) renderTOTPEmail(email, name, code, purpose string) (string, st
 	return subject, buf.String(), nil
 }
 
-// deliverCodeEmail ships the rendered HTML through the Resend HTTP API.
-// When RESEND_API_KEY is unset we log-and-no-op so local dev still works
-// (the code is printed via the log below the call site).
+// deliverCodeEmail renders the TOTP email and ships it. When
+// RESEND_API_KEY is unset we log the code and no-op so local dev works.
 func (s *Service) deliverCodeEmail(ctx context.Context, to, name, code, purpose string) error {
 	subject, html, err := s.renderTOTPEmail(to, name, code, purpose)
 	if err != nil {
@@ -120,6 +119,18 @@ func (s *Service) deliverCodeEmail(ctx context.Context, to, name, code, purpose 
 	if s.ResendAPIKey == "" {
 		// Dev fallback: print the code to logs.
 		fmt.Printf("[auth/email] (dev) RESEND_API_KEY unset — code for %s: %s\n", to, code)
+		return nil
+	}
+	return s.SendEmail(ctx, to, subject, html)
+}
+
+// SendEmail ships an already-rendered HTML email through the Resend HTTP
+// API. Generic sibling of deliverCodeEmail for non-auth senders (task
+// reminders, etc). Dev fallback logs and no-ops when RESEND_API_KEY is
+// unset so local dev never hard-fails on a missing key.
+func (s *Service) SendEmail(ctx context.Context, to, subject, html string) error {
+	if s.ResendAPIKey == "" {
+		fmt.Printf("[email] (dev) RESEND_API_KEY unset — would send %q to %s\n", subject, to)
 		return nil
 	}
 	body, _ := json.Marshal(map[string]any{
@@ -141,6 +152,34 @@ func (s *Service) deliverCodeEmail(ctx context.Context, to, name, code, purpose 
 		return fmt.Errorf("resend send: %s — %s", resp.Status, string(b))
 	}
 	return nil
+}
+
+// SendTaskReminder renders + ships the task-reminder email. whenLabel is
+// the event time already formatted in the user's tz by the caller (e.g.
+// "today at 5:00 PM"); route is the in-app path the CTA opens (e.g.
+// "/tasks"). Kept here so the AppURL + embedded template stay in one place.
+func (s *Service) SendTaskReminder(ctx context.Context, to, name, taskTitle, whenLabel, route string) error {
+	tpl, err := template.ParseFS(emailTemplatesFS, "email_templates/reminder.html")
+	if err != nil {
+		return err
+	}
+	displayName := strings.TrimSpace(name)
+	if displayName == "" {
+		displayName = strings.SplitN(to, "@", 2)[0]
+	}
+	appURL := strings.TrimRight(s.AppURL, "/")
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, map[string]any{
+		"Name":      displayName,
+		"TaskTitle": taskTitle,
+		"WhenLabel": whenLabel,
+		"AppURL":    appURL,
+		"CTAURL":    appURL + route,
+	}); err != nil {
+		return err
+	}
+	subject := "Reminder: " + taskTitle
+	return s.SendEmail(ctx, to, subject, buf.String())
 }
 
 // consumeEmailCode verifies a 6-digit code for the given email + purpose.

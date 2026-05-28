@@ -43,6 +43,7 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	apiMux.HandleFunc("GET /api/auth/me", deps.Auth.HandleMe)
 	apiMux.HandleFunc("POST /api/auth/profile", deps.Auth.HandleUpdateProfile)
 	apiMux.HandleFunc("POST /api/auth/onboarded", deps.Auth.HandleOnboarded)
+	apiMux.HandleFunc("POST /api/auth/timezone", deps.Auth.HandleSetTimezone)
 	registerMemoRoutes(apiMux, deps)
 	registerTaskRoutes(apiMux, deps)
 	registerTaskListRoutes(apiMux, deps)
@@ -93,9 +94,10 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	root.HandleFunc("/healthz", healthHandler)
 	root.HandleFunc("/readyz", healthHandler)
 
-	// Cron webhook for the insights engine. Auth is by a shared secret
-	// header (INSIGHT_CRON_SECRET); the handler 401s without it.
+	// Cron webhooks. Auth is by a shared secret header; each 401s without
+	// it. Insights run daily; reminders every 5 min (Cloud Scheduler).
 	RegisterInsightCronHandler(root, deps)
+	RegisterReminderCronHandler(root, deps)
 
 	if frontendDir != "" {
 		fs := http.FileServer(http.Dir(frontendDir))

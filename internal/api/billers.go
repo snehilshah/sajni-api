@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+
+	"sajni/internal/db"
 )
 
 // Billers + subscriptions live alongside finance: every biller schedules a
@@ -39,6 +41,7 @@ type billerResp struct {
 	CategoryColor  *string `json:"category_color"`
 	IsSubscription bool    `json:"is_subscription"`
 	AutoRenew      bool    `json:"auto_renew"`
+	RemindTask     bool    `json:"remind_task"`
 	AlertDays      int     `json:"alert_days"`
 	Color          string  `json:"color"`
 	Notes          string  `json:"notes"`
@@ -78,7 +81,7 @@ func listBillers(deps Deps) http.HandlerFunc {
 
 		q := `SELECT b.id, b.name, b.amount, b.frequency, b.next_due_date::text,
 			b.account_id, a.name, b.category_id, c.name, c.color,
-			b.is_subscription, b.auto_renew, b.alert_days, b.color, b.notes, b.archived,
+			b.is_subscription, b.auto_renew, b.remind_task, b.alert_days, b.color, b.notes, b.archived,
 			(SELECT MAX(paid_date)::text FROM fin_biller_payments p WHERE p.biller_id = b.id),
 			b.created_at::text
 			FROM fin_billers b
@@ -101,7 +104,7 @@ func listBillers(deps Deps) http.HandlerFunc {
 			var b billerResp
 			rows.Scan(&b.ID, &b.Name, &b.Amount, &b.Frequency, &b.NextDueDate,
 				&b.AccountID, &b.AccountName, &b.CategoryID, &b.CategoryName, &b.CategoryColor,
-				&b.IsSubscription, &b.AutoRenew, &b.AlertDays, &b.Color, &b.Notes, &b.Archived,
+				&b.IsSubscription, &b.AutoRenew, &b.RemindTask, &b.AlertDays, &b.Color, &b.Notes, &b.Archived,
 				&b.LastPaidDate, &b.CreatedAt)
 			out = append(out, b)
 		}
@@ -122,6 +125,7 @@ func createBiller(deps Deps) http.HandlerFunc {
 			CategoryID     *int64  `json:"category_id"`
 			IsSubscription bool    `json:"is_subscription"`
 			AutoRenew      bool    `json:"auto_renew"`
+			RemindTask     bool    `json:"remind_task"`
 			AlertDays      *int    `json:"alert_days"`
 			Color          string  `json:"color"`
 			Notes          string  `json:"notes"`
@@ -158,10 +162,10 @@ func createBiller(deps Deps) http.HandlerFunc {
 		var id int64
 		err := d.QueryRow(`INSERT INTO fin_billers
 			(user_id, name, amount, frequency, next_due_date, account_id, category_id,
-			 is_subscription, auto_renew, alert_days, color, notes)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+			 is_subscription, auto_renew, remind_task, alert_days, color, notes)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
 			uid, body.Name, body.Amount, body.Frequency, body.NextDueDate, body.AccountID, body.CategoryID,
-			body.IsSubscription, body.AutoRenew, alertDays, body.Color, body.Notes).Scan(&id)
+			body.IsSubscription, body.AutoRenew, body.RemindTask, alertDays, body.Color, body.Notes).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
@@ -188,6 +192,7 @@ func updateBiller(deps Deps) http.HandlerFunc {
 			CategoryID     *int64   `json:"category_id"`
 			IsSubscription *bool    `json:"is_subscription"`
 			AutoRenew      *bool    `json:"auto_renew"`
+			RemindTask     *bool    `json:"remind_task"`
 			AlertDays      *int     `json:"alert_days"`
 			Color          *string  `json:"color"`
 			Notes          *string  `json:"notes"`
@@ -232,6 +237,9 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		}
 		if body.AutoRenew != nil {
 			add("auto_renew", *body.AutoRenew)
+		}
+		if body.RemindTask != nil {
+			add("remind_task", *body.RemindTask)
 		}
 		if body.AlertDays != nil {
 			add("alert_days", *body.AlertDays)
@@ -434,7 +442,7 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 	today := time.Now().Format("2006-01-02")
 
 	rows, err := d.QueryContext(ctx, `SELECT id, user_id, name, amount, frequency, next_due_date::text,
-		account_id, category_id, auto_renew, alert_days
+		account_id, category_id, auto_renew, remind_task, alert_days
 		FROM fin_billers WHERE archived = FALSE`)
 	if err != nil {
 		return 0, 0, err
@@ -448,13 +456,14 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 		amount                float64
 		accountID, categoryID sql.NullInt64
 		autoRenew             bool
+		remindTask            bool
 		alertDays             int
 	}
 	var bills []bill
 	for rows.Next() {
 		var b bill
 		rows.Scan(&b.id, &b.userID, &b.name, &b.amount, &b.freq, &b.dueDate,
-			&b.accountID, &b.categoryID, &b.autoRenew, &b.alertDays)
+			&b.accountID, &b.categoryID, &b.autoRenew, &b.remindTask, &b.alertDays)
 		bills = append(bills, b)
 	}
 
@@ -492,11 +501,40 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 		}
 		gap := int(due.Sub(todayT).Hours() / 24)
 		if gap >= 0 && gap <= b.alertDays {
-			d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
-				VALUES ($1,$2,'upcoming',$3) ON CONFLICT DO NOTHING`,
-				b.userID, b.id, due.Format("2006-01-02"))
-			upcomingNoticed++
+			if b.remindTask {
+				// Opt-in: spawn one bill-pay reminder task for this cycle.
+				// The 'reminder_task' alert row (uniq on biller,kind,due) is
+				// the idempotency sentinel — only create the task when the
+				// insert actually took, so re-runs don't duplicate it. The
+				// task itself carries the nudge, so we skip the 'upcoming'
+				// alert for these billers.
+				res, _ := d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
+					VALUES ($1,$2,'reminder_task',$3) ON CONFLICT DO NOTHING`,
+					b.userID, b.id, due.Format("2006-01-02"))
+				if n, _ := res.RowsAffected(); n == 1 {
+					spawnBillerTask(ctx, d, b.userID, b.name, due)
+					upcomingNoticed++
+				}
+			} else {
+				d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
+					VALUES ($1,$2,'upcoming',$3) ON CONFLICT DO NOTHING`,
+					b.userID, b.id, due.Format("2006-01-02"))
+				upcomingNoticed++
+			}
 		}
 	}
 	return autoPosted, upcomingNoticed, nil
+}
+
+// spawnBillerTask creates a "Pay {name}" reminder task for a biller's due
+// cycle: scheduled at 09:00 on the due date in the user's local tz, with
+// remind on so the reminder cron emails the morning-of nudge. Idempotency
+// is the caller's responsibility (the reminder_task alert sentinel).
+func spawnBillerTask(ctx context.Context, d *db.DB, uid, name string, due time.Time) {
+	loc := userLocation(d, uid)
+	sched := time.Date(due.Year(), due.Month(), due.Day(), 9, 0, 0, 0, loc)
+	d.ExecContext(ctx, `
+		INSERT INTO tasks (user_id, title, priority, status, due_date, scheduled_at, remind)
+		VALUES ($1, $2, 'high', 'todo', $3, $4, TRUE)`,
+		uid, "Pay "+name, due.Format("2006-01-02"), sched.UTC())
 }

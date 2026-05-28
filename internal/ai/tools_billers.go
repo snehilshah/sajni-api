@@ -87,10 +87,10 @@ func createBillerTool(ctx context.Context, d *db.DB, uid string, args map[string
 	var id int64
 	err := d.QueryRowContext(ctx, `INSERT INTO fin_billers
 		(user_id, name, amount, frequency, next_due_date, account_id, category_id,
-		 is_subscription, auto_renew, alert_days, notes)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+		 is_subscription, auto_renew, remind_task, alert_days, notes)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
 		uid, name, amount, freq, due, accountArg, categoryArg,
-		argBool(args, "is_subscription", false), autoRenew, alertDays, argStr(args, "notes")).Scan(&id)
+		argBool(args, "is_subscription", false), autoRenew, argBool(args, "remind_task", false), alertDays, argStr(args, "notes")).Scan(&id)
 	if err != nil {
 		return nil, nil, err
 	}

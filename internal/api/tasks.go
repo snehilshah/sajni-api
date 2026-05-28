@@ -39,6 +39,7 @@ func getTask(deps Deps) http.HandlerFunc {
 		err = d.QueryRow(`
 			SELECT t.id, t.title, t.description, t.status, t.priority,
 			       t.due_date::text, t.scheduled_at::text,
+			       t.remind, t.reminded_at::text,
 			       t.list_id, t.parent_task_id, t.important, t.steps,
 			       COALESCE(t.sort_order, 0),
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
@@ -55,6 +56,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			WHERE t.user_id = $1 AND t.id = $2`, uid, id).Scan(
 			&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority,
 			&t.DueDate, &t.ScheduledAt,
+			&t.Remind, &t.RemindedAt,
 			&t.ListID, &t.ParentTaskID, &t.Important, &stepsRaw,
 			&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
 			&t.CreatedAt, &t.UpdatedAt,
@@ -93,6 +95,8 @@ type taskRow struct {
 	Tags         []string `json:"tags"`
 	DueDate      *string  `json:"due_date"`
 	ScheduledAt  *string  `json:"scheduled_at"`
+	Remind       bool     `json:"remind"`
+	RemindedAt   *string  `json:"reminded_at"`
 	ListID       *int64   `json:"list_id"`
 	ParentTaskID *int64   `json:"parent_task_id"`
 	Important    bool     `json:"important"`
@@ -129,6 +133,8 @@ func listTasks(deps Deps) http.HandlerFunc {
 			clauses = append(clauses, "t.important = TRUE", "t.status != 'done'")
 		case "planned":
 			clauses = append(clauses, "t.due_date IS NOT NULL", "t.status != 'done'")
+		case "scheduled":
+			clauses = append(clauses, "t.scheduled_at IS NOT NULL", "t.status != 'done'")
 		case "inbox":
 			clauses = append(clauses, "t.list_id IS NULL")
 		case "all":
@@ -180,6 +186,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 		q := `
 			SELECT t.id, t.title, t.description, t.status, t.priority,
 			       t.due_date::text, t.scheduled_at::text,
+			       t.remind, t.reminded_at::text,
 			       t.list_id, t.parent_task_id, t.important, t.steps,
 			       COALESCE(t.sort_order, 0),
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
@@ -290,6 +297,8 @@ func createTask(deps Deps) http.HandlerFunc {
 			Priority     string  `json:"priority"`
 			Status       string  `json:"status"`
 			DueDate      *string `json:"due_date"`
+			ScheduledAt  *string `json:"scheduled_at"`
+			Remind       bool    `json:"remind"`
 			ListID       *int64  `json:"list_id"`
 			ParentTaskID *int64  `json:"parent_task_id"`
 			Important    bool    `json:"important"`
@@ -330,6 +339,20 @@ func createTask(deps Deps) http.HandlerFunc {
 			dueArg = *body.DueDate
 		}
 
+		// scheduled_at is the event instant (powers time chips + reminders).
+		var schedArg any
+		if body.ScheduledAt != nil && strings.TrimSpace(*body.ScheduledAt) != "" {
+			schedArg = *body.ScheduledAt
+			// Keep due_date (the all-day bucket the smart-lists use) in sync
+			// with the scheduled day in the user's local tz when the client
+			// didn't send one explicitly.
+			if dueArg == nil {
+				if t, err := time.Parse(time.RFC3339, *body.ScheduledAt); err == nil {
+					dueArg = t.In(userLocation(d, uid)).Format("2006-01-02")
+				}
+			}
+		}
+
 		// Compute the next sort_order in a separate query. Inlining it
 		// inside the INSERT made Postgres unable to infer the type of the
 		// nullable bigint placeholders, throwing 500 on empty payloads.
@@ -352,11 +375,11 @@ func createTask(deps Deps) http.HandlerFunc {
 
 		var id int64
 		err := d.QueryRow(`
-			INSERT INTO tasks (user_id, title, description, priority, status, due_date,
+			INSERT INTO tasks (user_id, title, description, priority, status, due_date, scheduled_at, remind,
 			                   list_id, parent_task_id, important, steps, sort_order)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13)
 			RETURNING id`,
-			uid, body.Title, body.Description, body.Priority, body.Status, dueArg,
+			uid, body.Title, body.Description, body.Priority, body.Status, dueArg, schedArg, body.Remind,
 			body.ListID, body.ParentTaskID, body.Important, stepsJSON, nextSort,
 		).Scan(&id)
 		if err != nil {
@@ -388,15 +411,18 @@ func updateTask(deps Deps) http.HandlerFunc {
 			Title        *string `json:"title"`
 			Description  *string `json:"description"`
 			Status       *string `json:"status"`
-			Priority     *string `json:"priority"`
-			DueDate      *string `json:"due_date"`
-			ListID       *int64  `json:"list_id"`
-			ParentTaskID *int64  `json:"parent_task_id"`
-			Important    *bool   `json:"important"`
-			Steps        *[]Step `json:"steps"`
-			SortOrder    *int    `json:"sort_order"`
-			ClearList    bool    `json:"clear_list"`
-			ClearParent  bool    `json:"clear_parent"`
+			Priority       *string `json:"priority"`
+			DueDate        *string `json:"due_date"`
+			ScheduledAt    *string `json:"scheduled_at"`
+			Remind         *bool   `json:"remind"`
+			ListID         *int64  `json:"list_id"`
+			ParentTaskID   *int64  `json:"parent_task_id"`
+			Important      *bool   `json:"important"`
+			Steps          *[]Step `json:"steps"`
+			SortOrder      *int    `json:"sort_order"`
+			ClearList      bool    `json:"clear_list"`
+			ClearParent    bool    `json:"clear_parent"`
+			ClearScheduled bool    `json:"clear_scheduled"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -481,6 +507,26 @@ func updateTask(deps Deps) http.HandlerFunc {
 				}
 			}
 			d.Exec("UPDATE tasks SET parent_task_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
+		}
+		// scheduled_at: set or clear the event time. Either change clears
+		// reminded_at so the reminder re-arms (an edited time should fire
+		// again). When a time is set and the client didn't override due_date,
+		// keep due_date aligned to the new local day for the smart-lists.
+		if body.ScheduledAt != nil || body.ClearScheduled {
+			var schedArg any
+			if body.ScheduledAt != nil && !body.ClearScheduled && strings.TrimSpace(*body.ScheduledAt) != "" {
+				schedArg = *body.ScheduledAt
+			}
+			d.Exec("UPDATE tasks SET scheduled_at=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3", schedArg, id, uid)
+			if s, ok := schedArg.(string); ok && body.DueDate == nil {
+				if t, err := time.Parse(time.RFC3339, s); err == nil {
+					d.Exec("UPDATE tasks SET due_date=$1 WHERE id=$2 AND user_id=$3", t.In(userLocation(d, uid)).Format("2006-01-02"), id, uid)
+				}
+			}
+		}
+		if body.Remind != nil {
+			// Toggling remind re-arms too (turning it back on should re-send).
+			d.Exec("UPDATE tasks SET remind=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.Remind, id, uid)
 		}
 		if body.Important != nil {
 			d.Exec("UPDATE tasks SET important=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.Important, id, uid)

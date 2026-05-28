@@ -9,6 +9,10 @@ import (
 	"os"
 	"strings"
 	"time"
+	// Embed the IANA tz database so time.LoadLocation works on the
+	// distroless Cloud Run image (no system zoneinfo). Needed to render
+	// reminder emails in the user's local clock time.
+	_ "time/tzdata"
 
 	"github.com/rs/zerolog/log"
 

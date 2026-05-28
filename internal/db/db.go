@@ -554,6 +554,23 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_thinking_cards_project ON thinking_cards(project_id, created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_thinking_cards_user ON thinking_cards(user_id);
+
+	-- ─── Reminders (extends tasks) ────────────────────────────────────
+	-- Reminders ride on tasks rather than a separate model: scheduled_at
+	-- (already present) is the event instant, remind gates the email, and
+	-- reminded_at is the sent-sentinel (NULL = unsent). Clearing it on edit
+	-- re-arms the reminder; the */5 cron uses it for idempotency.
+	ALTER TABLE tasks       ADD COLUMN IF NOT EXISTS remind      BOOLEAN     NOT NULL DEFAULT FALSE;
+	ALTER TABLE tasks       ADD COLUMN IF NOT EXISTS reminded_at TIMESTAMPTZ;
+	-- IANA timezone captured from the browser once, used to render the
+	-- reminder email in the user's local clock time. NULL until captured.
+	ALTER TABLE users       ADD COLUMN IF NOT EXISTS timezone    TEXT;
+	-- Opt-in: when on (and the biller is not auto_renew) the biller cron
+	-- spawns one bill-pay reminder task per due cycle.
+	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS remind_task BOOLEAN     NOT NULL DEFAULT FALSE;
+	-- Hot path for the reminder cron: only the un-sent, remind-on rows.
+	CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(scheduled_at)
+		WHERE remind = TRUE AND reminded_at IS NULL;
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err

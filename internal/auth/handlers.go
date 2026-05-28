@@ -103,6 +103,7 @@ type userResponse struct {
 	ID          string             `json:"id"`
 	Email       string             `json:"email"`
 	Name        string             `json:"name"`
+	Timezone    string             `json:"timezone"`
 	OnboardedAt *string            `json:"onboarded_at"`
 	Identities  []identityResponse `json:"identities"`
 	DeletedAt   *string            `json:"deleted_at,omitempty"`
@@ -131,16 +132,17 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 func (s *Service) loadUser(ctx context.Context, id string) (*userResponse, error) {
 	var (
 		email, name string
+		tz          sql.NullString
 		onboarded   sql.NullTime
 		deleted     sql.NullTime
 	)
 	err := s.DB.QueryRowContext(ctx,
-		`SELECT email, name, onboarded_at, deleted_at FROM users WHERE id=$1`, id,
-	).Scan(&email, &name, &onboarded, &deleted)
+		`SELECT email, name, timezone, onboarded_at, deleted_at FROM users WHERE id=$1`, id,
+	).Scan(&email, &name, &tz, &onboarded, &deleted)
 	if err != nil {
 		return nil, err
 	}
-	resp := &userResponse{ID: id, Email: email, Name: name, Identities: []identityResponse{}}
+	resp := &userResponse{ID: id, Email: email, Name: name, Timezone: tz.String, Identities: []identityResponse{}}
 	if onboarded.Valid {
 		v := onboarded.Time.UTC().Format(time.RFC3339)
 		resp.OnboardedAt = &v
@@ -575,4 +577,35 @@ func (s *Service) HandleOnboarded(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// HandleSetTimezone stores the user's IANA timezone (captured by the
+// frontend from the browser). Reminder emails are rendered in this zone.
+// Validated against the tz database so we never persist garbage that would
+// silently fall back to UTC in the cron.
+func (s *Service) HandleSetTimezone(w http.ResponseWriter, r *http.Request) {
+	id := MustUserID(r.Context())
+	var body struct {
+		Timezone string `json:"timezone"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	tz := strings.TrimSpace(body.Timezone)
+	if tz == "" || len(tz) > 64 {
+		writeErr(w, http.StatusBadRequest, "valid timezone required")
+		return
+	}
+	if _, err := time.LoadLocation(tz); err != nil {
+		writeErr(w, http.StatusBadRequest, "unknown timezone")
+		return
+	}
+	if _, err := s.DB.ExecContext(r.Context(),
+		`UPDATE users SET timezone=$2 WHERE id=$1`, id, tz,
+	); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "timezone": tz})
 }

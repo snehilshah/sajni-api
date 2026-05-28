@@ -315,14 +315,15 @@ func (s *Service) buildTools() []Tool {
 		// ---------------- WRITE ----------------
 		{
 			Name:        "create_task",
-			Description: "Create a new task. Resolve relative dates ('tomorrow', 'next monday') against get_current_context first. Use list_task_lists to look up list_id by name; use list_tasks to find a parent_task_id when nesting.",
+			Description: "Create a new task. Resolve relative dates ('tomorrow', 'next monday') against get_current_context first. Use list_task_lists to look up list_id by name; use list_tasks to find a parent_task_id when nesting. For 'remind me to X at <time>' requests, set scheduled_at to the event time AND remind=true — Sajni emails the user ~5 min before.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"title":            str("Required. Short title."),
 				"description":      str("Optional details."),
 				"priority":         str("'high' | 'medium' | 'low'. Default 'medium'."),
 				"due_date":         str("Optional ISO date YYYY-MM-DD."),
-				"scheduled_at":     str("Optional ISO timestamp YYYY-MM-DDTHH:MM:00Z."),
+				"scheduled_at":     str("Optional ISO timestamp with offset, e.g. 2026-05-30T17:00:00+05:30. The event/reminder time."),
+				"remind":           boolean("Optional. If true, email the user ~5 min before scheduled_at. Requires scheduled_at."),
 				"duration_minutes": intg("Optional. Default 30."),
 				"list_id":          intg("Optional. Place the task inside this user list."),
 				"parent_task_id":   intg("Optional. Make this a subtask of the given task id."),
@@ -535,6 +536,7 @@ func (s *Service) buildTools() []Tool {
 				"category_id":     intg("Optional expense category."),
 				"is_subscription": boolean("True for streaming-type recurring services."),
 				"auto_renew":      boolean("If true, cron posts the expense automatically on/after due date."),
+				"remind_task":     boolean("If true (and not auto_renew), the biller cron spawns a 'Pay {name}' reminder task each cycle that emails the user."),
 				"alert_days":      intg("Days before due_date to alert (default 3)."),
 				"notes":           str("Optional."),
 			}, "name", "amount"),
@@ -1372,6 +1374,7 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	scheduled := argStr(args, "scheduled_at")
 	dur := argInt(args, "duration_minutes", 30)
 	important := argBool(args, "important", false)
+	remind := argBool(args, "remind", false)
 
 	var (
 		id        int64
@@ -1436,11 +1439,11 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	}
 
 	err := d.QueryRowContext(ctx, `
-		INSERT INTO tasks (user_id, title, description, priority, status, due_date, scheduled_at,
+		INSERT INTO tasks (user_id, title, description, priority, status, due_date, scheduled_at, remind,
 		                   duration_minutes, list_id, parent_task_id, important, steps)
-		VALUES ($1,$2,$3,$4,'todo',$5,$6,$7,$8,$9,$10,$11::jsonb)
+		VALUES ($1,$2,$3,$4,'todo',$5,$6,$7,$8,$9,$10,$11,$12::jsonb)
 		RETURNING id`,
-		uid, title, desc, priority, dueArg, schArg, dur, listArg, parentArg, important, stepsJSON,
+		uid, title, desc, priority, dueArg, schArg, remind, dur, listArg, parentArg, important, stepsJSON,
 	).Scan(&id)
 	if err != nil {
 		return nil, nil, err
