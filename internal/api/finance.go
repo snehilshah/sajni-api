@@ -455,6 +455,7 @@ type txnResp struct {
 	Type          string  `json:"type"`
 	Amount        float64 `json:"amount"`
 	Description   string  `json:"description"`
+	Note          string  `json:"note"`
 	TxnDate       string  `json:"txn_date"`
 	TransferPair  *int64  `json:"transfer_pair"`
 	LinkedAccount *int64  `json:"linked_account"`
@@ -508,7 +509,7 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		}
 
 		q := `SELECT t.id, t.account_id, a.name, t.category_id, c.name, c.color, t.type, t.amount,
-			  t.description, t.txn_date::text, t.transfer_pair, t.linked_account, t.created_at::text
+			  t.description, t.note, t.txn_date::text, t.transfer_pair, t.linked_account, t.created_at::text
 			  FROM fin_transactions t
 			  JOIN fin_accounts a ON a.id = t.account_id
 			  LEFT JOIN fin_categories c ON c.id = t.category_id
@@ -525,7 +526,7 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		for rows.Next() {
 			var t txnResp
 			rows.Scan(&t.ID, &t.AccountID, &t.AccountName, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
-				&t.Type, &t.Amount, &t.Description, &t.TxnDate, &t.TransferPair, &t.LinkedAccount, &t.CreatedAt)
+				&t.Type, &t.Amount, &t.Description, &t.Note, &t.TxnDate, &t.TransferPair, &t.LinkedAccount, &t.CreatedAt)
 			out = append(out, t)
 		}
 		if out == nil {
@@ -545,6 +546,7 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			Type          string  `json:"type"`
 			Amount        float64 `json:"amount"`
 			Description   string  `json:"description"`
+			Note          string  `json:"note"`
 			TxnDate       string  `json:"txn_date"`
 			LinkedAccount *int64  `json:"linked_account"`
 		}
@@ -575,14 +577,14 @@ func createTransaction(deps Deps) http.HandlerFunc {
 				return
 			}
 			var outID, inID int64
-			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_date, linked_account) VALUES ($1,$2,'transfer_out',$3,$4,$5,$6) RETURNING id`,
-				uid, b.AccountID, b.Amount, b.Description, b.TxnDate, *b.LinkedAccount).Scan(&outID); err != nil {
+			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_date, linked_account) VALUES ($1,$2,'transfer_out',$3,$4,$5,$6,$7) RETURNING id`,
+				uid, b.AccountID, b.Amount, b.Description, b.Note, b.TxnDate, *b.LinkedAccount).Scan(&outID); err != nil {
 				tx.Rollback()
 				errJSON(w, 500, err.Error())
 				return
 			}
-			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_date, linked_account, transfer_pair) VALUES ($1,$2,'transfer_in',$3,$4,$5,$6,$7) RETURNING id`,
-				uid, *b.LinkedAccount, b.Amount, b.Description, b.TxnDate, b.AccountID, outID).Scan(&inID); err != nil {
+			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_date, linked_account, transfer_pair) VALUES ($1,$2,'transfer_in',$3,$4,$5,$6,$7,$8) RETURNING id`,
+				uid, *b.LinkedAccount, b.Amount, b.Description, b.Note, b.TxnDate, b.AccountID, outID).Scan(&inID); err != nil {
 				tx.Rollback()
 				errJSON(w, 500, err.Error())
 				return
@@ -601,8 +603,8 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		}
 
 		var id int64
-		err := d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_date) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-			uid, b.AccountID, b.CategoryID, b.Type, b.Amount, b.Description, b.TxnDate,
+		err := d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, note, txn_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+			uid, b.AccountID, b.CategoryID, b.Type, b.Amount, b.Description, b.Note, b.TxnDate,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -625,6 +627,7 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			CategoryID  *int64   `json:"category_id"`
 			Amount      *float64 `json:"amount"`
 			Description *string  `json:"description"`
+			Note        *string  `json:"note"`
 			TxnDate     *string  `json:"txn_date"`
 		}
 		if err := readJSON(r, &b); err != nil {
@@ -642,6 +645,10 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 		if b.Description != nil {
 			d.Exec("UPDATE fin_transactions SET description = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.Description, id, uid)
 			d.Exec("UPDATE fin_transactions SET description = $1, updated_at = NOW() WHERE transfer_pair = $2 AND user_id = $3", *b.Description, id, uid)
+		}
+		if b.Note != nil {
+			d.Exec("UPDATE fin_transactions SET note = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.Note, id, uid)
+			d.Exec("UPDATE fin_transactions SET note = $1, updated_at = NOW() WHERE transfer_pair = $2 AND user_id = $3", *b.Note, id, uid)
 		}
 		if b.TxnDate != nil {
 			d.Exec("UPDATE fin_transactions SET txn_date = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.TxnDate, id, uid)

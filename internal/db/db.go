@@ -568,6 +568,8 @@ func (d *DB) migrate() error {
 	-- Opt-in: when on (and the biller is not auto_renew) the biller cron
 	-- spawns one bill-pay reminder task per due cycle.
 	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS remind_task BOOLEAN     NOT NULL DEFAULT FALSE;
+	-- Free-text note on a transaction (separate from the one-line description).
+	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';
 	-- Hot path for the reminder cron: only the un-sent, remind-on rows.
 	CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(scheduled_at)
 		WHERE remind = TRUE AND reminded_at IS NULL;
