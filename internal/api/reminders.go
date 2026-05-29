@@ -101,7 +101,13 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 	sent := 0
 	for _, x := range pending {
 		whenLabel := formatReminderWhen(x.scheduledAt, x.tz)
-		if err := deps.Auth.SendTaskReminder(ctx, x.email, x.name, x.title, whenLabel, "/tasks"); err != nil {
+		// Fall back to the email as the greeting name for users who never
+		// set a display name (name defaults to '' in the schema).
+		name := x.name
+		if name == "" {
+			name = x.email
+		}
+		if err := deps.Auth.SendTaskReminder(ctx, x.email, name, x.title, whenLabel, "/tasks"); err != nil {
 			// Leave reminded_at NULL so the next tick retries this one.
 			log.Warn().Err(err).Int64("task", x.id).Msg("reminder email failed")
 			continue
