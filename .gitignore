@@ -9,6 +9,10 @@
 # Local blob storage. Production uses GCS — see DEPLOY.md.
 /data/
 
+# DB backups (CSV dumps via cmd/dbdump / scripts/). Contain prod data —
+# user emails, refresh-token hashes, email codes. NEVER commit.
+/backups/
+
 # Environment files. Only .env.example is ever committed.
 .env
 .env.*

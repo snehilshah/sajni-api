@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"sajni/internal/db"
@@ -10,6 +11,7 @@ import (
 func registerHabitRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/habits", listHabits(deps))
 	mux.HandleFunc("GET /api/habits/status", habitStatusForDate(deps))
+	mux.HandleFunc("GET /api/habits/logs", recentHabitLogs(deps))
 	mux.HandleFunc("POST /api/habits", createHabit(deps))
 	mux.HandleFunc("PUT /api/habits/{id}", updateHabit(deps))
 	mux.HandleFunc("DELETE /api/habits/{id}", deleteHabit(deps))
@@ -22,7 +24,7 @@ func listHabits(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
-		today := time.Now().Format("2006-01-02")
+		today := userNow(d, uid).Format("2006-01-02")
 		rows, err := d.Query(`
 			SELECT h.id, h.name, h.frequency, h.color, h.created_at,
 				   EXISTS(SELECT 1 FROM habit_logs hl WHERE hl.habit_id = h.id AND hl.user_id = h.user_id AND hl.logged_date = $1) as logged_today,
@@ -176,7 +178,7 @@ func toggleHabitLog(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid id")
 			return
 		}
-		today := time.Now().Format("2006-01-02")
+		today := userNow(d, uid).Format("2006-01-02")
 		toggleLog(d, uid, id, today, w)
 	}
 }
@@ -216,6 +218,42 @@ func toggleLog(d *db.DB, uid string, habitID int64, date string, w http.Response
 	} else {
 		d.Exec("INSERT INTO habit_logs (user_id, habit_id, logged_date) VALUES ($1, $2, $3)", uid, habitID, date)
 		writeJSON(w, 200, map[string]bool{"logged": true})
+	}
+}
+
+// recentHabitLogs returns logged dates for ALL of the user's habits within the
+// last `days` window in a single query, keyed by habit id (as a string so it
+// serializes as a JSON object). Replaces the per-habit N+1 the Today page used
+// to fire (one /habits/{id}/logs call per habit).
+func recentHabitLogs(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		days := queryParam(r, "days")
+		if days == "" {
+			days = "30"
+		}
+		rows, err := d.Query(
+			`SELECT habit_id, logged_date::text FROM habit_logs
+			 WHERE user_id = $1 AND logged_date >= CURRENT_DATE - ($2::int * INTERVAL '1 day')
+			 ORDER BY logged_date ASC`,
+			uid, days,
+		)
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		defer rows.Close()
+
+		out := map[string][]string{}
+		for rows.Next() {
+			var hid int64
+			var dt string
+			rows.Scan(&hid, &dt)
+			key := strconv.FormatInt(hid, 10)
+			out[key] = append(out[key], dt)
+		}
+		writeJSON(w, 200, out)
 	}
 }
 
@@ -261,7 +299,7 @@ func habitStatusForDate(deps Deps) http.HandlerFunc {
 		uid := userID(r.Context())
 		date := queryParam(r, "date")
 		if date == "" {
-			date = time.Now().Format("2006-01-02")
+			date = userNow(d, uid).Format("2006-01-02")
 		}
 		rows, err := d.Query(`
 			SELECT h.id, h.name, h.frequency, h.color,

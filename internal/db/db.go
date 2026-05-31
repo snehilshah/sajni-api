@@ -565,6 +565,13 @@ func (d *DB) migrate() error {
 	-- IANA timezone captured from the browser once, used to render the
 	-- reminder email in the user's local clock time. NULL until captured.
 	ALTER TABLE users       ADD COLUMN IF NOT EXISTS timezone    TEXT;
+	-- Timezone backfill / normalization (idempotent; touches 0 rows once clean).
+	-- Every Sajni user is IST. Old accounts predate browser capture (NULL) and
+	-- early captures stored the deprecated 'Asia/Calcutta' alias; collapse both
+	-- to the canonical 'Asia/Kolkata' so the column is consistent. Same +05:30,
+	-- so this is zero behaviour change — purely a consistency fix.
+	UPDATE users SET timezone = 'Asia/Kolkata'
+		WHERE timezone IS NULL OR timezone = 'Asia/Calcutta';
 	-- Opt-in: when on (and the biller is not auto_renew) the biller cron
 	-- spawns one bill-pay reminder task per due cycle.
 	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS remind_task BOOLEAN     NOT NULL DEFAULT FALSE;

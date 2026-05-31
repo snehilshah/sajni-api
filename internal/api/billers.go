@@ -146,7 +146,7 @@ func createBiller(deps Deps) http.HandlerFunc {
 			return
 		}
 		if body.NextDueDate == "" {
-			body.NextDueDate = time.Now().Format("2006-01-02")
+			body.NextDueDate = userNow(d, uid).Format("2006-01-02")
 		}
 		if body.Color == "" {
 			body.Color = "#2D5A4F"
@@ -315,7 +315,7 @@ func payBiller(deps Deps) http.HandlerFunc {
 		}
 		paidDate := body.PaidDate
 		if paidDate == "" {
-			paidDate = time.Now().Format("2006-01-02")
+			paidDate = userNow(d, uid).Format("2006-01-02")
 		}
 
 		txnID, perr := postBillerTxn(r.Context(), deps, uid, id, accountID.Int64, categoryID,
@@ -439,7 +439,9 @@ func markBillerAlertSeen(deps Deps) http.HandlerFunc {
 // on (biller_id, due_date).
 func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcomingNoticed int, err error) {
 	d := deps.DB
-	today := time.Now().Format("2006-01-02")
+	// Cron spans all users; every Sajni user is IST, so use the shared default
+	// zone rather than the server's UTC clock for the due-date comparison.
+	today := time.Now().In(defaultLoc).Format("2006-01-02")
 
 	rows, err := d.QueryContext(ctx, `SELECT id, user_id, name, amount, frequency, next_due_date::text,
 		account_id, category_id, auto_renew, remind_task, alert_days

@@ -579,10 +579,20 @@ func (s *Service) HandleOnboarded(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// canonicalTZ collapses deprecated IANA aliases to their canonical name so the
+// users.timezone column stays consistent. Older browsers report Asia/Calcutta
+// for IST; we store Asia/Kolkata everywhere (same +05:30).
+func canonicalTZ(tz string) string {
+	if tz == "Asia/Calcutta" {
+		return "Asia/Kolkata"
+	}
+	return tz
+}
+
 // HandleSetTimezone stores the user's IANA timezone (captured by the
 // frontend from the browser). Reminder emails are rendered in this zone.
 // Validated against the tz database so we never persist garbage that would
-// silently fall back to UTC in the cron.
+// silently fall back to the default zone in the cron.
 func (s *Service) HandleSetTimezone(w http.ResponseWriter, r *http.Request) {
 	id := MustUserID(r.Context())
 	var body struct {
@@ -601,6 +611,7 @@ func (s *Service) HandleSetTimezone(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "unknown timezone")
 		return
 	}
+	tz = canonicalTZ(tz)
 	if _, err := s.DB.ExecContext(r.Context(),
 		`UPDATE users SET timezone=$2 WHERE id=$1`, id, tz,
 	); err != nil {

@@ -562,7 +562,7 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			b.Type = "expense"
 		}
 		if b.TxnDate == "" {
-			b.TxnDate = time.Now().Format("2006-01-02")
+			b.TxnDate = userNow(d, uid).Format("2006-01-02")
 		}
 
 		// Transfer: insert a pair (transfer_out from source, transfer_in to dest)
@@ -1357,9 +1357,11 @@ func financeOverview(deps Deps) http.HandlerFunc {
 
 		netWorth := totalAssets - totalLiabilities
 
-		// Current month income / expenses
-		now := time.Now()
-		monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.Local).Format("2006-01-02")
+		// Current month income / expenses. Month boundaries must be in the
+		// user's tz, not the server's (Cloud Run = UTC), or the 1st/last day
+		// straddles wrong for IST users near midnight.
+		now := time.Now().In(userLocation(d, uid))
+		monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
 		monthEnd := now.Format("2006-01-02")
 		var monthIncome, monthExpense float64
 		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND type = 'income' AND txn_date BETWEEN $2 AND $3`, uid, monthStart, monthEnd).Scan(&monthIncome)
@@ -1577,7 +1579,7 @@ func networthSnapshot(deps Deps) http.HandlerFunc {
 		assets += invTotal
 
 		netWorth := assets - liabilities
-		today := time.Now().Format("2006-01-02")
+		today := userNow(d, uid).Format("2006-01-02")
 		_, err := d.Exec(`INSERT INTO fin_networth_snapshots (user_id, snapshot_date, assets, liabilities, net_worth)
 			VALUES ($1,$2,$3,$4,$5)
 			ON CONFLICT (user_id, snapshot_date) DO UPDATE SET assets = EXCLUDED.assets, liabilities = EXCLUDED.liabilities, net_worth = EXCLUDED.net_worth`,
