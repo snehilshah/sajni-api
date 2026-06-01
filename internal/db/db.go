@@ -596,6 +596,50 @@ func (d *DB) migrate() error {
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
+
+	-- ─── Finance: CC statement breakdown ──────────────────────────────
+	-- A statement now records the carried-over previous balance and this
+	-- cycle's new charges separately; amount_due is the payable total
+	-- (previous_balance + new_charges). Both may be negative (= credit).
+	ALTER TABLE fin_cc_statements ADD COLUMN IF NOT EXISTS previous_balance NUMERIC(14,2) NOT NULL DEFAULT 0;
+	ALTER TABLE fin_cc_statements ADD COLUMN IF NOT EXISTS new_charges      NUMERIC(14,2) NOT NULL DEFAULT 0;
+
+	-- ─── Finance: trading holdings ────────────────────────────────────
+	-- stock/etf/sip/mutual_fund are bought against a trading account and can
+	-- be partially sold. quantity/avg_buy_price track remaining cost basis,
+	-- realized_pl accumulates booked gains, status flips to 'closed' at qty 0.
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS quantity      NUMERIC(18,6) NOT NULL DEFAULT 0;
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS avg_buy_price NUMERIC(18,6) NOT NULL DEFAULT 0;
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS realized_pl   NUMERIC(14,2) NOT NULL DEFAULT 0;
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS status        TEXT          NOT NULL DEFAULT 'open';
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS sold_at       TIMESTAMPTZ;
+
+	-- ─── Finance: variable billers ────────────────────────────────────
+	-- e.g. electricity — amount unknown upfront. When also auto_renew, the
+	-- cron posts the last paid amount and flags the alert/email loudly.
+	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS variable BOOLEAN NOT NULL DEFAULT FALSE;
+
+	-- ─── Finance: salary accounts ─────────────────────────────────────
+	-- A 'salary' account stores the expected monthly inflow + the day it lands,
+	-- so the UI can offer a one-tap "Credit salary". Bonuses stay manual.
+	ALTER TABLE fin_accounts ADD COLUMN IF NOT EXISTS salary_amount NUMERIC(14,2) NOT NULL DEFAULT 0;
+	ALTER TABLE fin_accounts ADD COLUMN IF NOT EXISTS salary_day    INT;
+
+	-- ─── Finance: trading account backfill (breaking change) ──────────
+	-- Trades now require a 'trading' account. Every user who already owns a
+	-- trading-type holding gets one "Default Trading" account; those holdings
+	-- are relinked to it (catches stocks added on a personal account). The
+	-- relink is guarded so a holding the user later moves stays put.
+	INSERT INTO fin_accounts (user_id, name, type, color)
+	SELECT DISTINCT i.user_id, 'Default Trading', 'trading', '#4F6FA1'
+	FROM fin_investments i
+	WHERE i.type IN ('stock','etf','sip','mutual_fund')
+	  AND NOT EXISTS (SELECT 1 FROM fin_accounts a WHERE a.user_id = i.user_id AND a.type = 'trading');
+	UPDATE fin_investments i
+	SET account_id = (SELECT a.id FROM fin_accounts a WHERE a.user_id = i.user_id AND a.type = 'trading' ORDER BY a.id ASC LIMIT 1)
+	WHERE i.type IN ('stock','etf','sip','mutual_fund')
+	  AND (i.account_id IS NULL
+	       OR i.account_id NOT IN (SELECT a.id FROM fin_accounts a WHERE a.user_id = i.user_id AND a.type = 'trading'));
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err
