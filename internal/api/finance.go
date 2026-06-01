@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"sajni/internal/db"
 )
 
 func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
@@ -82,7 +84,7 @@ var defaultExpenseCategories = []struct {
 	{"Transport", "#3B82F6", "car"},
 	{"Bills & Utilities", "#06B6D4", "plug"},
 	{"Shopping", "#EC4899", "shopping-bag"},
-	{"Other", "#6B7280", "circle"},
+	{"Others", "#6B7280", "circle"},
 }
 
 var defaultIncomeCategories = []struct {
@@ -92,7 +94,7 @@ var defaultIncomeCategories = []struct {
 }{
 	{"Salary", "#10B981", "wallet"},
 	{"Interest", "#22C55E", "trending-up"},
-	{"Other", "#6B7280", "circle"},
+	{"Others", "#6B7280", "circle"},
 }
 
 func seedDefaultCategoriesIfEmpty(deps Deps, uid string) {
@@ -613,6 +615,8 @@ func createTransaction(deps Deps) http.HandlerFunc {
 				errJSON(w, 500, err.Error())
 				return
 			}
+			// Index #hashtags from the note (the out leg carries the txn id).
+			syncTags(d, uid, "transaction", outID, b.Note)
 			writeJSON(w, 201, map[string]int64{"id": outID, "pair_id": inID})
 			return
 		}
@@ -625,6 +629,11 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			errJSON(w, 500, err.Error())
 			return
 		}
+		// Index #hashtags from the note into the shared tag system.
+		syncTags(d, uid, "transaction", id, b.Note)
+		// Learn merchant → category so the next shared SMS for the same
+		// merchant pre-fills without an AI call.
+		learnMerchantCategory(d, uid, b.Description, b.CategoryID)
 		writeJSON(w, 201, map[string]int64{"id": id})
 	}
 }
@@ -639,6 +648,7 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		var b struct {
+			AccountID   *int64   `json:"account_id"`
 			CategoryID  *int64   `json:"category_id"`
 			Amount      *float64 `json:"amount"`
 			Description *string  `json:"description"`
@@ -648,6 +658,14 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
 			return
+		}
+		if b.AccountID != nil {
+			// Move the txn to another account. Balances are computed from
+			// account_id, so this rebalances both sides for free. For a
+			// transfer the paired leg points back via linked_account — keep
+			// it in sync so the other side still references this account.
+			d.Exec("UPDATE fin_transactions SET account_id = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.AccountID, id, uid)
+			d.Exec("UPDATE fin_transactions SET linked_account = $1, updated_at = NOW() WHERE transfer_pair = $2 AND user_id = $3", *b.AccountID, id, uid)
 		}
 		if b.CategoryID != nil {
 			d.Exec("UPDATE fin_transactions SET category_id = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.CategoryID, id, uid)
@@ -664,6 +682,8 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 		if b.Note != nil {
 			d.Exec("UPDATE fin_transactions SET note = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.Note, id, uid)
 			d.Exec("UPDATE fin_transactions SET note = $1, updated_at = NOW() WHERE transfer_pair = $2 AND user_id = $3", *b.Note, id, uid)
+			// Re-index #hashtags from the edited note.
+			syncTags(d, uid, "transaction", id, *b.Note)
 		}
 		if b.TxnDate != nil {
 			d.Exec("UPDATE fin_transactions SET txn_date = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.TxnDate, id, uid)
@@ -686,6 +706,7 @@ func deleteTransaction(deps Deps) http.HandlerFunc {
 		var pair *int64
 		d.QueryRow("SELECT transfer_pair FROM fin_transactions WHERE id = $1 AND user_id = $2", id, uid).Scan(&pair)
 		d.Exec("DELETE FROM fin_transactions WHERE id = $1 AND user_id = $2", id, uid)
+		d.Exec("DELETE FROM tags WHERE user_id = $1 AND entity_type = 'transaction' AND entity_id = $2", uid, id)
 		if pair != nil {
 			d.Exec("DELETE FROM fin_transactions WHERE id = $1 AND user_id = $2", *pair, uid)
 		}
@@ -2106,8 +2127,11 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 		// label without a binding.
 		var matchedID *int64
 		var matchedName = picked
+		// Treat "Other" and "Others" as the same bucket so a legacy "Other"
+		// category still binds when the model picks the canonical "Others".
+		isOthers := func(s string) bool { return strings.EqualFold(s, "Others") || strings.EqualFold(s, "Other") }
 		for _, c := range cats {
-			if strings.EqualFold(c.name, picked) {
+			if strings.EqualFold(c.name, picked) || (isOthers(picked) && isOthers(c.name)) {
 				id := c.id
 				matchedID = &id
 				matchedName = c.name
@@ -2127,6 +2151,40 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 // share-target confirm sheet to pre-fill. Best-effort and behind the shared
 // AI limiter — a parse failure still returns 200 with empty fields so the
 // sheet opens for manual entry.
+// learnMerchantCategory remembers (or refreshes) the category a merchant is
+// filed under. No-op when merchant or category is empty. merchant is keyed
+// lowercase so casing doesn't fork the rule.
+func learnMerchantCategory(d *db.DB, uid, merchant string, categoryID *int64) {
+	m := strings.ToLower(strings.TrimSpace(merchant))
+	if m == "" || categoryID == nil {
+		return
+	}
+	d.Exec(`INSERT INTO fin_merchant_categories (user_id, merchant, category_id)
+	        VALUES ($1, $2, $3)
+	        ON CONFLICT (user_id, merchant)
+	        DO UPDATE SET category_id = EXCLUDED.category_id, updated_at = NOW()`,
+		uid, m, *categoryID)
+}
+
+// lookupMerchantCategory returns the learned (category_id, name) for a
+// merchant, or (nil,"") when no rule exists (or its category was deleted).
+func lookupMerchantCategory(d *db.DB, uid, merchant string) (*int64, string) {
+	m := strings.ToLower(strings.TrimSpace(merchant))
+	if m == "" {
+		return nil, ""
+	}
+	var id int64
+	var name string
+	err := d.QueryRow(`SELECT mc.category_id, c.name
+	                   FROM fin_merchant_categories mc
+	                   JOIN fin_categories c ON c.id = mc.category_id AND c.user_id = mc.user_id
+	                   WHERE mc.user_id = $1 AND mc.merchant = $2`, uid, m).Scan(&id, &name)
+	if err != nil {
+		return nil, ""
+	}
+	return &id, name
+}
+
 func parseTransactionMessage(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if deps.AI == nil {
@@ -2173,17 +2231,68 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 		if err != nil {
 			// Best-effort: empty fields → sheet opens for manual entry.
 			writeJSON(w, 200, map[string]any{
-				"amount": 0, "type": "expense", "description": "", "date": today, "account_hint": "",
+				"amount": 0, "type": "expense", "description": "", "note": "",
+				"date": today, "account_hint": "", "category_id": nil, "category_name": "",
 			})
 			return
 		}
 
+		// Resolve a category for the parsed merchant. Prefer a learned rule
+		// (instant, no AI); fall back to AI inference against the user's
+		// categories. Either way the client gets a pre-filled, editable pick.
+		var catID *int64
+		var catName string
+		if parsed.Amount > 0 && strings.TrimSpace(parsed.Description) != "" {
+			if id, name := lookupMerchantCategory(deps.DB, uid, parsed.Description); id != nil {
+				catID, catName = id, name
+			} else {
+				kind := parsed.Type
+				if kind != "income" {
+					kind = "expense"
+				}
+				type cat struct {
+					id   int64
+					name string
+				}
+				var cats []cat
+				var names []string
+				if crows, qerr := deps.DB.Query(`SELECT id, name FROM fin_categories WHERE user_id=$1 AND kind=$2 ORDER BY name`, uid, kind); qerr == nil {
+					for crows.Next() {
+						var c cat
+						if crows.Scan(&c.id, &c.name) == nil {
+							cats = append(cats, c)
+							names = append(names, c.name)
+						}
+					}
+					crows.Close()
+				}
+				picked, ctoks, cerr := deps.AI.CategorizeExpense(ctx, parsed.Description, kind, names)
+				if ctoks <= 0 {
+					ctoks = 30
+				}
+				deps.AILimiter.record(uid, ctoks)
+				if cerr == nil {
+					isOthers := func(s string) bool { return strings.EqualFold(s, "Others") || strings.EqualFold(s, "Other") }
+					for _, c := range cats {
+						if strings.EqualFold(c.name, picked) || (isOthers(picked) && isOthers(c.name)) {
+							id := c.id
+							catID, catName = &id, c.name
+							break
+						}
+					}
+				}
+			}
+		}
+
 		writeJSON(w, 200, map[string]any{
-			"amount":       parsed.Amount,
-			"type":         parsed.Type,
-			"description":  parsed.Description,
-			"date":         parsed.Date,
-			"account_hint": parsed.AccountHint,
+			"amount":        parsed.Amount,
+			"type":          parsed.Type,
+			"description":   parsed.Description,
+			"note":          parsed.Note,
+			"date":          parsed.Date,
+			"account_hint":  parsed.AccountHint,
+			"category_id":   catID,
+			"category_name": catName,
 		})
 	}
 }

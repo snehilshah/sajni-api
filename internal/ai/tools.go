@@ -406,6 +406,33 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "add_task_reminder",
+			Description: "Add a reminder to a task at a specific time. A task can carry multiple reminders on any date — each emails the user at that instant, independent of the task's own time. Resolve relative times against get_current_context; use list_tasks to find the task id.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"task_id":   intg("Required. Task to remind about."),
+				"remind_at": str("Required. ISO timestamp with offset, e.g. 2026-06-27T09:00:00+05:30."),
+			}, "task_id", "remind_at"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				tid := argInt(args, "task_id", 0)
+				at := strings.TrimSpace(argStr(args, "remind_at"))
+				if tid == 0 || at == "" {
+					return nil, nil, fmt.Errorf("missing task_id or remind_at")
+				}
+				var owned int
+				d.QueryRowContext(ctx, `SELECT 1 FROM tasks WHERE id=$1 AND user_id=$2`, tid, uid).Scan(&owned)
+				if owned != 1 {
+					return nil, nil, fmt.Errorf("task not found")
+				}
+				var rid int64
+				if err := d.QueryRowContext(ctx, `INSERT INTO task_reminders (user_id, task_id, remind_at) VALUES ($1,$2,$3) RETURNING id`, uid, tid, at).Scan(&rid); err != nil {
+					return nil, nil, err
+				}
+				return map[string]any{"id": rid, "task_id": tid, "remind_at": at},
+					map[string]any{"kind": "task_updated", "id": tid, "route": "/tasks"}, nil
+			},
+		},
+		{
 			Name:        "create_habit",
 			Description: "Create a new habit to track.",
 			Mutating:    true,
@@ -676,10 +703,11 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "update_transaction",
-			Description: "Update an existing finance transaction by id — change its category, amount, type, description, or date. To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. Use list_finance_transactions to find the id first.",
+			Description: "Update an existing finance transaction by id — change its account, category, amount, type, description, or date. To move it to another account pass account_id (balances recompute automatically). To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. Use list_finance_transactions to find the id first.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"id":            intg("Required. Transaction id to update."),
+				"account_id":    intg("Optional. Move the transaction to this account id."),
 				"category_id":   intg("Optional category id."),
 				"category_name": str("Optional category name to auto-match (e.g. 'Groceries', 'Rent')."),
 				"type":          str("Optional 'expense' | 'income'."),
@@ -1803,6 +1831,9 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		ph++
 	}
 
+	if acctID := argInt(args, "account_id", 0); acctID > 0 {
+		add("account_id", acctID)
+	}
 	catID := argInt(args, "category_id", 0)
 	if catID == 0 {
 		if catName := strings.TrimSpace(argStr(args, "category_name")); catName != "" {
@@ -1833,6 +1864,10 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		fmt.Sprintf(" WHERE id=$%d AND user_id=$%d", ph, ph+1)
 	if _, err := d.ExecContext(ctx, q, vals...); err != nil {
 		return nil, nil, err
+	}
+	// Keep a transfer pair's back-reference in sync when the account moves.
+	if acctID := argInt(args, "account_id", 0); acctID > 0 {
+		d.ExecContext(ctx, "UPDATE fin_transactions SET linked_account=$1, updated_at=NOW() WHERE transfer_pair=$2 AND user_id=$3", acctID, id, uid)
 	}
 	return map[string]any{"id": id, "updated": true},
 		map[string]any{"kind": "transaction_updated", "id": id, "route": "/finance/transactions"}, nil

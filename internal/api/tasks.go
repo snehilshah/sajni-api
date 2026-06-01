@@ -17,6 +17,9 @@ func registerTaskRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/tasks/{id}/history", getTaskHistory(deps))
 	mux.HandleFunc("GET /api/tasks/{id}/events", getTaskEvents(deps))
 	mux.HandleFunc("GET /api/tasks/{id}/subtasks", listSubtasks(deps))
+	mux.HandleFunc("GET /api/tasks/{id}/reminders", listTaskReminders(deps))
+	mux.HandleFunc("POST /api/tasks/{id}/reminders", addTaskReminder(deps))
+	mux.HandleFunc("DELETE /api/tasks/{id}/reminders/{rid}", deleteTaskReminder(deps))
 
 	mux.HandleFunc("GET /api/tasks", listTasks(deps))
 	mux.HandleFunc("POST /api/tasks", createTask(deps))
@@ -107,8 +110,24 @@ type taskRow struct {
 	SortOrder    int      `json:"sort_order"`
 	SubtaskCount int      `json:"subtask_count"`
 	SubtasksDone int      `json:"subtasks_done"`
-	CreatedAt    string   `json:"created_at"`
-	UpdatedAt    string   `json:"updated_at"`
+	// Subtasks are embedded (brief shape) so the list view can render the
+	// nested children instantly on expand — no per-row /subtasks round-trip.
+	Subtasks  []subtaskBrief `json:"subtasks"`
+	CreatedAt string         `json:"created_at"`
+	UpdatedAt string         `json:"updated_at"`
+}
+
+// subtaskBrief is the lightweight child shape embedded in a task list row
+// and returned by the dedicated /subtasks endpoint.
+type subtaskBrief struct {
+	ID           int64   `json:"id"`
+	Title        string  `json:"title"`
+	Status       string  `json:"status"`
+	Priority     string  `json:"priority"`
+	DueDate      *string `json:"due_date"`
+	Important    bool    `json:"important"`
+	ParentTaskID *int64  `json:"parent_task_id"`
+	SortOrder    int     `json:"sort_order"`
 }
 
 // Step is one item on a task's inline checklist (Microsoft-Todo style).
@@ -258,6 +277,38 @@ func listTasks(deps Deps) http.HandlerFunc {
 		if tasks == nil {
 			tasks = []taskRow{}
 		}
+
+		// Prefetch every returned task's children in ONE query and attach them,
+		// so the client can expand subtasks instantly (no per-row request).
+		if len(tasks) > 0 {
+			idx := make(map[int64]int, len(tasks))
+			ph2 := []string{}
+			cargs := []any{uid}
+			for i := range tasks {
+				idx[tasks[i].ID] = i
+				cargs = append(cargs, tasks[i].ID)
+				ph2 = append(ph2, "$"+itoa(len(cargs)))
+			}
+			crows, cerr := d.Query(`
+				SELECT id, title, status, priority, due_date::text,
+				       important, parent_task_id, COALESCE(sort_order, 0)
+				FROM tasks
+				WHERE user_id = $1 AND parent_task_id IN (`+strings.Join(ph2, ",")+`)
+				ORDER BY sort_order ASC, created_at ASC`, cargs...)
+			if cerr == nil {
+				for crows.Next() {
+					var s subtaskBrief
+					if crows.Scan(&s.ID, &s.Title, &s.Status, &s.Priority, &s.DueDate,
+						&s.Important, &s.ParentTaskID, &s.SortOrder) == nil && s.ParentTaskID != nil {
+						if i, ok := idx[*s.ParentTaskID]; ok {
+							tasks[i].Subtasks = append(tasks[i].Subtasks, s)
+						}
+					}
+				}
+				crows.Close()
+			}
+		}
+
 		writeJSON(w, 200, tasks)
 	}
 }
@@ -496,16 +547,35 @@ func updateTask(deps Deps) http.HandlerFunc {
 			}
 			newDate := *body.DueDate
 			if oldDate != "" && oldDate != newDate && currentStatus != "done" {
+				// If the old due date was already past (the task was missed) and
+				// we're moving to a new date, the lifecycle entry for that date is
+				// a "rescheduled", not a bare "missed" — record it that way so the
+				// Lifecycle list reads "rescheduled" instead of "missed".
+				today := userNow(d, uid).Format("2006-01-02")
+				rescheduled := oldDate < today && strings.TrimSpace(newDate) != ""
+				outcome := "missed"
+				if rescheduled {
+					outcome = "rescheduled"
+				}
 				var cnt int
 				d.QueryRow(
-					"SELECT COUNT(*) FROM task_due_history WHERE user_id = $1 AND task_id = $2 AND due_date = $3 AND outcome = 'missed'",
+					"SELECT COUNT(*) FROM task_due_history WHERE user_id = $1 AND task_id = $2 AND due_date = $3",
 					uid, id, oldDate,
 				).Scan(&cnt)
 				if cnt == 0 {
 					d.Exec(
-						"INSERT INTO task_due_history (user_id, task_id, due_date, outcome) VALUES ($1, $2, $3, 'missed')",
+						"INSERT INTO task_due_history (user_id, task_id, due_date, outcome) VALUES ($1, $2, $3, $4)",
+						uid, id, oldDate, outcome,
+					)
+				} else if rescheduled {
+					// Promote a prior bare "missed" row for this date to "rescheduled".
+					d.Exec(
+						"UPDATE task_due_history SET outcome = 'rescheduled' WHERE user_id = $1 AND task_id = $2 AND due_date = $3",
 						uid, id, oldDate,
 					)
+				}
+				if rescheduled {
+					logTaskEvent(d, uid, id, "rescheduled", oldDate, newDate)
 				}
 			}
 			d.Exec("UPDATE tasks SET due_date = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", newDate, id, uid)

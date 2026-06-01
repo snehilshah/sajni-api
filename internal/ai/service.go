@@ -473,6 +473,7 @@ type ParsedTxn struct {
 	Amount      float64 `json:"amount"`
 	Type        string  `json:"type"` // "expense" | "income"
 	Description string  `json:"description"`
+	Note        string  `json:"note"`
 	Date        string  `json:"date"` // YYYY-MM-DD
 	AccountHint string  `json:"account_hint"`
 }
@@ -498,12 +499,13 @@ func (s *Service) ParseTransactionMessage(ctx context.Context, msg, today string
 	sys := `You read a single bank / UPI transaction message and extract its fields as JSON.
 
 Reply with ONLY a JSON object — no markdown, no prose:
-{"amount": number, "type": "expense"|"income", "description": string, "date": "YYYY-MM-DD", "account_hint": string}
+{"amount": number, "type": "expense"|"income", "description": string, "note": string, "date": "YYYY-MM-DD", "account_hint": string}
 
 Rules:
 - amount: the transaction amount as a positive number (no currency symbol, no commas).
 - type: "expense" if money left the user (debited/spent/paid/sent), "income" if received (credited/received).
-- description: the merchant / counterparty / purpose, kept short. Empty string if unknown.
+- description: a SHORT, clean merchant / counterparty name only — e.g. "Swiggy", "Amazon", "Kotak ATM", "Rahul Sharma". Title-case it. NOT the whole SMS, no amounts, no reference numbers. Empty string if truly unknown.
+- note: any extra useful context worth keeping — UPI ref no., card last-4 phrasing, "to/from", purpose — kept to one short line. Empty string if nothing useful.
 - date: the transaction date as YYYY-MM-DD. If the message has no date, use today's date provided below.
 - account_hint: the last 4 digits of the account/card, or the bank name, if present; else empty string.
 - If the text is not a transaction message, set amount to 0.

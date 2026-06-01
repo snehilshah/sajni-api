@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"os"
 	"time"
@@ -133,7 +134,163 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 		}
 		sent++
 	}
+
+	// Second pass: explicit multi-reminders (task_reminders). These fire AT
+	// their own remind_at (no lead) and can sit on any date, independent of
+	// the task's own time. sent_at is the idempotency stamp.
+	sent += processTaskReminders(ctx, deps)
 	return sent, nil
+}
+
+// processTaskReminders emails every due, un-sent row in task_reminders and
+// stamps sent_at. Same window/grace/idempotency model as the legacy path.
+func processTaskReminders(ctx context.Context, deps Deps) int {
+	d := deps.DB
+	rows, err := d.QueryContext(ctx, `
+		SELECT r.id, t.id, t.title, t.scheduled_at, r.remind_at,
+		       u.email, u.name, COALESCE(u.timezone,'')
+		  FROM task_reminders r
+		  JOIN tasks t ON t.id = r.task_id AND t.user_id = r.user_id
+		  JOIN users u ON u.id = r.user_id
+		 WHERE r.sent_at IS NULL
+		   AND t.status <> 'done'
+		   AND r.remind_at <= NOW()
+		   AND r.remind_at >= NOW() - make_interval(secs => $1)
+		   AND u.deleted_at IS NULL`,
+		int(reminderGrace.Seconds()))
+	if err != nil {
+		log.Warn().Err(err).Msg("task_reminders query failed")
+		return 0
+	}
+	defer rows.Close()
+
+	type due struct {
+		rid, tid    int64
+		title       string
+		scheduledAt sql.NullTime
+		remindAt    time.Time
+		email, name string
+		tz          string
+	}
+	var pending []due
+	for rows.Next() {
+		var x due
+		if err := rows.Scan(&x.rid, &x.tid, &x.title, &x.scheduledAt, &x.remindAt, &x.email, &x.name, &x.tz); err != nil {
+			continue
+		}
+		pending = append(pending, x)
+	}
+	rows.Close()
+
+	sent := 0
+	for _, x := range pending {
+		// Anchor the "when" phrase to the task's own time if it has one,
+		// otherwise to this reminder's instant.
+		when := x.remindAt
+		if x.scheduledAt.Valid {
+			when = x.scheduledAt.Time
+		}
+		name := x.name
+		if name == "" {
+			name = x.email
+		}
+		if err := deps.Auth.SendTaskReminder(ctx, x.email, name, x.title, formatReminderWhen(when, x.tz), "/tasks"); err != nil {
+			log.Warn().Err(err).Int64("reminder", x.rid).Msg("task reminder email failed")
+			continue
+		}
+		if _, err := d.ExecContext(ctx, `UPDATE task_reminders SET sent_at = NOW() WHERE id = $1`, x.rid); err != nil {
+			log.Warn().Err(err).Int64("reminder", x.rid).Msg("task reminder stamp failed")
+			continue
+		}
+		sent++
+	}
+	return sent
+}
+
+// --- task reminder CRUD ----------------------------------------------------
+
+type taskReminderRow struct {
+	ID       int64   `json:"id"`
+	RemindAt string  `json:"remind_at"`
+	SentAt   *string `json:"sent_at"`
+}
+
+// listTaskReminders returns a task's explicit reminders, soonest first.
+func listTaskReminders(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		rows, err := d.Query(
+			`SELECT id, remind_at::text, sent_at::text FROM task_reminders
+			 WHERE user_id = $1 AND task_id = $2 ORDER BY remind_at ASC`, uid, id)
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		defer rows.Close()
+		out := []taskReminderRow{}
+		for rows.Next() {
+			var x taskReminderRow
+			rows.Scan(&x.ID, &x.RemindAt, &x.SentAt)
+			out = append(out, x)
+		}
+		writeJSON(w, 200, out)
+	}
+}
+
+// addTaskReminder inserts one reminder instant for a task the user owns.
+func addTaskReminder(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		var owned int
+		d.QueryRow("SELECT 1 FROM tasks WHERE id = $1 AND user_id = $2", id, uid).Scan(&owned)
+		if owned != 1 {
+			errJSON(w, 404, "task not found")
+			return
+		}
+		var body struct {
+			RemindAt string `json:"remind_at"`
+		}
+		if err := readJSON(r, &body); err != nil || body.RemindAt == "" {
+			errJSON(w, 400, "remind_at required")
+			return
+		}
+		var rid int64
+		if err := d.QueryRow(
+			`INSERT INTO task_reminders (user_id, task_id, remind_at) VALUES ($1, $2, $3) RETURNING id`,
+			uid, id, body.RemindAt,
+		).Scan(&rid); err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 201, map[string]int64{"id": rid})
+	}
+}
+
+// deleteTaskReminder removes one reminder by id.
+func deleteTaskReminder(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		rid, err := intParam(r, "rid")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		d.Exec("DELETE FROM task_reminders WHERE id = $1 AND user_id = $2", rid, uid)
+		writeJSON(w, 200, map[string]string{"status": "ok"})
+	}
 }
 
 // formatReminderWhen renders the event instant in the user's local tz as a

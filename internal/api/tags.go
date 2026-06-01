@@ -1,6 +1,9 @@
 package api
 
-import "net/http"
+import (
+	"fmt"
+	"net/http"
+)
 
 func registerTagRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/tags", listTags(deps))
@@ -73,6 +76,17 @@ func getTagEntities(deps Deps) http.HandlerFunc {
 				var status string
 				d.QueryRow("SELECT title, status FROM tasks WHERE user_id = $1 AND id = $2", uid, e.ID).Scan(&e.Title, &status)
 				e.Subtitle = status
+			case "transaction":
+				var desc string
+				var amount float64
+				var ttype string
+				d.QueryRow("SELECT description, amount, type FROM fin_transactions WHERE user_id = $1 AND id = $2", uid, e.ID).Scan(&desc, &amount, &ttype)
+				if desc != "" {
+					e.Title = desc
+				} else {
+					e.Title = ttype
+				}
+				e.Subtitle = fmt.Sprintf("₹%.0f · %s", amount, ttype)
 			}
 			if e.Title == "" {
 				continue

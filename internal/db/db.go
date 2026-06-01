@@ -644,6 +644,60 @@ func (d *DB) migrate() error {
 	WHERE i.type IN ('stock','etf','sip','mutual_fund')
 	  AND (i.account_id IS NULL
 	       OR i.account_id NOT IN (SELECT a.id FROM fin_accounts a WHERE a.user_id = i.user_id AND a.type = 'trading'));
+
+	-- ─── Finance: collapse "Other" → "Others" (idempotent) ────────────
+	-- The seed once used "Other" while AI categorize emits the canonical
+	-- "Others", so both surfaced in the UI. Reassign anything pointing at a
+	-- per-user "Other" to that user's "Others" (when present), drop the dup,
+	-- then rename any lone "Other" so only "Others" remains. Category FKs are
+	-- ON DELETE SET NULL, so reassigning BEFORE the delete preserves bindings.
+	UPDATE fin_transactions t SET category_id = s.id
+	FROM fin_categories o
+	JOIN fin_categories s ON s.user_id = o.user_id AND s.kind = o.kind AND LOWER(s.name) = 'others'
+	WHERE t.category_id = o.id AND LOWER(o.name) = 'other';
+	UPDATE fin_budget_items bi SET category_id = s.id
+	FROM fin_categories o
+	JOIN fin_categories s ON s.user_id = o.user_id AND s.kind = o.kind AND LOWER(s.name) = 'others'
+	WHERE bi.category_id = o.id AND LOWER(o.name) = 'other';
+	UPDATE fin_billers b SET category_id = s.id
+	FROM fin_categories o
+	JOIN fin_categories s ON s.user_id = o.user_id AND s.kind = o.kind AND LOWER(s.name) = 'others'
+	WHERE b.category_id = o.id AND LOWER(o.name) = 'other';
+	DELETE FROM fin_categories o
+	WHERE LOWER(o.name) = 'other'
+	  AND EXISTS (SELECT 1 FROM fin_categories s
+	              WHERE s.user_id = o.user_id AND s.kind = o.kind AND LOWER(s.name) = 'others');
+	UPDATE fin_categories SET name = 'Others' WHERE LOWER(name) = 'other';
+
+	-- ─── Tasks: multiple reminders ────────────────────────────────────
+	-- The legacy single reminder (tasks.remind + scheduled_at) only fires on
+	-- the task's own time. task_reminders lets a task carry any number of
+	-- reminder instants on any date. sent_at is the idempotency sentinel
+	-- (NULL = unsent), mirroring tasks.reminded_at; the */5 cron stamps it.
+	CREATE TABLE IF NOT EXISTS task_reminders (
+		id         BIGSERIAL   PRIMARY KEY,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		task_id    BIGINT      NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+		remind_at  TIMESTAMPTZ NOT NULL,
+		sent_at    TIMESTAMPTZ,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_task_reminders_task ON task_reminders(task_id);
+	CREATE INDEX IF NOT EXISTS idx_task_reminders_due  ON task_reminders(remind_at) WHERE sent_at IS NULL;
+
+	-- ─── Finance: learned merchant → category ─────────────────────────
+	-- Remember the category the user files a given merchant under, so the
+	-- next shared SMS for that merchant pre-fills the category without an AI
+	-- call. merchant is the lowercased transaction description; one row per
+	-- (user, merchant). Category FK clears the row's target if the category
+	-- is later deleted (the rule just stops applying).
+	CREATE TABLE IF NOT EXISTS fin_merchant_categories (
+		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		merchant    TEXT        NOT NULL,
+		category_id BIGINT      NOT NULL REFERENCES fin_categories(id) ON DELETE CASCADE,
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (user_id, merchant)
+	);
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err
