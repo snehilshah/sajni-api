@@ -1416,6 +1416,7 @@ func deriveDueDate(deps Deps, uid string, acctID int64, stmtDate string) string 
 //   - new_charges     = purchases − refunds in (prev statement, this statement]
 //   - previous_balance = prior statement's payable total − payments this cycle
 //     (first statement carries any unbilled opening debt instead)
+//
 // Both components may be negative (overpayment leaves a credit). All three are
 // overridable from the client.
 func createStatement(deps Deps) http.HandlerFunc {
