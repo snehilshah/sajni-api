@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +43,7 @@ type billerResp struct {
 	IsSubscription bool    `json:"is_subscription"`
 	AutoRenew      bool    `json:"auto_renew"`
 	RemindTask     bool    `json:"remind_task"`
+	Variable       bool    `json:"variable"`
 	AlertDays      int     `json:"alert_days"`
 	Color          string  `json:"color"`
 	Notes          string  `json:"notes"`
@@ -81,7 +83,7 @@ func listBillers(deps Deps) http.HandlerFunc {
 
 		q := `SELECT b.id, b.name, b.amount, b.frequency, b.next_due_date::text,
 			b.account_id, a.name, b.category_id, c.name, c.color,
-			b.is_subscription, b.auto_renew, b.remind_task, b.alert_days, b.color, b.notes, b.archived,
+			b.is_subscription, b.auto_renew, b.remind_task, b.variable, b.alert_days, b.color, b.notes, b.archived,
 			(SELECT MAX(paid_date)::text FROM fin_biller_payments p WHERE p.biller_id = b.id),
 			b.created_at::text
 			FROM fin_billers b
@@ -104,7 +106,7 @@ func listBillers(deps Deps) http.HandlerFunc {
 			var b billerResp
 			rows.Scan(&b.ID, &b.Name, &b.Amount, &b.Frequency, &b.NextDueDate,
 				&b.AccountID, &b.AccountName, &b.CategoryID, &b.CategoryName, &b.CategoryColor,
-				&b.IsSubscription, &b.AutoRenew, &b.RemindTask, &b.AlertDays, &b.Color, &b.Notes, &b.Archived,
+				&b.IsSubscription, &b.AutoRenew, &b.RemindTask, &b.Variable, &b.AlertDays, &b.Color, &b.Notes, &b.Archived,
 				&b.LastPaidDate, &b.CreatedAt)
 			out = append(out, b)
 		}
@@ -126,6 +128,7 @@ func createBiller(deps Deps) http.HandlerFunc {
 			IsSubscription bool    `json:"is_subscription"`
 			AutoRenew      bool    `json:"auto_renew"`
 			RemindTask     bool    `json:"remind_task"`
+			Variable       bool    `json:"variable"`
 			AlertDays      *int    `json:"alert_days"`
 			Color          string  `json:"color"`
 			Notes          string  `json:"notes"`
@@ -162,10 +165,10 @@ func createBiller(deps Deps) http.HandlerFunc {
 		var id int64
 		err := d.QueryRow(`INSERT INTO fin_billers
 			(user_id, name, amount, frequency, next_due_date, account_id, category_id,
-			 is_subscription, auto_renew, remind_task, alert_days, color, notes)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+			 is_subscription, auto_renew, remind_task, variable, alert_days, color, notes)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
 			uid, body.Name, body.Amount, body.Frequency, body.NextDueDate, body.AccountID, body.CategoryID,
-			body.IsSubscription, body.AutoRenew, body.RemindTask, alertDays, body.Color, body.Notes).Scan(&id)
+			body.IsSubscription, body.AutoRenew, body.RemindTask, body.Variable, alertDays, body.Color, body.Notes).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
@@ -193,6 +196,7 @@ func updateBiller(deps Deps) http.HandlerFunc {
 			IsSubscription *bool    `json:"is_subscription"`
 			AutoRenew      *bool    `json:"auto_renew"`
 			RemindTask     *bool    `json:"remind_task"`
+			Variable       *bool    `json:"variable"`
 			AlertDays      *int     `json:"alert_days"`
 			Color          *string  `json:"color"`
 			Notes          *string  `json:"notes"`
@@ -240,6 +244,9 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		}
 		if body.RemindTask != nil {
 			add("remind_task", *body.RemindTask)
+		}
+		if body.Variable != nil {
+			add("variable", *body.Variable)
 		}
 		if body.AlertDays != nil {
 			add("alert_days", *body.AlertDays)
@@ -444,7 +451,7 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 	today := time.Now().In(defaultLoc).Format("2006-01-02")
 
 	rows, err := d.QueryContext(ctx, `SELECT id, user_id, name, amount, frequency, next_due_date::text,
-		account_id, category_id, auto_renew, remind_task, alert_days
+		account_id, category_id, auto_renew, remind_task, variable, alert_days
 		FROM fin_billers WHERE archived = FALSE`)
 	if err != nil {
 		return 0, 0, err
@@ -459,13 +466,14 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 		accountID, categoryID sql.NullInt64
 		autoRenew             bool
 		remindTask            bool
+		variable              bool
 		alertDays             int
 	}
 	var bills []bill
 	for rows.Next() {
 		var b bill
 		rows.Scan(&b.id, &b.userID, &b.name, &b.amount, &b.freq, &b.dueDate,
-			&b.accountID, &b.categoryID, &b.autoRenew, &b.remindTask, &b.alertDays)
+			&b.accountID, &b.categoryID, &b.autoRenew, &b.remindTask, &b.variable, &b.alertDays)
 		bills = append(bills, b)
 	}
 
@@ -478,16 +486,38 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 		// 1) auto-renew: catch up every cycle whose due date is <= today.
 		if b.autoRenew && b.accountID.Valid {
 			for !due.After(todayT) {
+				// Variable billers (e.g. electricity) have no fixed amount, so
+				// auto-pay the most recent paid amount, falling back to the
+				// estimate on the very first cycle.
+				amt := b.amount
+				if b.variable {
+					var last sql.NullFloat64
+					d.QueryRowContext(ctx, `SELECT amount FROM fin_biller_payments
+						WHERE biller_id = $1 ORDER BY paid_date DESC, id DESC LIMIT 1`, b.id).Scan(&last)
+					if last.Valid && last.Float64 > 0 {
+						amt = last.Float64
+					}
+				}
 				_, terr := postBillerTxn(ctx, deps, b.userID, b.id, b.accountID.Int64, b.categoryID,
-					b.name, b.amount, today, due.Format("2006-01-02"), true)
+					b.name, amt, today, due.Format("2006-01-02"), true)
 				if terr != nil {
 					log.Warn().Err(terr).Int64("biller", b.id).Msg("biller auto-post failed")
 					break
 				}
-				// Notify the user the auto-charge happened.
-				d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
-					VALUES ($1,$2,'auto_paid',$3) ON CONFLICT DO NOTHING`,
-					b.userID, b.id, due.Format("2006-01-02"))
+				// Notify the user the auto-charge happened. Variable bills get a
+				// distinct kind so the UI + email can flag the estimated amount.
+				kind := "auto_paid"
+				if b.variable {
+					kind = "auto_paid_variable"
+				}
+				res, _ := d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
+					VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
+					b.userID, b.id, kind, due.Format("2006-01-02"))
+				if b.variable {
+					if n, _ := res.RowsAffected(); n == 1 {
+						notifyVariableAutoPay(ctx, deps, b.userID, b.name, amt, due.Format("2006-01-02"))
+					}
+				}
 				autoPosted++
 				due = advanceDueDate(due, b.freq)
 			}
@@ -526,6 +556,33 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 		}
 	}
 	return autoPosted, upcomingNoticed, nil
+}
+
+// notifyVariableAutoPay emails the user when a variable biller was auto-paid
+// with an estimated (last-known) amount, so they can verify and adjust. Best
+// effort: a missing email service or send failure is logged, not fatal — the
+// in-app auto_paid_variable alert is the durable record.
+func notifyVariableAutoPay(ctx context.Context, deps Deps, uid, billerName string, amount float64, dueDate string) {
+	if deps.Auth == nil {
+		return
+	}
+	var email, name string
+	if err := deps.DB.QueryRowContext(ctx, `SELECT email, name FROM users WHERE id = $1`, uid).Scan(&email, &name); err != nil || email == "" {
+		return
+	}
+	if name == "" {
+		name = email
+	}
+	subject := "Auto-paid " + billerName + " (variable amount)"
+	html := "<p>Hi " + name + ",</p>" +
+		"<p>Your variable bill <strong>" + billerName + "</strong> (due " + dueDate + ") was auto-paid " +
+		"using the <strong>last known amount</strong> of <strong>₹" +
+		strconv.FormatFloat(amount, 'f', 2, 64) + "</strong>, since its exact amount isn't known upfront.</p>" +
+		"<p><strong>Please verify the actual bill and adjust the transaction in Sajni if it differs.</strong></p>" +
+		"<p>— Sajni</p>"
+	if err := deps.Auth.SendEmail(ctx, email, subject, html); err != nil {
+		log.Warn().Err(err).Str("biller", billerName).Msg("variable auto-pay email failed")
+	}
 }
 
 // spawnBillerTask creates a "Pay {name}" reminder task for a biller's due
