@@ -67,6 +67,8 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 
 	// AI-assisted category inference for transaction titles.
 	mux.HandleFunc("POST /api/finance/categorize", categorizeTransaction(deps))
+	// AI parse of a shared bank/UPI message into transaction fields (PWA share target).
+	mux.HandleFunc("POST /api/finance/parse-message", parseTransactionMessage(deps))
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -2110,6 +2112,72 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 		writeJSON(w, 200, map[string]any{
 			"category_id":   matchedID,
 			"category_name": matchedName,
+		})
+	}
+}
+
+// parseTransactionMessage reads a shared bank / UPI message (SMS or
+// notification text) and returns structured transaction fields for the
+// share-target confirm sheet to pre-fill. Best-effort and behind the shared
+// AI limiter — a parse failure still returns 200 with empty fields so the
+// sheet opens for manual entry.
+func parseTransactionMessage(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if deps.AI == nil {
+			errJSON(w, http.StatusServiceUnavailable, "AI is not configured on this server")
+			return
+		}
+		uid := userID(r.Context())
+
+		var body struct {
+			Text string `json:"text"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			errJSON(w, 400, "invalid json")
+			return
+		}
+		text := strings.TrimSpace(body.Text)
+		if text == "" {
+			errJSON(w, 400, "missing text")
+			return
+		}
+		if len(text) > 2000 {
+			text = text[:2000]
+		}
+
+		if ok, retryAfter := deps.AILimiter.check(uid); !ok {
+			secs := int(math.Ceil(retryAfter.Seconds()))
+			if secs < 1 {
+				secs = 1
+			}
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
+			errJSON(w, 429, "AI hourly limit reached — try again later")
+			return
+		}
+
+		today := userNow(deps.DB, uid).Format("2006-01-02")
+		ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
+		defer cancel()
+
+		parsed, tokens, err := deps.AI.ParseTransactionMessage(ctx, text, today)
+		if tokens <= 0 {
+			tokens = 80 // conservative floor for cap accounting
+		}
+		deps.AILimiter.record(uid, tokens)
+		if err != nil {
+			// Best-effort: empty fields → sheet opens for manual entry.
+			writeJSON(w, 200, map[string]any{
+				"amount": 0, "type": "expense", "description": "", "date": today, "account_hint": "",
+			})
+			return
+		}
+
+		writeJSON(w, 200, map[string]any{
+			"amount":       parsed.Amount,
+			"type":         parsed.Type,
+			"description":  parsed.Description,
+			"date":         parsed.Date,
+			"account_hint": parsed.AccountHint,
 		})
 	}
 }
