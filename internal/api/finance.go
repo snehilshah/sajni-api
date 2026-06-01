@@ -41,6 +41,7 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /api/finance/investments", createInvestment(deps))
 	mux.HandleFunc("PUT /api/finance/investments/{id}", updateInvestment(deps))
 	mux.HandleFunc("DELETE /api/finance/investments/{id}", deleteInvestment(deps))
+	mux.HandleFunc("POST /api/finance/investments/{id}/sell", sellInvestment(deps))
 
 	// Virtual savings
 	mux.HandleFunc("GET /api/finance/savings", listSavings(deps))
@@ -108,20 +109,24 @@ func seedDefaultCategoriesIfEmpty(deps Deps, uid string) {
 }
 
 // computeBalance returns the current signed balance of an account based on
-// opening_balance + income - expense + transfer_in - transfer_out.
-// For credit cards this comes out negative when money is owed.
+// opening_balance + income - expense + transfer_in - transfer_out - buy + sell.
+// For credit cards this comes out negative when money is owed. For trading
+// accounts `buy` debits cash (deploying into a holding) and `sell` credits it
+// (proceeds back); neither counts as income/expense in analytics.
 func computeBalance(deps Deps, uid string, accountID int64) float64 {
 	d := deps.DB
 	var opening float64
 	d.QueryRow("SELECT opening_balance FROM fin_accounts WHERE id = $1 AND user_id = $2", accountID, uid).Scan(&opening)
 
-	var income, expense, transferIn, transferOut float64
+	var income, expense, transferIn, transferOut, buy, sell float64
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'income'", uid, accountID).Scan(&income)
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'expense'", uid, accountID).Scan(&expense)
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_in'", uid, accountID).Scan(&transferIn)
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_out'", uid, accountID).Scan(&transferOut)
+	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'buy'", uid, accountID).Scan(&buy)
+	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'sell'", uid, accountID).Scan(&sell)
 
-	return opening + income - expense + transferIn - transferOut
+	return opening + income - expense + transferIn - transferOut - buy + sell
 }
 
 // --- accounts --------------------------------------------------------------
@@ -848,7 +853,8 @@ func listInvestments(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
 		rows, err := d.Query(`SELECT id, name, type, account_id, invested_amount, current_value, monthly_amount,
-			frequency, start_date::text, maturity_date::text, expected_return, notes, last_updated::text
+			frequency, start_date::text, maturity_date::text, expected_return, notes, last_updated::text,
+			quantity, avg_buy_price, realized_pl, status
 			FROM fin_investments WHERE user_id = $1 ORDER BY created_at ASC`, uid)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -869,12 +875,17 @@ func listInvestments(deps Deps) http.HandlerFunc {
 			ExpectedReturn float64 `json:"expected_return"`
 			Notes          string  `json:"notes"`
 			LastUpdated    string  `json:"last_updated"`
+			Quantity       float64 `json:"quantity"`
+			AvgBuyPrice    float64 `json:"avg_buy_price"`
+			RealizedPL     float64 `json:"realized_pl"`
+			Status         string  `json:"status"`
 		}
 		var out []Inv
 		for rows.Next() {
 			var i Inv
 			rows.Scan(&i.ID, &i.Name, &i.Type, &i.AccountID, &i.InvestedAmount, &i.CurrentValue, &i.MonthlyAmount,
-				&i.Frequency, &i.StartDate, &i.MaturityDate, &i.ExpectedReturn, &i.Notes, &i.LastUpdated)
+				&i.Frequency, &i.StartDate, &i.MaturityDate, &i.ExpectedReturn, &i.Notes, &i.LastUpdated,
+				&i.Quantity, &i.AvgBuyPrice, &i.RealizedPL, &i.Status)
 			out = append(out, i)
 		}
 		if out == nil {
@@ -882,6 +893,17 @@ func listInvestments(deps Deps) http.HandlerFunc {
 		}
 		writeJSON(w, 200, out)
 	}
+}
+
+// isTradingType reports whether a holding is a market instrument that lives in
+// the Trading tab and must be bought against a trading account. Everything else
+// (fd/rd/other) is a guaranteed instrument shown under Investments.
+func isTradingType(t string) bool {
+	switch t {
+	case "stock", "etf", "sip", "mutual_fund":
+		return true
+	}
+	return false
 }
 
 func createInvestment(deps Deps) http.HandlerFunc {
@@ -900,6 +922,8 @@ func createInvestment(deps Deps) http.HandlerFunc {
 			MaturityDate   *string `json:"maturity_date"`
 			ExpectedReturn float64 `json:"expected_return"`
 			Notes          string  `json:"notes"`
+			Quantity       float64 `json:"quantity"`
+			AvgBuyPrice    float64 `json:"avg_buy_price"`
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -908,21 +932,180 @@ func createInvestment(deps Deps) http.HandlerFunc {
 		if b.Type == "" {
 			b.Type = "sip"
 		}
+		// Default frequency depends on instrument: stocks/etfs are one-off
+		// (lumpsum), recurring contributions (sip/rd) default monthly.
 		if b.Frequency == "" {
-			b.Frequency = "monthly"
+			switch b.Type {
+			case "sip", "rd":
+				b.Frequency = "monthly"
+			default:
+				b.Frequency = "lumpsum"
+			}
 		}
+
+		trading := isTradingType(b.Type)
+		if trading {
+			// A trade can only be placed against a trading account.
+			if b.AccountID == nil {
+				errJSON(w, 400, "a trading account is required to add stocks/ETFs/SIPs")
+				return
+			}
+			var atype string
+			d.QueryRow("SELECT type FROM fin_accounts WHERE id = $1 AND user_id = $2", *b.AccountID, uid).Scan(&atype)
+			if atype != "trading" {
+				errJSON(w, 400, "trades must be linked to a trading account")
+				return
+			}
+		}
+		// Cost basis from units × price when supplied; else trust invested_amount.
+		if b.Quantity > 0 && b.AvgBuyPrice > 0 {
+			b.InvestedAmount = b.Quantity * b.AvgBuyPrice
+		}
+		if b.CurrentValue == 0 {
+			b.CurrentValue = b.InvestedAmount
+		}
+
 		var id int64
 		err := d.QueryRow(`INSERT INTO fin_investments
-			(user_id, name, type, account_id, invested_amount, current_value, monthly_amount, frequency, start_date, maturity_date, expected_return, notes)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+			(user_id, name, type, account_id, invested_amount, current_value, monthly_amount, frequency, start_date, maturity_date, expected_return, notes, quantity, avg_buy_price, status)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'open') RETURNING id`,
 			uid, b.Name, b.Type, b.AccountID, b.InvestedAmount, b.CurrentValue, b.MonthlyAmount, b.Frequency,
-			b.StartDate, b.MaturityDate, b.ExpectedReturn, b.Notes,
+			b.StartDate, b.MaturityDate, b.ExpectedReturn, b.Notes, b.Quantity, b.AvgBuyPrice,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
+		// Buying deploys cash: debit the trading account so its balance reflects
+		// what's been spent. (Sells credit it back via the sell endpoint.)
+		if trading && b.AccountID != nil && b.InvestedAmount > 0 {
+			buyDate := userNow(d, uid).Format("2006-01-02")
+			if b.StartDate != nil && *b.StartDate != "" {
+				buyDate = *b.StartDate
+			}
+			d.Exec(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_date)
+				VALUES ($1,$2,'buy',$3,$4,$5)`, uid, *b.AccountID, b.InvestedAmount, "Buy "+b.Name, buyDate)
+		}
 		writeJSON(w, 201, map[string]int64{"id": id})
+	}
+}
+
+// sellInvestment books a (partial or full) sale of a trading holding: it
+// reduces the holding's units/cost basis, accumulates realized P/L, and posts
+// a `sell` transaction crediting the linked trading account with the proceeds.
+func sellInvestment(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		var b struct {
+			Units  float64 `json:"units"`  // units to sell; <=0 or >held => sell all
+			Price  float64 `json:"price"`  // sale price per unit
+			Amount float64 `json:"amount"` // alt: total proceeds when no units tracked
+			Date   string  `json:"date"`
+		}
+		if err := readJSON(r, &b); err != nil {
+			errJSON(w, 400, "invalid json")
+			return
+		}
+
+		var name string
+		var acctID *int64
+		var qty, avgPrice, invested, current, realized float64
+		var status string
+		err = d.QueryRow(`SELECT name, account_id, quantity, avg_buy_price, invested_amount, current_value, realized_pl, status
+			FROM fin_investments WHERE id = $1 AND user_id = $2`, id, uid).Scan(
+			&name, &acctID, &qty, &avgPrice, &invested, &current, &realized, &status)
+		if err != nil {
+			errJSON(w, 404, "not found")
+			return
+		}
+		if acctID == nil {
+			errJSON(w, 400, "holding has no trading account")
+			return
+		}
+		if status == "closed" {
+			errJSON(w, 400, "holding already sold")
+			return
+		}
+
+		date := b.Date
+		if date == "" {
+			date = userNow(d, uid).Format("2006-01-02")
+		}
+
+		// Determine proceeds + cost of the sold portion.
+		var proceeds, costSold, sellUnits float64
+		if qty > 0 {
+			sellUnits = b.Units
+			if sellUnits <= 0 || sellUnits > qty {
+				sellUnits = qty // default / clamp to a full exit
+			}
+			proceeds = sellUnits * b.Price
+			costSold = sellUnits * avgPrice
+		} else {
+			// Legacy holding with no unit tracking: full sell by total amount.
+			proceeds = b.Amount
+			if proceeds == 0 {
+				proceeds = b.Price
+			}
+			costSold = invested
+		}
+
+		newRealized := realized + (proceeds - costSold)
+		newQty := qty - sellUnits
+
+		var newInvested, newCurrent float64
+		newStatus := status
+		if qty > 0 && newQty > 0 {
+			frac := newQty / qty
+			newInvested = invested * frac
+			newCurrent = current * frac
+		} else {
+			newStatus = "closed" // nothing left (or untracked full sell)
+		}
+
+		tx, terr := d.Begin()
+		if terr != nil {
+			errJSON(w, 500, terr.Error())
+			return
+		}
+		if newStatus == "closed" {
+			if _, e := tx.Exec(`UPDATE fin_investments
+				SET quantity = 0, invested_amount = 0, current_value = 0, realized_pl = $1,
+				    status = 'closed', sold_at = NOW(), last_updated = NOW()
+				WHERE id = $2 AND user_id = $3`, newRealized, id, uid); e != nil {
+				tx.Rollback()
+				errJSON(w, 500, e.Error())
+				return
+			}
+		} else {
+			if _, e := tx.Exec(`UPDATE fin_investments
+				SET quantity = $1, invested_amount = $2, current_value = $3, realized_pl = $4, last_updated = NOW()
+				WHERE id = $5 AND user_id = $6`, newQty, newInvested, newCurrent, newRealized, id, uid); e != nil {
+				tx.Rollback()
+				errJSON(w, 500, e.Error())
+				return
+			}
+		}
+		if _, e := tx.Exec(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_date)
+			VALUES ($1,$2,'sell',$3,$4,$5)`, uid, *acctID, proceeds, "Sell "+name, date); e != nil {
+			tx.Rollback()
+			errJSON(w, 500, e.Error())
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{
+			"status": "ok", "proceeds": proceeds, "realized_pl": newRealized,
+			"remaining_units": newQty, "closed": newStatus == "closed",
+		})
 	}
 }
 
@@ -947,6 +1130,8 @@ func updateInvestment(deps Deps) http.HandlerFunc {
 			MaturityDate   *string  `json:"maturity_date"`
 			ExpectedReturn *float64 `json:"expected_return"`
 			Notes          *string  `json:"notes"`
+			Quantity       *float64 `json:"quantity"`
+			AvgBuyPrice    *float64 `json:"avg_buy_price"`
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -992,6 +1177,12 @@ func updateInvestment(deps Deps) http.HandlerFunc {
 		}
 		if b.Notes != nil {
 			add("notes", *b.Notes)
+		}
+		if b.Quantity != nil {
+			add("quantity", *b.Quantity)
+		}
+		if b.AvgBuyPrice != nil {
+			add("avg_buy_price", *b.AvgBuyPrice)
 		}
 		args = append(args, id, uid)
 		q := "UPDATE fin_investments SET " + strings.Join(set, ", ") + " WHERE id = $" + itoa(ph) + " AND user_id = $" + itoa(ph+1)
