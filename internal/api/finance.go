@@ -1341,7 +1341,7 @@ func listStatements(deps Deps) http.HandlerFunc {
 		uid := userID(r.Context())
 		args := []any{uid}
 		q := `SELECT s.id, s.account_id, a.name, s.statement_date::text, s.due_date::text,
-			s.amount_due, s.cashback_earned, s.paid, s.paid_at::text
+			s.amount_due, s.new_charges, s.previous_balance, s.cashback_earned, s.paid, s.paid_at::text
 			FROM fin_cc_statements s JOIN fin_accounts a ON a.id = s.account_id
 			WHERE s.user_id = $1`
 		if v := queryParam(r, "account_id"); v != "" {
@@ -1356,21 +1356,23 @@ func listStatements(deps Deps) http.HandlerFunc {
 		}
 		defer rows.Close()
 		type Stmt struct {
-			ID             int64   `json:"id"`
-			AccountID      int64   `json:"account_id"`
-			AccountName    string  `json:"account_name"`
-			StatementDate  string  `json:"statement_date"`
-			DueDate        string  `json:"due_date"`
-			AmountDue      float64 `json:"amount_due"`
-			CashbackEarned float64 `json:"cashback_earned"`
-			Paid           bool    `json:"paid"`
-			PaidAt         *string `json:"paid_at"`
+			ID              int64   `json:"id"`
+			AccountID       int64   `json:"account_id"`
+			AccountName     string  `json:"account_name"`
+			StatementDate   string  `json:"statement_date"`
+			DueDate         string  `json:"due_date"`
+			AmountDue       float64 `json:"amount_due"`
+			NewCharges      float64 `json:"new_charges"`
+			PreviousBalance float64 `json:"previous_balance"`
+			CashbackEarned  float64 `json:"cashback_earned"`
+			Paid            bool    `json:"paid"`
+			PaidAt          *string `json:"paid_at"`
 		}
 		var out []Stmt
 		for rows.Next() {
 			var s Stmt
 			rows.Scan(&s.ID, &s.AccountID, &s.AccountName, &s.StatementDate, &s.DueDate,
-				&s.AmountDue, &s.CashbackEarned, &s.Paid, &s.PaidAt)
+				&s.AmountDue, &s.NewCharges, &s.PreviousBalance, &s.CashbackEarned, &s.Paid, &s.PaidAt)
 			out = append(out, s)
 		}
 		if out == nil {
@@ -1380,6 +1382,42 @@ func listStatements(deps Deps) http.HandlerFunc {
 	}
 }
 
+// deriveDueDate computes a statement's due date from the card's due_day: the
+// due day in the same month when it falls after the statement day, otherwise
+// the next month. Clamped to the 28th to avoid month-length overflow.
+func deriveDueDate(deps Deps, uid string, acctID int64, stmtDate string) string {
+	d := deps.DB
+	t, err := time.Parse("2006-01-02", stmtDate)
+	if err != nil {
+		return stmtDate
+	}
+	var dueDay *int
+	d.QueryRow("SELECT due_day FROM fin_accounts WHERE id = $1 AND user_id = $2", acctID, uid).Scan(&dueDay)
+	dd := t.Day() + 15
+	if dueDay != nil && *dueDay > 0 {
+		dd = *dueDay
+	}
+	year, month := t.Year(), t.Month()
+	if dd <= t.Day() {
+		month++
+		if month > 12 {
+			month = 1
+			year++
+		}
+	}
+	if dd > 28 {
+		dd = 28
+	}
+	return time.Date(year, month, dd, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+}
+
+// createStatement closes a billing cycle. amount_due (the payable total) =
+// previous_balance + new_charges, where:
+//   - new_charges     = purchases − refunds in (prev statement, this statement]
+//   - previous_balance = prior statement's payable total − payments this cycle
+//     (first statement carries any unbilled opening debt instead)
+// Both components may be negative (overpayment leaves a credit). All three are
+// overridable from the client.
 func createStatement(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -1392,30 +1430,70 @@ func createStatement(deps Deps) http.HandlerFunc {
 		var b struct {
 			StatementDate  string   `json:"statement_date"`
 			DueDate        string   `json:"due_date"`
-			AmountDue      *float64 `json:"amount_due"`
+			AmountDue      *float64 `json:"amount_due"`  // override payable total
+			NewCharges     *float64 `json:"new_charges"` // override cycle charges
 			CashbackEarned *float64 `json:"cashback_earned"`
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
 			return
 		}
-		// auto-compute amount_due if not provided: sum of expense txns on this card up to statement_date that aren't tied to a previous statement window
-		var amount float64
-		if b.AmountDue != nil {
-			amount = *b.AmountDue
+		if b.StatementDate == "" {
+			b.StatementDate = userNow(d, uid).Format("2006-01-02")
+		}
+
+		// Cycle window: previous statement_date (exclusive) → this one (inclusive).
+		var lastStmt *string
+		d.QueryRow("SELECT MAX(statement_date)::text FROM fin_cc_statements WHERE user_id = $1 AND account_id = $2 AND statement_date < $3",
+			uid, acctID, b.StatementDate).Scan(&lastStmt)
+		from := "1970-01-01"
+		if lastStmt != nil {
+			from = *lastStmt
+		}
+
+		// New charges = purchases − refunds this cycle.
+		var newCharges float64
+		if b.NewCharges != nil {
+			newCharges = *b.NewCharges
 		} else {
-			var lastStmt *string
-			d.QueryRow("SELECT MAX(statement_date)::text FROM fin_cc_statements WHERE user_id = $1 AND account_id = $2 AND statement_date < $3",
-				uid, acctID, b.StatementDate).Scan(&lastStmt)
-			from := "1970-01-01"
-			if lastStmt != nil {
-				from = *lastStmt
-			}
+			var spend, refund float64
 			d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
 				WHERE user_id = $1 AND account_id = $2 AND type = 'expense' AND txn_date > $3 AND txn_date <= $4`,
-				uid, acctID, from, b.StatementDate).Scan(&amount)
+				uid, acctID, from, b.StatementDate).Scan(&spend)
+			d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+				WHERE user_id = $1 AND account_id = $2 AND type = 'income' AND txn_date > $3 AND txn_date <= $4`,
+				uid, acctID, from, b.StatementDate).Scan(&refund)
+			newCharges = spend - refund
 		}
-		// auto-compute cashback if not provided
+
+		// Previous balance carried in: prior statement's total − payments this
+		// cycle. No prior statement → unbilled opening debt (owed = −opening).
+		var prevBalance float64
+		var priorTotal *float64
+		d.QueryRow(`SELECT amount_due FROM fin_cc_statements
+			WHERE user_id = $1 AND account_id = $2 AND statement_date < $3
+			ORDER BY statement_date DESC LIMIT 1`, uid, acctID, b.StatementDate).Scan(&priorTotal)
+		if priorTotal != nil {
+			prevBalance = *priorTotal
+		} else {
+			var opening float64
+			d.QueryRow("SELECT opening_balance FROM fin_accounts WHERE id = $1 AND user_id = $2", acctID, uid).Scan(&opening)
+			if opening < 0 {
+				prevBalance = -opening
+			}
+		}
+		var payments float64
+		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+			WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_in' AND txn_date > $3 AND txn_date <= $4`,
+			uid, acctID, from, b.StatementDate).Scan(&payments)
+		prevBalance -= payments
+
+		total := prevBalance + newCharges
+		if b.AmountDue != nil {
+			total = *b.AmountDue
+		}
+
+		// Cashback on this cycle's new charges.
 		var cashback float64
 		if b.CashbackEarned != nil {
 			cashback = *b.CashbackEarned
@@ -1423,22 +1501,32 @@ func createStatement(deps Deps) http.HandlerFunc {
 			var cbType string
 			var cbVal float64
 			d.QueryRow("SELECT cashback_type, cashback_value FROM fin_accounts WHERE id = $1 AND user_id = $2", acctID, uid).Scan(&cbType, &cbVal)
-			if cbType == "percentage" {
-				cashback = amount * cbVal / 100
+			if cbType == "percentage" && newCharges > 0 {
+				cashback = newCharges * cbVal / 100
 			} else if cbType == "fixed" {
 				cashback = cbVal
 			}
 		}
+
+		dueDate := b.DueDate
+		if dueDate == "" {
+			dueDate = deriveDueDate(deps, uid, acctID, b.StatementDate)
+		}
+
 		var id int64
-		err = d.QueryRow(`INSERT INTO fin_cc_statements (user_id, account_id, statement_date, due_date, amount_due, cashback_earned)
-			VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-			uid, acctID, b.StatementDate, b.DueDate, amount, cashback,
+		err = d.QueryRow(`INSERT INTO fin_cc_statements
+			(user_id, account_id, statement_date, due_date, amount_due, new_charges, previous_balance, cashback_earned)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+			uid, acctID, b.StatementDate, dueDate, total, newCharges, prevBalance, cashback,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
-		writeJSON(w, 201, map[string]any{"id": id, "amount_due": amount, "cashback_earned": cashback})
+		writeJSON(w, 201, map[string]any{
+			"id": id, "amount_due": total, "new_charges": newCharges,
+			"previous_balance": prevBalance, "cashback_earned": cashback,
+		})
 	}
 }
 
@@ -1452,11 +1540,12 @@ func updateStatement(deps Deps) http.HandlerFunc {
 			return
 		}
 		var b struct {
-			AmountDue      *float64 `json:"amount_due"`
-			CashbackEarned *float64 `json:"cashback_earned"`
-			DueDate        *string  `json:"due_date"`
-			StatementDate  *string  `json:"statement_date"`
-			Paid           *bool    `json:"paid"`
+			AmountDue       *float64 `json:"amount_due"`
+			CashbackEarned  *float64 `json:"cashback_earned"`
+			DueDate         *string  `json:"due_date"`
+			StatementDate   *string  `json:"statement_date"`
+			Paid            *bool    `json:"paid"`
+			PaidFromAccount *int64   `json:"paid_from_account"` // bank that pays the bill
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -1476,7 +1565,35 @@ func updateStatement(deps Deps) http.HandlerFunc {
 		}
 		if b.Paid != nil {
 			if *b.Paid {
+				// Read current state first so the payment posts at most once.
+				var alreadyPaid bool
+				var cardID int64
+				var amountDue float64
+				d.QueryRow("SELECT paid, account_id, amount_due FROM fin_cc_statements WHERE id = $1 AND user_id = $2", id, uid).
+					Scan(&alreadyPaid, &cardID, &amountDue)
 				d.Exec("UPDATE fin_cc_statements SET paid = TRUE, paid_at = NOW() WHERE id = $1 AND user_id = $2", id, uid)
+				// Post the bank→card payment: a transfer that reduces what's owed
+				// on the card and debits the paying bank account. Only on the
+				// first mark-paid, when a source is given and there's a real due.
+				if b.PaidFromAccount != nil && !alreadyPaid && amountDue > 0 && *b.PaidFromAccount != cardID {
+					today := userNow(d, uid).Format("2006-01-02")
+					tx, terr := d.Begin()
+					if terr == nil {
+						var outID int64
+						if e := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_date, linked_account)
+							VALUES ($1,$2,'transfer_out',$3,$4,$5,$6) RETURNING id`,
+							uid, *b.PaidFromAccount, amountDue, "Credit card payment", today, cardID).Scan(&outID); e == nil {
+							var inID int64
+							tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_date, linked_account, transfer_pair)
+								VALUES ($1,$2,'transfer_in',$3,$4,$5,$6,$7) RETURNING id`,
+								uid, cardID, amountDue, "Credit card payment", today, *b.PaidFromAccount, outID).Scan(&inID)
+							tx.Exec("UPDATE fin_transactions SET transfer_pair = $1 WHERE id = $2", inID, outID)
+							tx.Commit()
+						} else {
+							tx.Rollback()
+						}
+					}
+				}
 			} else {
 				d.Exec("UPDATE fin_cc_statements SET paid = FALSE, paid_at = NULL WHERE id = $1 AND user_id = $2", id, uid)
 			}
