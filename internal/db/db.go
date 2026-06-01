@@ -624,6 +624,10 @@ func (d *DB) migrate() error {
 	-- so the UI can offer a one-tap "Credit salary". Bonuses stay manual.
 	ALTER TABLE fin_accounts ADD COLUMN IF NOT EXISTS salary_amount NUMERIC(14,2) NOT NULL DEFAULT 0;
 	ALTER TABLE fin_accounts ADD COLUMN IF NOT EXISTS salary_day    INT;
+	-- Comma-separated identifiers (last-4 digits / bank name) seen in this
+	-- account's bank/UPI SMS, so the share-target confirm sheet can auto-pick
+	-- the right account from a parsed account_hint.
+	ALTER TABLE fin_accounts ADD COLUMN IF NOT EXISTS match_hints TEXT NOT NULL DEFAULT '';
 
 	-- ─── Finance: trading account backfill (breaking change) ──────────
 	-- Trades now require a 'trading' account. Every user who already owns a

@@ -148,6 +148,7 @@ type accountResp struct {
 	CashbackValue  float64  `json:"cashback_value"`
 	SalaryAmount   float64  `json:"salary_amount"`
 	SalaryDay      *int     `json:"salary_day"`
+	MatchHints     string   `json:"match_hints"`
 	Color          string   `json:"color"`
 	Archived       bool     `json:"archived"`
 	CreatedAt      string   `json:"created_at"`
@@ -158,7 +159,7 @@ func listAccounts(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
 		rows, err := d.Query(`SELECT id, name, type, institution, currency, opening_balance,
-			credit_limit, statement_day, due_day, cashback_type, cashback_value, salary_amount, salary_day, color, archived, created_at
+			credit_limit, statement_day, due_day, cashback_type, cashback_value, salary_amount, salary_day, match_hints, color, archived, created_at
 			FROM fin_accounts WHERE user_id = $1 ORDER BY archived ASC, created_at ASC`, uid)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -169,7 +170,7 @@ func listAccounts(deps Deps) http.HandlerFunc {
 		for rows.Next() {
 			var a accountResp
 			rows.Scan(&a.ID, &a.Name, &a.Type, &a.Institution, &a.Currency, &a.OpeningBalance,
-				&a.CreditLimit, &a.StatementDay, &a.DueDay, &a.CashbackType, &a.CashbackValue, &a.SalaryAmount, &a.SalaryDay, &a.Color, &a.Archived, &a.CreatedAt)
+				&a.CreditLimit, &a.StatementDay, &a.DueDay, &a.CashbackType, &a.CashbackValue, &a.SalaryAmount, &a.SalaryDay, &a.MatchHints, &a.Color, &a.Archived, &a.CreatedAt)
 			a.Balance = computeBalance(deps, uid, a.ID)
 			out = append(out, a)
 		}
@@ -197,6 +198,7 @@ func createAccount(deps Deps) http.HandlerFunc {
 			CashbackValue  float64  `json:"cashback_value"`
 			SalaryAmount   float64  `json:"salary_amount"`
 			SalaryDay      *int     `json:"salary_day"`
+			MatchHints     string   `json:"match_hints"`
 			Color          string   `json:"color"`
 		}
 		if err := readJSON(r, &b); err != nil {
@@ -217,10 +219,10 @@ func createAccount(deps Deps) http.HandlerFunc {
 		}
 		var id int64
 		err := d.QueryRow(`INSERT INTO fin_accounts
-			(user_id, name, type, institution, currency, opening_balance, credit_limit, statement_day, due_day, cashback_type, cashback_value, salary_amount, salary_day, color)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+			(user_id, name, type, institution, currency, opening_balance, credit_limit, statement_day, due_day, cashback_type, cashback_value, salary_amount, salary_day, match_hints, color)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
 			uid, b.Name, b.Type, b.Institution, b.Currency, b.OpeningBalance,
-			b.CreditLimit, b.StatementDay, b.DueDay, b.CashbackType, b.CashbackValue, b.SalaryAmount, b.SalaryDay, b.Color,
+			b.CreditLimit, b.StatementDay, b.DueDay, b.CashbackType, b.CashbackValue, b.SalaryAmount, b.SalaryDay, b.MatchHints, b.Color,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -252,6 +254,7 @@ func updateAccount(deps Deps) http.HandlerFunc {
 			CashbackValue  *float64 `json:"cashback_value"`
 			SalaryAmount   *float64 `json:"salary_amount"`
 			SalaryDay      *int     `json:"salary_day"`
+			MatchHints     *string  `json:"match_hints"`
 			Color          *string  `json:"color"`
 			Archived       *bool    `json:"archived"`
 		}
@@ -302,6 +305,9 @@ func updateAccount(deps Deps) http.HandlerFunc {
 		}
 		if b.SalaryDay != nil {
 			add("salary_day", *b.SalaryDay)
+		}
+		if b.MatchHints != nil {
+			add("match_hints", *b.MatchHints)
 		}
 		if b.Color != nil {
 			add("color", *b.Color)
