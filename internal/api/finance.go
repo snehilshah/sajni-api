@@ -76,16 +76,9 @@ var defaultExpenseCategories = []struct {
 	Icon  string
 }{
 	{"Food & Dining", "#F97316", "utensils"},
-	{"Groceries", "#84CC16", "shopping-basket"},
 	{"Transport", "#3B82F6", "car"},
-	{"Rent", "#8B5CF6", "home"},
-	{"Utilities", "#06B6D4", "plug"},
+	{"Bills & Utilities", "#06B6D4", "plug"},
 	{"Shopping", "#EC4899", "shopping-bag"},
-	{"Entertainment", "#A855F7", "film"},
-	{"Health", "#EF4444", "heart-pulse"},
-	{"Travel", "#0EA5E9", "plane"},
-	{"Education", "#F59E0B", "book-open"},
-	{"Subscriptions", "#6366F1", "repeat"},
 	{"Other", "#6B7280", "circle"},
 }
 
@@ -96,9 +89,6 @@ var defaultIncomeCategories = []struct {
 }{
 	{"Salary", "#10B981", "wallet"},
 	{"Interest", "#22C55E", "trending-up"},
-	{"Dividends", "#14B8A6", "pie-chart"},
-	{"Refund", "#0D9488", "rotate-ccw"},
-	{"Gift", "#F472B6", "gift"},
 	{"Other", "#6B7280", "circle"},
 }
 
