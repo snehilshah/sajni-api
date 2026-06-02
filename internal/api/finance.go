@@ -2185,6 +2185,108 @@ func lookupMerchantCategory(d *db.DB, uid, merchant string) (*int64, string) {
 	return &id, name
 }
 
+// matchAccountByHint resolves a parsed account_hint (e.g. "2805", "XX2805",
+// "Kotak") to one of the user's accounts via each account's comma-separated
+// match_hints. A numeric token must equal a full digit run in the hint, or be a
+// >=4-digit suffix of one — exact last-4, NOT the loose substring the web
+// client used (which mis-matched a short/other token onto the wrong account, so
+// the confirm sheet showed "matched" but never switched to the right account).
+// Text tokens (bank names, >=3 chars) match as a case-insensitive substring.
+// Numeric matches (more specific) win over name matches. Returns nil,false when
+// nothing matches.
+func matchAccountByHint(d *db.DB, uid, hint string) *int64 {
+	h := strings.ToLower(strings.TrimSpace(hint))
+	if h == "" {
+		return nil
+	}
+	runs := hintDigitRuns(h)
+
+	rows, err := d.Query(`SELECT id, COALESCE(match_hints,'') FROM fin_accounts WHERE user_id=$1 AND archived=false`, uid)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	type cand struct {
+		id    int64
+		hints string
+	}
+	var cands []cand
+	for rows.Next() {
+		var c cand
+		if rows.Scan(&c.id, &c.hints) == nil {
+			cands = append(cands, c)
+		}
+	}
+
+	// Pass 1: numeric exact / last-4 suffix (most specific).
+	for _, c := range cands {
+		for _, tok := range splitMatchHints(c.hints) {
+			if !isAllDigits(tok) {
+				continue
+			}
+			for _, run := range runs {
+				if run == tok || (len(tok) >= 4 && strings.HasSuffix(run, tok)) {
+					id := c.id
+					return &id
+				}
+			}
+		}
+	}
+	// Pass 2: bank-name substring.
+	for _, c := range cands {
+		for _, tok := range splitMatchHints(c.hints) {
+			if !isAllDigits(tok) && len(tok) >= 3 && strings.Contains(h, tok) {
+				id := c.id
+				return &id
+			}
+		}
+	}
+	return nil
+}
+
+func splitMatchHints(s string) []string {
+	var out []string
+	for _, t := range strings.Split(s, ",") {
+		if t = strings.ToLower(strings.TrimSpace(t)); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// hintDigitRuns returns the maximal consecutive-digit substrings of s
+// (e.g. "a/c xx2805 on card 12" -> ["2805", "12"]).
+func hintDigitRuns(s string) []string {
+	var runs []string
+	start := -1
+	for i, r := range s {
+		if r >= '0' && r <= '9' {
+			if start < 0 {
+				start = i
+			}
+		} else if start >= 0 {
+			runs = append(runs, s[start:i])
+			start = -1
+		}
+	}
+	if start >= 0 {
+		runs = append(runs, s[start:])
+	}
+	return runs
+}
+
 func parseTransactionMessage(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if deps.AI == nil {
@@ -2232,7 +2334,7 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 			// Best-effort: empty fields → sheet opens for manual entry.
 			writeJSON(w, 200, map[string]any{
 				"amount": 0, "type": "expense", "description": "", "note": "",
-				"date": today, "account_hint": "", "category_id": nil, "category_name": "",
+				"date": today, "account_hint": "", "account_id": nil, "category_id": nil, "category_name": "",
 			})
 			return
 		}
@@ -2284,6 +2386,13 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 			}
 		}
 
+		// Resolve the matched account server-side (single source of truth for
+		// web + android) so the confirm sheet can pre-select it.
+		var acctID *int64
+		if parsed.Amount > 0 {
+			acctID = matchAccountByHint(deps.DB, uid, parsed.AccountHint)
+		}
+
 		writeJSON(w, 200, map[string]any{
 			"amount":        parsed.Amount,
 			"type":          parsed.Type,
@@ -2291,6 +2400,7 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 			"note":          parsed.Note,
 			"date":          parsed.Date,
 			"account_hint":  parsed.AccountHint,
+			"account_id":    acctID,
 			"category_id":   catID,
 			"category_name": catName,
 		})
