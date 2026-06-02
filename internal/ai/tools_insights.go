@@ -141,10 +141,10 @@ func timeTravelTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 		}
 	}
 	if allowAll || typesAllowed["transaction"] {
-		query := `SELECT t.id, t.txn_date::text, t.description, t.amount, a.name FROM fin_transactions t
+		query := `SELECT t.id, (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date::text, t.description, t.amount, a.name FROM fin_transactions t
 			JOIN fin_accounts a ON a.id = t.account_id
-			WHERE t.user_id=$1 AND t.description ILIKE $2` + expand("t.txn_date") +
-			` ORDER BY t.txn_date DESC LIMIT 20`
+			WHERE t.user_id=$1 AND t.description ILIKE $2` + expand("(t.txn_at AT TIME ZONE 'Asia/Kolkata')::date") +
+			` ORDER BY t.txn_at DESC LIMIT 20`
 		args := append([]any{uid, like}, dateArgs...)
 		rows, err := d.QueryContext(ctx, query, args...)
 		if err == nil {

@@ -418,15 +418,16 @@ func exportFinanceCategories(ctx context.Context, zw *zip.Writer, deps Deps, uid
 
 func exportFinanceTransactions(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx, `
-		SELECT id, account_id, COALESCE(category_id,0), type, amount, description, txn_date,
+		SELECT id, account_id, COALESCE(category_id,0), type, amount, description, txn_at,
 		       COALESCE(linked_account,0), created_at
-		FROM fin_transactions WHERE user_id = $1 ORDER BY txn_date`, uid)
+		FROM fin_transactions WHERE user_id = $1 ORDER BY txn_at`, uid)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
+	loc := userLocation(deps.DB, uid)
 	return writeCSV(zw, "finance/transactions.csv",
-		[]string{"id", "account_id", "category_id", "type", "amount", "description", "txn_date", "linked_account", "created_at"},
+		[]string{"id", "account_id", "category_id", "type", "amount", "description", "txn_at", "linked_account", "created_at"},
 		func(emit func([]string)) {
 			for rows.Next() {
 				var id, acct, cat, linked int64
@@ -438,7 +439,7 @@ func exportFinanceTransactions(ctx context.Context, zw *zip.Writer, deps Deps, u
 					emit([]string{
 						strconv.FormatInt(id, 10), strconv.FormatInt(acct, 10),
 						strconv.FormatInt(cat, 10), kind, strconv.FormatFloat(amt, 'f', 2, 64),
-						desc, date.Format("2006-01-02"), strconv.FormatInt(linked, 10),
+						desc, date.In(loc).Format(time.RFC3339), strconv.FormatInt(linked, 10),
 						created.Format(time.RFC3339),
 					})
 				}
@@ -824,7 +825,9 @@ func importFinTransactions(ctx context.Context, deps Deps, uid string, body []by
 	}
 	n := 0
 	for _, r := range rows {
-		// id,account_id,category_id,type,amount,description,txn_date,linked_account,created_at
+		// id,account_id,category_id,type,amount,description,txn_at,linked_account,created_at
+		// (col 6 = txn_at ISO; legacy backups hold a bare date there — both are
+		// read as IST wall-clock by the cast below.)
 		if len(r) < 8 {
 			continue
 		}
@@ -847,8 +850,8 @@ func importFinTransactions(ctx context.Context, deps Deps, uid string, body []by
 		}
 		amt, _ := strconv.ParseFloat(r[4], 64)
 		_, err := deps.DB.ExecContext(ctx, `
-			INSERT INTO fin_transactions(user_id, account_id, category_id, type, amount, description, txn_date, linked_account)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+			INSERT INTO fin_transactions(user_id, account_id, category_id, type, amount, description, txn_at, linked_account)
+			VALUES ($1,$2,$3,$4,$5,$6,($7::timestamp AT TIME ZONE 'Asia/Kolkata'),$8)`,
 			uid, newAcct, catArg, r[3], amt, r[5], r[6], linkedArg)
 		if err == nil {
 			n++

@@ -342,7 +342,7 @@ func (d *DB) migrate() error {
 		type            TEXT        NOT NULL DEFAULT 'expense',
 		amount          NUMERIC(14,2) NOT NULL DEFAULT 0,
 		description     TEXT        NOT NULL DEFAULT '',
-		txn_date        DATE        NOT NULL,
+		txn_at          TIMESTAMPTZ NOT NULL,
 		transfer_pair   BIGINT,
 		linked_account  BIGINT      REFERENCES fin_accounts(id) ON DELETE SET NULL,
 		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -350,7 +350,8 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_user ON fin_transactions(user_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_account ON fin_transactions(account_id);
-	CREATE INDEX IF NOT EXISTS idx_fin_transactions_date ON fin_transactions(user_id, txn_date);
+	-- idx on txn_at created after the txn_date→txn_at migration below (the
+	-- column doesn't exist yet on an upgrading DB at this point in the script).
 
 	CREATE TABLE IF NOT EXISTS fin_budgets (
 		id          BIGSERIAL   PRIMARY KEY,
@@ -698,6 +699,26 @@ func (d *DB) migrate() error {
 		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		PRIMARY KEY (user_id, merchant)
 	);
+
+	-- ─── Finance: transactions gain a time-of-day (txn_date → txn_at) ──
+	-- Was a bare DATE; now a full TIMESTAMPTZ so a transaction records when,
+	-- not just which day. Existing rows are backfilled to IST midnight (the
+	-- "add 00" rule) so day-bucketed queries stay put. Guarded on the old
+	-- column existing so this is a no-op on fresh installs (which already
+	-- create txn_at) and runs exactly once on an upgrading DB.
+	DO $$
+	BEGIN
+		IF EXISTS (SELECT 1 FROM information_schema.columns
+		           WHERE table_name = 'fin_transactions' AND column_name = 'txn_date') THEN
+			ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS txn_at TIMESTAMPTZ;
+			UPDATE fin_transactions
+				SET txn_at = (txn_date::timestamp AT TIME ZONE 'Asia/Kolkata')
+				WHERE txn_at IS NULL;
+			ALTER TABLE fin_transactions ALTER COLUMN txn_at SET NOT NULL;
+			ALTER TABLE fin_transactions DROP COLUMN txn_date;  -- cascades old idx
+		END IF;
+	END $$;
+	CREATE INDEX IF NOT EXISTS idx_fin_transactions_at ON fin_transactions(user_id, txn_at);
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err

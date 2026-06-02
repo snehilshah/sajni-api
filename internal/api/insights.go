@@ -310,13 +310,13 @@ func detectHabitStreaks(ctx context.Context, d *db.DB, uid string, cutoff string
 func detectSpendingSpikes(ctx context.Context, d *db.DB, uid string, cutoff string, days int) []detected {
 	rows, err := d.QueryContext(ctx, `WITH recent AS (
 		SELECT category_id, SUM(amount) AS amt
-		FROM fin_transactions WHERE user_id=$1 AND type='expense' AND txn_date >= $2
+		FROM fin_transactions WHERE user_id=$1 AND type='expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date >= $2
 		GROUP BY category_id),
 	baseline AS (
 		SELECT category_id, AVG(daily) AS avg_daily FROM (
-			SELECT category_id, txn_date, SUM(amount) AS daily
-			FROM fin_transactions WHERE user_id=$1 AND type='expense' AND txn_date < $2
-			GROUP BY category_id, txn_date
+			SELECT category_id, (txn_at AT TIME ZONE 'Asia/Kolkata')::date AS d, SUM(amount) AS daily
+			FROM fin_transactions WHERE user_id=$1 AND type='expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date < $2
+			GROUP BY category_id, d
 		) x GROUP BY category_id)
 	SELECT c.name, r.amt, COALESCE(b.avg_daily,0) * $3
 	FROM recent r LEFT JOIN baseline b ON b.category_id = r.category_id
@@ -479,10 +479,10 @@ func timeTravelHandler(deps Deps) http.HandlerFunc {
 			}
 		}
 		if all || allow["transaction"] {
-			rows, _ := d.Query(`SELECT t.id, t.txn_date::text, t.description, a.name FROM fin_transactions t
+			rows, _ := d.Query(`SELECT t.id, (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date::text, t.description, a.name FROM fin_transactions t
 				JOIN fin_accounts a ON a.id = t.account_id
-				WHERE t.user_id=$1 AND t.description ILIKE $2`+date("t.txn_date")+
-				` ORDER BY t.txn_date DESC LIMIT 20`, append([]any{uid, like}, dargs...)...)
+				WHERE t.user_id=$1 AND t.description ILIKE $2`+date("(t.txn_at AT TIME ZONE 'Asia/Kolkata')::date")+
+				` ORDER BY t.txn_at DESC LIMIT 20`, append([]any{uid, like}, dargs...)...)
 			if rows != nil {
 				for rows.Next() {
 					var id int64

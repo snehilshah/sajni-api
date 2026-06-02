@@ -1181,19 +1181,19 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		vals = append(vals, a)
 	}
 	if df := argStr(args, "date_from"); df != "" {
-		clauses = append(clauses, fmt.Sprintf("t.txn_date >= $%d", len(vals)+1))
+		clauses = append(clauses, fmt.Sprintf("(t.txn_at AT TIME ZONE 'Asia/Kolkata')::date >= $%d", len(vals)+1))
 		vals = append(vals, df)
 	}
 	if dt := argStr(args, "date_to"); dt != "" {
-		clauses = append(clauses, fmt.Sprintf("t.txn_date <= $%d", len(vals)+1))
+		clauses = append(clauses, fmt.Sprintf("(t.txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $%d", len(vals)+1))
 		vals = append(vals, dt)
 	}
 	limit := argInt(args, "limit", 50)
-	q := `SELECT t.id, t.account_id, t.type, t.amount, t.description, t.txn_date::text, t.category_id, COALESCE(c.name, '') 
-	      FROM fin_transactions t 
-	      LEFT JOIN fin_categories c ON c.id = t.category_id 
+	q := `SELECT t.id, t.account_id, t.type, t.amount, t.description, (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date::text, t.category_id, COALESCE(c.name, '')
+	      FROM fin_transactions t
+	      LEFT JOIN fin_categories c ON c.id = t.category_id
 	      WHERE ` + strings.Join(clauses, " AND ") +
-		fmt.Sprintf(` ORDER BY t.txn_date DESC LIMIT %d`, limit)
+		fmt.Sprintf(` ORDER BY t.txn_at DESC LIMIT %d`, limit)
 	rows, err := d.QueryContext(ctx, q, vals...)
 	if err != nil {
 		return nil, nil, err
@@ -1265,13 +1265,13 @@ func runSearchTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	}
 	if want("transaction") {
 		add("transaction", `
-			SELECT t.id, 
-			       t.description || ' - ' || t.txn_date::text AS title, 
-			       a.currency || ' ' || t.amount::text AS subtitle 
-			FROM fin_transactions t 
-			JOIN fin_accounts a ON a.id = t.account_id 
-			WHERE t.user_id=$1 AND ($2='' OR t.description ILIKE $3) 
-			ORDER BY t.txn_date DESC LIMIT 10`)
+			SELECT t.id,
+			       t.description || ' - ' || (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date::text AS title,
+			       a.currency || ' ' || t.amount::text AS subtitle
+			FROM fin_transactions t
+			JOIN fin_accounts a ON a.id = t.account_id
+			WHERE t.user_id=$1 AND ($2='' OR t.description ILIKE $3)
+			ORDER BY t.txn_at DESC LIMIT 10`)
 	}
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
@@ -1757,9 +1757,6 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	}
 	desc := argStr(args, "description")
 	date := argStr(args, "date")
-	if date == "" {
-		date = time.Now().Format("2006-01-02")
-	}
 
 	// Resolve Category
 	var catID int64 = argInt(args, "category_id", 0)
@@ -1783,11 +1780,19 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		catArg = catID
 	}
 
+	// txn_at: a model-supplied date is read as IST midnight; absent → now (so a
+	// chat-logged "spent 200 on lunch" gets a real time, not midnight).
+	insArgs := []any{uid, acct, catArg, ttype, amount, desc}
+	txnCol := "NOW()"
+	if date != "" {
+		txnCol = "($7::timestamp AT TIME ZONE 'Asia/Kolkata')"
+		insArgs = append(insArgs, date)
+	}
 	var id int64
-	err := d.QueryRowContext(ctx, `
-		INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_date)
-		VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-		uid, acct, catArg, ttype, amount, desc, date).Scan(&id)
+	err := d.QueryRowContext(ctx,
+		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,`+txnCol+`) RETURNING id`,
+		insArgs...).Scan(&id)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1853,7 +1858,9 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		add("description", argStr(args, "description"))
 	}
 	if dt := argStr(args, "date"); dt != "" {
-		add("txn_date", dt)
+		sets = append(sets, fmt.Sprintf("txn_at = ($%d::timestamp AT TIME ZONE 'Asia/Kolkata')", ph))
+		vals = append(vals, dt)
+		ph++
 	}
 	if len(sets) == 1 {
 		return nil, nil, fmt.Errorf("nothing to update")
@@ -1932,8 +1939,8 @@ func listBudgetsTool(ctx context.Context, d *db.DB, uid string, args map[string]
 				itemRows.Scan(&itemID, &catID, &amt, &catName)
 				var spent float64
 				if catID.Valid {
-					d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions 
-						WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND txn_date BETWEEN $3 AND $4`,
+					d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+						WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
 						uid, catID.Int64, startDate, endDate).Scan(&spent)
 				}
 				item := map[string]any{
@@ -1948,8 +1955,8 @@ func listBudgetsTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		}
 
 		var totalSpent float64
-		d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions 
-			WHERE user_id = $1 AND type = 'expense' AND txn_date BETWEEN $2 AND $3`,
+		d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+			WHERE user_id = $1 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
 			uid, startDate, endDate).Scan(&totalSpent)
 
 		out = append(out, map[string]any{

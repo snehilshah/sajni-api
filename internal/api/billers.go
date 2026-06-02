@@ -370,8 +370,8 @@ func postBillerTxn(ctx context.Context, deps Deps, uid string, billerID, account
 		catArg = categoryID.Int64
 	}
 	err := d.QueryRowContext(ctx,
-		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_date)
-		 VALUES ($1,$2,$3,'expense',$4,$5,$6) RETURNING id`,
+		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_at)
+		 VALUES ($1,$2,$3,'expense',$4,$5,($6::timestamp AT TIME ZONE 'Asia/Kolkata')) RETURNING id`,
 		uid, accountID, catArg, amount, desc, paidDate).Scan(&txnID)
 	if err != nil {
 		return 0, err

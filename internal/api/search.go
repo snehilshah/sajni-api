@@ -196,11 +196,11 @@ func search(deps Deps) http.HandlerFunc {
 		// Finance transactions
 		if want("transaction") {
 			results = appendQuery(results, d, "transaction",
-				`SELECT t.id, t.description, t.amount::text, t.type, t.txn_date::text, COALESCE(a.name, '')
+				`SELECT t.id, t.description, t.amount::text, t.type, (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date::text, COALESCE(a.name, '')
 				 FROM fin_transactions t
 				 LEFT JOIN fin_accounts a ON a.id = t.account_id
 				 WHERE t.user_id = $1 AND ($2 = '' OR t.description ILIKE $3)
-				 ORDER BY t.txn_date DESC LIMIT 30`,
+				 ORDER BY t.txn_at DESC LIMIT 30`,
 				uid, q, like,
 				func(rs *sql.Rows) (SearchHit, bool) {
 					var id int64

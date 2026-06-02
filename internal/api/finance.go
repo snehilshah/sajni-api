@@ -473,10 +473,51 @@ type txnResp struct {
 	Amount        float64 `json:"amount"`
 	Description   string  `json:"description"`
 	Note          string  `json:"note"`
-	TxnDate       string  `json:"txn_date"`
+	TxnAt         string  `json:"txn_at"` // RFC3339 in IST (carries +05:30)
 	TransferPair  *int64  `json:"transfer_pair"`
 	LinkedAccount *int64  `json:"linked_account"`
 	CreatedAt     string  `json:"created_at"`
+}
+
+// istDateExpr is the SQL that projects a txn_at TIMESTAMPTZ down to its IST
+// calendar date — used wherever a query filters/groups by day, so the existing
+// date-string params (from/to, month boundaries) keep their exact semantics
+// after the txn_date→txn_at migration.
+const istDateExpr = "(%s AT TIME ZONE 'Asia/Kolkata')::date"
+
+func istDate(col string) string { return fmt.Sprintf(istDateExpr, col) }
+
+// resolveTxnAt picks a transaction instant from a request: the new ISO txn_at
+// (preferred), else the legacy date-only txn_date read as IST midnight
+// (back-compat for older web / the android app), else `now`.
+func resolveTxnAt(loc *time.Location, txnAt, txnDate string, now time.Time) time.Time {
+	if txnAt != "" {
+		if t, err := time.Parse(time.RFC3339, txnAt); err == nil {
+			return t
+		}
+	}
+	if txnDate != "" {
+		if d, err := time.ParseInLocation("2006-01-02", txnDate, loc); err == nil {
+			return d // IST midnight
+		}
+	}
+	return now
+}
+
+// composeTxnAt builds an IST instant from a date ("YYYY-MM-DD") and an optional
+// time ("HH:MM"). A blank/invalid time falls back to now's clock, so an
+// AI-parsed message that states no time lands on the current minute rather than
+// midnight (per the parse-message contract). Bad date → now.
+func composeTxnAt(loc *time.Location, date, hhmm string, now time.Time) time.Time {
+	d, err := time.ParseInLocation("2006-01-02", date, loc)
+	if err != nil {
+		return now
+	}
+	hh, mm, ss := now.Hour(), now.Minute(), now.Second()
+	if t, err := time.ParseInLocation("15:04", hhmm, loc); err == nil {
+		hh, mm, ss = t.Hour(), t.Minute(), 0
+	}
+	return time.Date(d.Year(), d.Month(), d.Day(), hh, mm, ss, 0, loc)
 }
 
 func listTransactions(deps Deps) http.HandlerFunc {
@@ -503,12 +544,12 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			ph++
 		}
 		if v := queryParam(r, "from"); v != "" {
-			clauses = append(clauses, "t.txn_date >= $"+itoa(ph))
+			clauses = append(clauses, istDate("t.txn_at")+" >= $"+itoa(ph))
 			args = append(args, v)
 			ph++
 		}
 		if v := queryParam(r, "to"); v != "" {
-			clauses = append(clauses, "t.txn_date <= $"+itoa(ph))
+			clauses = append(clauses, istDate("t.txn_at")+" <= $"+itoa(ph))
 			args = append(args, v)
 			ph++
 		}
@@ -526,12 +567,12 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		}
 
 		q := `SELECT t.id, t.account_id, a.name, t.category_id, c.name, c.color, t.type, t.amount,
-			  t.description, t.note, t.txn_date::text, t.transfer_pair, t.linked_account, t.created_at::text
+			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.created_at::text
 			  FROM fin_transactions t
 			  JOIN fin_accounts a ON a.id = t.account_id
 			  LEFT JOIN fin_categories c ON c.id = t.category_id
 			  WHERE ` + strings.Join(clauses, " AND ") +
-			` ORDER BY t.txn_date DESC, t.id DESC LIMIT ` + itoa(limit)
+			` ORDER BY t.txn_at DESC, t.id DESC LIMIT ` + itoa(limit)
 
 		rows, err := d.Query(q, args...)
 		if err != nil {
@@ -539,11 +580,14 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			return
 		}
 		defer rows.Close()
+		loc := userLocation(d, uid)
 		var out []txnResp
 		for rows.Next() {
 			var t txnResp
+			var at time.Time
 			rows.Scan(&t.ID, &t.AccountID, &t.AccountName, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
-				&t.Type, &t.Amount, &t.Description, &t.Note, &t.TxnDate, &t.TransferPair, &t.LinkedAccount, &t.CreatedAt)
+				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount, &t.CreatedAt)
+			t.TxnAt = at.In(loc).Format(time.RFC3339)
 			out = append(out, t)
 		}
 		if out == nil {
@@ -564,7 +608,8 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			Amount        float64 `json:"amount"`
 			Description   string  `json:"description"`
 			Note          string  `json:"note"`
-			TxnDate       string  `json:"txn_date"`
+			TxnAt         string  `json:"txn_at"`   // RFC3339 (IST). Preferred.
+			TxnDate       string  `json:"txn_date"` // legacy date-only; back-compat
 			LinkedAccount *int64  `json:"linked_account"`
 		}
 		if err := readJSON(r, &b); err != nil {
@@ -578,9 +623,7 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		if b.Type == "" {
 			b.Type = "expense"
 		}
-		if b.TxnDate == "" {
-			b.TxnDate = userNow(d, uid).Format("2006-01-02")
-		}
+		txnAt := resolveTxnAt(userLocation(d, uid), b.TxnAt, b.TxnDate, userNow(d, uid))
 
 		// Transfer: insert a pair (transfer_out from source, transfer_in to dest)
 		if b.Type == "transfer" {
@@ -594,14 +637,14 @@ func createTransaction(deps Deps) http.HandlerFunc {
 				return
 			}
 			var outID, inID int64
-			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_date, linked_account) VALUES ($1,$2,'transfer_out',$3,$4,$5,$6,$7) RETURNING id`,
-				uid, b.AccountID, b.Amount, b.Description, b.Note, b.TxnDate, *b.LinkedAccount).Scan(&outID); err != nil {
+			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_at, linked_account) VALUES ($1,$2,'transfer_out',$3,$4,$5,$6,$7) RETURNING id`,
+				uid, b.AccountID, b.Amount, b.Description, b.Note, txnAt, *b.LinkedAccount).Scan(&outID); err != nil {
 				tx.Rollback()
 				errJSON(w, 500, err.Error())
 				return
 			}
-			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_date, linked_account, transfer_pair) VALUES ($1,$2,'transfer_in',$3,$4,$5,$6,$7,$8) RETURNING id`,
-				uid, *b.LinkedAccount, b.Amount, b.Description, b.Note, b.TxnDate, b.AccountID, outID).Scan(&inID); err != nil {
+			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_at, linked_account, transfer_pair) VALUES ($1,$2,'transfer_in',$3,$4,$5,$6,$7,$8) RETURNING id`,
+				uid, *b.LinkedAccount, b.Amount, b.Description, b.Note, txnAt, b.AccountID, outID).Scan(&inID); err != nil {
 				tx.Rollback()
 				errJSON(w, 500, err.Error())
 				return
@@ -622,8 +665,8 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		}
 
 		var id int64
-		err := d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, note, txn_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-			uid, b.AccountID, b.CategoryID, b.Type, b.Amount, b.Description, b.Note, b.TxnDate,
+		err := d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, note, txn_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+			uid, b.AccountID, b.CategoryID, b.Type, b.Amount, b.Description, b.Note, txnAt,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -653,7 +696,8 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			Amount      *float64 `json:"amount"`
 			Description *string  `json:"description"`
 			Note        *string  `json:"note"`
-			TxnDate     *string  `json:"txn_date"`
+			TxnAt       *string  `json:"txn_at"`   // RFC3339 (IST). Preferred.
+			TxnDate     *string  `json:"txn_date"` // legacy date-only; back-compat
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -685,9 +729,17 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			// Re-index #hashtags from the edited note.
 			syncTags(d, uid, "transaction", id, *b.Note)
 		}
-		if b.TxnDate != nil {
-			d.Exec("UPDATE fin_transactions SET txn_date = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.TxnDate, id, uid)
-			d.Exec("UPDATE fin_transactions SET txn_date = $1, updated_at = NOW() WHERE transfer_pair = $2 AND user_id = $3", *b.TxnDate, id, uid)
+		if b.TxnAt != nil || b.TxnDate != nil {
+			at, dt := "", ""
+			if b.TxnAt != nil {
+				at = *b.TxnAt
+			}
+			if b.TxnDate != nil {
+				dt = *b.TxnDate
+			}
+			txnAt := resolveTxnAt(userLocation(d, uid), at, dt, userNow(d, uid))
+			d.Exec("UPDATE fin_transactions SET txn_at = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", txnAt, id, uid)
+			d.Exec("UPDATE fin_transactions SET txn_at = $1, updated_at = NOW() WHERE transfer_pair = $2 AND user_id = $3", txnAt, id, uid)
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
@@ -757,7 +809,7 @@ func listBudgets(deps Deps) http.HandlerFunc {
 					itemRows.Scan(&it.ID, &it.CategoryID, &it.Amount)
 					if it.CategoryID != nil {
 						d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-							WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND txn_date BETWEEN $3 AND $4`,
+							WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
 							uid, *it.CategoryID, b.StartDate, b.EndDate).Scan(&it.Spent)
 					}
 					b.Items = append(b.Items, it)
@@ -768,7 +820,7 @@ func listBudgets(deps Deps) http.HandlerFunc {
 				b.Items = []budgetItemResp{}
 			}
 			d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-				WHERE user_id = $1 AND type = 'expense' AND txn_date BETWEEN $2 AND $3`,
+				WHERE user_id = $1 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
 				uid, b.StartDate, b.EndDate).Scan(&b.Spent)
 			out = append(out, b)
 		}
@@ -1012,8 +1064,8 @@ func createInvestment(deps Deps) http.HandlerFunc {
 			if b.StartDate != nil && *b.StartDate != "" {
 				buyDate = *b.StartDate
 			}
-			d.Exec(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_date)
-				VALUES ($1,$2,'buy',$3,$4,$5)`, uid, *b.AccountID, b.InvestedAmount, "Buy "+b.Name, buyDate)
+			d.Exec(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_at)
+				VALUES ($1,$2,'buy',$3,$4,($5::timestamp AT TIME ZONE 'Asia/Kolkata'))`, uid, *b.AccountID, b.InvestedAmount, "Buy "+b.Name, buyDate)
 		}
 		writeJSON(w, 201, map[string]int64{"id": id})
 	}
@@ -1121,8 +1173,8 @@ func sellInvestment(deps Deps) http.HandlerFunc {
 				return
 			}
 		}
-		if _, e := tx.Exec(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_date)
-			VALUES ($1,$2,'sell',$3,$4,$5)`, uid, *acctID, proceeds, "Sell "+name, date); e != nil {
+		if _, e := tx.Exec(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_at)
+			VALUES ($1,$2,'sell',$3,$4,($5::timestamp AT TIME ZONE 'Asia/Kolkata'))`, uid, *acctID, proceeds, "Sell "+name, date); e != nil {
 			tx.Rollback()
 			errJSON(w, 500, e.Error())
 			return
@@ -1488,10 +1540,10 @@ func createStatement(deps Deps) http.HandlerFunc {
 		} else {
 			var spend, refund float64
 			d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-				WHERE user_id = $1 AND account_id = $2 AND type = 'expense' AND txn_date > $3 AND txn_date <= $4`,
+				WHERE user_id = $1 AND account_id = $2 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
 				uid, acctID, from, b.StatementDate).Scan(&spend)
 			d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-				WHERE user_id = $1 AND account_id = $2 AND type = 'income' AND txn_date > $3 AND txn_date <= $4`,
+				WHERE user_id = $1 AND account_id = $2 AND type = 'income' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
 				uid, acctID, from, b.StatementDate).Scan(&refund)
 			newCharges = spend - refund
 		}
@@ -1514,7 +1566,7 @@ func createStatement(deps Deps) http.HandlerFunc {
 		}
 		var payments float64
 		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_in' AND txn_date > $3 AND txn_date <= $4`,
+			WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_in' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
 			uid, acctID, from, b.StatementDate).Scan(&payments)
 		prevBalance -= payments
 
@@ -1610,12 +1662,12 @@ func updateStatement(deps Deps) http.HandlerFunc {
 					tx, terr := d.Begin()
 					if terr == nil {
 						var outID int64
-						if e := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_date, linked_account)
-							VALUES ($1,$2,'transfer_out',$3,$4,$5,$6) RETURNING id`,
+						if e := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_at, linked_account)
+							VALUES ($1,$2,'transfer_out',$3,$4,($5::timestamp AT TIME ZONE 'Asia/Kolkata'),$6) RETURNING id`,
 							uid, *b.PaidFromAccount, amountDue, "Credit card payment", today, cardID).Scan(&outID); e == nil {
 							var inID int64
-							tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_date, linked_account, transfer_pair)
-								VALUES ($1,$2,'transfer_in',$3,$4,$5,$6,$7) RETURNING id`,
+							tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_at, linked_account, transfer_pair)
+								VALUES ($1,$2,'transfer_in',$3,$4,($5::timestamp AT TIME ZONE 'Asia/Kolkata'),$6,$7) RETURNING id`,
 								uid, cardID, amountDue, "Credit card payment", today, *b.PaidFromAccount, outID).Scan(&inID)
 							tx.Exec("UPDATE fin_transactions SET transfer_pair = $1 WHERE id = $2", inID, outID)
 							tx.Commit()
@@ -1704,8 +1756,8 @@ func financeOverview(deps Deps) http.HandlerFunc {
 		monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
 		monthEnd := now.Format("2006-01-02")
 		var monthIncome, monthExpense float64
-		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND type = 'income' AND txn_date BETWEEN $2 AND $3`, uid, monthStart, monthEnd).Scan(&monthIncome)
-		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND type = 'expense' AND txn_date BETWEEN $2 AND $3`, uid, monthStart, monthEnd).Scan(&monthExpense)
+		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND type = 'income' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`, uid, monthStart, monthEnd).Scan(&monthIncome)
+		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`, uid, monthStart, monthEnd).Scan(&monthExpense)
 
 		// Top expense categories this month
 		type CatStat struct {
@@ -1717,7 +1769,7 @@ func financeOverview(deps Deps) http.HandlerFunc {
 		var topCats []CatStat
 		crows, _ := d.Query(`SELECT c.id, COALESCE(c.name, 'Uncategorized'), COALESCE(c.color, '#6B7280'), SUM(t.amount)
 			FROM fin_transactions t LEFT JOIN fin_categories c ON c.id = t.category_id
-			WHERE t.user_id = $1 AND t.type = 'expense' AND t.txn_date BETWEEN $2 AND $3
+			WHERE t.user_id = $1 AND t.type = 'expense' AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3
 			GROUP BY c.id, c.name, c.color ORDER BY SUM(t.amount) DESC LIMIT 8`, uid, monthStart, monthEnd)
 		if crows != nil {
 			for crows.Next() {
@@ -1735,11 +1787,11 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			Expense float64 `json:"expense"`
 		}
 		trendStart := now.AddDate(0, 0, -29).Format("2006-01-02")
-		drows, _ := d.Query(`SELECT txn_date::text,
+		drows, _ := d.Query(`SELECT (txn_at AT TIME ZONE 'Asia/Kolkata')::date::text AS d,
 			COALESCE(SUM(CASE WHEN type='income' THEN amount END), 0),
 			COALESCE(SUM(CASE WHEN type='expense' THEN amount END), 0)
-			FROM fin_transactions WHERE user_id = $1 AND txn_date >= $2 AND type IN ('income','expense')
-			GROUP BY txn_date ORDER BY txn_date ASC`, uid, trendStart)
+			FROM fin_transactions WHERE user_id = $1 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date >= $2 AND type IN ('income','expense')
+			GROUP BY d ORDER BY d ASC`, uid, trendStart)
 		var trend []DayPoint
 		if drows != nil {
 			for drows.Next() {
@@ -1949,11 +2001,11 @@ func exportTransactionsCSV(deps Deps) http.HandlerFunc {
 		cw := csv.NewWriter(w)
 		defer cw.Flush()
 		cw.Write([]string{"date", "account", "type", "category", "amount", "description"})
-		rows, _ := d.Query(`SELECT t.txn_date::text, a.name, t.type, COALESCE(c.name,''), t.amount, t.description
+		rows, _ := d.Query(`SELECT (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date::text, a.name, t.type, COALESCE(c.name,''), t.amount, t.description
 			FROM fin_transactions t
 			JOIN fin_accounts a ON a.id = t.account_id
 			LEFT JOIN fin_categories c ON c.id = t.category_id
-			WHERE t.user_id = $1 ORDER BY t.txn_date ASC, t.id ASC`, uid)
+			WHERE t.user_id = $1 ORDER BY t.txn_at ASC, t.id ASC`, uid)
 		if rows != nil {
 			for rows.Next() {
 				var date, acct, ttype, cat, desc string
@@ -1982,7 +2034,7 @@ func exportBudgetsCSV(deps Deps) http.HandlerFunc {
 				var name, period, sd, ed string
 				rows.Scan(&bid, &name, &period, &sd, &ed)
 				irows, _ := d.Query(`SELECT COALESCE(c.name,''), bi.amount,
-					COALESCE((SELECT SUM(t.amount) FROM fin_transactions t WHERE t.user_id = $1 AND t.type = 'expense' AND t.category_id = bi.category_id AND t.txn_date BETWEEN $2 AND $3), 0)
+					COALESCE((SELECT SUM(t.amount) FROM fin_transactions t WHERE t.user_id = $1 AND t.type = 'expense' AND t.category_id = bi.category_id AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3), 0)
 					FROM fin_budget_items bi LEFT JOIN fin_categories c ON c.id = bi.category_id
 					WHERE bi.budget_id = $4`, uid, sd, ed, bid)
 				if irows != nil {
@@ -2321,7 +2373,9 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		today := userNow(deps.DB, uid).Format("2006-01-02")
+		loc := userLocation(deps.DB, uid)
+		now := userNow(deps.DB, uid)
+		today := now.Format("2006-01-02")
 		ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
 		defer cancel()
 
@@ -2334,7 +2388,7 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 			// Best-effort: empty fields → sheet opens for manual entry.
 			writeJSON(w, 200, map[string]any{
 				"amount": 0, "type": "expense", "description": "", "note": "",
-				"date": today, "account_hint": "", "account_id": nil, "category_id": nil, "category_name": "",
+				"txn_at": now.Format(time.RFC3339), "account_hint": "", "account_id": nil, "category_id": nil, "category_name": "",
 			})
 			return
 		}
@@ -2393,12 +2447,15 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 			acctID = matchAccountByHint(deps.DB, uid, parsed.AccountHint)
 		}
 
+		// Compose the prefill instant: parsed date + parsed time, falling back
+		// to the current minute when the message stated no time.
+		txnAt := composeTxnAt(loc, parsed.Date, parsed.Time, now)
 		writeJSON(w, 200, map[string]any{
 			"amount":        parsed.Amount,
 			"type":          parsed.Type,
 			"description":   parsed.Description,
 			"note":          parsed.Note,
-			"date":          parsed.Date,
+			"txn_at":        txnAt.Format(time.RFC3339),
 			"account_hint":  parsed.AccountHint,
 			"account_id":    acctID,
 			"category_id":   catID,
