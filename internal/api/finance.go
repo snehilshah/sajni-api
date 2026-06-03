@@ -53,6 +53,7 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 
 	// Credit card statements
 	mux.HandleFunc("GET /api/finance/cards/statements", listStatements(deps))
+	mux.HandleFunc("POST /api/finance/cards/{id}/statement-preview", previewStatement(deps))
 	mux.HandleFunc("POST /api/finance/cards/{id}/statements", createStatement(deps))
 	mux.HandleFunc("PUT /api/finance/cards/statements/{id}", updateStatement(deps))
 	mux.HandleFunc("DELETE /api/finance/cards/statements/{id}", deleteStatement(deps))
@@ -1492,6 +1493,127 @@ func deriveDueDate(deps Deps, uid string, acctID int64, stmtDate string) string 
 	return time.Date(year, month, dd, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
 }
 
+type statementCalcInput struct {
+	StatementDate  string
+	AmountDue      *float64
+	NewCharges     *float64
+	CashbackEarned *float64
+}
+
+type statementCalcResult struct {
+	AmountDue       float64 `json:"amount_due"`
+	NewCharges      float64 `json:"new_charges"`
+	PreviousBalance float64 `json:"previous_balance"`
+	CashbackEarned  float64 `json:"cashback_earned"`
+	Payments        float64 `json:"payments"`
+}
+
+func computeStatementTotals(d *db.DB, uid string, acctID int64, in statementCalcInput) statementCalcResult {
+	// Cycle window: previous statement_date (exclusive) -> this one (inclusive).
+	var lastStmt *string
+	d.QueryRow("SELECT MAX(statement_date)::text FROM fin_cc_statements WHERE user_id = $1 AND account_id = $2 AND statement_date < $3",
+		uid, acctID, in.StatementDate).Scan(&lastStmt)
+	from := "1970-01-01"
+	if lastStmt != nil {
+		from = *lastStmt
+	}
+
+	var newCharges float64
+	if in.NewCharges != nil {
+		newCharges = *in.NewCharges
+	} else {
+		var spend, refund float64
+		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+			WHERE user_id = $1 AND account_id = $2 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
+			uid, acctID, from, in.StatementDate).Scan(&spend)
+		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+			WHERE user_id = $1 AND account_id = $2 AND type = 'income' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
+			uid, acctID, from, in.StatementDate).Scan(&refund)
+		newCharges = spend - refund
+	}
+
+	var prevBalance float64
+	var priorTotal *float64
+	d.QueryRow(`SELECT amount_due FROM fin_cc_statements
+		WHERE user_id = $1 AND account_id = $2 AND statement_date < $3
+		ORDER BY statement_date DESC LIMIT 1`, uid, acctID, in.StatementDate).Scan(&priorTotal)
+	if priorTotal != nil {
+		prevBalance = *priorTotal
+	} else {
+		var opening float64
+		d.QueryRow("SELECT opening_balance FROM fin_accounts WHERE id = $1 AND user_id = $2", acctID, uid).Scan(&opening)
+		if opening < 0 {
+			prevBalance = -opening
+		}
+	}
+	var payments float64
+	d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+		WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_in' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
+		uid, acctID, from, in.StatementDate).Scan(&payments)
+	prevBalance -= payments
+
+	total := prevBalance + newCharges
+	if in.AmountDue != nil {
+		total = *in.AmountDue
+	}
+
+	var cashback float64
+	if in.CashbackEarned != nil {
+		cashback = *in.CashbackEarned
+	} else {
+		var cbType string
+		var cbVal float64
+		d.QueryRow("SELECT cashback_type, cashback_value FROM fin_accounts WHERE id = $1 AND user_id = $2", acctID, uid).Scan(&cbType, &cbVal)
+		if cbType == "percentage" && newCharges > 0 {
+			cashback = newCharges * cbVal / 100
+		} else if cbType == "fixed" {
+			cashback = cbVal
+		}
+	}
+
+	return statementCalcResult{
+		AmountDue: total, NewCharges: newCharges, PreviousBalance: prevBalance,
+		CashbackEarned: cashback, Payments: payments,
+	}
+}
+
+func previewStatement(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		acctID, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		var b struct {
+			StatementDate  string   `json:"statement_date"`
+			AmountDue      *float64 `json:"amount_due"`
+			NewCharges     *float64 `json:"new_charges"`
+			CashbackEarned *float64 `json:"cashback_earned"`
+		}
+		if err := readJSON(r, &b); err != nil {
+			errJSON(w, 400, "invalid json")
+			return
+		}
+		if b.StatementDate == "" {
+			b.StatementDate = userNow(d, uid).Format("2006-01-02")
+		}
+
+		calc := computeStatementTotals(d, uid, acctID, statementCalcInput{
+			StatementDate: b.StatementDate, AmountDue: b.AmountDue,
+			NewCharges: b.NewCharges, CashbackEarned: b.CashbackEarned,
+		})
+		writeJSON(w, 200, map[string]any{
+			"statement_date": b.StatementDate,
+			"due_date":       deriveDueDate(deps, uid, acctID, b.StatementDate),
+			"amount_due":     calc.AmountDue, "new_charges": calc.NewCharges,
+			"previous_balance": calc.PreviousBalance, "cashback_earned": calc.CashbackEarned,
+			"payments": calc.Payments,
+		})
+	}
+}
+
 // createStatement closes a billing cycle. amount_due (the payable total) =
 // previous_balance + new_charges, where:
 //   - new_charges     = purchases − refunds in (prev statement, this statement]
@@ -1524,71 +1646,10 @@ func createStatement(deps Deps) http.HandlerFunc {
 			b.StatementDate = userNow(d, uid).Format("2006-01-02")
 		}
 
-		// Cycle window: previous statement_date (exclusive) → this one (inclusive).
-		var lastStmt *string
-		d.QueryRow("SELECT MAX(statement_date)::text FROM fin_cc_statements WHERE user_id = $1 AND account_id = $2 AND statement_date < $3",
-			uid, acctID, b.StatementDate).Scan(&lastStmt)
-		from := "1970-01-01"
-		if lastStmt != nil {
-			from = *lastStmt
-		}
-
-		// New charges = purchases − refunds this cycle.
-		var newCharges float64
-		if b.NewCharges != nil {
-			newCharges = *b.NewCharges
-		} else {
-			var spend, refund float64
-			d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-				WHERE user_id = $1 AND account_id = $2 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
-				uid, acctID, from, b.StatementDate).Scan(&spend)
-			d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-				WHERE user_id = $1 AND account_id = $2 AND type = 'income' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
-				uid, acctID, from, b.StatementDate).Scan(&refund)
-			newCharges = spend - refund
-		}
-
-		// Previous balance carried in: prior statement's total − payments this
-		// cycle. No prior statement → unbilled opening debt (owed = −opening).
-		var prevBalance float64
-		var priorTotal *float64
-		d.QueryRow(`SELECT amount_due FROM fin_cc_statements
-			WHERE user_id = $1 AND account_id = $2 AND statement_date < $3
-			ORDER BY statement_date DESC LIMIT 1`, uid, acctID, b.StatementDate).Scan(&priorTotal)
-		if priorTotal != nil {
-			prevBalance = *priorTotal
-		} else {
-			var opening float64
-			d.QueryRow("SELECT opening_balance FROM fin_accounts WHERE id = $1 AND user_id = $2", acctID, uid).Scan(&opening)
-			if opening < 0 {
-				prevBalance = -opening
-			}
-		}
-		var payments float64
-		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_in' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
-			uid, acctID, from, b.StatementDate).Scan(&payments)
-		prevBalance -= payments
-
-		total := prevBalance + newCharges
-		if b.AmountDue != nil {
-			total = *b.AmountDue
-		}
-
-		// Cashback on this cycle's new charges.
-		var cashback float64
-		if b.CashbackEarned != nil {
-			cashback = *b.CashbackEarned
-		} else {
-			var cbType string
-			var cbVal float64
-			d.QueryRow("SELECT cashback_type, cashback_value FROM fin_accounts WHERE id = $1 AND user_id = $2", acctID, uid).Scan(&cbType, &cbVal)
-			if cbType == "percentage" && newCharges > 0 {
-				cashback = newCharges * cbVal / 100
-			} else if cbType == "fixed" {
-				cashback = cbVal
-			}
-		}
+		calc := computeStatementTotals(d, uid, acctID, statementCalcInput{
+			StatementDate: b.StatementDate, AmountDue: b.AmountDue,
+			NewCharges: b.NewCharges, CashbackEarned: b.CashbackEarned,
+		})
 
 		dueDate := b.DueDate
 		if dueDate == "" {
@@ -1599,15 +1660,15 @@ func createStatement(deps Deps) http.HandlerFunc {
 		err = d.QueryRow(`INSERT INTO fin_cc_statements
 			(user_id, account_id, statement_date, due_date, amount_due, new_charges, previous_balance, cashback_earned)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-			uid, acctID, b.StatementDate, dueDate, total, newCharges, prevBalance, cashback,
+			uid, acctID, b.StatementDate, dueDate, calc.AmountDue, calc.NewCharges, calc.PreviousBalance, calc.CashbackEarned,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
 		writeJSON(w, 201, map[string]any{
-			"id": id, "amount_due": total, "new_charges": newCharges,
-			"previous_balance": prevBalance, "cashback_earned": cashback,
+			"id": id, "amount_due": calc.AmountDue, "new_charges": calc.NewCharges,
+			"previous_balance": calc.PreviousBalance, "cashback_earned": calc.CashbackEarned,
 		})
 	}
 }
