@@ -146,21 +146,39 @@ func listTasks(deps Deps) http.HandlerFunc {
 		clauses := []string{"t.user_id = $1"}
 		ph := 2
 
-		// Smart list shortcut: my_day | important | planned | all | inbox.
-		// If absent, fall back to the existing list/status filters.
+		// Smart list shortcut: my_day | important | planned | scheduled |
+		// missed | all | inbox. If absent, fall back to the list/status filters.
+		// "active" excludes both done and scratched — a scratched task is
+		// abandoned, so it must drop out of every act-on-it view (and the
+		// reminder cron, see reminders.go) the same way a done task does.
+		// Dates are the USER's local day (userNow), not the server's UTC
+		// CURRENT_DATE — otherwise an IST user between 00:00–05:30 sees the
+		// wrong "today"/"overdue" set.
+		const active = "t.status NOT IN ('done','scratched')"
+		today := userNow(d, uid).Format("2006-01-02")
 		switch queryParam(r, "smart") {
 		case "my_day":
-			clauses = append(clauses, "t.due_date = CURRENT_DATE", "t.status != 'done'")
+			clauses = append(clauses, "t.due_date = $"+itoa(ph), active)
+			args = append(args, today)
+			ph++
 		case "important":
-			clauses = append(clauses, "t.important = TRUE", "t.status != 'done'")
+			clauses = append(clauses, "t.important = TRUE", active)
 		case "planned":
-			clauses = append(clauses, "t.due_date IS NOT NULL", "t.status != 'done'")
+			clauses = append(clauses, "t.due_date IS NOT NULL", active)
 		case "scheduled":
-			clauses = append(clauses, "t.scheduled_at IS NOT NULL", "t.status != 'done'")
+			clauses = append(clauses, "t.scheduled_at IS NOT NULL", active)
+		case "missed":
+			// Every still-open task whose day is already past — accumulates,
+			// not just yesterday. Drives the Missed smart list + the reschedule
+			// banner. Scratched/done are excluded by `active`.
+			clauses = append(clauses, "t.due_date < $"+itoa(ph), active)
+			args = append(args, today)
+			ph++
 		case "inbox":
 			clauses = append(clauses, "t.list_id IS NULL")
 		case "all":
-			// no extra filter
+			// no extra filter (returns done + scratched too; the client
+			// buckets them into collapsible groups)
 		}
 
 		// Explicit list filter: numeric id, "none" for tasks without a list.
@@ -214,6 +232,13 @@ func listTasks(deps Deps) http.HandlerFunc {
 		if queryParam(r, "smart") == "my_day" {
 			orderBy = `ORDER BY CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
 			         t.scheduled_at ASC NULLS LAST,
+			         t.created_at DESC`
+		}
+		// Missed leads with the oldest overdue day so the longest-ignored
+		// task is first to reschedule.
+		if queryParam(r, "smart") == "missed" {
+			orderBy = `ORDER BY t.due_date ASC,
+			         CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
 			         t.created_at DESC`
 		}
 
@@ -546,17 +571,13 @@ func updateTask(deps Deps) http.HandlerFunc {
 				oldDate = *currentDueDate
 			}
 			newDate := *body.DueDate
-			if oldDate != "" && oldDate != newDate && currentStatus != "done" {
+			if oldDate != "" && oldDate != newDate && currentStatus != "done" && currentStatus != "scratched" {
 				// If the old due date was already past (the task was missed) and
 				// we're moving to a new date, the lifecycle entry for that date is
 				// a "rescheduled", not a bare "missed" — record it that way so the
 				// Lifecycle list reads "rescheduled" instead of "missed".
 				today := userNow(d, uid).Format("2006-01-02")
-				rescheduled := oldDate < today && strings.TrimSpace(newDate) != ""
-				outcome := "missed"
-				if rescheduled {
-					outcome = "rescheduled"
-				}
+				outcome, rescheduled := rescheduleOutcome(oldDate, newDate, today)
 				var cnt int
 				d.QueryRow(
 					"SELECT COUNT(*) FROM task_due_history WHERE user_id = $1 AND task_id = $2 AND due_date = $3",
@@ -739,7 +760,7 @@ func listMissedTasks(deps Deps) http.HandlerFunc {
 		rows2, err := d.Query(
 			`SELECT id, title, status, priority, due_date::text
 			 FROM tasks
-			 WHERE user_id = $1 AND due_date = $2 AND status != 'done' AND $2::date < CURRENT_DATE`,
+			 WHERE user_id = $1 AND due_date = $2 AND status NOT IN ('done','scratched') AND $2::date < CURRENT_DATE`,
 			uid, date,
 		)
 		if err == nil {
@@ -853,6 +874,20 @@ func getTaskEvents(deps Deps) http.HandlerFunc {
 		}
 		writeJSON(w, 200, out)
 	}
+}
+
+// rescheduleOutcome classifies what to record for a task's PREVIOUS due date
+// when its due date changes while the task is still open. Moving off an
+// already-past day onto a real new day is a "rescheduled" (the user salvaged
+// it); any other change leaves the lapsed day standing as "missed". today is
+// the user's local YYYY-MM-DD. Pure, so the Missed/Lifecycle semantics are
+// unit-testable without a DB. The SQL "active" filter (status NOT IN
+// ('done','scratched')) is the row-level mirror of this same intent.
+func rescheduleOutcome(oldDate, newDate, today string) (outcome string, rescheduled bool) {
+	if oldDate != "" && oldDate < today && strings.TrimSpace(newDate) != "" {
+		return "rescheduled", true
+	}
+	return "missed", false
 }
 
 // decodeSteps tolerates malformed JSONB by returning an empty slice.

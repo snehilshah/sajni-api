@@ -133,6 +133,28 @@ func nullableStr(s string) any {
 	return s
 }
 
+// userTZLoc resolves the user's captured IANA timezone, falling back to
+// Asia/Kolkata (every Sajni user is IST). Cloud Run runs UTC, so deriving a
+// "today" or a due-date from a bare time.Now() shifts the day by 5.5h and
+// mis-resolves "today"/"tomorrow" for anyone awake past midnight IST. Mirrors
+// the api package's userLocation (kept local to avoid an import cycle).
+func userTZLoc(ctx context.Context, d *db.DB, uid string) *time.Location {
+	var tz string
+	d.QueryRowContext(ctx, `SELECT COALESCE(timezone,'') FROM users WHERE id=$1`, uid).Scan(&tz)
+	if tz == "" {
+		tz = "Asia/Kolkata"
+	}
+	if l, err := time.LoadLocation(tz); err == nil {
+		return l
+	}
+	return time.UTC
+}
+
+// userTZNow is time.Now() in the user's timezone. See userTZLoc.
+func userTZNow(ctx context.Context, d *db.DB, uid string) time.Time {
+	return time.Now().In(userTZLoc(ctx, d, uid))
+}
+
 // buildTools constructs the registry. Captures *Service so tools can
 // reach the DB and storage backend.
 func (s *Service) buildTools() []Tool {
@@ -150,12 +172,12 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_tasks",
-			Description: "List the user's tasks with optional filters. Use this before suggesting actions on tasks. Smart filters: 'my_day' (due today), 'important' (starred), 'planned' (has due date), 'inbox' (no list).",
+			Description: "List the user's tasks with optional filters. Use this before suggesting actions on tasks. Smart filters: 'my_day' (due today), 'important' (starred), 'planned' (has due date), 'missed' (overdue and still open — past due_date, not done/scratched), 'inbox' (no list). Scratched (abandoned) tasks are excluded from every smart filter; pass status='scratched' to see them.",
 			Schema: obj(map[string]*genai.Schema{
-				"smart":     str("Smart-list shortcut: 'my_day' | 'important' | 'planned' | 'inbox' | 'all'."),
+				"smart":     str("Smart-list shortcut: 'my_day' | 'important' | 'planned' | 'missed' | 'inbox' | 'all'."),
 				"list_id":   intg("Filter to a specific user list."),
 				"parent_id": intg("Set to non-zero to fetch children of a parent task. Default returns top-level only."),
-				"status":    str("Filter by status: 'todo', 'done', 'in_progress'."),
+				"status":    str("Filter by status: 'todo', 'in_progress', 'done', 'scratched'."),
 				"due_from":  str("Lower bound (inclusive) ISO date YYYY-MM-DD."),
 				"due_to":    str("Upper bound (inclusive) ISO date YYYY-MM-DD."),
 				"priority":  str("Filter by priority: 'high', 'medium', 'low'."),
@@ -385,6 +407,32 @@ func (s *Service) buildTools() []Tool {
 				}
 				return map[string]any{"id": id, "status": "done"},
 					map[string]any{"kind": "task_completed", "id": id}, nil
+			},
+		},
+		{
+			Name:        "reschedule_task",
+			Description: "Move an existing task's due date and/or time. The main way to clear 'missed' (overdue) tasks — set due_date to a future day. Resolve relative dates against get_current_context. Moving a past due_date forward is recorded as a reschedule in the task's lifecycle (not a miss). Pass scheduled_at to also set a time + reminder; due_date follows the scheduled day if omitted.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"id":           intg("Required. Task id (use list_tasks, smart='missed' to find overdue ones)."),
+				"due_date":     str("New due date, ISO YYYY-MM-DD."),
+				"scheduled_at": str("Optional new event time, ISO with offset e.g. 2026-06-06T17:00:00+05:30. Re-arms the reminder."),
+				"remind":       boolean("Optional. Email the user ~5 min before scheduled_at."),
+			}, "id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return rescheduleTaskTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "scratch_task",
+			Description: "Scratch (abandon) a task the user has decided not to do — it drops out of open lists, My Day, Missed, and reminders, but is kept (struck-through) and reversible. Prefer this over delete_task when the user says 'drop', 'skip', 'never mind', 'cancel' a task. Pass unscratch=true to restore it to 'todo'.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"id":        intg("Required. Task id."),
+				"unscratch": boolean("Optional. true restores a scratched task back to 'todo'."),
+			}, "id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return scratchTaskTool(ctx, d, uid, args)
 			},
 		},
 		{
@@ -725,21 +773,24 @@ func (s *Service) buildTools() []Tool {
 // ----- handler implementations -----
 
 func getCurrentContextTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
-	now := time.Now()
+	now := userTZNow(ctx, d, uid)
 	today := now.Format("2006-01-02")
 	out := map[string]any{
 		"today":     today,
 		"weekday":   now.Weekday().String(),
 		"timestamp": now.Format(time.RFC3339),
 	}
-	var openTasks, dueToday, habitsTotal, habitsDone, memos7d int
-	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status<>'done'`, uid).Scan(&openTasks)
-	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status<>'done' AND due_date=$2`, uid, today).Scan(&dueToday)
+	// "open" excludes scratched (abandoned) as well as done.
+	var openTasks, dueToday, missed, habitsTotal, habitsDone, memos7d int
+	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status NOT IN ('done','scratched')`, uid).Scan(&openTasks)
+	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status NOT IN ('done','scratched') AND due_date=$2`, uid, today).Scan(&dueToday)
+	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status NOT IN ('done','scratched') AND due_date < $2`, uid, today).Scan(&missed)
 	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM habits WHERE user_id=$1`, uid).Scan(&habitsTotal)
 	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM habit_logs WHERE user_id=$1 AND logged_date=$2`, uid, today).Scan(&habitsDone)
 	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM memos WHERE user_id=$1 AND created_at > NOW() - INTERVAL '7 days'`, uid).Scan(&memos7d)
 	out["open_tasks"] = openTasks
 	out["tasks_due_today"] = dueToday
+	out["tasks_missed"] = missed
 	out["habits"] = map[string]any{"total": habitsTotal, "done_today": habitsDone}
 	out["recent_memos_7d"] = memos7d
 	return out, nil, nil
@@ -749,13 +800,21 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	clauses := []string{"user_id=$1"}
 	vals := []any{uid}
 
+	// "active" excludes scratched (abandoned) and done. Dates are the user's
+	// local day, not the server's UTC CURRENT_DATE.
+	const active = "status NOT IN ('done','scratched')"
+	today := userTZNow(ctx, d, uid).Format("2006-01-02")
 	switch argStr(args, "smart") {
 	case "my_day":
-		clauses = append(clauses, "due_date = CURRENT_DATE", "status != 'done'")
+		clauses = append(clauses, fmt.Sprintf("due_date = $%d", len(vals)+1), active)
+		vals = append(vals, today)
 	case "important":
-		clauses = append(clauses, "important = TRUE", "status != 'done'")
+		clauses = append(clauses, "important = TRUE", active)
 	case "planned":
-		clauses = append(clauses, "due_date IS NOT NULL", "status != 'done'")
+		clauses = append(clauses, "due_date IS NOT NULL", active)
+	case "missed":
+		clauses = append(clauses, fmt.Sprintf("due_date < $%d", len(vals)+1), active)
+		vals = append(vals, today)
 	case "inbox":
 		clauses = append(clauses, "list_id IS NULL")
 	case "all":
@@ -842,7 +901,7 @@ func listTaskListsTool(ctx context.Context, d *db.DB, uid string) (any, map[stri
 		FROM task_lists l
 		LEFT JOIN (
 			SELECT list_id, COUNT(*) AS cnt FROM tasks
-			WHERE user_id=$1 AND parent_task_id IS NULL AND status != 'done'
+			WHERE user_id=$1 AND parent_task_id IS NULL AND status NOT IN ('done','scratched')
 			GROUP BY list_id
 		) c ON c.list_id = l.id
 		WHERE l.user_id=$1
@@ -1433,6 +1492,15 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	}
 	if scheduled != "" {
 		schArg = scheduled
+		// Keep due_date aligned to the scheduled day (user's tz) when the model
+		// set a time but no explicit date. Without this the task carries a
+		// reminder yet has a NULL due_date, so it never surfaces in My Day /
+		// Today / Planned — the "schedules well but timing feels off" glitch.
+		if dueArg == nil {
+			if t, err := time.Parse(time.RFC3339, scheduled); err == nil {
+				dueArg = t.In(userTZLoc(ctx, d, uid)).Format("2006-01-02")
+			}
+		}
 	}
 	if lid := argInt(args, "list_id", 0); lid != 0 {
 		// Validate list ownership.
@@ -1498,6 +1566,95 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	}
 	return map[string]any{"id": id, "title": title},
 		map[string]any{"kind": "task_created", "id": id, "title": title, "route": "/tasks"}, nil
+}
+
+// rescheduleTaskTool moves a task's due_date and/or scheduled_at. Mirrors the
+// REST updateTask reschedule semantics: moving a past due day forward records
+// a 'rescheduled' lifecycle row (so the Missed banner stops counting it) and
+// an audit event; setting a time re-arms the reminder by clearing reminded_at.
+func rescheduleTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	id := argInt(args, "id", 0)
+	if id == 0 {
+		return nil, nil, fmt.Errorf("missing id")
+	}
+	due := strings.TrimSpace(argStr(args, "due_date"))
+	sched := strings.TrimSpace(argStr(args, "scheduled_at"))
+	_, hasRemind := args["remind"]
+	if due == "" && sched == "" && !hasRemind {
+		return nil, nil, fmt.Errorf("nothing to change: pass due_date and/or scheduled_at")
+	}
+
+	var oldDue sql.NullString
+	var status string
+	if err := d.QueryRowContext(ctx, `SELECT due_date::text, status FROM tasks WHERE id=$1 AND user_id=$2`, id, uid).
+		Scan(&oldDue, &status); err != nil {
+		return nil, nil, fmt.Errorf("task not found")
+	}
+
+	loc := userTZLoc(ctx, d, uid)
+	today := time.Now().In(loc).Format("2006-01-02")
+
+	if due != "" {
+		od := ""
+		if oldDue.Valid {
+			od = oldDue.String
+		}
+		// A move off an already-past day (while still open) is a reschedule,
+		// not a miss — promote/insert the lifecycle row and log the event.
+		if od != "" && od != due && status != "done" && status != "scratched" && od < today {
+			var cnt int
+			d.QueryRowContext(ctx, `SELECT COUNT(*) FROM task_due_history WHERE user_id=$1 AND task_id=$2 AND due_date=$3`, uid, id, od).Scan(&cnt)
+			if cnt == 0 {
+				d.ExecContext(ctx, `INSERT INTO task_due_history (user_id, task_id, due_date, outcome) VALUES ($1,$2,$3,'rescheduled')`, uid, id, od)
+			} else {
+				d.ExecContext(ctx, `UPDATE task_due_history SET outcome='rescheduled' WHERE user_id=$1 AND task_id=$2 AND due_date=$3`, uid, id, od)
+			}
+			d.ExecContext(ctx, `INSERT INTO task_events (user_id, task_id, kind, from_val, to_val) VALUES ($1,$2,'rescheduled',$3,$4)`, uid, id, od, due)
+		}
+		d.ExecContext(ctx, `UPDATE tasks SET due_date=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, due, id, uid)
+	}
+
+	if sched != "" {
+		d.ExecContext(ctx, `UPDATE tasks SET scheduled_at=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3`, sched, id, uid)
+		if due == "" {
+			if t, err := time.Parse(time.RFC3339, sched); err == nil {
+				d.ExecContext(ctx, `UPDATE tasks SET due_date=$1 WHERE id=$2 AND user_id=$3`, t.In(loc).Format("2006-01-02"), id, uid)
+			}
+		}
+	}
+
+	if hasRemind {
+		d.ExecContext(ctx, `UPDATE tasks SET remind=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3`, argBool(args, "remind", false), id, uid)
+	}
+
+	return map[string]any{"id": id, "due_date": due, "scheduled_at": sched},
+		map[string]any{"kind": "task_updated", "id": id, "route": "/tasks"}, nil
+}
+
+// scratchTaskTool flips a task to (or back from) the 'scratched' status — an
+// abandoned task kept for the record but excluded from open lists, smart
+// views, and the reminder cron. Reversible via unscratch.
+func scratchTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	id := argInt(args, "id", 0)
+	if id == 0 {
+		return nil, nil, fmt.Errorf("missing id")
+	}
+	var cur string
+	if err := d.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=$1 AND user_id=$2`, id, uid).Scan(&cur); err != nil {
+		return nil, nil, fmt.Errorf("task not found")
+	}
+	next := "scratched"
+	if argBool(args, "unscratch", false) {
+		next = "todo"
+	}
+	if cur != next {
+		if _, err := d.ExecContext(ctx, `UPDATE tasks SET status=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, next, id, uid); err != nil {
+			return nil, nil, err
+		}
+		d.ExecContext(ctx, `INSERT INTO task_events (user_id, task_id, kind, from_val, to_val) VALUES ($1,$2,'status',$3,$4)`, uid, id, cur, next)
+	}
+	return map[string]any{"id": id, "status": next},
+		map[string]any{"kind": "task_updated", "id": id, "route": "/tasks"}, nil
 }
 
 func createHabitTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {

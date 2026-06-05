@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 )
 
 // systemPromptTemplate is the persona + house rules. Kept terse to
@@ -52,14 +51,18 @@ Today's snapshot:
 // of the user's day. Lets the model answer trivial date/count
 // questions in one round.
 func (s *Service) buildSystemInstruction(ctx context.Context, uid string) string {
-	now := time.Now()
+	now := userTZNow(ctx, s.db, uid)
+	today := now.Format("2006-01-02")
 	parts := []string{
-		fmt.Sprintf("- Date: %s (%s)", now.Format("2006-01-02"), now.Weekday()),
+		fmt.Sprintf("- Date: %s (%s)", today, now.Weekday()),
 	}
-	var openTasks, dueToday int
-	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status<>'done'`, uid).Scan(&openTasks)
-	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status<>'done' AND due_date=$2`, uid, now.Format("2006-01-02")).Scan(&dueToday)
-	parts = append(parts, fmt.Sprintf("- Open tasks: %d (%d due today)", openTasks, dueToday))
+	// "open" excludes scratched (abandoned) as well as done. Surface the
+	// overdue count so Sajni can proactively nudge a reschedule.
+	var openTasks, dueToday, missed int
+	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status NOT IN ('done','scratched')`, uid).Scan(&openTasks)
+	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status NOT IN ('done','scratched') AND due_date=$2`, uid, today).Scan(&dueToday)
+	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status NOT IN ('done','scratched') AND due_date < $2`, uid, today).Scan(&missed)
+	parts = append(parts, fmt.Sprintf("- Open tasks: %d (%d due today, %d overdue)", openTasks, dueToday, missed))
 	var habitsTotal, habitsDone int
 	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM habits WHERE user_id=$1`, uid).Scan(&habitsTotal)
 	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM habit_logs WHERE user_id=$1 AND logged_date=$2`, uid, now.Format("2006-01-02")).Scan(&habitsDone)

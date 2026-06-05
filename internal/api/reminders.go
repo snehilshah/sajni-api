@@ -86,7 +86,7 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 		  JOIN users u ON u.id = t.user_id
 		 WHERE t.remind = TRUE
 		   AND t.reminded_at IS NULL
-		   AND t.status <> 'done'
+		   AND t.status NOT IN ('done','scratched')
 		   AND t.scheduled_at IS NOT NULL
 		   AND t.scheduled_at <= NOW() + make_interval(secs => $1)
 		   AND t.scheduled_at >= NOW() - make_interval(secs => $2)
@@ -153,7 +153,7 @@ func processTaskReminders(ctx context.Context, deps Deps) int {
 		  JOIN tasks t ON t.id = r.task_id AND t.user_id = r.user_id
 		  JOIN users u ON u.id = r.user_id
 		 WHERE r.sent_at IS NULL
-		   AND t.status <> 'done'
+		   AND t.status NOT IN ('done','scratched')
 		   AND r.remind_at <= NOW()
 		   AND r.remind_at >= NOW() - make_interval(secs => $1)
 		   AND u.deleted_at IS NULL`,

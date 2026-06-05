@@ -38,7 +38,7 @@ func listTaskLists(deps Deps) http.HandlerFunc {
 			FROM task_lists l
 			LEFT JOIN (
 				SELECT list_id, COUNT(*) AS cnt FROM tasks
-				WHERE user_id = $1 AND parent_task_id IS NULL AND status != 'done'
+				WHERE user_id = $1 AND parent_task_id IS NULL AND status NOT IN ('done','scratched')
 				GROUP BY list_id
 			) c ON c.list_id = l.id
 			WHERE l.user_id = $1
