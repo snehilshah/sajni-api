@@ -39,9 +39,9 @@ func TestRescheduleOutcome(t *testing.T) {
 func TestNormalizeSteps(t *testing.T) {
 	in := []Step{
 		{ID: "keep-me", Text: "  buy milk  ", Done: true}, // trimmed, id kept
-		{ID: "", Text: "call mom"},                          // gets an id
-		{ID: "", Text: "   "},                               // dropped (blank)
-		{ID: "", Text: ""},                                  // dropped (empty)
+		{ID: "", Text: "call mom"},                        // gets an id
+		{ID: "", Text: "   "},                             // dropped (blank)
+		{ID: "", Text: ""},                                // dropped (empty)
 	}
 	out := normalizeSteps(in)
 	if len(out) != 2 {
