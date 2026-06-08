@@ -936,7 +936,8 @@ func listInvestments(deps Deps) http.HandlerFunc {
 		uid := userID(r.Context())
 		rows, err := d.Query(`SELECT id, name, type, account_id, invested_amount, current_value, monthly_amount,
 			frequency, start_date::text, maturity_date::text, expected_return, notes, last_updated::text,
-			quantity, avg_buy_price, realized_pl, status
+			quantity, avg_buy_price, realized_pl, status,
+			symbol, exchange, last_price, price_error, price_at
 			FROM fin_investments WHERE user_id = $1 ORDER BY created_at ASC`, uid)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -961,13 +962,25 @@ func listInvestments(deps Deps) http.HandlerFunc {
 			AvgBuyPrice    float64 `json:"avg_buy_price"`
 			RealizedPL     float64 `json:"realized_pl"`
 			Status         string  `json:"status"`
+			Symbol         string  `json:"symbol"`
+			Exchange       string  `json:"exchange"`
+			LastPrice      float64 `json:"last_price"`
+			PriceError     string  `json:"price_error"`
+			PriceAt        *string `json:"price_at"`
 		}
+		loc := userLocation(d, uid)
 		var out []Inv
 		for rows.Next() {
 			var i Inv
+			var priceAt *time.Time
 			rows.Scan(&i.ID, &i.Name, &i.Type, &i.AccountID, &i.InvestedAmount, &i.CurrentValue, &i.MonthlyAmount,
 				&i.Frequency, &i.StartDate, &i.MaturityDate, &i.ExpectedReturn, &i.Notes, &i.LastUpdated,
-				&i.Quantity, &i.AvgBuyPrice, &i.RealizedPL, &i.Status)
+				&i.Quantity, &i.AvgBuyPrice, &i.RealizedPL, &i.Status,
+				&i.Symbol, &i.Exchange, &i.LastPrice, &i.PriceError, &priceAt)
+			if priceAt != nil {
+				s := priceAt.In(loc).Format(time.RFC3339)
+				i.PriceAt = &s
+			}
 			out = append(out, i)
 		}
 		if out == nil {
@@ -1006,6 +1019,8 @@ func createInvestment(deps Deps) http.HandlerFunc {
 			Notes          string  `json:"notes"`
 			Quantity       float64 `json:"quantity"`
 			AvgBuyPrice    float64 `json:"avg_buy_price"`
+			Symbol         string  `json:"symbol"`   // stocks/ETFs: market ticker for EOD auto-pricing
+			Exchange       string  `json:"exchange"` // NSE (default) / BSE
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -1039,6 +1054,23 @@ func createInvestment(deps Deps) http.HandlerFunc {
 				return
 			}
 		}
+		// Stocks/ETFs may carry a market symbol for EOD auto-pricing. When one is
+		// supplied, validate it once here (validate-on-submit) so a typo fails
+		// fast; when omitted the holding is created un-priced (manual value) —
+		// kept lenient so older clients that don't send a symbol still work. The
+		// web enforces presence for good UX. sip/mutual_fund stay manual.
+		if b.Type == "stock" || b.Type == "etf" {
+			b.Symbol = strings.ToUpper(strings.TrimSpace(b.Symbol))
+			if b.Symbol != "" {
+				if b.Exchange == "" {
+					b.Exchange = "NSE"
+				}
+				if err := validateSymbol(r.Context(), b.Symbol, b.Exchange); err != nil {
+					errJSON(w, 400, err.Error())
+					return
+				}
+			}
+		}
 		// Cost basis from units × price when supplied; else trust invested_amount.
 		if b.Quantity > 0 && b.AvgBuyPrice > 0 {
 			b.InvestedAmount = b.Quantity * b.AvgBuyPrice
@@ -1049,10 +1081,10 @@ func createInvestment(deps Deps) http.HandlerFunc {
 
 		var id int64
 		err := d.QueryRow(`INSERT INTO fin_investments
-			(user_id, name, type, account_id, invested_amount, current_value, monthly_amount, frequency, start_date, maturity_date, expected_return, notes, quantity, avg_buy_price, status)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'open') RETURNING id`,
+			(user_id, name, type, account_id, invested_amount, current_value, monthly_amount, frequency, start_date, maturity_date, expected_return, notes, quantity, avg_buy_price, symbol, exchange, status)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'open') RETURNING id`,
 			uid, b.Name, b.Type, b.AccountID, b.InvestedAmount, b.CurrentValue, b.MonthlyAmount, b.Frequency,
-			b.StartDate, b.MaturityDate, b.ExpectedReturn, b.Notes, b.Quantity, b.AvgBuyPrice,
+			b.StartDate, b.MaturityDate, b.ExpectedReturn, b.Notes, b.Quantity, b.AvgBuyPrice, b.Symbol, b.Exchange,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -1214,6 +1246,8 @@ func updateInvestment(deps Deps) http.HandlerFunc {
 			Notes          *string  `json:"notes"`
 			Quantity       *float64 `json:"quantity"`
 			AvgBuyPrice    *float64 `json:"avg_buy_price"`
+			Symbol         *string  `json:"symbol"`
+			Exchange       *string  `json:"exchange"`
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -1265,6 +1299,16 @@ func updateInvestment(deps Deps) http.HandlerFunc {
 		}
 		if b.AvgBuyPrice != nil {
 			add("avg_buy_price", *b.AvgBuyPrice)
+		}
+		// A symbol edit is lazily re-validated by the price cron: reset
+		// price_at (→ stalest, NULLS FIRST) and clear the stale error so the
+		// next ping re-fetches and re-proves it.
+		if b.Symbol != nil {
+			add("symbol", strings.ToUpper(strings.TrimSpace(*b.Symbol)))
+			set = append(set, "price_at = NULL", "price_error = ''")
+		}
+		if b.Exchange != nil {
+			add("exchange", *b.Exchange)
 		}
 		args = append(args, id, uid)
 		q := "UPDATE fin_investments SET " + strings.Join(set, ", ") + " WHERE id = $" + itoa(ph) + " AND user_id = $" + itoa(ph+1)

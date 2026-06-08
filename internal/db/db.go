@@ -615,6 +615,18 @@ func (d *DB) migrate() error {
 	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS status        TEXT          NOT NULL DEFAULT 'open';
 	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS sold_at       TIMESTAMPTZ;
 
+	-- ─── Finance: auto price fetch (stocks/ETFs) ──────────────────────
+	-- symbol+exchange identify the instrument to the price provider (Yahoo
+	-- Finance, NSE=.NS/BSE=.BO); an EOD cron (chunk-per-ping, see prices.go)
+	-- refreshes last_price and recomputes current_value. price_error holds the
+	-- last fetch failure ('' = ok); price_at marks the last refresh attempt so
+	-- the cron picks the stalest holdings first.
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS symbol      TEXT NOT NULL DEFAULT '';
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS exchange    TEXT NOT NULL DEFAULT 'NSE';
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS last_price  NUMERIC(18,6) NOT NULL DEFAULT 0;
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS price_error TEXT NOT NULL DEFAULT '';
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS price_at    TIMESTAMPTZ;
+
 	-- ─── Finance: variable billers ────────────────────────────────────
 	-- e.g. electricity — amount unknown upfront. When also auto_renew, the
 	-- cron posts the last paid amount and flags the alert/email loudly.

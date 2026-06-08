@@ -371,6 +371,24 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "update_task",
+			Description: "Edit an existing task in place: title, description, priority, due_date, and/or move it between lists. This is the only way to move or promote a task to a different list — pass list_id (resolve names via list_task_lists), or to_inbox=true to clear its list. Only the fields you pass change. For reminder/scheduled-time edits use reschedule_task instead.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"id":             intg("Required. Task id (use list_tasks to find it)."),
+				"title":          str("Optional. New title."),
+				"description":    str("Optional. New details."),
+				"priority":       str("Optional. 'high' | 'medium' | 'low'."),
+				"due_date":       str("Optional. New due date, ISO YYYY-MM-DD."),
+				"list_id":        intg("Optional. Move the task into this list."),
+				"parent_task_id": intg("Optional. Re-parent as a subtask of this task id."),
+				"to_inbox":       boolean("Optional. true clears the task's list (promote to Inbox). Ignored when list_id is set."),
+			}, "id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return updateTaskTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "set_task_important",
 			Description: "Toggle or set the 'important' star on a task.",
 			Mutating:    true,
@@ -1654,6 +1672,82 @@ func scratchTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		d.ExecContext(ctx, `INSERT INTO task_events (user_id, task_id, kind, from_val, to_val) VALUES ($1,$2,'status',$3,$4)`, uid, id, cur, next)
 	}
 	return map[string]any{"id": id, "status": next},
+		map[string]any{"kind": "task_updated", "id": id, "route": "/tasks"}, nil
+}
+
+// updateTaskTool edits a task's mutable fields in place. Only the fields the
+// model actually passes are touched; everything else stays as-is. This is the
+// AI's path to move/promote a task between lists (list_id / to_inbox) — the gap
+// the read/write tool split previously had no cover for. Time/reminder edits
+// stay with reschedule_task, which owns the reschedule lifecycle bookkeeping.
+func updateTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	id := argInt(args, "id", 0)
+	if id == 0 {
+		return nil, nil, fmt.Errorf("missing id")
+	}
+	var exists int
+	d.QueryRowContext(ctx, `SELECT 1 FROM tasks WHERE id=$1 AND user_id=$2`, id, uid).Scan(&exists)
+	if exists != 1 {
+		return nil, nil, fmt.Errorf("task not found")
+	}
+
+	var (
+		sets []string
+		vals []any
+	)
+	add := func(frag string, v any) {
+		vals = append(vals, v)
+		sets = append(sets, fmt.Sprintf("%s=$%d", frag, len(vals)))
+	}
+
+	if _, ok := args["title"]; ok {
+		if t := strings.TrimSpace(argStr(args, "title")); t != "" {
+			add("title", t)
+		}
+	}
+	if _, ok := args["description"]; ok {
+		add("description", argStr(args, "description"))
+	}
+	if _, ok := args["priority"]; ok {
+		if p := strings.TrimSpace(argStr(args, "priority")); p == "high" || p == "medium" || p == "low" {
+			add("priority", p)
+		}
+	}
+	if _, ok := args["due_date"]; ok {
+		if due := strings.TrimSpace(argStr(args, "due_date")); due != "" {
+			add("due_date", due)
+		}
+	}
+	if lid := argInt(args, "list_id", 0); lid != 0 {
+		var ok int
+		d.QueryRowContext(ctx, `SELECT 1 FROM task_lists WHERE id=$1 AND user_id=$2`, lid, uid).Scan(&ok)
+		if ok != 1 {
+			return nil, nil, fmt.Errorf("list not found")
+		}
+		add("list_id", lid)
+	} else if argBool(args, "to_inbox", false) {
+		add("list_id", nil)
+	}
+	if pid := argInt(args, "parent_task_id", 0); pid != 0 {
+		var ok int
+		d.QueryRowContext(ctx, `SELECT 1 FROM tasks WHERE id=$1 AND user_id=$2`, pid, uid).Scan(&ok)
+		if ok != 1 {
+			return nil, nil, fmt.Errorf("parent task not found")
+		}
+		add("parent_task_id", pid)
+	}
+
+	if len(sets) == 0 {
+		return nil, nil, fmt.Errorf("nothing to update: pass at least one of title, description, priority, due_date, list_id, parent_task_id, to_inbox")
+	}
+
+	vals = append(vals, id, uid)
+	q := fmt.Sprintf(`UPDATE tasks SET %s, updated_at=NOW() WHERE id=$%d AND user_id=$%d`,
+		strings.Join(sets, ", "), len(vals)-1, len(vals))
+	if _, err := d.ExecContext(ctx, q, vals...); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"id": id, "updated": true},
 		map[string]any{"kind": "task_updated", "id": id, "route": "/tasks"}, nil
 }
 

@@ -99,6 +99,7 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	// it. Insights run daily; reminders every 5 min (Cloud Scheduler).
 	RegisterInsightCronHandler(root, deps)
 	RegisterReminderCronHandler(root, deps)
+	RegisterPriceCronHandler(root, deps)
 
 	if frontendDir != "" {
 		fs := http.FileServer(http.Dir(frontendDir))
