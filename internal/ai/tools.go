@@ -250,6 +250,19 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "list_bookmarks",
+			Description: "List the user's saved bookmarks (links to videos, articles, sites). Filter by kind, unread (read-later queue), or a substring query.",
+			Schema: obj(map[string]*genai.Schema{
+				"kind":   str("'video' | 'site'."),
+				"unread": boolean("true = only the read-later queue, false = only already-read."),
+				"query":  str("Optional ILIKE substring over title/url/note."),
+				"limit":  intg("Default 30."),
+			}),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return listBookmarksTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "media_taste",
 			Description: "Returns the user's taste profile: top-rated titles, favourite genres (weighted by rating), completion vs. drop ratio per type, and most-recently completed entries. Call this once BEFORE tmdb_search when recommending anything so the suggestion is personalised, not generic.",
 			Schema:      obj(map[string]*genai.Schema{}),
@@ -604,6 +617,34 @@ func (s *Service) buildTools() []Tool {
 			}, "title", "type"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return addMediaTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "create_bookmark",
+			Description: "Save a link (website, video, article) to the user's bookmarks. New bookmarks land in the read-later queue (unread).",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"url":   str("Required. Full http(s) URL."),
+				"title": str("Optional. If omitted the host is used."),
+				"note":  str("Optional context. #tags are extracted."),
+			}, "url"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return createBookmarkTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "update_bookmark",
+			Description: "Update a bookmark: mark read/unread, archive/unarchive, or change title/note. Use list_bookmarks first to find the id.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"id":       intg("Required. Bookmark id."),
+				"unread":   boolean("false = mark as read."),
+				"archived": boolean("true = archive."),
+				"title":    str("Optional new title."),
+				"note":     str("Optional new note."),
+			}, "id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return updateBookmarkTool(ctx, d, uid, args)
 			},
 		},
 		{
