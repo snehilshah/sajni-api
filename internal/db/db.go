@@ -219,6 +219,26 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_media_events_user_completed ON media_events(user_id, created_at DESC)
 		WHERE kind = 'completed';
 
+	-- Saved links (read-later + keep-forever). kind: 'video' | 'site',
+	-- derived from the URL host at create time. Metadata (title/site/icons)
+	-- is fetched server-side on save; blanks are fine.
+	CREATE TABLE IF NOT EXISTS bookmarks (
+		id          BIGSERIAL   PRIMARY KEY,
+		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		url         TEXT        NOT NULL,
+		kind        TEXT        NOT NULL DEFAULT 'site',
+		title       TEXT        NOT NULL DEFAULT '',
+		site_name   TEXT        NOT NULL DEFAULT '',
+		favicon_url TEXT        NOT NULL DEFAULT '',
+		image_url   TEXT        NOT NULL DEFAULT '',
+		note        TEXT        NOT NULL DEFAULT '',
+		unread      BOOLEAN     NOT NULL DEFAULT TRUE,
+		archived    BOOLEAN     NOT NULL DEFAULT FALSE,
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_bookmarks_user ON bookmarks(user_id, created_at DESC);
+
 	CREATE TABLE IF NOT EXISTS journal_entries (
 		id             BIGSERIAL   PRIMARY KEY,
 		user_id        UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,

@@ -154,6 +154,27 @@ func search(deps Deps) http.HandlerFunc {
 				})
 		}
 
+		// Bookmarks
+		if want("bookmark") {
+			results = appendQuery(results, d, "bookmark",
+				`SELECT id, title, kind, url FROM bookmarks
+				 WHERE user_id = $1 AND archived = FALSE AND ($2 = '' OR title ILIKE $3 OR url ILIKE $3 OR note ILIKE $3 OR site_name ILIKE $3)
+				 ORDER BY created_at DESC LIMIT 20`,
+				uid, q, like,
+				func(rs *sql.Rows) (SearchHit, bool) {
+					var id int64
+					var title, kind, url string
+					if err := rs.Scan(&id, &title, &kind, &url); err != nil {
+						return SearchHit{}, false
+					}
+					tab := "sites"
+					if kind == "video" {
+						tab = "videos"
+					}
+					return SearchHit{Type: "bookmark", ID: id, Title: title, Subtitle: url, Route: "/media?tab=" + tab}, true
+				})
+		}
+
 		// Tags
 		if want("tag") {
 			results = appendQuery(results, d, "tag",

@@ -1,6 +1,7 @@
 # sajni-api — Go backend (deployed to Cloud Run).
 
 -include .env
+LOG_LEVEL ?= debug
 export
 
 .PHONY: help dev build run fmt lint check test docker-build docker-run clean sync-vars
