@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"html"
 	"io"
 	"net/http"
@@ -231,6 +232,50 @@ type bookmarkMeta struct {
 	favicon  string
 }
 
+// oembedEndpoint returns the provider's oEmbed URL for hosts whose pages
+// can't be scraped reliably. YouTube buries its og: tags past the 256 KB
+// scrape cap below, so titles and thumbnails came back blank; oEmbed
+// returns both in a small JSON document with no API key.
+func oembedEndpoint(u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+	host = strings.TrimPrefix(host, "www.")
+	host = strings.TrimPrefix(host, "m.")
+	switch host {
+	case "youtube.com", "youtu.be":
+		return "https://www.youtube.com/oembed?format=json&url=" + url.QueryEscape(u.String())
+	case "vimeo.com":
+		return "https://vimeo.com/api/oembed.json?url=" + url.QueryEscape(u.String())
+	}
+	return ""
+}
+
+func fetchOEmbed(ctx context.Context, endpoint string) (title, provider, thumb string, ok bool) {
+	fctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(fctx, "GET", endpoint, nil)
+	if err != nil {
+		return "", "", "", false
+	}
+	req.Header.Set("User-Agent", "SajniBot/1.0 (+https://ohmysajni.com)")
+	resp, err := previewClient.Do(req)
+	if err != nil {
+		return "", "", "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", "", "", false
+	}
+	var body struct {
+		Title        string `json:"title"`
+		ProviderName string `json:"provider_name"`
+		ThumbnailURL string `json:"thumbnail_url"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&body); err != nil {
+		return "", "", "", false
+	}
+	return body.Title, body.ProviderName, body.ThumbnailURL, body.Title != ""
+}
+
 // fetchBookmarkMeta pulls title/site/og-image/favicon. Best-effort: any
 // failure returns whatever was gathered (possibly all blanks) so the save
 // itself never fails on a slow or hostile page.
@@ -242,6 +287,16 @@ func fetchBookmarkMeta(ctx context.Context, u *url.URL) bookmarkMeta {
 	}
 	if err := guardURL(u); err != nil {
 		return meta
+	}
+
+	// oEmbed first for hosts that defeat the HTML scrape.
+	if ep := oembedEndpoint(u); ep != "" {
+		if title, provider, thumb, ok := fetchOEmbed(ctx, ep); ok {
+			meta.title = title
+			meta.siteName = provider
+			meta.image = thumb
+			return meta
+		}
 	}
 
 	fctx, cancel := context.WithTimeout(ctx, 6*time.Second)
