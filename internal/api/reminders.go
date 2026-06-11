@@ -10,12 +10,13 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"sajni/internal/db"
+	"sajni/internal/reminderqueue"
 )
 
 // Reminders ride on tasks: a task with remind=TRUE and a scheduled_at gets
-// one email RemindLead before its event time. The send is driven by an
-// external trigger (Cloud Scheduler */5 → POST /internal/reminders/run),
-// not an in-process ticker, because Cloud Run scales to zero between
+// one email RemindLead before its event time. The send is driven by
+// Cloud Tasks (POST /internal/reminders/fire). The old sweep endpoint remains
+// as a low-frequency safety net because Cloud Run scales to zero between
 // requests. reminded_at is the idempotency gate.
 
 // RemindLead is how far ahead of scheduled_at the email goes out. Fixed by
@@ -27,6 +28,13 @@ const RemindLead = 5 * time.Minute
 // send. Without it, recovering from a multi-hour outage would blast every
 // reminder whose window elapsed while we were down.
 const reminderGrace = 30 * time.Minute
+
+// reminderSkew widens the single-fire window's upper bound. Cloud Tasks
+// dispatches at-or-after schedule_time on Google's clock, but the window is
+// evaluated against Postgres's NOW(); if Postgres runs a few seconds behind,
+// an exact bound would no-op the fire with a 200 and the reminder would never
+// retry. Worst case under the allowance: the email lands reminderSkew early.
+const reminderSkew = 60 * time.Second
 
 // defaultTZ is the fallback zone when a user's timezone is unset/unparseable.
 // Every Sajni user is IST (see the users.timezone backfill in db.migrate), so
@@ -43,12 +51,12 @@ var defaultLoc = func() *time.Location {
 	return time.UTC
 }()
 
-// RegisterReminderCronHandler mounts the unauthenticated webhook Cloud
-// Scheduler hits every 5 minutes. Header X-Reminder-Cron must match
-// REMINDER_CRON_SECRET; the handler 401s without it. Mirrors the insight
-// cron. Call from main once the root mux exists.
+// RegisterReminderCronHandler mounts the internal reminder webhooks. Header
+// X-Reminder-Cron must match REMINDER_CRON_SECRET; handlers 401 without it.
+// /fire is called by Cloud Tasks, /run is the once-daily safety sweep.
 func RegisterReminderCronHandler(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /internal/reminders/run", reminderCronHandler(deps))
+	mux.HandleFunc("POST /internal/reminders/fire", reminderFireHandler(deps))
 }
 
 func reminderCronHandler(deps Deps) http.HandlerFunc {
@@ -65,6 +73,68 @@ func reminderCronHandler(deps Deps) http.HandlerFunc {
 		}
 		writeJSON(w, 200, map[string]int{"sent": n})
 	}
+}
+
+func reminderFireHandler(deps Deps) http.HandlerFunc {
+	expected := os.Getenv("REMINDER_CRON_SECRET")
+	return func(w http.ResponseWriter, r *http.Request) {
+		if expected == "" || r.Header.Get("X-Reminder-Cron") != expected {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		var body struct {
+			Kind string `json:"kind"`
+			ID   int64  `json:"id"`
+		}
+		if err := readJSON(r, &body); err != nil || body.ID <= 0 {
+			errJSON(w, 400, "invalid reminder fire payload")
+			return
+		}
+		n, err := ProcessReminderFire(r.Context(), deps, body.Kind, body.ID)
+		if err != nil {
+			if _, ok := err.(errInvalidReminderKind); ok {
+				errJSON(w, 400, err.Error())
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, 200, map[string]int{"sent": n})
+	}
+}
+
+// ProcessReminderFire handles one Cloud Tasks delivery. Stale tasks are
+// successful no-ops: Postgres remains the source of truth, and the idempotency
+// stamps prevent duplicate sends.
+func ProcessReminderFire(ctx context.Context, deps Deps, kind string, id int64) (int, error) {
+	switch kind {
+	case reminderqueue.KindTask:
+		sent, err := sendSingleTaskReminder(ctx, deps, id)
+		if err != nil {
+			return 0, err
+		}
+		if sent {
+			return 1, nil
+		}
+		return 0, nil
+	case reminderqueue.KindMulti:
+		sent, err := sendSingleMultiReminder(ctx, deps, id)
+		if err != nil {
+			return 0, err
+		}
+		if sent {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		return 0, errInvalidReminderKind(kind)
+	}
+}
+
+type errInvalidReminderKind string
+
+func (e errInvalidReminderKind) Error() string {
+	return "invalid reminder kind: " + string(e)
 }
 
 // ProcessReminderCron emails every due, un-sent task reminder and stamps
@@ -142,6 +212,57 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 	return sent, nil
 }
 
+func sendSingleTaskReminder(ctx context.Context, deps Deps, id int64) (bool, error) {
+	d := deps.DB
+	if deps.Auth == nil {
+		return false, nil
+	}
+	type due struct {
+		id          int64
+		title       string
+		scheduledAt time.Time
+		email, name string
+		tz          string
+	}
+	var x due
+	err := d.QueryRowContext(ctx, `
+		SELECT t.id, t.title, t.scheduled_at, u.email, u.name, COALESCE(u.timezone,'')
+		  FROM tasks t
+		  JOIN users u ON u.id = t.user_id
+		 WHERE t.id = $1
+		   AND t.remind = TRUE
+		   AND t.reminded_at IS NULL
+		   AND t.status NOT IN ('done','scratched')
+		   AND t.scheduled_at IS NOT NULL
+		   AND t.scheduled_at <= NOW() + make_interval(secs => $2)
+		   AND t.scheduled_at >= NOW() - make_interval(secs => $3)
+		   AND u.deleted_at IS NULL`,
+		id, int((RemindLead+reminderSkew).Seconds()), int(reminderGrace.Seconds())).
+		Scan(&x.id, &x.title, &x.scheduledAt, &x.email, &x.name, &x.tz)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		log.Warn().Err(err).Int64("task", id).Msg("single reminder query failed")
+		return false, err
+	}
+	name := x.name
+	if name == "" {
+		name = x.email
+	}
+	if err := deps.Auth.SendTaskReminder(ctx, x.email, name, x.title, formatReminderWhen(x.scheduledAt, x.tz), "/tasks"); err != nil {
+		log.Warn().Err(err).Int64("task", x.id).Msg("single reminder email failed")
+		return false, err
+	}
+	res, err := d.ExecContext(ctx, `UPDATE tasks SET reminded_at = NOW() WHERE id = $1 AND reminded_at IS NULL`, x.id)
+	if err != nil {
+		log.Warn().Err(err).Int64("task", x.id).Msg("single reminder stamp failed")
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
 // processTaskReminders emails every due, un-sent row in task_reminders and
 // stamps sent_at. Same window/grace/idempotency model as the legacy path.
 func processTaskReminders(ctx context.Context, deps Deps) int {
@@ -207,6 +328,92 @@ func processTaskReminders(ctx context.Context, deps Deps) int {
 	return sent
 }
 
+func sendSingleMultiReminder(ctx context.Context, deps Deps, id int64) (bool, error) {
+	d := deps.DB
+	if deps.Auth == nil {
+		return false, nil
+	}
+	type due struct {
+		rid, tid    int64
+		title       string
+		scheduledAt sql.NullTime
+		remindAt    time.Time
+		email, name string
+		tz          string
+	}
+	var x due
+	err := d.QueryRowContext(ctx, `
+		SELECT r.id, t.id, t.title, t.scheduled_at, r.remind_at,
+		       u.email, u.name, COALESCE(u.timezone,'')
+		  FROM task_reminders r
+		  JOIN tasks t ON t.id = r.task_id AND t.user_id = r.user_id
+		  JOIN users u ON u.id = r.user_id
+		 WHERE r.id = $1
+		   AND r.sent_at IS NULL
+		   AND t.status NOT IN ('done','scratched')
+		   AND r.remind_at <= NOW() + make_interval(secs => $2)
+		   AND r.remind_at >= NOW() - make_interval(secs => $3)
+		   AND u.deleted_at IS NULL`,
+		id, int(reminderSkew.Seconds()), int(reminderGrace.Seconds())).
+		Scan(&x.rid, &x.tid, &x.title, &x.scheduledAt, &x.remindAt, &x.email, &x.name, &x.tz)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		log.Warn().Err(err).Int64("reminder", id).Msg("single task_reminder query failed")
+		return false, err
+	}
+	when := x.remindAt
+	if x.scheduledAt.Valid {
+		when = x.scheduledAt.Time
+	}
+	name := x.name
+	if name == "" {
+		name = x.email
+	}
+	if err := deps.Auth.SendTaskReminder(ctx, x.email, name, x.title, formatReminderWhen(when, x.tz), "/tasks"); err != nil {
+		log.Warn().Err(err).Int64("reminder", x.rid).Msg("single task reminder email failed")
+		return false, err
+	}
+	res, err := d.ExecContext(ctx, `UPDATE task_reminders SET sent_at = NOW() WHERE id = $1 AND sent_at IS NULL`, x.rid)
+	if err != nil {
+		log.Warn().Err(err).Int64("reminder", x.rid).Msg("single task reminder stamp failed")
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+func enqueueTaskReminderFromDB(ctx context.Context, d *db.DB, uid string, id int64) {
+	var scheduledAt time.Time
+	err := d.QueryRowContext(ctx, `
+		SELECT scheduled_at
+		  FROM tasks
+		 WHERE id = $1
+		   AND user_id = $2
+		   AND remind = TRUE
+		   AND reminded_at IS NULL
+		   AND scheduled_at IS NOT NULL
+		   AND status NOT IN ('done','scratched')`,
+		id, uid).Scan(&scheduledAt)
+	if err == sql.ErrNoRows {
+		return
+	}
+	if err != nil {
+		log.Warn().Err(err).Int64("task", id).Msg("reminder enqueue lookup failed")
+		return
+	}
+	if err := reminderqueue.EnqueueTask(ctx, id, scheduledAt); err != nil {
+		log.Warn().Err(err).Int64("task", id).Msg("reminder cloud task enqueue failed")
+	}
+}
+
+func enqueueMultiReminder(ctx context.Context, id int64, remindAt time.Time) {
+	if err := reminderqueue.EnqueueMulti(ctx, id, remindAt); err != nil {
+		log.Warn().Err(err).Int64("reminder", id).Msg("task_reminder cloud task enqueue failed")
+	}
+}
+
 // --- task reminder CRUD ----------------------------------------------------
 
 type taskReminderRow struct {
@@ -267,13 +474,15 @@ func addTaskReminder(deps Deps) http.HandlerFunc {
 			return
 		}
 		var rid int64
+		var remindAt time.Time
 		if err := d.QueryRow(
-			`INSERT INTO task_reminders (user_id, task_id, remind_at) VALUES ($1, $2, $3) RETURNING id`,
+			`INSERT INTO task_reminders (user_id, task_id, remind_at) VALUES ($1, $2, $3) RETURNING id, remind_at`,
 			uid, id, body.RemindAt,
-		).Scan(&rid); err != nil {
+		).Scan(&rid, &remindAt); err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
+		enqueueMultiReminder(r.Context(), rid, remindAt)
 		writeJSON(w, 201, map[string]int64{"id": rid})
 	}
 }

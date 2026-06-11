@@ -12,9 +12,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"google.golang.org/genai"
 
 	"sajni/internal/db"
+	"sajni/internal/reminderqueue"
 	"sajni/internal/storage"
 )
 
@@ -504,9 +506,11 @@ func (s *Service) buildTools() []Tool {
 					return nil, nil, fmt.Errorf("task not found")
 				}
 				var rid int64
-				if err := d.QueryRowContext(ctx, `INSERT INTO task_reminders (user_id, task_id, remind_at) VALUES ($1,$2,$3) RETURNING id`, uid, tid, at).Scan(&rid); err != nil {
+				var remindAt time.Time
+				if err := d.QueryRowContext(ctx, `INSERT INTO task_reminders (user_id, task_id, remind_at) VALUES ($1,$2,$3) RETURNING id, remind_at`, uid, tid, at).Scan(&rid, &remindAt); err != nil {
 					return nil, nil, err
 				}
+				enqueueMultiReminder(ctx, rid, remindAt)
 				return map[string]any{"id": rid, "task_id": tid, "remind_at": at},
 					map[string]any{"kind": "task_updated", "id": tid, "route": "/tasks"}, nil
 			},
@@ -1610,15 +1614,19 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 		}
 	}
 
+	var scheduledAt sql.NullTime
 	err := d.QueryRowContext(ctx, `
 		INSERT INTO tasks (user_id, title, description, priority, status, due_date, scheduled_at, remind,
 		                   duration_minutes, list_id, parent_task_id, important, steps)
 		VALUES ($1,$2,$3,$4,'todo',$5,$6,$7,$8,$9,$10,$11,$12::jsonb)
-		RETURNING id`,
+		RETURNING id, scheduled_at`,
 		uid, title, desc, priority, dueArg, schArg, remind, dur, listArg, parentArg, important, stepsJSON,
-	).Scan(&id)
+	).Scan(&id, &scheduledAt)
 	if err != nil {
 		return nil, nil, err
+	}
+	if remind && scheduledAt.Valid {
+		enqueueTaskReminder(ctx, id, scheduledAt.Time)
 	}
 	for _, tag := range argStrSlice(args, "tags") {
 		d.ExecContext(ctx, `INSERT INTO tags (user_id, entity_type, entity_id, tag) VALUES ($1,'task',$2,$3)`, uid, id, tag)
@@ -1685,6 +1693,9 @@ func rescheduleTaskTool(ctx context.Context, d *db.DB, uid string, args map[stri
 	if hasRemind {
 		d.ExecContext(ctx, `UPDATE tasks SET remind=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3`, argBool(args, "remind", false), id, uid)
 	}
+	if sched != "" || hasRemind {
+		enqueueTaskReminderFromDB(ctx, d, uid, int64(id))
+	}
 
 	return map[string]any{"id": id, "due_date": due, "scheduled_at": sched},
 		map[string]any{"kind": "task_updated", "id": id, "route": "/tasks"}, nil
@@ -1714,6 +1725,40 @@ func scratchTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]
 	}
 	return map[string]any{"id": id, "status": next},
 		map[string]any{"kind": "task_updated", "id": id, "route": "/tasks"}, nil
+}
+
+func enqueueTaskReminderFromDB(ctx context.Context, d *db.DB, uid string, id int64) {
+	var scheduledAt time.Time
+	err := d.QueryRowContext(ctx, `
+		SELECT scheduled_at
+		  FROM tasks
+		 WHERE id = $1
+		   AND user_id = $2
+		   AND remind = TRUE
+		   AND reminded_at IS NULL
+		   AND scheduled_at IS NOT NULL
+		   AND status NOT IN ('done','scratched')`,
+		id, uid).Scan(&scheduledAt)
+	if err == sql.ErrNoRows {
+		return
+	}
+	if err != nil {
+		log.Warn().Err(err).Int64("task", id).Msg("AI reminder enqueue lookup failed")
+		return
+	}
+	enqueueTaskReminder(ctx, id, scheduledAt)
+}
+
+func enqueueTaskReminder(ctx context.Context, id int64, scheduledAt time.Time) {
+	if err := reminderqueue.EnqueueTask(ctx, id, scheduledAt); err != nil {
+		log.Warn().Err(err).Int64("task", id).Msg("AI reminder cloud task enqueue failed")
+	}
+}
+
+func enqueueMultiReminder(ctx context.Context, id int64, remindAt time.Time) {
+	if err := reminderqueue.EnqueueMulti(ctx, id, remindAt); err != nil {
+		log.Warn().Err(err).Int64("reminder", id).Msg("AI task_reminder cloud task enqueue failed")
+	}
 }
 
 // updateTaskTool edits a task's mutable fields in place. Only the fields the

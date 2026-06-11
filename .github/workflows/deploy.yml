@@ -91,6 +91,9 @@ jobs:
             STORAGE_BACKEND=gcs
             GCS_BUCKET=${{ vars.GCS_BUCKET }}
             GEMINI_MODEL=gemini-2.5-flash
+            CLOUD_TASKS_PROJECT=${{ vars.GCP_PROJECT_ID }}
+            CLOUD_TASKS_LOCATION=${{ vars.GCP_REGION }}
+            CLOUD_TASKS_QUEUE=${{ vars.CLOUD_TASKS_QUEUE }}
           # Everything sensitive (or treated as sensitive) is mounted
           # from Google Secret Manager at start-up. Names on the left
           # are the env vars the Go app reads; names on the right

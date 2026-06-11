@@ -580,7 +580,8 @@ func (d *DB) migrate() error {
 	-- Reminders ride on tasks rather than a separate model: scheduled_at
 	-- (already present) is the event instant, remind gates the email, and
 	-- reminded_at is the sent-sentinel (NULL = unsent). Clearing it on edit
-	-- re-arms the reminder; the */5 cron uses it for idempotency.
+	-- re-arms the reminder; Cloud Tasks and the safety sweep use it for
+	-- idempotency.
 	ALTER TABLE tasks       ADD COLUMN IF NOT EXISTS remind      BOOLEAN     NOT NULL DEFAULT FALSE;
 	ALTER TABLE tasks       ADD COLUMN IF NOT EXISTS reminded_at TIMESTAMPTZ;
 	-- IANA timezone captured from the browser once, used to render the
@@ -637,8 +638,8 @@ func (d *DB) migrate() error {
 
 	-- ─── Finance: auto price fetch (stocks/ETFs) ──────────────────────
 	-- symbol+exchange identify the instrument to the price provider (Yahoo
-	-- Finance, NSE=.NS/BSE=.BO); an EOD cron (chunk-per-ping, see prices.go)
-	-- refreshes last_price and recomputes current_value. price_error holds the
+	-- Finance, NSE=.NS/BSE=.BO); lazy refresh (see prices.go) refreshes
+	-- last_price and recomputes current_value. price_error holds the
 	-- last fetch failure ('' = ok); price_at marks the last refresh attempt so
 	-- the cron picks the stalest holdings first.
 	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS symbol      TEXT NOT NULL DEFAULT '';
@@ -706,7 +707,8 @@ func (d *DB) migrate() error {
 	-- The legacy single reminder (tasks.remind + scheduled_at) only fires on
 	-- the task's own time. task_reminders lets a task carry any number of
 	-- reminder instants on any date. sent_at is the idempotency sentinel
-	-- (NULL = unsent), mirroring tasks.reminded_at; the */5 cron stamps it.
+	-- (NULL = unsent), mirroring tasks.reminded_at; Cloud Tasks and the safety
+	-- sweep stamp it.
 	CREATE TABLE IF NOT EXISTS task_reminders (
 		id         BIGSERIAL   PRIMARY KEY,
 		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,

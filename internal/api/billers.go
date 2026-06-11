@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-
-	"sajni/internal/db"
 )
 
 // Billers + subscriptions live alongside finance: every biller schedules a
@@ -544,7 +542,7 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 					VALUES ($1,$2,'reminder_task',$3) ON CONFLICT DO NOTHING`,
 					b.userID, b.id, due.Format("2006-01-02"))
 				if n, _ := res.RowsAffected(); n == 1 {
-					spawnBillerTask(ctx, d, b.userID, b.name, due)
+					spawnBillerTask(ctx, deps, b.userID, b.name, due)
 					upcomingNoticed++
 				}
 			} else {
@@ -589,11 +587,19 @@ func notifyVariableAutoPay(ctx context.Context, deps Deps, uid, billerName strin
 // cycle: scheduled at 09:00 on the due date in the user's local tz, with
 // remind on so the reminder cron emails the morning-of nudge. Idempotency
 // is the caller's responsibility (the reminder_task alert sentinel).
-func spawnBillerTask(ctx context.Context, d *db.DB, uid, name string, due time.Time) {
+func spawnBillerTask(ctx context.Context, deps Deps, uid, name string, due time.Time) {
+	d := deps.DB
 	loc := userLocation(d, uid)
 	sched := time.Date(due.Year(), due.Month(), due.Day(), 9, 0, 0, 0, loc)
-	d.ExecContext(ctx, `
+	var id int64
+	err := d.QueryRowContext(ctx, `
 		INSERT INTO tasks (user_id, title, priority, status, due_date, scheduled_at, remind)
-		VALUES ($1, $2, 'high', 'todo', $3, $4, TRUE)`,
-		uid, "Pay "+name, due.Format("2006-01-02"), sched.UTC())
+		VALUES ($1, $2, 'high', 'todo', $3, $4, TRUE)
+		RETURNING id`,
+		uid, "Pay "+name, due.Format("2006-01-02"), sched.UTC()).Scan(&id)
+	if err != nil {
+		log.Warn().Err(err).Str("biller", name).Msg("biller reminder task insert failed")
+		return
+	}
+	enqueueTaskReminderFromDB(ctx, d, uid, id)
 }

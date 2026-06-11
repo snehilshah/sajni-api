@@ -482,6 +482,9 @@ func createTask(deps Deps) http.HandlerFunc {
 		syncBacklinks(d, uid, "task", id, contentForTags)
 
 		logTaskEvent(d, uid, id, "created", "", body.Title)
+		if body.Remind {
+			enqueueTaskReminderFromDB(r.Context(), d, uid, id)
+		}
 
 		writeJSON(w, 201, map[string]int64{"id": id})
 	}
@@ -520,6 +523,7 @@ func updateTask(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid json")
 			return
 		}
+		reminderTimingChanged := body.ScheduledAt != nil || body.ClearScheduled || body.Remind != nil
 
 		// Lifecycle snapshot: due-date misses + audit-trail diffing.
 		var (
@@ -656,6 +660,9 @@ func updateTask(deps Deps) http.HandlerFunc {
 		}
 		if body.SortOrder != nil {
 			d.Exec("UPDATE tasks SET sort_order=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.SortOrder, id, uid)
+		}
+		if reminderTimingChanged {
+			enqueueTaskReminderFromDB(r.Context(), d, uid, id)
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}

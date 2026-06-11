@@ -31,6 +31,7 @@ to the Cloud Run default URL.
 | Artifact Registry         | <500MB images, lifecycle keeps 5 latest | <$0.10/mo |
 | Secret Manager            | 4 secrets, ≤6 free                      | $0          |
 | GCS (`sajni-blobs`)       | Standard, single region, <1GB           | <$0.05/mo |
+| Cloud Tasks               | First 1M ops/month free                 | $0          |
 | Cloud Run domain mapping  | `api.ohmysajni.com`                     | $0          |
 | **Postgres**              | **Use Supabase / Neon free tier**       | $0          |
 |                           | (Cloud SQL min ≈ ₹830/mo — avoid)      |              |
@@ -55,6 +56,7 @@ gcloud services enable \
   artifactregistry.googleapis.com \
   secretmanager.googleapis.com \
   iamcredentials.googleapis.com \
+  cloudtasks.googleapis.com \
   storage.googleapis.com
 
 # Container registry. Add a cleanup policy to cap storage.
@@ -78,6 +80,10 @@ gcloud artifacts repositories set-cleanup-policies sajni \
 # GCS for note/journal blobs (Cloud Run filesystem is ephemeral).
 gcloud storage buckets create "gs://sajni-blobs" \
   --location="$REGION" --uniform-bucket-level-access
+
+# Cloud Tasks queue for exact reminder delivery. The app enqueues reminders
+# here and Cloud Tasks calls POST /internal/reminders/fire at the right time.
+gcloud tasks queues create sajni-reminders --location="$REGION"
 ```
 
 ### Secrets
@@ -126,6 +132,8 @@ echo -n "https://www.ohmysajni.com"    | gcloud secrets create CORS_ORIGIN    --
 echo -n "https://sajni-api-REGION-HASH.a.run.app" | gcloud secrets create API_BASE_URL --data-file=-
 echo -n "Sajni <hello@ohmysajni.com>"  | gcloud secrets create EMAIL_FROM     --data-file=-
 echo -n "info"                         | gcloud secrets create LOG_LEVEL      --data-file=-
+openssl rand -hex 32                   | gcloud secrets create REMINDER_CRON_SECRET --data-file=-
+openssl rand -hex 32                   | gcloud secrets create PRICE_CRON_SECRET    --data-file=-
 ```
 
 For OAuth providers, register the same-origin callback URLs that hit
@@ -193,6 +201,14 @@ gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
 
 # Note this — it's the GCP_WIF_PROVIDER value below.
 echo "projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github/providers/github-provider"
+
+# Let the Cloud Run runtime identity enqueue reminder tasks. The workflow does
+# not set a custom runtime service account, so Cloud Run uses the Compute
+# Engine default service account.
+RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:${RUNTIME_SA}" \
+  --role=roles/cloudtasks.enqueuer
 ```
 
 ### GitHub configuration
@@ -212,6 +228,34 @@ config lives in Secret Manager (above).
 | `GCP_SERVICE_ACCOUNT` | `sajni-deployer@ohmysajni.iam.gserviceaccount.com`                                               |
 | `GCP_WIF_PROVIDER`    | the line you `echo`d at the end of the IAM block                                                 |
 | `GCS_BUCKET`          | e.g. `ohmysajni-sajni-blobs`                                                                     |
+
+---
+
+## Scheduler cleanup
+
+Reminders are delivered by Cloud Tasks now. Keep the old reminder
+Cloud Scheduler job only as a safety sweep, and slow it down from
+`*/5` to once daily:
+
+```sh
+gcloud scheduler jobs list --location="$REGION"
+gcloud scheduler jobs update http REMINDER_JOB_NAME \
+  --location="$REGION" \
+  --schedule="0 3 * * *" \
+  --time-zone="Asia/Kolkata"
+```
+
+Prices are lazy-refreshed by `GET /api/finance/investments` when a
+stock/ETF price is older than one hour. Delete the old price scheduler
+job after this revision is deployed:
+
+```sh
+gcloud scheduler jobs delete PRICE_JOB_NAME --location="$REGION"
+```
+
+After a month of clean reminder logs, you can delete the daily reminder
+sweep too. Until then it catches missed Cloud Tasks deliveries with the
+same idempotency gates.
 
 ---
 

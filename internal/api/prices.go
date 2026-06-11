@@ -23,15 +23,15 @@ import (
 // isolated to fetchPrice/validateSymbol so swapping to a keyed provider later
 // is a two-function change.
 //
-// Driven chunk-per-ping: Cloud Scheduler hits POST /internal/prices/run on a
-// short window a few times a day, each hit refreshes only the priceChunkSize
-// stalest holdings and returns in ~1s. No in-process sleep, no held-open
-// request — the instance wakes, does a chunk, scales back to zero. Suggested
-// schedule (Asia/Kolkata, weekdays): `0-4 10,13,16 * * 1-5`.
+// Driven lazily: GET /api/finance/investments refreshes at most
+// priceChunkSize stale user holdings before returning. The internal cron
+// endpoint remains only as a compatibility/manual hook; normal operation does
+// not need a price scheduler.
 
 const (
 	yahooChartBase = "https://query1.finance.yahoo.com/v8/finance/chart/"
 	priceChunkSize = 8
+	priceMaxAge    = time.Hour
 	// Yahoo rejects requests with no/blank User-Agent; identify politely.
 	priceUserAgent = "Mozilla/5.0 (compatible; Sajni/1.0; +https://ohmysajni.com)"
 )
@@ -117,10 +117,9 @@ func validateSymbol(ctx context.Context, symbol, exchange string) error {
 	return nil
 }
 
-// RegisterPriceCronHandler mounts the unauthenticated webhook Cloud Scheduler
-// hits to refresh one chunk of holdings. Header X-Price-Cron must match
-// PRICE_CRON_SECRET. Mirror of the insight/reminder cron handlers; call from
-// main once the root mux exists.
+// RegisterPriceCronHandler mounts the optional internal webhook that refreshes
+// one chunk of holdings. Header X-Price-Cron must match PRICE_CRON_SECRET.
+// Normal operation uses lazy refresh from listInvestments instead.
 func RegisterPriceCronHandler(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /internal/prices/run", priceCronHandler(deps))
 }
@@ -150,7 +149,7 @@ func priceCronHandler(deps Deps) http.HandlerFunc {
 // Idempotent — extra pings after everything is fresh are cheap.
 func RunPriceCron(ctx context.Context, deps Deps) (int, error) {
 	d := deps.DB
-	rows, err := d.Query(`SELECT id, symbol, exchange, quantity
+	rows, err := d.QueryContext(ctx, `SELECT id, symbol, exchange, quantity
 		FROM fin_investments
 		WHERE type IN ('stock','etf') AND status = 'open' AND symbol <> ''
 		ORDER BY price_at ASC NULLS FIRST, id ASC
@@ -158,37 +157,69 @@ func RunPriceCron(ctx context.Context, deps Deps) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	type holding struct {
-		id       int64
-		symbol   string
-		exchange string
-		qty      float64
+	defer rows.Close()
+	return refreshPriceRows(ctx, deps, rows), nil
+}
+
+// RefreshStaleUserPrices lazily refreshes the user's stale market holdings
+// when the trading/investments list is read. It replaces the background price
+// scheduler for normal use: no page view, no price work.
+func RefreshStaleUserPrices(ctx context.Context, deps Deps, uid string) (int, error) {
+	d := deps.DB
+	rows, err := d.QueryContext(ctx, `SELECT id, symbol, exchange, quantity
+		FROM fin_investments
+		WHERE user_id = $1
+		  AND type IN ('stock','etf')
+		  AND status = 'open'
+		  AND symbol <> ''
+		  AND (price_at IS NULL OR price_at < NOW() - make_interval(secs => $2))
+		ORDER BY price_at ASC NULLS FIRST, id ASC
+		LIMIT $3`, uid, int(priceMaxAge.Seconds()), priceChunkSize)
+	if err != nil {
+		return 0, err
 	}
-	var batch []holding
+	defer rows.Close()
+	return refreshPriceRows(ctx, deps, rows), nil
+}
+
+type priceHolding struct {
+	id       int64
+	symbol   string
+	exchange string
+	qty      float64
+}
+
+type priceRows interface {
+	Next() bool
+	Scan(dest ...any) error
+}
+
+func refreshPriceRows(ctx context.Context, deps Deps, rows priceRows) int {
+	d := deps.DB
+	var batch []priceHolding
 	for rows.Next() {
-		var h holding
+		var h priceHolding
 		rows.Scan(&h.id, &h.symbol, &h.exchange, &h.qty)
 		batch = append(batch, h)
 	}
-	rows.Close()
 
 	updated := 0
 	for _, h := range batch {
 		price, ferr := fetchPrice(ctx, h.symbol, h.exchange)
 		if ferr != nil {
 			// Record the failure but advance price_at so the queue rotates.
-			d.Exec(`UPDATE fin_investments SET price_error = $1, price_at = NOW(), last_updated = NOW() WHERE id = $2`,
+			d.ExecContext(ctx, `UPDATE fin_investments SET price_error = $1, price_at = NOW(), last_updated = NOW() WHERE id = $2`,
 				ferr.Error(), h.id)
 			continue
 		}
 		// quantity > 0 → mark-to-market the holding; legacy untracked holdings
 		// (qty 0) still record the price for display without zeroing value.
-		d.Exec(`UPDATE fin_investments
+		d.ExecContext(ctx, `UPDATE fin_investments
 			SET last_price = $1,
 			    current_value = CASE WHEN quantity > 0 THEN quantity * $1 ELSE current_value END,
 			    price_error = '', price_at = NOW(), last_updated = NOW()
 			WHERE id = $2`, price, h.id)
 		updated++
 	}
-	return updated, nil
+	return updated
 }

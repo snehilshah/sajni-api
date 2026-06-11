@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog/log"
+
 	"sajni/internal/db"
 )
 
@@ -934,6 +936,15 @@ func listInvestments(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
+		// Cap the lazy refresh so a hung price provider can't hold the page
+		// hostage — whatever doesn't finish stays stale until the next view.
+		refreshCtx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+		if n, err := RefreshStaleUserPrices(refreshCtx, deps, uid); err != nil {
+			log.Warn().Err(err).Str("user", uid).Msg("lazy price refresh failed")
+		} else if n > 0 {
+			log.Info().Int("updated", n).Str("user", uid).Msg("lazy price refresh completed")
+		}
+		cancel()
 		rows, err := d.Query(`SELECT id, name, type, account_id, invested_amount, current_value, monthly_amount,
 			frequency, start_date::text, maturity_date::text, expected_return, notes, last_updated::text,
 			quantity, avg_buy_price, realized_pl, status,
@@ -1300,7 +1311,7 @@ func updateInvestment(deps Deps) http.HandlerFunc {
 		if b.AvgBuyPrice != nil {
 			add("avg_buy_price", *b.AvgBuyPrice)
 		}
-		// A symbol edit is lazily re-validated by the price cron: reset
+		// A symbol edit is lazily re-validated by the next price refresh: reset
 		// price_at (→ stalest, NULLS FIRST) and clear the stale error so the
 		// next ping re-fetches and re-proves it.
 		if b.Symbol != nil {
@@ -2283,7 +2294,7 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 		// explicit "Others", id stays null and the client shows the
 		// label without a binding.
 		var matchedID *int64
-		var matchedName = picked
+		matchedName := picked
 		// Treat "Other" and "Others" as the same bucket so a legacy "Other"
 		// category still binds when the model picks the canonical "Others".
 		isOthers := func(s string) bool { return strings.EqualFold(s, "Others") || strings.EqualFold(s, "Other") }

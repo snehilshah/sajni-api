@@ -142,6 +142,7 @@ func pinInsight(deps Deps) http.HandlerFunc {
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
 }
+
 func unpinInsight(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {

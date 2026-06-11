@@ -96,8 +96,9 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	root.HandleFunc("/healthz", healthHandler)
 	root.HandleFunc("/readyz", healthHandler)
 
-	// Cron webhooks. Auth is by a shared secret header; each 401s without
-	// it. Insights run daily; reminders every 5 min (Cloud Scheduler).
+	// Internal webhooks. Auth is by a shared secret header; each 401s without
+	// it. Insights and reminder sweeps run by Cloud Scheduler; exact reminder
+	// fires run by Cloud Tasks.
 	RegisterInsightCronHandler(root, deps)
 	RegisterReminderCronHandler(root, deps)
 	RegisterPriceCronHandler(root, deps)

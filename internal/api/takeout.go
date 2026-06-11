@@ -234,9 +234,11 @@ func exportMedia(ctx context.Context, zw *zip.Writer, deps Deps, uid string) err
 	}
 	defer rows.Close()
 	return writeCSV(zw, "media.csv",
-		[]string{"id", "title", "type", "status", "rating", "notes", "platform", "poster_url", "year",
+		[]string{
+			"id", "title", "type", "status", "rating", "notes", "platform", "poster_url", "year",
 			"genre", "external_id", "episodes_watched", "episodes_total", "seasons_watched", "seasons_total",
-			"collection_id", "collection_name", "created_at", "updated_at"},
+			"collection_id", "collection_name", "created_at", "updated_at",
+		},
 		func(emit func([]string)) {
 			for rows.Next() {
 				var id int64
@@ -372,8 +374,10 @@ func exportFinanceAccounts(ctx context.Context, zw *zip.Writer, deps Deps, uid s
 	}
 	defer rows.Close()
 	return writeCSV(zw, "finance/accounts.csv",
-		[]string{"id", "name", "type", "institution", "currency", "opening_balance", "credit_limit",
-			"statement_day", "due_day", "cashback_type", "cashback_value", "color", "archived", "created_at"},
+		[]string{
+			"id", "name", "type", "institution", "currency", "opening_balance", "credit_limit",
+			"statement_day", "due_day", "cashback_type", "cashback_value", "color", "archived", "created_at",
+		},
 		func(emit func([]string)) {
 			for rows.Next() {
 				var id int64
