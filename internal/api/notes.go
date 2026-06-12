@@ -428,14 +428,81 @@ func deleteFolder(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		var cnt int
-		d.QueryRow("SELECT COUNT(*) FROM notes WHERE user_id = $1 AND (folder = $2 OR folder LIKE $3)", uid, path, path+"/%").Scan(&cnt)
-		if cnt > 0 {
-			errJSON(w, 409, fmt.Sprintf("folder not empty: %d notes inside", cnt))
+		rows, err := d.Query(
+			"SELECT id, blob_key FROM notes WHERE user_id = $1 AND (folder = $2 OR folder LIKE $3)",
+			uid, path, path+"/%",
+		)
+		if err != nil {
+			errJSON(w, 500, err.Error())
 			return
 		}
-		d.Exec("DELETE FROM note_folders WHERE user_id = $1 AND (path = $2 OR path LIKE $3)", uid, path, path+"/%")
-		writeJSON(w, 200, map[string]string{"status": "ok"})
+		type noteRef struct {
+			id      int64
+			blobKey string
+		}
+		var notes []noteRef
+		for rows.Next() {
+			var n noteRef
+			if err := rows.Scan(&n.id, &n.blobKey); err != nil {
+				rows.Close()
+				errJSON(w, 500, err.Error())
+				return
+			}
+			notes = append(notes, n)
+		}
+		if err := rows.Close(); err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+
+		tx, err := d.BeginTx(r.Context(), nil)
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		rollback := func() { _ = tx.Rollback() }
+
+		if _, err := tx.Exec(
+			"DELETE FROM tags WHERE user_id = $1 AND entity_type = 'note' AND entity_id IN (SELECT id FROM notes WHERE user_id = $1 AND (folder = $2 OR folder LIKE $3))",
+			uid, path, path+"/%",
+		); err != nil {
+			rollback()
+			errJSON(w, 500, err.Error())
+			return
+		}
+		if _, err := tx.Exec(
+			"DELETE FROM backlinks WHERE user_id = $1 AND source_type = 'note' AND source_id IN (SELECT id FROM notes WHERE user_id = $1 AND (folder = $2 OR folder LIKE $3))",
+			uid, path, path+"/%",
+		); err != nil {
+			rollback()
+			errJSON(w, 500, err.Error())
+			return
+		}
+		if _, err := tx.Exec("DELETE FROM notes WHERE user_id = $1 AND (folder = $2 OR folder LIKE $3)", uid, path, path+"/%"); err != nil {
+			rollback()
+			errJSON(w, 500, err.Error())
+			return
+		}
+		if _, err := tx.Exec("DELETE FROM note_folders WHERE user_id = $1 AND (path = $2 OR path LIKE $3)", uid, path, path+"/%"); err != nil {
+			rollback()
+			errJSON(w, 500, err.Error())
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+
+		// Remove blobs after DB commit. If object deletion fails, rows are still
+		// gone and the folder is gone; leftover objects are inaccessible and can
+		// be cleaned by storage lifecycle later.
+		for _, n := range notes {
+			if n.blobKey != "" {
+				_ = deps.Storage.Delete(r.Context(), n.blobKey)
+			}
+		}
+
+		writeJSON(w, 200, map[string]any{"status": "ok", "deleted_notes": len(notes)})
 	}
 }
 
