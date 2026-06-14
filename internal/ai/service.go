@@ -223,6 +223,15 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		}
 	}
 	temp := float32(temperature)
+	// Disable model "thinking" on the agent loop. The lite tier otherwise
+	// spends the whole MaxOutputTokens budget on internal reasoning and
+	// emits zero visible text — the palette then shows "the model didn't
+	// return text for this one" and the sidebar chat renders an empty
+	// reply. Same fix already applied to QuickGenerate / CategorizeExpense
+	// / ParseTransactionMessage; the chat loop was the one path that
+	// missed it. Function calling does not require thinking, so tool use
+	// is unaffected.
+	thinkBudget := int32(0)
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: &genai.Content{
 			Parts: []*genai.Part{{Text: sysPrompt}},
@@ -239,6 +248,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		},
 		MaxOutputTokens: maxOutputTokens,
 		Temperature:     &temp,
+		ThinkingConfig:  &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
 	}
 
 	rounds := maxToolRounds
