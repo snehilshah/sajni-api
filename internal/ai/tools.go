@@ -881,7 +881,7 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	case "week":
 		// Week-scoped tasks for the current Monday-anchored week.
 		now := userTZNow(ctx, d, uid)
-		mon := now.AddDate(0, 0, -((int(now.Weekday())+6)%7)).Format("2006-01-02")
+		mon := now.AddDate(0, 0, -((int(now.Weekday()) + 6) % 7)).Format("2006-01-02")
 		clauses = append(clauses, fmt.Sprintf("week_of = $%d", len(vals)+1), active)
 		vals = append(vals, mon)
 	case "missed":
