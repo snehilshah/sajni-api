@@ -4,11 +4,62 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
+	"net/mail"
 	"strings"
 	"time"
 
 	"sajni/internal/db"
 )
+
+// maxNotifyEmails caps the extra reminder recipients per task. Outbound mail
+// to arbitrary addresses is an abuse surface; for a single-owner PKMS a small
+// cap + per-address validation is the pragmatic guard.
+const maxNotifyEmails = 3
+
+// sanitizeNotifyEmails trims, RFC-validates, lowercases and de-dups the custom
+// reminder recipients, capping at maxNotifyEmails. Invalid entries are dropped.
+func sanitizeNotifyEmails(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := map[string]bool{}
+	for _, e := range in {
+		addr, err := mail.ParseAddress(strings.TrimSpace(e))
+		if err != nil {
+			continue
+		}
+		a := strings.ToLower(addr.Address)
+		if seen[a] {
+			continue
+		}
+		seen[a] = true
+		out = append(out, a)
+		if len(out) >= maxNotifyEmails {
+			break
+		}
+	}
+	return out
+}
+
+// decodeEmails tolerates malformed JSONB by returning an empty slice.
+func decodeEmails(raw []byte) []string {
+	if len(raw) == 0 {
+		return []string{}
+	}
+	var out []string
+	if err := json.Unmarshal(raw, &out); err != nil || out == nil {
+		return []string{}
+	}
+	return out
+}
+
+// weekBounds returns this week's Monday and Sunday (YYYY-MM-DD) in the user's
+// tz. Weeks are Monday-anchored to match the journal weekly view; week_of on a
+// week task always stores the Monday.
+func weekBounds(d *db.DB, uid string) (monday, sunday string) {
+	now := userNow(d, uid)
+	offset := (int(now.Weekday()) + 6) % 7 // days since Monday (Sun=6)
+	mon := now.AddDate(0, 0, -offset)
+	return mon.Format("2006-01-02"), mon.AddDate(0, 0, 6).Format("2006-01-02")
+}
 
 func registerTaskRoutes(mux *http.ServeMux, deps Deps) {
 	// Specific paths must register before /{id}.
@@ -41,11 +92,11 @@ func getTask(deps Deps) http.HandlerFunc {
 			return
 		}
 		var t taskRow
-		var stepsRaw []byte
+		var stepsRaw, emailsRaw []byte
 		err = d.QueryRow(`
 			SELECT t.id, t.title, t.description, t.status, t.priority,
-			       t.due_date::text, t.scheduled_at::text,
-			       t.remind, t.reminded_at::text,
+			       t.due_date::text, t.week_of::text, t.scheduled_at::text,
+			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
 			       t.list_id, t.parent_task_id, t.important, t.steps,
 			       COALESCE(t.sort_order, 0),
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
@@ -61,8 +112,8 @@ func getTask(deps Deps) http.HandlerFunc {
 			) c ON c.parent_task_id = t.id
 			WHERE t.user_id = $1 AND t.id = $2`, uid, id).Scan(
 			&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority,
-			&t.DueDate, &t.ScheduledAt,
-			&t.Remind, &t.RemindedAt,
+			&t.DueDate, &t.WeekOf, &t.ScheduledAt,
+			&t.Remind, &t.RemindedAt, &emailsRaw,
 			&t.ListID, &t.ParentTaskID, &t.Important, &stepsRaw,
 			&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
 			&t.CreatedAt, &t.UpdatedAt,
@@ -72,6 +123,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			return
 		}
 		t.Steps = decodeSteps(stepsRaw)
+		t.NotifyEmails = decodeEmails(emailsRaw)
 		tagRows, err := d.Query("SELECT tag FROM tags WHERE user_id = $1 AND entity_type = 'task' AND entity_id = $2", uid, t.ID)
 		if err == nil {
 			for tagRows.Next() {
@@ -100,9 +152,11 @@ type taskRow struct {
 	Priority     string   `json:"priority"`
 	Tags         []string `json:"tags"`
 	DueDate      *string  `json:"due_date"`
+	WeekOf       *string  `json:"week_of"`
 	ScheduledAt  *string  `json:"scheduled_at"`
 	Remind       bool     `json:"remind"`
 	RemindedAt   *string  `json:"reminded_at"`
+	NotifyEmails []string `json:"notify_emails"`
 	ListID       *int64   `json:"list_id"`
 	ParentTaskID *int64   `json:"parent_task_id"`
 	Important    bool     `json:"important"`
@@ -167,13 +221,21 @@ func listTasks(deps Deps) http.HandlerFunc {
 			clauses = append(clauses, "t.due_date IS NOT NULL", active)
 		case "scheduled":
 			clauses = append(clauses, "t.scheduled_at IS NOT NULL", active)
+		case "week":
+			// Week-scoped tasks for the current (Monday-anchored) week.
+			mon, _ := weekBounds(d, uid)
+			clauses = append(clauses, "t.week_of = $"+itoa(ph), active)
+			args = append(args, mon)
+			ph++
 		case "missed":
 			// Every still-open task whose day is already past — accumulates,
 			// not just yesterday. Drives the Missed smart list + the reschedule
-			// banner. Scratched/done are excluded by `active`.
-			clauses = append(clauses, "t.due_date < $"+itoa(ph), active)
-			args = append(args, today)
-			ph++
+			// banner. A week task is missed once its whole week has elapsed
+			// (week_of before this Monday). Scratched/done excluded by `active`.
+			mon, _ := weekBounds(d, uid)
+			clauses = append(clauses, "(t.due_date < $"+itoa(ph)+" OR t.week_of < $"+itoa(ph+1)+")", active)
+			args = append(args, today, mon)
+			ph += 2
 		case "inbox":
 			clauses = append(clauses, "t.list_id IS NULL")
 		case "all":
@@ -217,6 +279,13 @@ func listTasks(deps Deps) http.HandlerFunc {
 			args = append(args, dd)
 			ph++
 		}
+		// week_of: week tasks for a specific (Monday-anchored) week — drives the
+		// journal weekly view, which can page through past/future weeks.
+		if wo := queryParam(r, "week_of"); wo != "" {
+			clauses = append(clauses, "t.week_of = $"+itoa(ph))
+			args = append(args, wo)
+			ph++
+		}
 		if cd := queryParam(r, "completed_date"); cd != "" {
 			clauses = append(clauses, "t.status = 'done' AND t.updated_at::date = $"+itoa(ph))
 			args = append(args, cd)
@@ -244,8 +313,8 @@ func listTasks(deps Deps) http.HandlerFunc {
 
 		q := `
 			SELECT t.id, t.title, t.description, t.status, t.priority,
-			       t.due_date::text, t.scheduled_at::text,
-			       t.remind, t.reminded_at::text,
+			       t.due_date::text, t.week_of::text, t.scheduled_at::text,
+			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
 			       t.list_id, t.parent_task_id, t.important, t.steps,
 			       COALESCE(t.sort_order, 0),
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
@@ -272,11 +341,11 @@ func listTasks(deps Deps) http.HandlerFunc {
 		var tasks []taskRow
 		for rows.Next() {
 			var t taskRow
-			var stepsRaw []byte
+			var stepsRaw, emailsRaw []byte
 			if err := rows.Scan(
 				&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority,
-				&t.DueDate, &t.ScheduledAt,
-				&t.Remind, &t.RemindedAt,
+				&t.DueDate, &t.WeekOf, &t.ScheduledAt,
+				&t.Remind, &t.RemindedAt, &emailsRaw,
 				&t.ListID, &t.ParentTaskID, &t.Important, &stepsRaw,
 				&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
 				&t.CreatedAt, &t.UpdatedAt,
@@ -285,6 +354,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 				return
 			}
 			t.Steps = decodeSteps(stepsRaw)
+			t.NotifyEmails = decodeEmails(emailsRaw)
 			tagRows, err := d.Query("SELECT tag FROM tags WHERE user_id = $1 AND entity_type = 'task' AND entity_id = $2", uid, t.ID)
 			if err == nil {
 				for tagRows.Next() {
@@ -382,17 +452,19 @@ func createTask(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
 		var body struct {
-			Title        string  `json:"title"`
-			Description  string  `json:"description"`
-			Priority     string  `json:"priority"`
-			Status       string  `json:"status"`
-			DueDate      *string `json:"due_date"`
-			ScheduledAt  *string `json:"scheduled_at"`
-			Remind       bool    `json:"remind"`
-			ListID       *int64  `json:"list_id"`
-			ParentTaskID *int64  `json:"parent_task_id"`
-			Important    bool    `json:"important"`
-			Steps        []Step  `json:"steps"`
+			Title        string   `json:"title"`
+			Description  string   `json:"description"`
+			Priority     string   `json:"priority"`
+			Status       string   `json:"status"`
+			DueDate      *string  `json:"due_date"`
+			WeekOf       *string  `json:"week_of"`
+			ScheduledAt  *string  `json:"scheduled_at"`
+			Remind       bool     `json:"remind"`
+			NotifyEmails []string `json:"notify_emails"`
+			ListID       *int64   `json:"list_id"`
+			ParentTaskID *int64   `json:"parent_task_id"`
+			Important    bool     `json:"important"`
+			Steps        []Step   `json:"steps"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -428,6 +500,14 @@ func createTask(deps Deps) http.HandlerFunc {
 		if body.DueDate != nil && strings.TrimSpace(*body.DueDate) != "" {
 			dueArg = *body.DueDate
 		}
+
+		// week_of marks a week-scoped task (no specific day). Same ''→NULL guard.
+		var weekArg any
+		if body.WeekOf != nil && strings.TrimSpace(*body.WeekOf) != "" {
+			weekArg = *body.WeekOf
+		}
+
+		notifyJSON, _ := json.Marshal(sanitizeNotifyEmails(body.NotifyEmails))
 
 		// scheduled_at is the event instant (powers time chips + reminders).
 		var schedArg any
@@ -465,12 +545,12 @@ func createTask(deps Deps) http.HandlerFunc {
 
 		var id int64
 		err := d.QueryRow(`
-			INSERT INTO tasks (user_id, title, description, priority, status, due_date, scheduled_at, remind,
-			                   list_id, parent_task_id, important, steps, sort_order)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13)
+			INSERT INTO tasks (user_id, title, description, priority, status, due_date, week_of, scheduled_at, remind,
+			                   notify_emails, list_id, parent_task_id, important, steps, sort_order)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14::jsonb, $15)
 			RETURNING id`,
-			uid, body.Title, body.Description, body.Priority, body.Status, dueArg, schedArg, body.Remind,
-			body.ListID, body.ParentTaskID, body.Important, stepsJSON, nextSort,
+			uid, body.Title, body.Description, body.Priority, body.Status, dueArg, weekArg, schedArg, body.Remind,
+			string(notifyJSON), body.ListID, body.ParentTaskID, body.Important, stepsJSON, nextSort,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -503,21 +583,25 @@ func updateTask(deps Deps) http.HandlerFunc {
 		// any field with a non-nil pointer is updated. due_date/list_id/parent
 		// also accept the JSON literal null to clear the column.
 		var body struct {
-			Title          *string `json:"title"`
-			Description    *string `json:"description"`
-			Status         *string `json:"status"`
-			Priority       *string `json:"priority"`
-			DueDate        *string `json:"due_date"`
-			ScheduledAt    *string `json:"scheduled_at"`
-			Remind         *bool   `json:"remind"`
-			ListID         *int64  `json:"list_id"`
-			ParentTaskID   *int64  `json:"parent_task_id"`
-			Important      *bool   `json:"important"`
-			Steps          *[]Step `json:"steps"`
-			SortOrder      *int    `json:"sort_order"`
-			ClearList      bool    `json:"clear_list"`
-			ClearParent    bool    `json:"clear_parent"`
-			ClearScheduled bool    `json:"clear_scheduled"`
+			Title          *string   `json:"title"`
+			Description    *string   `json:"description"`
+			Status         *string   `json:"status"`
+			Priority       *string   `json:"priority"`
+			DueDate        *string   `json:"due_date"`
+			WeekOf         *string   `json:"week_of"`
+			ScheduledAt    *string   `json:"scheduled_at"`
+			Remind         *bool     `json:"remind"`
+			NotifyEmails   *[]string `json:"notify_emails"`
+			ListID         *int64    `json:"list_id"`
+			ParentTaskID   *int64    `json:"parent_task_id"`
+			Important      *bool     `json:"important"`
+			Steps          *[]Step   `json:"steps"`
+			SortOrder      *int      `json:"sort_order"`
+			ClearList      bool      `json:"clear_list"`
+			ClearParent    bool      `json:"clear_parent"`
+			ClearScheduled bool      `json:"clear_scheduled"`
+			ClearDue       bool      `json:"clear_due"`
+			ClearWeek      bool      `json:"clear_week"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -653,6 +737,23 @@ func updateTask(deps Deps) http.HandlerFunc {
 		}
 		if body.Important != nil {
 			d.Exec("UPDATE tasks SET important=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.Important, id, uid)
+		}
+		// week_of: set/clear the Monday anchor of a week task. Switching a task
+		// between "day" and "week" scope is the form sending week_of + clear_due
+		// (→ week) or due_date + clear_week (→ day) so only one is ever set.
+		if body.WeekOf != nil || body.ClearWeek {
+			var v any
+			if body.WeekOf != nil && !body.ClearWeek && strings.TrimSpace(*body.WeekOf) != "" {
+				v = *body.WeekOf
+			}
+			d.Exec("UPDATE tasks SET week_of=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
+		}
+		if body.ClearDue {
+			d.Exec("UPDATE tasks SET due_date=NULL, updated_at=NOW() WHERE id=$1 AND user_id=$2", id, uid)
+		}
+		if body.NotifyEmails != nil {
+			b, _ := json.Marshal(sanitizeNotifyEmails(*body.NotifyEmails))
+			d.Exec("UPDATE tasks SET notify_emails=$1::jsonb, updated_at=NOW() WHERE id=$2 AND user_id=$3", string(b), id, uid)
 		}
 		if body.Steps != nil {
 			stepsJSON, _ := json.Marshal(normalizeSteps(*body.Steps))

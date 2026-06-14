@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"os"
 	"strings"
@@ -174,7 +175,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_tasks",
-			Description: "List the user's tasks with optional filters. Use this before suggesting actions on tasks. Smart filters: 'my_day' (due today), 'important' (starred), 'planned' (has due date), 'missed' (overdue and still open — past due_date, not done/scratched), 'inbox' (no list). Scratched (abandoned) tasks are excluded from every smart filter; pass status='scratched' to see them.",
+			Description: "List the user's tasks with optional filters. Use this before suggesting actions on tasks. Smart filters: 'my_day' (due today), 'important' (starred), 'planned' (has due date), 'week' (week-scoped tasks for the current week), 'missed' (overdue and still open — past due_date, not done/scratched), 'inbox' (no list). Scratched (abandoned) tasks are excluded from every smart filter; pass status='scratched' to see them.",
 			Schema: obj(map[string]*genai.Schema{
 				"smart":     str("Smart-list shortcut: 'my_day' | 'important' | 'planned' | 'missed' | 'inbox' | 'all'."),
 				"list_id":   intg("Filter to a specific user list."),
@@ -359,8 +360,10 @@ func (s *Service) buildTools() []Tool {
 				"description":      str("Optional details."),
 				"priority":         str("'high' | 'medium' | 'low'. Default 'medium'."),
 				"due_date":         str("Optional ISO date YYYY-MM-DD."),
+				"week_of":          str("Optional. Makes this a week-scoped task with no specific day — pass the ISO Monday date (YYYY-MM-DD) of the target week. Shows in the 'This Week' list. Mutually exclusive with due_date."),
 				"scheduled_at":     str("Optional ISO timestamp with offset, e.g. 2026-05-30T17:00:00+05:30. The event/reminder time."),
 				"remind":           boolean("Optional. If true, email the user ~5 min before scheduled_at. Requires scheduled_at."),
+				"notify_emails":    arrayOf(str(""), "Optional. Extra email addresses to also notify when this task's reminders fire (e.g. a friend for a meet-up). Max 3."),
 				"duration_minutes": intg("Optional. Default 30."),
 				"list_id":          intg("Optional. Place the task inside this user list."),
 				"parent_task_id":   intg("Optional. Make this a subtask of the given task id."),
@@ -875,6 +878,12 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		clauses = append(clauses, "important = TRUE", active)
 	case "planned":
 		clauses = append(clauses, "due_date IS NOT NULL", active)
+	case "week":
+		// Week-scoped tasks for the current Monday-anchored week.
+		now := userTZNow(ctx, d, uid)
+		mon := now.AddDate(0, 0, -((int(now.Weekday())+6)%7)).Format("2006-01-02")
+		clauses = append(clauses, fmt.Sprintf("week_of = $%d", len(vals)+1), active)
+		vals = append(vals, mon)
 	case "missed":
 		clauses = append(clauses, fmt.Sprintf("due_date < $%d", len(vals)+1), active)
 		vals = append(vals, today)
@@ -1527,6 +1536,30 @@ func findFreeSlotsTool(ctx context.Context, d *db.DB, uid string, args map[strin
 
 // ----- write handlers -----
 
+// sanitizeAITaskEmails mirrors the REST sanitizeNotifyEmails guard (trim,
+// RFC-validate, lowercase, de-dup, cap at 3) for the AI create path, which
+// lives in a different package and can't reach the api helper.
+func sanitizeAITaskEmails(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := map[string]bool{}
+	for _, e := range in {
+		addr, err := mail.ParseAddress(strings.TrimSpace(e))
+		if err != nil {
+			continue
+		}
+		a := strings.ToLower(addr.Address)
+		if seen[a] {
+			continue
+		}
+		seen[a] = true
+		out = append(out, a)
+		if len(out) >= 3 {
+			break
+		}
+	}
+	return out
+}
+
 func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	title := argStr(args, "title")
 	if title == "" {
@@ -1538,6 +1571,7 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 		priority = "medium"
 	}
 	dueDate := argStr(args, "due_date")
+	weekOf := argStr(args, "week_of")
 	scheduled := argStr(args, "scheduled_at")
 	dur := argInt(args, "duration_minutes", 30)
 	important := argBool(args, "important", false)
@@ -1546,12 +1580,20 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	var (
 		id        int64
 		dueArg    any = nil
+		weekArg   any = nil
 		schArg    any = nil
 		listArg   any = nil
 		parentArg any = nil
 	)
 	if dueDate != "" {
 		dueArg = dueDate
+	}
+	if weekOf != "" {
+		weekArg = weekOf
+	}
+	notifyJSON := "[]"
+	if b, err := json.Marshal(sanitizeAITaskEmails(argStrSlice(args, "notify_emails"))); err == nil {
+		notifyJSON = string(b)
 	}
 	if scheduled != "" {
 		schArg = scheduled
@@ -1616,11 +1658,11 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 
 	var scheduledAt sql.NullTime
 	err := d.QueryRowContext(ctx, `
-		INSERT INTO tasks (user_id, title, description, priority, status, due_date, scheduled_at, remind,
-		                   duration_minutes, list_id, parent_task_id, important, steps)
-		VALUES ($1,$2,$3,$4,'todo',$5,$6,$7,$8,$9,$10,$11,$12::jsonb)
+		INSERT INTO tasks (user_id, title, description, priority, status, due_date, week_of, scheduled_at, remind,
+		                   notify_emails, duration_minutes, list_id, parent_task_id, important, steps)
+		VALUES ($1,$2,$3,$4,'todo',$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14::jsonb)
 		RETURNING id, scheduled_at`,
-		uid, title, desc, priority, dueArg, schArg, remind, dur, listArg, parentArg, important, stepsJSON,
+		uid, title, desc, priority, dueArg, weekArg, schArg, remind, notifyJSON, dur, listArg, parentArg, important, stepsJSON,
 	).Scan(&id, &scheduledAt)
 	if err != nil {
 		return nil, nil, err

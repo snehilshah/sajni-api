@@ -15,6 +15,7 @@ import (
 	"sajni/internal/ai"
 	"sajni/internal/auth"
 	"sajni/internal/db"
+	"sajni/internal/push"
 	"sajni/internal/storage"
 )
 
@@ -23,7 +24,8 @@ type Deps struct {
 	DB      *db.DB
 	Auth    *auth.Service
 	Storage storage.Storage
-	AI      *ai.Service // nil when GEMINI_API_KEY is unset
+	AI      *ai.Service  // nil when GEMINI_API_KEY is unset
+	Push    *push.Sender // nil when FIREBASE_PROJECT_ID is unset
 	// AILimiter is shared across all AI endpoints (chat, palette,
 	// categorize, …) so a single per-user budget governs total spend.
 	AILimiter *aiLimiter
@@ -64,6 +66,7 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	registerTakeoutRoutes(apiMux, deps)
 	registerLinkRoutes(apiMux, deps)
 	registerBookmarkRoutes(apiMux, deps)
+	registerPushRoutes(apiMux, deps)
 
 	protected := deps.Auth.Middleware(apiMux)
 

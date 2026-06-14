@@ -21,6 +21,7 @@ import (
 	"sajni/internal/auth"
 	"sajni/internal/db"
 	"sajni/internal/logger"
+	"sajni/internal/push"
 	"sajni/internal/storage"
 )
 
@@ -86,6 +87,11 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to initialize AI service")
 	}
 
+	pushSvc, err := push.New(ctx)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to initialize push sender")
+	}
+
 	// Log startup state once — not on each request.
 	backend := os.Getenv("STORAGE_BACKEND")
 	if backend == "" {
@@ -100,6 +106,7 @@ func main() {
 	if os.Getenv("TMDB_API_KEY") == "" {
 		evt = evt.Bool("tmdb", false)
 	}
+	evt = evt.Bool("push", pushSvc != nil)
 	evt.Msg("sajni started")
 
 	deps := api.Deps{
@@ -107,6 +114,7 @@ func main() {
 		Auth:    authSvc,
 		Storage: store,
 		AI:      aiSvc,
+		Push:    pushSvc,
 	}
 	handler := api.Router(deps, *frontendDir)
 

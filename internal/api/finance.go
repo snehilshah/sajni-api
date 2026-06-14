@@ -490,18 +490,13 @@ const istDateExpr = "(%s AT TIME ZONE 'Asia/Kolkata')::date"
 
 func istDate(col string) string { return fmt.Sprintf(istDateExpr, col) }
 
-// resolveTxnAt picks a transaction instant from a request: the new ISO txn_at
-// (preferred), else the legacy date-only txn_date read as IST midnight
-// (back-compat for older web / the android app), else `now`.
-func resolveTxnAt(loc *time.Location, txnAt, txnDate string, now time.Time) time.Time {
+// resolveTxnAt parses the request's ISO txn_at, falling back to `now` when
+// absent or unparseable. The legacy date-only txn_date shim is gone: both
+// clients (web, android) send txn_at.
+func resolveTxnAt(txnAt string, now time.Time) time.Time {
 	if txnAt != "" {
 		if t, err := time.Parse(time.RFC3339, txnAt); err == nil {
 			return t
-		}
-	}
-	if txnDate != "" {
-		if d, err := time.ParseInLocation("2006-01-02", txnDate, loc); err == nil {
-			return d // IST midnight
 		}
 	}
 	return now
@@ -611,8 +606,7 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			Amount        float64 `json:"amount"`
 			Description   string  `json:"description"`
 			Note          string  `json:"note"`
-			TxnAt         string  `json:"txn_at"`   // RFC3339 (IST). Preferred.
-			TxnDate       string  `json:"txn_date"` // legacy date-only; back-compat
+			TxnAt         string  `json:"txn_at"` // RFC3339 (IST)
 			LinkedAccount *int64  `json:"linked_account"`
 		}
 		if err := readJSON(r, &b); err != nil {
@@ -626,7 +620,7 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		if b.Type == "" {
 			b.Type = "expense"
 		}
-		txnAt := resolveTxnAt(userLocation(d, uid), b.TxnAt, b.TxnDate, userNow(d, uid))
+		txnAt := resolveTxnAt(b.TxnAt, userNow(d, uid))
 
 		// Transfer: insert a pair (transfer_out from source, transfer_in to dest)
 		if b.Type == "transfer" {
@@ -699,8 +693,7 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			Amount      *float64 `json:"amount"`
 			Description *string  `json:"description"`
 			Note        *string  `json:"note"`
-			TxnAt       *string  `json:"txn_at"`   // RFC3339 (IST). Preferred.
-			TxnDate     *string  `json:"txn_date"` // legacy date-only; back-compat
+			TxnAt       *string  `json:"txn_at"` // RFC3339 (IST)
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -732,15 +725,8 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			// Re-index #hashtags from the edited note.
 			syncTags(d, uid, "transaction", id, *b.Note)
 		}
-		if b.TxnAt != nil || b.TxnDate != nil {
-			at, dt := "", ""
-			if b.TxnAt != nil {
-				at = *b.TxnAt
-			}
-			if b.TxnDate != nil {
-				dt = *b.TxnDate
-			}
-			txnAt := resolveTxnAt(userLocation(d, uid), at, dt, userNow(d, uid))
+		if b.TxnAt != nil {
+			txnAt := resolveTxnAt(*b.TxnAt, userNow(d, uid))
 			d.Exec("UPDATE fin_transactions SET txn_at = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", txnAt, id, uid)
 			d.Exec("UPDATE fin_transactions SET txn_at = $1, updated_at = NOW() WHERE transfer_pair = $2 AND user_id = $3", txnAt, id, uid)
 		}

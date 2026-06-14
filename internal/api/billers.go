@@ -3,12 +3,15 @@ package api
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
+
+	"sajni/internal/push"
 )
 
 // Billers + subscriptions live alongside finance: every biller schedules a
@@ -546,9 +549,25 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 					upcomingNoticed++
 				}
 			} else {
-				d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
+				res, _ := d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
 					VALUES ($1,$2,'upcoming',$3) ON CONFLICT DO NOTHING`,
 					b.userID, b.id, due.Format("2006-01-02"))
+				// First time this cycle's alert lands, nudge any registered
+				// device. The in-app alert row stays the durable record; there
+				// was never an email for this kind, so push is best-effort only.
+				if n, _ := res.RowsAffected(); n == 1 {
+					when := "today"
+					if gap == 1 {
+						when = "tomorrow"
+					} else if gap > 1 {
+						when = fmt.Sprintf("in %d days", gap)
+					}
+					notifyPush(ctx, deps, b.userID, push.Notification{
+						Title: "Bill due " + when,
+						Body:  fmt.Sprintf("%s — ₹%.2f due %s", b.name, b.amount, due.Format("Jan 2")),
+						Route: "/finance",
+					})
+				}
 				upcomingNoticed++
 			}
 		}
@@ -556,11 +575,16 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 	return autoPosted, upcomingNoticed, nil
 }
 
-// notifyVariableAutoPay emails the user when a variable biller was auto-paid
-// with an estimated (last-known) amount, so they can verify and adjust. Best
-// effort: a missing email service or send failure is logged, not fatal — the
-// in-app auto_paid_variable alert is the durable record.
+// notifyVariableAutoPay tells the user a variable biller was auto-paid with
+// an estimated (last-known) amount, so they can verify and adjust. Sent over
+// BOTH channels (push to registered devices + email). Best effort either
+// way: the in-app auto_paid_variable alert is the durable record.
 func notifyVariableAutoPay(ctx context.Context, deps Deps, uid, billerName string, amount float64, dueDate string) {
+	notifyPush(ctx, deps, uid, push.Notification{
+		Title: "Auto-paid " + billerName,
+		Body:  fmt.Sprintf("₹%.2f (estimated, due %s) — verify and adjust if it differs", amount, dueDate),
+		Route: "/finance",
+	})
 	if deps.Auth == nil {
 		return
 	}

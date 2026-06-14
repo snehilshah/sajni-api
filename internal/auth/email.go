@@ -182,6 +182,34 @@ func (s *Service) SendTaskReminder(ctx context.Context, to, name, taskTitle, whe
 	return s.SendEmail(ctx, to, subject, buf.String())
 }
 
+// SendGuestTaskReminder ships the reminder to a custom (external) recipient the
+// owner added to a task — e.g. a friend invited to a meet-up. The copy names
+// the owner (fromName) rather than greeting the recipient, since they're not a
+// Sajni user. Email-only; push never applies to a non-user address.
+func (s *Service) SendGuestTaskReminder(ctx context.Context, to, fromName, taskTitle, whenLabel, route string) error {
+	tpl, err := template.ParseFS(emailTemplatesFS, "email_templates/reminder_guest.html")
+	if err != nil {
+		return err
+	}
+	sender := strings.TrimSpace(fromName)
+	if sender == "" {
+		sender = "Someone"
+	}
+	appURL := strings.TrimRight(s.AppURL, "/")
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, map[string]any{
+		"FromName":  sender,
+		"TaskTitle": taskTitle,
+		"WhenLabel": whenLabel,
+		"AppURL":    appURL,
+		"CTAURL":    appURL + route,
+	}); err != nil {
+		return err
+	}
+	subject := sender + " wanted to remind you: " + taskTitle
+	return s.SendEmail(ctx, to, subject, buf.String())
+}
+
 // consumeEmailCode verifies a 6-digit code for the given email + purpose.
 // On success returns the matched row's metadata so the handler can act
 // on link payloads. Increments attempts on mismatch; locks at 5.

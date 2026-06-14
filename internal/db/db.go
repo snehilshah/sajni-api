@@ -753,6 +753,33 @@ func (d *DB) migrate() error {
 		END IF;
 	END $$;
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_at ON fin_transactions(user_id, txn_at);
+
+	-- ─── Push devices (FCM) ───────────────────────────────────────────
+	-- One row per registered native device token. Notifications go to BOTH
+	-- channels: every live token gets push, email goes out regardless.
+	-- Invalid tokens are pruned by the sender on FCM UNREGISTERED. token is
+	-- the PK so a device that re-registers under a different user moves over.
+	CREATE TABLE IF NOT EXISTS push_devices (
+		token        TEXT        PRIMARY KEY,
+		user_id      UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		platform     TEXT        NOT NULL DEFAULT 'android',
+		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id);
+
+	-- ─── Tasks: week-scoped tasks + custom reminder recipients ─────────
+	-- week_of (Monday-anchored, IST) marks a "week task": it has no specific
+	-- day, surfaces in the "This Week" smart list + the journal weekly view,
+	-- and goes Missed once its week has fully passed. due_date stays NULL for
+	-- these, so they never leak into the day-based smart lists.
+	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS week_of DATE;
+	CREATE INDEX IF NOT EXISTS idx_tasks_week_of ON tasks(user_id, week_of) WHERE week_of IS NOT NULL;
+	-- Extra email recipients for a task's reminders (e.g. a friend for a
+	-- meet-up). The owner is always notified separately; these are email-only,
+	-- friendlier copy. JSONB array of addresses (mirrors steps) — the API caps
+	-- the count and validates each address on write.
+	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notify_emails JSONB NOT NULL DEFAULT '[]'::jsonb;
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err

@@ -16,34 +16,26 @@ func istLoc(t *testing.T) *time.Location {
 	return loc
 }
 
-// resolveTxnAt prefers the ISO txn_at, falls back to the legacy date-only field
-// (read as IST midnight), then to now. Order and the IST midnight rule matter:
-// they back-fill android / older web without shifting the day.
+// resolveTxnAt parses the ISO txn_at and falls back to now — the legacy
+// txn_date shim is gone now that both clients send txn_at.
 func TestResolveTxnAt(t *testing.T) {
 	loc := istLoc(t)
 	now := time.Date(2026, 6, 3, 9, 15, 0, 0, loc)
 
-	// ISO wins, offset preserved as the same instant.
-	got := resolveTxnAt(loc, "2026-06-02T14:30:00+05:30", "2026-01-01", now)
+	// ISO parses, offset preserved as the same instant.
+	got := resolveTxnAt("2026-06-02T14:30:00+05:30", now)
 	if want := time.Date(2026, 6, 2, 14, 30, 0, 0, loc); !got.Equal(want) {
 		t.Errorf("iso txn_at: got %v want %v", got, want)
 	}
 
-	// Legacy date-only → IST midnight (the "add 00" rule).
-	got = resolveTxnAt(loc, "", "2026-06-02", now)
-	if want := time.Date(2026, 6, 2, 0, 0, 0, 0, loc); !got.Equal(want) {
-		t.Errorf("legacy date: got %v want %v", got, want)
-	}
-
-	// Nothing usable → now.
-	if got = resolveTxnAt(loc, "", "", now); !got.Equal(now) {
+	// Empty → now.
+	if got = resolveTxnAt("", now); !got.Equal(now) {
 		t.Errorf("empty: got %v want now %v", got, now)
 	}
 
-	// Garbage ISO falls through to legacy date, not now.
-	got = resolveTxnAt(loc, "not-a-time", "2026-06-02", now)
-	if want := time.Date(2026, 6, 2, 0, 0, 0, 0, loc); !got.Equal(want) {
-		t.Errorf("bad iso → legacy: got %v want %v", got, want)
+	// Garbage → now.
+	if got = resolveTxnAt("not-a-time", now); !got.Equal(now) {
+		t.Errorf("bad iso: got %v want now %v", got, now)
 	}
 }
 
