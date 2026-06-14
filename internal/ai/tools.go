@@ -1721,6 +1721,9 @@ func rescheduleTaskTool(ctx context.Context, d *db.DB, uid string, args map[stri
 			d.ExecContext(ctx, `INSERT INTO task_events (user_id, task_id, kind, from_val, to_val) VALUES ($1,$2,'rescheduled',$3,$4)`, uid, id, od, due)
 		}
 		d.ExecContext(ctx, `UPDATE tasks SET due_date=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, due, id, uid)
+		// Day/week scope are exclusive — rescheduling to a concrete day converts
+		// a week task to a day task, so clear any stale week_of.
+		d.ExecContext(ctx, `UPDATE tasks SET week_of=NULL WHERE id=$1 AND user_id=$2`, id, uid)
 	}
 
 	if sched != "" {
@@ -1844,6 +1847,8 @@ func updateTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	if _, ok := args["due_date"]; ok {
 		if due := strings.TrimSpace(argStr(args, "due_date")); due != "" {
 			add("due_date", due)
+			// Day/week scope are exclusive — setting a day clears week scope.
+			sets = append(sets, "week_of=NULL")
 		}
 	}
 	if lid := argInt(args, "list_id", 0); lid != 0 {

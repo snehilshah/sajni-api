@@ -688,6 +688,15 @@ func updateTask(deps Deps) http.HandlerFunc {
 				}
 			}
 			d.Exec("UPDATE tasks SET due_date = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", newDate, id, uid)
+			// Day and week scope are mutually exclusive. Setting a real due_date
+			// (e.g. rescheduling a lapsed week task from the Missed banner)
+			// converts it to a day task — clear any stale week_of so it drops out
+			// of the week views and the Missed predicate. Skipped when the caller
+			// is explicitly driving week_of itself (the form sends week_of /
+			// clear_week), so we don't fight an intentional scope set.
+			if strings.TrimSpace(newDate) != "" && body.WeekOf == nil && !body.ClearWeek {
+				d.Exec("UPDATE tasks SET week_of = NULL WHERE id = $1 AND user_id = $2", id, uid)
+			}
 		}
 		if body.ListID != nil || body.ClearList {
 			var v sql.NullInt64
