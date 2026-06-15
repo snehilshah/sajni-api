@@ -7,7 +7,11 @@
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+# proxy.golang.org occasionally resets the HTTP/2 stream mid-zip
+# ("INTERNAL_ERROR; received from peer"). Force HTTP/1.1 to dodge it and
+# retry a few times for any other transient blip. GOPROXY keeps its default
+# ",direct" fallback.
+RUN GODEBUG=http2client=0 sh -c 'for i in 1 2 3 4 5; do go mod download && exit 0; echo "go mod download retry $i"; sleep 3; done; exit 1'
 COPY cmd/ cmd/
 COPY internal/ internal/
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/sajni ./cmd
