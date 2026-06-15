@@ -67,7 +67,7 @@ func listNotes(deps Deps) http.HandlerFunc {
 		args := []any{uid}
 		clauses := []string{"n.user_id = $1"}
 		ph := 2
-		base := "SELECT n.id, n.title, n.folder, n.created_at, n.updated_at FROM notes n"
+		base := "SELECT n.id, n.title, n.folder, n.description, n.created_at, n.updated_at FROM notes n"
 
 		if s := queryParam(r, "search"); s != "" {
 			clauses = append(clauses, "n.title ILIKE $"+itoa(ph))
@@ -75,7 +75,7 @@ func listNotes(deps Deps) http.HandlerFunc {
 			ph++
 		}
 		if tag := queryParam(r, "tag"); tag != "" {
-			base = "SELECT n.id, n.title, n.folder, n.created_at, n.updated_at FROM notes n INNER JOIN tags t ON t.user_id = n.user_id AND t.entity_type = 'note' AND t.entity_id = n.id"
+			base = "SELECT n.id, n.title, n.folder, n.description, n.created_at, n.updated_at FROM notes n INNER JOIN tags t ON t.user_id = n.user_id AND t.entity_type = 'note' AND t.entity_id = n.id"
 			clauses = append(clauses, "t.tag = $"+itoa(ph))
 			args = append(args, tag)
 			ph++
@@ -95,17 +95,18 @@ func listNotes(deps Deps) http.HandlerFunc {
 		defer rows.Close()
 
 		type Note struct {
-			ID        int64    `json:"id"`
-			Title     string   `json:"title"`
-			Folder    string   `json:"folder"`
-			Tags      []string `json:"tags"`
-			CreatedAt string   `json:"created_at"`
-			UpdatedAt string   `json:"updated_at"`
+			ID          int64    `json:"id"`
+			Title       string   `json:"title"`
+			Folder      string   `json:"folder"`
+			Description string   `json:"description"`
+			Tags        []string `json:"tags"`
+			CreatedAt   string   `json:"created_at"`
+			UpdatedAt   string   `json:"updated_at"`
 		}
 		var notes []Note
 		for rows.Next() {
 			var n Note
-			if err := rows.Scan(&n.ID, &n.Title, &n.Folder, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			if err := rows.Scan(&n.ID, &n.Title, &n.Folder, &n.Description, &n.CreatedAt, &n.UpdatedAt); err != nil {
 				errJSON(w, 500, err.Error())
 				return
 			}
@@ -141,20 +142,21 @@ func getNote(deps Deps) http.HandlerFunc {
 		}
 
 		type Note struct {
-			ID        int64          `json:"id"`
-			Title     string         `json:"title"`
-			Folder    string         `json:"folder"`
-			Content   string         `json:"content"`
-			Tags      []string       `json:"tags"`
-			Backlinks []BacklinkInfo `json:"backlinks"`
-			CreatedAt string         `json:"created_at"`
-			UpdatedAt string         `json:"updated_at"`
+			ID          int64          `json:"id"`
+			Title       string         `json:"title"`
+			Folder      string         `json:"folder"`
+			Description string         `json:"description"`
+			Content     string         `json:"content"`
+			Tags        []string       `json:"tags"`
+			Backlinks   []BacklinkInfo `json:"backlinks"`
+			CreatedAt   string         `json:"created_at"`
+			UpdatedAt   string         `json:"updated_at"`
 		}
 
 		var n Note
 		var blobKey string
-		err = d.QueryRow("SELECT id, title, folder, blob_key, created_at, updated_at FROM notes WHERE id = $1 AND user_id = $2", id, uid).
-			Scan(&n.ID, &n.Title, &n.Folder, &blobKey, &n.CreatedAt, &n.UpdatedAt)
+		err = d.QueryRow("SELECT id, title, folder, description, blob_key, created_at, updated_at FROM notes WHERE id = $1 AND user_id = $2", id, uid).
+			Scan(&n.ID, &n.Title, &n.Folder, &n.Description, &blobKey, &n.CreatedAt, &n.UpdatedAt)
 		if err != nil {
 			errJSON(w, 404, "not found")
 			return
@@ -189,9 +191,10 @@ func createNote(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
 		var body struct {
-			Title   string `json:"title"`
-			Content string `json:"content"`
-			Folder  string `json:"folder"`
+			Title       string `json:"title"`
+			Content     string `json:"content"`
+			Folder      string `json:"folder"`
+			Description string `json:"description"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -208,8 +211,8 @@ func createNote(deps Deps) http.HandlerFunc {
 
 		var id int64
 		err := d.QueryRow(
-			"INSERT INTO notes (user_id, title, blob_key, folder) VALUES ($1, $2, $3, $4) RETURNING id",
-			uid, body.Title, key, folder,
+			"INSERT INTO notes (user_id, title, blob_key, folder, description) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+			uid, body.Title, key, folder, body.Description,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -232,9 +235,10 @@ func updateNote(deps Deps) http.HandlerFunc {
 		}
 
 		var body struct {
-			Title   *string `json:"title"`
-			Content *string `json:"content"`
-			Folder  *string `json:"folder"`
+			Title       *string `json:"title"`
+			Content     *string `json:"content"`
+			Folder      *string `json:"folder"`
+			Description *string `json:"description"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -298,6 +302,10 @@ func updateNote(deps Deps) http.HandlerFunc {
 			d.Exec("UPDATE notes SET updated_at = NOW() WHERE id = $1 AND user_id = $2", id, uid)
 			syncTags(d, uid, "note", id, *body.Content)
 			syncBacklinks(d, uid, "note", id, *body.Content)
+		}
+
+		if body.Description != nil {
+			d.Exec("UPDATE notes SET description = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Description, id, uid)
 		}
 
 		writeJSON(w, 200, map[string]any{"status": "ok", "folder": nextFolder, "title": nextTitle})

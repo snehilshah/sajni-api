@@ -588,10 +588,11 @@ func (s *Service) buildTools() []Tool {
 			Description: "Create a markdown note in the user's notes. Optional folder path (e.g. 'work/q2'). If title is empty, it's derived from the first content line.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"title":   str("Optional. If empty, derived from first content line."),
-				"content": str("Markdown body."),
-				"folder":  str("Optional. Folder path like 'work/q2'."),
-				"tags":    arrayOf(str(""), "Optional tag list."),
+				"title":       str("Optional. If empty, derived from first content line."),
+				"content":     str("Markdown body."),
+				"folder":      str("Optional. Folder path like 'work/q2'."),
+				"description": str("Optional one-line summary shown on the notes home cards."),
+				"tags":        arrayOf(str(""), "Optional tag list."),
 			}, "content"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createNoteTool(ctx, d, store, uid, args)
@@ -2016,8 +2017,8 @@ func createNoteTool(ctx context.Context, d *db.DB, store storage.Storage, uid st
 	}
 	var id int64
 	err := d.QueryRowContext(ctx,
-		`INSERT INTO notes (user_id, title, blob_key, folder) VALUES ($1,$2,$3,$4) RETURNING id`,
-		uid, title, blobKey, folder).Scan(&id)
+		`INSERT INTO notes (user_id, title, blob_key, folder, description) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+		uid, title, blobKey, folder, argStr(args, "description")).Scan(&id)
 	if err != nil {
 		return nil, nil, err
 	}
