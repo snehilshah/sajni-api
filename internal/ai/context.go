@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // systemPromptTemplate is the persona + house rules. Kept terse to
@@ -63,6 +64,13 @@ func (s *Service) buildSystemInstruction(ctx context.Context, uid string) string
 	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status NOT IN ('done','scratched') AND due_date=$2`, uid, today).Scan(&dueToday)
 	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status NOT IN ('done','scratched') AND due_date < $2`, uid, today).Scan(&missed)
 	parts = append(parts, fmt.Sprintf("- Open tasks: %d (%d due today, %d overdue)", openTasks, dueToday, missed))
+	// Month goals: long agendas for the current month (the "This Month" list).
+	var monthGoals int
+	firstOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status NOT IN ('done','scratched') AND month_of=$2`, uid, firstOfMonth).Scan(&monthGoals)
+	if monthGoals > 0 {
+		parts = append(parts, fmt.Sprintf("- Month goals: %d open this month", monthGoals))
+	}
 	var habitsTotal, habitsDone int
 	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM habits WHERE user_id=$1`, uid).Scan(&habitsTotal)
 	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM habit_logs WHERE user_id=$1 AND logged_date=$2`, uid, now.Format("2006-01-02")).Scan(&habitsDone)

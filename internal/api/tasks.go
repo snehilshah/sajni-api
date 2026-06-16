@@ -61,6 +61,61 @@ func weekBounds(d *db.DB, uid string) (monday, sunday string) {
 	return mon.Format("2006-01-02"), mon.AddDate(0, 0, 6).Format("2006-01-02")
 }
 
+// monthFirst returns the 1st of this month (YYYY-MM-DD) in the user's tz.
+// month_of on a month goal always stores this 1st, mirroring how week_of
+// stores the Monday.
+func monthFirst(d *db.DB, uid string) string {
+	now := userNow(d, uid)
+	return time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+}
+
+// notMonthGoalChild is a SQL predicate (no placeholders) that excludes tasks
+// whose parent is a month goal. A goal's dated sessions are real overdue
+// tasks, but they must never appear in Missed individually — they roll up to
+// the goal. `alias` is the tasks alias in the host query (e.g. "t").
+func notMonthGoalChild(alias string) string {
+	return "NOT EXISTS (SELECT 1 FROM tasks mgp WHERE mgp.id = " + alias + ".parent_task_id AND mgp.month_of IS NOT NULL)"
+}
+
+// completeParentGoalIfDone flips a month goal to done once all its children
+// are done. Called after a child's status changes — keeps a fully-worked goal
+// from sitting open (and so wrongly lingering in Missed after month-end). Only
+// rolls forward: reopening a child never reopens the goal. No-op when the task
+// has no parent or the parent isn't a month goal.
+func completeParentGoalIfDone(d *db.DB, uid string, childID int64) {
+	var parentID sql.NullInt64
+	d.QueryRow(`SELECT parent_task_id FROM tasks WHERE id=$1 AND user_id=$2`, childID, uid).Scan(&parentID)
+	if !parentID.Valid {
+		return
+	}
+	var open int
+	// Parent must be an open month goal with at least one still-open child.
+	d.QueryRow(`
+		SELECT COUNT(*) FROM tasks c
+		 WHERE c.parent_task_id = $1 AND c.user_id = $2
+		   AND c.status NOT IN ('done','scratched')
+		   AND EXISTS (SELECT 1 FROM tasks p
+		                WHERE p.id = $1 AND p.user_id = $2
+		                  AND p.month_of IS NOT NULL
+		                  AND p.status NOT IN ('done','scratched'))`,
+		parentID.Int64, uid).Scan(&open)
+	if open != 0 {
+		return
+	}
+	// All children done and parent is an open month goal → complete it.
+	res, _ := d.Exec(`
+		UPDATE tasks SET status='done', updated_at=NOW()
+		 WHERE id=$1 AND user_id=$2 AND month_of IS NOT NULL
+		   AND status NOT IN ('done','scratched')
+		   AND EXISTS (SELECT 1 FROM tasks c WHERE c.parent_task_id=$1 AND c.user_id=$2)`,
+		parentID.Int64, uid)
+	if res != nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			logTaskEvent(d, uid, parentID.Int64, "status", "todo", "done")
+		}
+	}
+}
+
 func registerTaskRoutes(mux *http.ServeMux, deps Deps) {
 	// Specific paths must register before /{id}.
 	mux.HandleFunc("GET /api/tasks/missed", listMissedTasks(deps))
@@ -95,7 +150,7 @@ func getTask(deps Deps) http.HandlerFunc {
 		var stepsRaw, emailsRaw []byte
 		err = d.QueryRow(`
 			SELECT t.id, t.title, t.description, t.status, t.priority,
-			       t.due_date::text, t.week_of::text, t.scheduled_at::text,
+			       t.due_date::text, t.week_of::text, t.month_of::text, t.scheduled_at::text,
 			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
 			       t.list_id, t.parent_task_id, t.important, t.steps,
 			       COALESCE(t.sort_order, 0),
@@ -112,7 +167,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			) c ON c.parent_task_id = t.id
 			WHERE t.user_id = $1 AND t.id = $2`, uid, id).Scan(
 			&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority,
-			&t.DueDate, &t.WeekOf, &t.ScheduledAt,
+			&t.DueDate, &t.WeekOf, &t.MonthOf, &t.ScheduledAt,
 			&t.Remind, &t.RemindedAt, &emailsRaw,
 			&t.ListID, &t.ParentTaskID, &t.Important, &stepsRaw,
 			&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
@@ -153,6 +208,7 @@ type taskRow struct {
 	Tags         []string `json:"tags"`
 	DueDate      *string  `json:"due_date"`
 	WeekOf       *string  `json:"week_of"`
+	MonthOf      *string  `json:"month_of"`
 	ScheduledAt  *string  `json:"scheduled_at"`
 	Remind       bool     `json:"remind"`
 	RemindedAt   *string  `json:"reminded_at"`
@@ -227,15 +283,25 @@ func listTasks(deps Deps) http.HandlerFunc {
 			clauses = append(clauses, "t.week_of = $"+itoa(ph), active)
 			args = append(args, mon)
 			ph++
+		case "month":
+			// Month goals for the current (1st-anchored) month.
+			clauses = append(clauses, "t.month_of = $"+itoa(ph), active)
+			args = append(args, monthFirst(d, uid))
+			ph++
 		case "missed":
 			// Every still-open task whose day is already past — accumulates,
 			// not just yesterday. Drives the Missed smart list + the reschedule
 			// banner. A week task is missed once its whole week has elapsed
-			// (week_of before this Monday). Scratched/done excluded by `active`.
+			// (week_of before this Monday); a month goal once its month has
+			// (month_of before this 1st). Child sessions of a month goal are
+			// suppressed — they roll up to the goal, the single missed unit.
+			// Scratched/done excluded by `active`.
 			mon, _ := weekBounds(d, uid)
-			clauses = append(clauses, "(t.due_date < $"+itoa(ph)+" OR t.week_of < $"+itoa(ph+1)+")", active)
-			args = append(args, today, mon)
-			ph += 2
+			clauses = append(clauses,
+				"(t.due_date < $"+itoa(ph)+" OR t.week_of < $"+itoa(ph+1)+" OR t.month_of < $"+itoa(ph+2)+")",
+				active, notMonthGoalChild("t"))
+			args = append(args, today, mon, monthFirst(d, uid))
+			ph += 3
 		case "inbox":
 			clauses = append(clauses, "t.list_id IS NULL")
 		case "all":
@@ -286,6 +352,12 @@ func listTasks(deps Deps) http.HandlerFunc {
 			args = append(args, wo)
 			ph++
 		}
+		// month_of: month goals for a specific (1st-anchored) month.
+		if mo := queryParam(r, "month_of"); mo != "" {
+			clauses = append(clauses, "t.month_of = $"+itoa(ph))
+			args = append(args, mo)
+			ph++
+		}
 		if cd := queryParam(r, "completed_date"); cd != "" {
 			clauses = append(clauses, "t.status = 'done' AND t.updated_at::date = $"+itoa(ph))
 			args = append(args, cd)
@@ -313,7 +385,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 
 		q := `
 			SELECT t.id, t.title, t.description, t.status, t.priority,
-			       t.due_date::text, t.week_of::text, t.scheduled_at::text,
+			       t.due_date::text, t.week_of::text, t.month_of::text, t.scheduled_at::text,
 			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
 			       t.list_id, t.parent_task_id, t.important, t.steps,
 			       COALESCE(t.sort_order, 0),
@@ -344,7 +416,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 			var stepsRaw, emailsRaw []byte
 			if err := rows.Scan(
 				&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority,
-				&t.DueDate, &t.WeekOf, &t.ScheduledAt,
+				&t.DueDate, &t.WeekOf, &t.MonthOf, &t.ScheduledAt,
 				&t.Remind, &t.RemindedAt, &emailsRaw,
 				&t.ListID, &t.ParentTaskID, &t.Important, &stepsRaw,
 				&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
@@ -458,6 +530,7 @@ func createTask(deps Deps) http.HandlerFunc {
 			Status       string   `json:"status"`
 			DueDate      *string  `json:"due_date"`
 			WeekOf       *string  `json:"week_of"`
+			MonthOf      *string  `json:"month_of"`
 			ScheduledAt  *string  `json:"scheduled_at"`
 			Remind       bool     `json:"remind"`
 			NotifyEmails []string `json:"notify_emails"`
@@ -507,6 +580,12 @@ func createTask(deps Deps) http.HandlerFunc {
 			weekArg = *body.WeekOf
 		}
 
+		// month_of marks a month goal (no specific day). Same ''→NULL guard.
+		var monthArg any
+		if body.MonthOf != nil && strings.TrimSpace(*body.MonthOf) != "" {
+			monthArg = *body.MonthOf
+		}
+
 		notifyJSON, _ := json.Marshal(sanitizeNotifyEmails(body.NotifyEmails))
 
 		// scheduled_at is the event instant (powers time chips + reminders).
@@ -545,11 +624,11 @@ func createTask(deps Deps) http.HandlerFunc {
 
 		var id int64
 		err := d.QueryRow(`
-			INSERT INTO tasks (user_id, title, description, priority, status, due_date, week_of, scheduled_at, remind,
+			INSERT INTO tasks (user_id, title, description, priority, status, due_date, week_of, month_of, scheduled_at, remind,
 			                   notify_emails, list_id, parent_task_id, important, steps, sort_order)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14::jsonb, $15)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15::jsonb, $16)
 			RETURNING id`,
-			uid, body.Title, body.Description, body.Priority, body.Status, dueArg, weekArg, schedArg, body.Remind,
+			uid, body.Title, body.Description, body.Priority, body.Status, dueArg, weekArg, monthArg, schedArg, body.Remind,
 			string(notifyJSON), body.ListID, body.ParentTaskID, body.Important, stepsJSON, nextSort,
 		).Scan(&id)
 		if err != nil {
@@ -589,6 +668,7 @@ func updateTask(deps Deps) http.HandlerFunc {
 			Priority       *string   `json:"priority"`
 			DueDate        *string   `json:"due_date"`
 			WeekOf         *string   `json:"week_of"`
+			MonthOf        *string   `json:"month_of"`
 			ScheduledAt    *string   `json:"scheduled_at"`
 			Remind         *bool     `json:"remind"`
 			NotifyEmails   *[]string `json:"notify_emails"`
@@ -602,6 +682,7 @@ func updateTask(deps Deps) http.HandlerFunc {
 			ClearScheduled bool      `json:"clear_scheduled"`
 			ClearDue       bool      `json:"clear_due"`
 			ClearWeek      bool      `json:"clear_week"`
+			ClearMonth     bool      `json:"clear_month"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -648,6 +729,10 @@ func updateTask(deps Deps) http.HandlerFunc {
 			d.Exec("UPDATE tasks SET status = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Status, id, uid)
 			if *body.Status != currentStatus {
 				logTaskEvent(d, uid, id, "status", currentStatus, *body.Status)
+			}
+			// Completing a month goal's session may finish the goal.
+			if *body.Status == "done" {
+				completeParentGoalIfDone(d, uid, id)
 			}
 		}
 		if body.Priority != nil {
@@ -696,6 +781,10 @@ func updateTask(deps Deps) http.HandlerFunc {
 			// clear_week), so we don't fight an intentional scope set.
 			if strings.TrimSpace(newDate) != "" && body.WeekOf == nil && !body.ClearWeek {
 				d.Exec("UPDATE tasks SET week_of = NULL WHERE id = $1 AND user_id = $2", id, uid)
+			}
+			// Likewise a real due_date converts a month goal to a day task.
+			if strings.TrimSpace(newDate) != "" && body.MonthOf == nil && !body.ClearMonth {
+				d.Exec("UPDATE tasks SET month_of = NULL WHERE id = $1 AND user_id = $2", id, uid)
 			}
 		}
 		if body.ListID != nil || body.ClearList {
@@ -756,6 +845,23 @@ func updateTask(deps Deps) http.HandlerFunc {
 				v = *body.WeekOf
 			}
 			d.Exec("UPDATE tasks SET week_of=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
+			// Week scope is exclusive with month scope.
+			if v != nil && body.MonthOf == nil && !body.ClearMonth {
+				d.Exec("UPDATE tasks SET month_of=NULL WHERE id=$1 AND user_id=$2", id, uid)
+			}
+		}
+		// month_of: set/clear the 1st-of-month anchor of a month goal. Mirrors
+		// week_of. Setting a real anchor clears any day/week scope so the three
+		// stay mutually exclusive (the form also sends clear_due/clear_week).
+		if body.MonthOf != nil || body.ClearMonth {
+			var v any
+			if body.MonthOf != nil && !body.ClearMonth && strings.TrimSpace(*body.MonthOf) != "" {
+				v = *body.MonthOf
+			}
+			d.Exec("UPDATE tasks SET month_of=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
+			if v != nil {
+				d.Exec("UPDATE tasks SET due_date=NULL, week_of=NULL, scheduled_at=NULL WHERE id=$1 AND user_id=$2", id, uid)
+			}
 		}
 		if body.ClearDue {
 			d.Exec("UPDATE tasks SET due_date=NULL, updated_at=NOW() WHERE id=$1 AND user_id=$2", id, uid)
@@ -876,8 +982,9 @@ func listMissedTasks(deps Deps) http.HandlerFunc {
 
 		rows2, err := d.Query(
 			`SELECT id, title, status, priority, due_date::text
-			 FROM tasks
-			 WHERE user_id = $1 AND due_date = $2 AND status NOT IN ('done','scratched') AND $2::date < CURRENT_DATE`,
+			 FROM tasks t
+			 WHERE user_id = $1 AND due_date = $2 AND status NOT IN ('done','scratched') AND $2::date < CURRENT_DATE
+			   AND `+notMonthGoalChild("t"),
 			uid, date,
 		)
 		if err == nil {

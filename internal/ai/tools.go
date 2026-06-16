@@ -175,9 +175,9 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_tasks",
-			Description: "List the user's tasks with optional filters. Use this before suggesting actions on tasks. Smart filters: 'my_day' (due today), 'important' (starred), 'planned' (has due date), 'week' (week-scoped tasks for the current week), 'missed' (overdue and still open — past due_date, not done/scratched), 'inbox' (no list). Scratched (abandoned) tasks are excluded from every smart filter; pass status='scratched' to see them.",
+			Description: "List the user's tasks with optional filters. Use this before suggesting actions on tasks. Smart filters: 'my_day' (due today), 'important' (starred), 'planned' (has due date), 'week' (week-scoped tasks for the current week), 'month' (month goals for the current month), 'missed' (overdue and still open — past due_date, not done/scratched; a month goal's child sessions are rolled up to the goal, not listed individually), 'inbox' (no list). Scratched (abandoned) tasks are excluded from every smart filter; pass status='scratched' to see them.",
 			Schema: obj(map[string]*genai.Schema{
-				"smart":     str("Smart-list shortcut: 'my_day' | 'important' | 'planned' | 'missed' | 'inbox' | 'all'."),
+				"smart":     str("Smart-list shortcut: 'my_day' | 'important' | 'planned' | 'week' | 'month' | 'missed' | 'inbox' | 'all'."),
 				"list_id":   intg("Filter to a specific user list."),
 				"parent_id": intg("Set to non-zero to fetch children of a parent task. Default returns top-level only."),
 				"status":    str("Filter by status: 'todo', 'in_progress', 'done', 'scratched'."),
@@ -361,6 +361,7 @@ func (s *Service) buildTools() []Tool {
 				"priority":         str("'high' | 'medium' | 'low'. Default 'medium'."),
 				"due_date":         str("Optional ISO date YYYY-MM-DD."),
 				"week_of":          str("Optional. Makes this a week-scoped task with no specific day — pass the ISO Monday date (YYYY-MM-DD) of the target week. Shows in the 'This Week' list. Mutually exclusive with due_date."),
+				"month_of":         str("Optional. Makes this a month goal with no specific day — pass the ISO 1st-of-month date (YYYY-MM-DD), e.g. 2026-06-01. Shows in the 'This Month' list; the user breaks it into dated child sessions (create them with parent_task_id + due_date). Mutually exclusive with due_date and week_of. Don't invent session dates — create only the goal unless the user gives a schedule."),
 				"scheduled_at":     str("Optional ISO timestamp with offset, e.g. 2026-05-30T17:00:00+05:30. The event/reminder time."),
 				"remind":           boolean("Optional. If true, email the user ~5 min before scheduled_at. Requires scheduled_at."),
 				"notify_emails":    arrayOf(str(""), "Optional. Extra email addresses to also notify when this task's reminders fire (e.g. a friend for a meet-up). Max 3."),
@@ -441,6 +442,15 @@ func (s *Service) buildTools() []Tool {
 				if err != nil {
 					return nil, nil, err
 				}
+				// Completing the last open session of a month goal finishes it.
+				d.Exec(`
+					UPDATE tasks g SET status='done', updated_at=NOW()
+					 WHERE g.user_id=$2 AND g.month_of IS NOT NULL
+					   AND g.status NOT IN ('done','scratched')
+					   AND g.id = (SELECT parent_task_id FROM tasks WHERE id=$1 AND user_id=$2)
+					   AND EXISTS (SELECT 1 FROM tasks c WHERE c.parent_task_id=g.id AND c.user_id=$2)
+					   AND NOT EXISTS (SELECT 1 FROM tasks c WHERE c.parent_task_id=g.id AND c.user_id=$2 AND c.status NOT IN ('done','scratched'))`,
+					id, uid)
 				return map[string]any{"id": id, "status": "done"},
 					map[string]any{"kind": "task_completed", "id": id}, nil
 			},
@@ -885,8 +895,17 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		mon := now.AddDate(0, 0, -((int(now.Weekday()) + 6) % 7)).Format("2006-01-02")
 		clauses = append(clauses, fmt.Sprintf("week_of = $%d", len(vals)+1), active)
 		vals = append(vals, mon)
+	case "month":
+		// Month goals for the current 1st-anchored month.
+		now := userTZNow(ctx, d, uid)
+		first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+		clauses = append(clauses, fmt.Sprintf("month_of = $%d", len(vals)+1), active)
+		vals = append(vals, first)
 	case "missed":
-		clauses = append(clauses, fmt.Sprintf("due_date < $%d", len(vals)+1), active)
+		// Child sessions of a month goal roll up to the goal — never list them
+		// here individually (mirrors the REST Missed list).
+		clauses = append(clauses, fmt.Sprintf("due_date < $%d", len(vals)+1), active,
+			"NOT EXISTS (SELECT 1 FROM tasks mgp WHERE mgp.id = tasks.parent_task_id AND mgp.month_of IS NOT NULL)")
 		vals = append(vals, today)
 	case "inbox":
 		clauses = append(clauses, "list_id IS NULL")
@@ -1573,6 +1592,7 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	}
 	dueDate := argStr(args, "due_date")
 	weekOf := argStr(args, "week_of")
+	monthOf := argStr(args, "month_of")
 	scheduled := argStr(args, "scheduled_at")
 	dur := argInt(args, "duration_minutes", 30)
 	important := argBool(args, "important", false)
@@ -1582,6 +1602,7 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 		id        int64
 		dueArg    any = nil
 		weekArg   any = nil
+		monthArg  any = nil
 		schArg    any = nil
 		listArg   any = nil
 		parentArg any = nil
@@ -1591,6 +1612,9 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	}
 	if weekOf != "" {
 		weekArg = weekOf
+	}
+	if monthOf != "" {
+		monthArg = monthOf
 	}
 	notifyJSON := "[]"
 	if b, err := json.Marshal(sanitizeAITaskEmails(argStrSlice(args, "notify_emails"))); err == nil {
@@ -1659,11 +1683,11 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 
 	var scheduledAt sql.NullTime
 	err := d.QueryRowContext(ctx, `
-		INSERT INTO tasks (user_id, title, description, priority, status, due_date, week_of, scheduled_at, remind,
+		INSERT INTO tasks (user_id, title, description, priority, status, due_date, week_of, month_of, scheduled_at, remind,
 		                   notify_emails, duration_minutes, list_id, parent_task_id, important, steps)
-		VALUES ($1,$2,$3,$4,'todo',$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14::jsonb)
+		VALUES ($1,$2,$3,$4,'todo',$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15::jsonb)
 		RETURNING id, scheduled_at`,
-		uid, title, desc, priority, dueArg, weekArg, schArg, remind, notifyJSON, dur, listArg, parentArg, important, stepsJSON,
+		uid, title, desc, priority, dueArg, weekArg, monthArg, schArg, remind, notifyJSON, dur, listArg, parentArg, important, stepsJSON,
 	).Scan(&id, &scheduledAt)
 	if err != nil {
 		return nil, nil, err
@@ -1848,8 +1872,8 @@ func updateTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	if _, ok := args["due_date"]; ok {
 		if due := strings.TrimSpace(argStr(args, "due_date")); due != "" {
 			add("due_date", due)
-			// Day/week scope are exclusive — setting a day clears week scope.
-			sets = append(sets, "week_of=NULL")
+			// Day/week/month scope are exclusive — a day clears week + month.
+			sets = append(sets, "week_of=NULL", "month_of=NULL")
 		}
 	}
 	if lid := argInt(args, "list_id", 0); lid != 0 {

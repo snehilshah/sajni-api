@@ -270,6 +270,23 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_journal_weekly_user ON journal_weekly(user_id, iso_year DESC, iso_week DESC);
 
+	-- Monthly journal entry. Same pattern as journal_weekly but keyed by
+	-- calendar year + month (1-12). Content lives in object storage under
+	-- journal/monthly/<key>.md. Powers the journal month view (parallel to
+	-- the week view) where month goals (tasks.month_of) are added.
+	CREATE TABLE IF NOT EXISTS journal_monthly (
+		id         BIGSERIAL   PRIMARY KEY,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		cal_year   INTEGER     NOT NULL,
+		cal_month  INTEGER     NOT NULL,
+		blob_key   TEXT        NOT NULL DEFAULT '',
+		mood       TEXT,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		UNIQUE(user_id, cal_year, cal_month)
+	);
+	CREATE INDEX IF NOT EXISTS idx_journal_monthly_user ON journal_monthly(user_id, cal_year DESC, cal_month DESC);
+
 	CREATE TABLE IF NOT EXISTS notes (
 		id         BIGSERIAL   PRIMARY KEY,
 		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -779,6 +796,14 @@ func (d *DB) migrate() error {
 	-- these, so they never leak into the day-based smart lists.
 	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS week_of DATE;
 	CREATE INDEX IF NOT EXISTS idx_tasks_week_of ON tasks(user_id, week_of) WHERE week_of IS NOT NULL;
+	-- month_of (1st-of-month-anchored, IST) marks a "month goal": a long agenda
+	-- with no specific day, broken into dated child sessions. Surfaces in the
+	-- "This Month" smart list; goes Missed once the month has fully passed. Its
+	-- child sessions carry their own due_date and are suppressed from Missed
+	-- (they roll up to the goal). due_date/week_of stay NULL on the goal row,
+	-- so the three scopes (day / week / month) stay mutually exclusive.
+	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS month_of DATE;
+	CREATE INDEX IF NOT EXISTS idx_tasks_month_of ON tasks(user_id, month_of) WHERE month_of IS NOT NULL;
 	-- Extra email recipients for a task's reminders (e.g. a friend for a
 	-- meet-up). The owner is always notified separately; these are email-only,
 	-- friendlier copy. JSONB array of addresses (mirrors steps) — the API caps

@@ -25,6 +25,13 @@ func registerJournalRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("PUT /api/journal/week/{year}/{week}", upsertWeeklyEntry(deps))
 	mux.HandleFunc("DELETE /api/journal/week/{year}/{week}", deleteWeeklyEntry(deps))
 	mux.HandleFunc("GET /api/journal/week/{year}/{week}/summary", weeklySummary(deps))
+
+	// Monthly routes — same literal-before-{date} ordering rule.
+	mux.HandleFunc("GET /api/journal/months", listMonthlyEntries(deps))
+	mux.HandleFunc("GET /api/journal/month/{year}/{month}", getMonthlyEntry(deps))
+	mux.HandleFunc("PUT /api/journal/month/{year}/{month}", upsertMonthlyEntry(deps))
+	mux.HandleFunc("DELETE /api/journal/month/{year}/{month}", deleteMonthlyEntry(deps))
+	mux.HandleFunc("GET /api/journal/month/{year}/{month}/summary", monthlySummary(deps))
 	mux.HandleFunc("GET /api/journal/{date}", getJournalEntry(deps))
 	mux.HandleFunc("PUT /api/journal/{date}", upsertJournalEntry(deps))
 	mux.HandleFunc("DELETE /api/journal/{date}", deleteJournalEntry(deps))
@@ -842,6 +849,318 @@ func weeklySummary(deps Deps) http.HandlerFunc {
 			"end_date":             endStr,
 			"days":                 days,
 			"habits":               habits,
+			"expense_total":        expenseTotal,
+			"expense_top_category": top,
+			"expense_currency":     currency,
+		})
+	}
+}
+
+// --- Monthly journal -------------------------------------------------------
+// Parallels the weekly journal: a long-form month entry + a per-week task
+// breakdown. Keyed by calendar year + month (1-12).
+
+func monthlyKey(uid string, year, month int) string {
+	return storage.UserKey(uid, "journal", fmt.Sprintf("monthly/%04d-%02d.md", year, month))
+}
+
+// parseYearMonth extracts year/month from URL path params and validates.
+func parseYearMonth(r *http.Request) (int, int, error) {
+	y, err := strconv.Atoi(pathParam(r, "year"))
+	if err != nil || y < 1970 || y > 9999 {
+		return 0, 0, errors.New("invalid year")
+	}
+	m, err := strconv.Atoi(pathParam(r, "month"))
+	if err != nil || m < 1 || m > 12 {
+		return 0, 0, errors.New("invalid month")
+	}
+	return y, m, nil
+}
+
+// mondayOf returns the Monday (00:00) of the week containing d.
+func mondayOf(d time.Time) time.Time {
+	offset := (int(d.Weekday()) + 6) % 7 // days since Monday (Sun=6)
+	return d.AddDate(0, 0, -offset)
+}
+
+func listMonthlyEntries(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		rows, err := d.Query(`SELECT id, cal_year, cal_month, mood, created_at, updated_at
+			FROM journal_monthly WHERE user_id = $1
+			ORDER BY cal_year DESC, cal_month DESC`, uid)
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		defer rows.Close()
+
+		type Entry struct {
+			ID        int64   `json:"id"`
+			Year      int     `json:"year"`
+			Month     int     `json:"month"`
+			Mood      *string `json:"mood"`
+			CreatedAt string  `json:"created_at"`
+			UpdatedAt string  `json:"updated_at"`
+		}
+		out := []Entry{}
+		for rows.Next() {
+			var e Entry
+			if err := rows.Scan(&e.ID, &e.Year, &e.Month, &e.Mood, &e.CreatedAt, &e.UpdatedAt); err != nil {
+				errJSON(w, 500, err.Error())
+				return
+			}
+			out = append(out, e)
+		}
+		writeJSON(w, 200, out)
+	}
+}
+
+func getMonthlyEntry(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		year, month, err := parseYearMonth(r)
+		if err != nil {
+			errJSON(w, 400, err.Error())
+			return
+		}
+
+		type Entry struct {
+			ID        int64   `json:"id"`
+			Year      int     `json:"year"`
+			Month     int     `json:"month"`
+			Mood      *string `json:"mood"`
+			Content   string  `json:"content"`
+			CreatedAt string  `json:"created_at"`
+			UpdatedAt string  `json:"updated_at"`
+		}
+
+		var e Entry
+		err = d.QueryRow(`SELECT id, cal_year, cal_month, mood, created_at, updated_at
+			FROM journal_monthly WHERE user_id = $1 AND cal_year = $2 AND cal_month = $3`,
+			uid, year, month).
+			Scan(&e.ID, &e.Year, &e.Month, &e.Mood, &e.CreatedAt, &e.UpdatedAt)
+		if err != nil {
+			// Empty stub mirrors getWeeklyEntry behaviour.
+			writeJSON(w, 200, map[string]any{
+				"id": 0, "year": year, "month": month,
+				"mood": nil, "content": "", "created_at": "", "updated_at": "",
+			})
+			return
+		}
+
+		if data, _, gerr := deps.Storage.Get(r.Context(), monthlyKey(uid, year, month)); gerr == nil {
+			e.Content = string(data)
+		}
+		writeJSON(w, 200, e)
+	}
+}
+
+func upsertMonthlyEntry(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		year, month, err := parseYearMonth(r)
+		if err != nil {
+			errJSON(w, 400, err.Error())
+			return
+		}
+		var body struct {
+			Content string  `json:"content"`
+			Mood    *string `json:"mood"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			errJSON(w, 400, "invalid json")
+			return
+		}
+
+		key := monthlyKey(uid, year, month)
+		if err := deps.Storage.Put(r.Context(), key, []byte(body.Content), "text/markdown"); err != nil {
+			errJSON(w, 500, "store entry: "+err.Error())
+			return
+		}
+
+		var id int64
+		err = d.QueryRow(`SELECT id FROM journal_monthly
+			WHERE user_id = $1 AND cal_year = $2 AND cal_month = $3`, uid, year, month).Scan(&id)
+		if err != nil {
+			err := d.QueryRow(
+				`INSERT INTO journal_monthly (user_id, cal_year, cal_month, blob_key, mood)
+				 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+				uid, year, month, key, body.Mood,
+			).Scan(&id)
+			if err != nil {
+				errJSON(w, 500, err.Error())
+				return
+			}
+		} else {
+			d.Exec(`UPDATE journal_monthly SET mood = $1, blob_key = $2, updated_at = NOW()
+				WHERE id = $3 AND user_id = $4`, body.Mood, key, id, uid)
+		}
+		writeJSON(w, 200, map[string]int64{"id": id})
+	}
+}
+
+func deleteMonthlyEntry(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		year, month, err := parseYearMonth(r)
+		if err != nil {
+			errJSON(w, 400, err.Error())
+			return
+		}
+		var id int64
+		if err := d.QueryRow(`SELECT id FROM journal_monthly
+			WHERE user_id = $1 AND cal_year = $2 AND cal_month = $3`, uid, year, month).Scan(&id); err != nil {
+			errJSON(w, 404, "not found")
+			return
+		}
+		if err := deps.Storage.Delete(r.Context(), monthlyKey(uid, year, month)); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			// log-and-continue
+		}
+		d.Exec("DELETE FROM journal_monthly WHERE id = $1 AND user_id = $2", id, uid)
+		writeJSON(w, 200, map[string]string{"status": "ok"})
+	}
+}
+
+// monthlySummary aggregates a calendar month into per-week rows (the "Tasks by
+// week" breakdown) plus month-total task/expense stats for the dashboard tiles.
+func monthlySummary(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		year, month, err := parseYearMonth(r)
+		if err != nil {
+			errJSON(w, 400, err.Error())
+			return
+		}
+
+		first := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+		last := first.AddDate(0, 1, -1)
+		firstStr := first.Format("2006-01-02")
+		lastStr := last.Format("2006-01-02")
+		daysInMonth := last.Day()
+
+		// Per-week rows: every ISO week whose Mon–Sun span overlaps the month.
+		// Aggregation uses the full week span (not clipped) so a row matches the
+		// week view you reach by clicking it.
+		type WeekStat struct {
+			IsoYear     int    `json:"iso_year"`
+			IsoWeek     int    `json:"iso_week"`
+			StartDate   string `json:"start_date"`
+			EndDate     string `json:"end_date"`
+			TasksDone   int    `json:"tasks_done"`
+			TasksDue    int    `json:"tasks_due"`
+			TasksMissed int    `json:"tasks_missed"`
+		}
+		weeks := []WeekStat{}
+		index := map[string]int{} // date (YYYY-MM-DD) -> week-row index
+		spanStart := mondayOf(first)
+		spanEnd := mondayOf(last).AddDate(0, 0, 6)
+		for ws := spanStart; !ws.After(spanEnd); ws = ws.AddDate(0, 0, 7) {
+			iy, iw := ws.ISOWeek()
+			we := ws.AddDate(0, 0, 6)
+			weeks = append(weeks, WeekStat{
+				IsoYear: iy, IsoWeek: iw,
+				StartDate: ws.Format("2006-01-02"), EndDate: we.Format("2006-01-02"),
+			})
+			for i := 0; i < 7; i++ {
+				index[ws.AddDate(0, 0, i).Format("2006-01-02")] = len(weeks) - 1
+			}
+		}
+		spanStartStr := spanStart.Format("2006-01-02")
+		spanEndStr := spanEnd.Format("2006-01-02")
+
+		if rows, err := d.Query(`SELECT due_date::text, status FROM tasks
+			WHERE user_id = $1 AND due_date BETWEEN $2 AND $3`, uid, spanStartStr, spanEndStr); err == nil {
+			for rows.Next() {
+				var dateStr, status string
+				rows.Scan(&dateStr, &status)
+				if i, ok := index[dateStr]; ok {
+					if status == "done" {
+						weeks[i].TasksDone++
+					} else {
+						weeks[i].TasksDue++
+					}
+				}
+			}
+			rows.Close()
+		}
+		if rows, err := d.Query(`SELECT due_date::text FROM task_due_history
+			WHERE user_id = $1 AND outcome = 'missed' AND due_date BETWEEN $2 AND $3`,
+			uid, spanStartStr, spanEndStr); err == nil {
+			for rows.Next() {
+				var dateStr string
+				rows.Scan(&dateStr)
+				if i, ok := index[dateStr]; ok {
+					weeks[i].TasksMissed++
+				}
+			}
+			rows.Close()
+		}
+
+		// Month-total task stats (clipped to the actual month, not the week span).
+		var totalDone, totalDue, totalMissed, entriesWritten int
+		d.QueryRow(`SELECT
+			COUNT(*) FILTER (WHERE status = 'done'),
+			COUNT(*) FILTER (WHERE status <> 'done')
+			FROM tasks WHERE user_id = $1 AND due_date BETWEEN $2 AND $3`,
+			uid, firstStr, lastStr).Scan(&totalDone, &totalDue)
+		d.QueryRow(`SELECT COUNT(*) FROM task_due_history
+			WHERE user_id = $1 AND outcome = 'missed' AND due_date BETWEEN $2 AND $3`,
+			uid, firstStr, lastStr).Scan(&totalMissed)
+		d.QueryRow(`SELECT COUNT(*) FROM journal_entries
+			WHERE user_id = $1 AND date BETWEEN $2 AND $3`, uid, firstStr, lastStr).Scan(&entriesWritten)
+
+		// Finance: total expense + top category for the month (IST day window).
+		var expenseTotal float64
+		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+			WHERE user_id = $1 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
+			uid, firstStr, lastStr).Scan(&expenseTotal)
+		type TopCat struct {
+			ID     int64   `json:"id"`
+			Name   string  `json:"name"`
+			Amount float64 `json:"amount"`
+		}
+		var top *TopCat
+		if rows, err := d.Query(`SELECT t.category_id, COALESCE(c.name, 'Uncategorized'), SUM(t.amount) AS total
+			FROM fin_transactions t
+			LEFT JOIN fin_categories c ON c.id = t.category_id
+			WHERE t.user_id = $1 AND t.type = 'expense' AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3
+			GROUP BY t.category_id, c.name
+			ORDER BY total DESC
+			LIMIT 1`, uid, firstStr, lastStr); err == nil {
+			if rows.Next() {
+				var tc TopCat
+				var catID *int64
+				rows.Scan(&catID, &tc.Name, &tc.Amount)
+				if catID != nil {
+					tc.ID = *catID
+				}
+				top = &tc
+			}
+			rows.Close()
+		}
+		var currency string
+		d.QueryRow(`SELECT currency FROM fin_accounts WHERE user_id = $1 LIMIT 1`, uid).Scan(&currency)
+		if currency == "" {
+			currency = "INR"
+		}
+
+		writeJSON(w, 200, map[string]any{
+			"year":                 year,
+			"month":                month,
+			"start_date":           firstStr,
+			"end_date":             lastStr,
+			"days_in_month":        daysInMonth,
+			"weeks":                weeks,
+			"total_done":           totalDone,
+			"total_due":            totalDue + totalDone,
+			"total_missed":         totalMissed,
+			"entries_written":      entriesWritten,
 			"expense_total":        expenseTotal,
 			"expense_top_category": top,
 			"expense_currency":     currency,
