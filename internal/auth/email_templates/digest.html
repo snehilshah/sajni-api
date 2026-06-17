@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sajni digest</title>
+  </head>
+  <body style="margin:0;padding:0;background:#F2F7F7;font-family:Georgia,'Roboto Serif',Cambria,serif;color:#162729;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F2F7F7;padding:32px 0;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#E8F1F0;border-radius:24px;overflow:hidden;border:1px solid #C9DCDA;">
+            <tr>
+              <td style="padding:32px 36px 8px;">
+                <div style="font-family:Georgia,'Roboto Serif',Cambria,serif;font-size:24px;letter-spacing:-0.01em;font-weight:600;color:#1A3F40;">Sajni</div>
+                <div style="font-family:'JetBrains Mono',Consolas,'Courier New',monospace;font-size:10px;letter-spacing:0.18em;text-transform:uppercase;color:#5C7173;margin-top:4px;">{{.Heading}} · {{.PeriodLabel}}</div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:8px 36px 0;">
+                <p style="font-family:Arial,'Roboto Flex',Helvetica,sans-serif;font-size:15px;line-height:1.55;color:#3D5253;margin:24px 0 16px;">Hi {{.Name}}, {{.Intro}}</p>
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+                  {{range .Tasks}}
+                  <tr>
+                    <td style="padding:10px 0;border-bottom:1px solid #C9DCDA;">
+                      <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+                        <td valign="top" style="width:18px;font-family:Arial,Helvetica,sans-serif;font-size:15px;color:#1A3F40;line-height:1.4;">•</td>
+                        <td style="font-family:Georgia,'Roboto Serif',Cambria,serif;font-size:16px;line-height:1.4;color:#162729;">{{.}}</td>
+                      </tr></table>
+                    </td>
+                  </tr>
+                  {{end}}
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td align="center" style="padding:24px 36px 28px;">
+                <a href="{{.CTAURL}}" style="display:inline-block;padding:14px 28px;background:#1A3F40;border-radius:9999px;font-family:Arial,'Roboto Flex',Helvetica,sans-serif;font-size:15px;font-weight:600;color:#E8F1F0;text-decoration:none;">Open in Sajni</a>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:0 36px 32px;">
+                <div style="height:1px;background:#C9DCDA;margin:0 0 16px;"></div>
+                <p style="font-family:Arial,'Roboto Flex',Helvetica,sans-serif;font-size:11px;line-height:1.55;color:#7C8E90;margin:0;">Sent by Sajni · <a href="{{.AppURL}}" style="color:#1A3F40;text-decoration:none;">ohmysajni.com</a> · A roundup of tasks still open this {{if eq .Heading "Pending this month"}}month{{else}}week{{end}}.</p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>

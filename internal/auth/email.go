@@ -182,6 +182,40 @@ func (s *Service) SendTaskReminder(ctx context.Context, to, name, taskTitle, whe
 	return s.SendEmail(ctx, to, subject, buf.String())
 }
 
+// SendTaskDigest renders + ships the weekly / monthly pending-task digest: one
+// email listing every still-pending week (or month) task. kind is "week" |
+// "month"; periodLabel is the human range (e.g. "Jun 16–22" / "June 2026")
+// already formatted by the caller. route is the in-app CTA path.
+func (s *Service) SendTaskDigest(ctx context.Context, to, name, kind, periodLabel string, titles []string, route string) error {
+	tpl, err := template.ParseFS(emailTemplatesFS, "email_templates/digest.html")
+	if err != nil {
+		return err
+	}
+	displayName := strings.TrimSpace(name)
+	if displayName == "" {
+		displayName = strings.SplitN(to, "@", 2)[0]
+	}
+	heading, intro, subject := "Pending this week", "Still open on your week tasks —", "Your week tasks · "+periodLabel
+	if kind == "month" {
+		heading, intro, subject = "Pending this month", "Still open on your month tasks —", "Your month tasks · "+periodLabel
+	}
+	appURL := strings.TrimRight(s.AppURL, "/")
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, map[string]any{
+		"Name":        displayName,
+		"Heading":     heading,
+		"Intro":       intro,
+		"PeriodLabel": periodLabel,
+		"Tasks":       titles,
+		"Count":       len(titles),
+		"AppURL":      appURL,
+		"CTAURL":      appURL + route,
+	}); err != nil {
+		return err
+	}
+	return s.SendEmail(ctx, to, subject, buf.String())
+}
+
 // SendGuestTaskReminder ships the reminder to a custom (external) recipient the
 // owner added to a task — e.g. a friend invited to a meet-up. The copy names
 // the owner (fromName) rather than greeting the recipient, since they're not a

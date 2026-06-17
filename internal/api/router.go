@@ -104,6 +104,7 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	// fires run by Cloud Tasks.
 	RegisterInsightCronHandler(root, deps)
 	RegisterReminderCronHandler(root, deps)
+	RegisterDigestCronHandler(root, deps)
 	RegisterPriceCronHandler(root, deps)
 
 	if frontendDir != "" {

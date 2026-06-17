@@ -257,6 +257,29 @@ After a month of clean reminder logs, you can delete the daily reminder
 sweep too. Until then it catches missed Cloud Tasks deliveries with the
 same idempotency gates.
 
+## Weekly / monthly task digests
+
+Week and month tasks have no `scheduled_at`, so the 5-min reminder never
+fires for them. A once-daily sweep at **10:00 IST** posts to
+`/internal/reminders/digest` (same `REMINDER_CRON_SECRET` header). The
+endpoint self-gates: it emails the pending **week** tasks only on Fridays
+and the pending **month** tasks only on the last calendar day of the month,
+so a single daily job covers both. Create it once:
+
+```sh
+gcloud scheduler jobs create http sajni-digest \
+  --location="$REGION" \
+  --schedule="0 10 * * *" \
+  --time-zone="Asia/Kolkata" \
+  --uri="$API_BASE_URL/internal/reminders/digest" \
+  --http-method=POST \
+  --headers="X-Reminder-Cron=$(gcloud secrets versions access latest --secret=REMINDER_CRON_SECRET)"
+```
+
+Idempotent via `tasks.digested_at`: a still-pending task is re-nudged each
+cycle, and a task added after a fire is caught on the next one. Safe to run
+any day — it no-ops when neither a Friday nor a month-end applies.
+
 ---
 
 ## Releasing
