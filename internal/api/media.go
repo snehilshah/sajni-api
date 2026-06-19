@@ -9,9 +9,49 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"sajni/internal/db"
 )
+
+// httpClient bounds every outbound TMDB / Open Library call. The stdlib
+// default has NO timeout, so a slow upstream (or a Cloud Run cold start)
+// left search requests hanging — that read as the whole Add dialog
+// freezing until the response landed.
+var httpClient = &http.Client{Timeout: 8 * time.Second}
+
+// Tiny in-memory TTL cache for the public metadata calls (search /
+// details / collection). Results are public + immutable enough that a
+// short TTL turns repeat lookups instant without any store or migration.
+type cacheEntry struct {
+	val any
+	exp time.Time
+}
+
+var (
+	tmdbCache   = map[string]cacheEntry{}
+	tmdbCacheMu sync.Mutex
+)
+
+func cacheGet(key string) (any, bool) {
+	tmdbCacheMu.Lock()
+	defer tmdbCacheMu.Unlock()
+	e, ok := tmdbCache[key]
+	if !ok || time.Now().After(e.exp) {
+		if ok {
+			delete(tmdbCache, key)
+		}
+		return nil, false
+	}
+	return e.val, true
+}
+
+func cacheSet(key string, val any, ttl time.Duration) {
+	tmdbCacheMu.Lock()
+	defer tmdbCacheMu.Unlock()
+	tmdbCache[key] = cacheEntry{val: val, exp: time.Now().Add(ttl)}
+}
 
 func registerMediaRoutes(mux *http.ServeMux, deps Deps) {
 	// More-specific routes register before /{id}.
@@ -491,18 +531,37 @@ func searchMedia() http.HandlerFunc {
 	}
 }
 
+// searchTMDB returns combined movie + show results for the movie/show
+// tabs via TMDB /search/multi, so a title of either kind surfaces from
+// either tab. The kind is carried in each external_id (tmdb:movie:… /
+// tmdb:tv:…) — the frontend derives its Movie/Show badge + form type
+// from that, so no response field changes. People results are dropped.
 func searchTMDB(query, mediaType string) []SearchResult {
 	apiKey := os.Getenv("TMDB_API_KEY")
 	if apiKey == "" {
 		return []SearchResult{}
 	}
-	endpoint := "movie"
-	if mediaType == "show" {
-		endpoint = "tv"
+	cacheKey := "search:" + mediaType + ":" + strings.ToLower(query)
+	if v, ok := cacheGet(cacheKey); ok {
+		return v.([]SearchResult)
 	}
-	u := fmt.Sprintf("https://api.themoviedb.org/3/search/%s?api_key=%s&query=%s&page=1",
-		endpoint, apiKey, url.QueryEscape(query))
-	resp, err := http.Get(u)
+
+	// movie / show (and the empty default) share one combined search;
+	// any other explicit type still hits its single endpoint.
+	combined := mediaType == "movie" || mediaType == "show" || mediaType == ""
+	var u string
+	if combined {
+		u = fmt.Sprintf("https://api.themoviedb.org/3/search/multi?api_key=%s&query=%s&page=1",
+			apiKey, url.QueryEscape(query))
+	} else {
+		endpoint := "movie"
+		if mediaType == "show" {
+			endpoint = "tv"
+		}
+		u = fmt.Sprintf("https://api.themoviedb.org/3/search/%s?api_key=%s&query=%s&page=1",
+			endpoint, apiKey, url.QueryEscape(query))
+	}
+	resp, err := httpClient.Get(u)
 	if err != nil {
 		return []SearchResult{}
 	}
@@ -519,9 +578,23 @@ func searchTMDB(query, mediaType string) []SearchResult {
 		var item map[string]any
 		json.Unmarshal(rr, &item)
 
+		// /search/multi tags each row with media_type; a single-endpoint
+		// search doesn't, so infer the kind from the requested type.
+		kind, _ := item["media_type"].(string)
+		if kind == "" {
+			if mediaType == "show" {
+				kind = "tv"
+			} else {
+				kind = "movie"
+			}
+		}
+		if kind != "movie" && kind != "tv" {
+			continue // drop people / anything else multi returns
+		}
+
 		sr := SearchResult{}
-		sr.ExternalID = fmt.Sprintf("tmdb:%s:%.0f", endpoint, item["id"])
-		if endpoint == "movie" {
+		sr.ExternalID = fmt.Sprintf("tmdb:%s:%.0f", kind, item["id"])
+		if kind == "movie" {
 			if v, ok := item["title"].(string); ok {
 				sr.Title = v
 			}
@@ -542,17 +615,25 @@ func searchTMDB(query, mediaType string) []SearchResult {
 		if v, ok := item["overview"].(string); ok {
 			sr.Overview = v
 		}
+		if sr.Title == "" {
+			continue
+		}
 		results = append(results, sr)
 	}
 	if len(results) > 8 {
 		results = results[:8]
 	}
+	cacheSet(cacheKey, results, 10*time.Minute)
 	return results
 }
 
 func searchOpenLibrary(query string) []SearchResult {
+	cacheKey := "ol:" + strings.ToLower(query)
+	if v, ok := cacheGet(cacheKey); ok {
+		return v.([]SearchResult)
+	}
 	u := fmt.Sprintf("https://openlibrary.org/search.json?q=%s&limit=10", url.QueryEscape(query))
-	resp, err := http.Get(u)
+	resp, err := httpClient.Get(u)
 	if err != nil {
 		return []SearchResult{}
 	}
@@ -596,6 +677,7 @@ func searchOpenLibrary(query string) []SearchResult {
 	if len(results) > 8 {
 		results = results[:8]
 	}
+	cacheSet(cacheKey, results, 10*time.Minute)
 	return results
 }
 
@@ -666,6 +748,11 @@ func mediaDetails() http.HandlerFunc {
 			errJSON(w, 503, "tmdb not configured")
 			return
 		}
+		cacheKey := "details:" + ext
+		if v, ok := cacheGet(cacheKey); ok {
+			writeJSON(w, 200, v.(MediaDetails))
+			return
+		}
 		out := MediaDetails{ExternalID: ext}
 		if kind == "tv" {
 			out.Type = "show"
@@ -680,13 +767,14 @@ func mediaDetails() http.HandlerFunc {
 				return
 			}
 		}
+		cacheSet(cacheKey, out, 30*time.Minute)
 		writeJSON(w, 200, out)
 	}
 }
 
 func fillShowDetails(out *MediaDetails, id, apiKey string) error {
 	u := fmt.Sprintf("https://api.themoviedb.org/3/tv/%s?api_key=%s", id, apiKey)
-	resp, err := http.Get(u)
+	resp, err := httpClient.Get(u)
 	if err != nil {
 		return err
 	}
@@ -760,7 +848,7 @@ func fillShowDetails(out *MediaDetails, id, apiKey string) error {
 
 func fillMovieDetails(out *MediaDetails, id, apiKey string) error {
 	u := fmt.Sprintf("https://api.themoviedb.org/3/movie/%s?api_key=%s", id, apiKey)
-	resp, err := http.Get(u)
+	resp, err := httpClient.Get(u)
 	if err != nil {
 		return err
 	}
@@ -822,8 +910,13 @@ func collectionDetails() http.HandlerFunc {
 			errJSON(w, 503, "tmdb not configured")
 			return
 		}
+		cacheKey := "collection:" + raw
+		if v, ok := cacheGet(cacheKey); ok {
+			writeJSON(w, 200, v.(CollectionPayload))
+			return
+		}
 		u := fmt.Sprintf("https://api.themoviedb.org/3/collection/%s?api_key=%s", raw, apiKey)
-		resp, err := http.Get(u)
+		resp, err := httpClient.Get(u)
 		if err != nil {
 			errJSON(w, 502, err.Error())
 			return
@@ -866,6 +959,7 @@ func collectionDetails() http.HandlerFunc {
 		// Sort parts chronologically — release order is more useful than
 		// TMDB's id order.
 		sortCollectionParts(out.Parts)
+		cacheSet(cacheKey, out, 30*time.Minute)
 		writeJSON(w, 200, out)
 	}
 }
