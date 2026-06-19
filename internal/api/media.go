@@ -532,10 +532,12 @@ func searchMedia() http.HandlerFunc {
 }
 
 // searchTMDB returns combined movie + show results for the movie/show
-// tabs via TMDB /search/multi, so a title of either kind surfaces from
-// either tab. The kind is carried in each external_id (tmdb:movie:… /
-// tmdb:tv:…) — the frontend derives its Movie/Show badge + form type
-// from that, so no response field changes. People results are dropped.
+// tabs. We query the movie and tv endpoints in PARALLEL and interleave
+// them so BOTH kinds always appear — TMDB's relevance-ranked /search/multi
+// let one kind crowd the other out (a movie-title query returned only
+// movies, which read as the tab still filtering). Kind is carried in each
+// external_id (tmdb:movie:… / tmdb:tv:…); the frontend derives its badge +
+// form type from that, so no response field changes.
 func searchTMDB(query, mediaType string) []SearchResult {
 	apiKey := os.Getenv("TMDB_API_KEY")
 	if apiKey == "" {
@@ -546,55 +548,53 @@ func searchTMDB(query, mediaType string) []SearchResult {
 		return v.([]SearchResult)
 	}
 
-	// movie / show (and the empty default) share one combined search;
-	// any other explicit type still hits its single endpoint.
+	// movie / show (and the empty default) get the combined, interleaved
+	// search; any other explicit type still hits its single endpoint.
 	combined := mediaType == "movie" || mediaType == "show" || mediaType == ""
-	var u string
+	var results []SearchResult
 	if combined {
-		u = fmt.Sprintf("https://api.themoviedb.org/3/search/multi?api_key=%s&query=%s&page=1",
-			apiKey, url.QueryEscape(query))
+		var movies, shows []SearchResult
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); movies = fetchTMDBList("movie", query, apiKey) }()
+		go func() { defer wg.Done(); shows = fetchTMDBList("tv", query, apiKey) }()
+		wg.Wait()
+		results = interleaveResults(movies, shows, 8)
 	} else {
 		endpoint := "movie"
 		if mediaType == "show" {
 			endpoint = "tv"
 		}
-		u = fmt.Sprintf("https://api.themoviedb.org/3/search/%s?api_key=%s&query=%s&page=1",
-			endpoint, apiKey, url.QueryEscape(query))
+		results = fetchTMDBList(endpoint, query, apiKey)
+		if len(results) > 8 {
+			results = results[:8]
+		}
 	}
+	cacheSet(cacheKey, results, 10*time.Minute)
+	return results
+}
+
+// fetchTMDBList queries one TMDB search endpoint ("movie" | "tv") and maps
+// the rows to SearchResult, tagging each external_id with the kind.
+func fetchTMDBList(endpoint, query, apiKey string) []SearchResult {
+	u := fmt.Sprintf("https://api.themoviedb.org/3/search/%s?api_key=%s&query=%s&page=1",
+		endpoint, apiKey, url.QueryEscape(query))
 	resp, err := httpClient.Get(u)
 	if err != nil {
-		return []SearchResult{}
+		return nil
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 
 	var raw struct {
-		Results []json.RawMessage `json:"results"`
+		Results []map[string]any `json:"results"`
 	}
 	json.Unmarshal(body, &raw)
 
-	results := []SearchResult{}
-	for _, rr := range raw.Results {
-		var item map[string]any
-		json.Unmarshal(rr, &item)
-
-		// /search/multi tags each row with media_type; a single-endpoint
-		// search doesn't, so infer the kind from the requested type.
-		kind, _ := item["media_type"].(string)
-		if kind == "" {
-			if mediaType == "show" {
-				kind = "tv"
-			} else {
-				kind = "movie"
-			}
-		}
-		if kind != "movie" && kind != "tv" {
-			continue // drop people / anything else multi returns
-		}
-
-		sr := SearchResult{}
-		sr.ExternalID = fmt.Sprintf("tmdb:%s:%.0f", kind, item["id"])
-		if kind == "movie" {
+	out := []SearchResult{}
+	for _, item := range raw.Results {
+		sr := SearchResult{ExternalID: fmt.Sprintf("tmdb:%s:%.0f", endpoint, item["id"])}
+		if endpoint == "movie" {
 			if v, ok := item["title"].(string); ok {
 				sr.Title = v
 			}
@@ -615,16 +615,30 @@ func searchTMDB(query, mediaType string) []SearchResult {
 		if v, ok := item["overview"].(string); ok {
 			sr.Overview = v
 		}
-		if sr.Title == "" {
-			continue
+		if sr.Title != "" {
+			out = append(out, sr)
 		}
-		results = append(results, sr)
 	}
-	if len(results) > 8 {
-		results = results[:8]
+	return out
+}
+
+// interleaveResults zips two lists (movie, show, movie, show, …) up to max
+// items so both kinds get near-equal billing in the dropdown.
+func interleaveResults(a, b []SearchResult, max int) []SearchResult {
+	out := make([]SearchResult, 0, max)
+	for i := 0; i < len(a) || i < len(b); i++ {
+		if i < len(a) {
+			if out = append(out, a[i]); len(out) >= max {
+				break
+			}
+		}
+		if i < len(b) {
+			if out = append(out, b[i]); len(out) >= max {
+				break
+			}
+		}
 	}
-	cacheSet(cacheKey, results, 10*time.Minute)
-	return results
+	return out
 }
 
 func searchOpenLibrary(query string) []SearchResult {

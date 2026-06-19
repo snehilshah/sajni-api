@@ -202,17 +202,44 @@ func deleteBookmark(deps Deps) http.HandlerFunc {
 
 // ─── URL classification + metadata ──────────────────────────────────────
 
-var videoHosts = map[string]bool{
-	"youtube.com": true, "youtu.be": true, "vimeo.com": true,
-	"twitch.tv": true, "dailymotion.com": true,
-}
-
-// bookmarkKind: 'video' for known video hosts, else 'site'.
-func bookmarkKind(u *url.URL) string {
+// isVideoURL reports whether the URL points at a single playable video —
+// not a channel, @handle, playlist, community post, or other host page.
+// A bare youtube.com/@channel previously classified as 'video', landed in
+// the Videos shelf, and failed its oEmbed fetch (no title/thumb), which
+// collapsed the card. Those now fall through to 'site'.
+func isVideoURL(u *url.URL) bool {
 	host := strings.ToLower(u.Hostname())
 	host = strings.TrimPrefix(host, "www.")
 	host = strings.TrimPrefix(host, "m.")
-	if videoHosts[host] {
+	path := strings.Trim(u.Path, "/")
+	seg := strings.Split(path, "/")
+	switch host {
+	case "youtube.com", "music.youtube.com":
+		if u.Query().Get("v") != "" { // /watch?v=ID
+			return true
+		}
+		// /shorts/ID, /embed/ID, /live/ID — but not /@handle, /channel,
+		// /c, /user, /playlist, /feed, /results, /post, /hashtag.
+		return len(seg) >= 2 && (seg[0] == "shorts" || seg[0] == "embed" || seg[0] == "live")
+	case "youtu.be":
+		// youtu.be/ID — first path segment is the video id.
+		return path != "" && !strings.HasPrefix(path, "@")
+	case "vimeo.com":
+		// vimeo.com/123456789 (numeric id) — not /user… or /channels….
+		return len(seg) >= 1 && isAllDigits(seg[0])
+	case "twitch.tv":
+		// /videos/ID or /<channel>/clip/ID — a bare channel is a live
+		// page, treated as a site so it doesn't break the video card.
+		return seg[0] == "videos" || (len(seg) >= 2 && seg[1] == "clip")
+	case "dailymotion.com":
+		return len(seg) >= 2 && seg[0] == "video"
+	}
+	return false
+}
+
+// bookmarkKind: 'video' only for a single playable video URL, else 'site'.
+func bookmarkKind(u *url.URL) string {
+	if isVideoURL(u) {
 		return "video"
 	}
 	return "site"
@@ -237,6 +264,11 @@ type bookmarkMeta struct {
 // scrape cap below, so titles and thumbnails came back blank; oEmbed
 // returns both in a small JSON document with no API key.
 func oembedEndpoint(u *url.URL) string {
+	// Only real videos have an oEmbed document; channel/post pages 404 it,
+	// so let them fall through to the HTML scrape instead.
+	if !isVideoURL(u) {
+		return ""
+	}
 	host := strings.ToLower(u.Hostname())
 	host = strings.TrimPrefix(host, "www.")
 	host = strings.TrimPrefix(host, "m.")
