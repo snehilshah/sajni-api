@@ -1695,8 +1695,12 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	if remind && scheduledAt.Valid {
 		enqueueTaskReminder(ctx, id, scheduledAt.Time)
 	}
-	for _, tag := range argStrSlice(args, "tags") {
-		d.ExecContext(ctx, `INSERT INTO tags (user_id, entity_type, entity_id, tag) VALUES ($1,'task',$2,$3)`, uid, id, tag)
+	contentForTags := title + " " + desc
+	for _, t := range argStrSlice(args, "tags") {
+		contentForTags += " #" + t
+	}
+	if err := d.SyncTags(ctx, uid, "task", id, contentForTags); err != nil {
+		return nil, nil, err
 	}
 	return map[string]any{"id": id, "title": title},
 		map[string]any{"kind": "task_created", "id": id, "title": title, "route": "/tasks"}, nil
@@ -1856,13 +1860,19 @@ func updateTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 		sets = append(sets, fmt.Sprintf("%s=$%d", frag, len(vals)))
 	}
 
+	var (
+		titleUpdated = false
+		descUpdated  = false
+	)
 	if _, ok := args["title"]; ok {
 		if t := strings.TrimSpace(argStr(args, "title")); t != "" {
 			add("title", t)
+			titleUpdated = true
 		}
 	}
 	if _, ok := args["description"]; ok {
 		add("description", argStr(args, "description"))
+		descUpdated = true
 	}
 	if _, ok := args["priority"]; ok {
 		if p := strings.TrimSpace(argStr(args, "priority")); p == "high" || p == "medium" || p == "low" {
@@ -1904,6 +1914,13 @@ func updateTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 		strings.Join(sets, ", "), len(vals)-1, len(vals))
 	if _, err := d.ExecContext(ctx, q, vals...); err != nil {
 		return nil, nil, err
+	}
+	if titleUpdated || descUpdated {
+		var finalTitle, finalDesc string
+		if err := d.QueryRowContext(ctx, `SELECT title, description FROM tasks WHERE id=$1 AND user_id=$2`, id, uid).Scan(&finalTitle, &finalDesc); err == nil {
+			contentForTags := finalTitle + " " + finalDesc
+			_ = d.SyncTags(ctx, uid, "task", id, contentForTags)
+		}
 	}
 	return map[string]any{"id": id, "updated": true},
 		map[string]any{"kind": "task_updated", "id": id, "route": "/tasks"}, nil

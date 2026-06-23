@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"regexp"
 	"strings"
 
@@ -8,20 +9,9 @@ import (
 )
 
 var (
-	tagRe       = regexp.MustCompile(`(?:^|[^\w&])#([\p{L}\p{N}_][\p{L}\p{N}_\-/]*)`)
 	backlinkRe  = regexp.MustCompile(`\[\[([^\]\n|]+)(?:\|[^\]\n]*)?\]\]`)
-	codeFenceRe = regexp.MustCompile("(?s)```[\\s\\S]*?```")
-	codeSpanRe  = regexp.MustCompile("`[^`\\n]+`")
-	urlRe       = regexp.MustCompile(`https?://\S+`)
 	dateRe      = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 )
-
-func stripNonProse(content string) string {
-	out := codeFenceRe.ReplaceAllString(content, "")
-	out = codeSpanRe.ReplaceAllString(out, "")
-	out = urlRe.ReplaceAllString(out, "")
-	return out
-}
 
 // NormalizeRef trims whitespace and lowercases a wiki-link reference for matching.
 func NormalizeRef(s string) string {
@@ -30,25 +20,7 @@ func NormalizeRef(s string) string {
 
 // syncTags deletes old tags for an entity and inserts fresh ones parsed from content.
 func syncTags(d *db.DB, userID string, entityType string, entityID int64, content string) error {
-	if _, err := d.Exec("DELETE FROM tags WHERE user_id = $1 AND entity_type = $2 AND entity_id = $3", userID, entityType, entityID); err != nil {
-		return err
-	}
-	scan := stripNonProse(content)
-	seen := map[string]bool{}
-	for _, m := range tagRe.FindAllStringSubmatch(scan, -1) {
-		tag := strings.ToLower(strings.Trim(m[1], "-/_"))
-		if tag == "" || seen[tag] {
-			continue
-		}
-		seen[tag] = true
-		if _, err := d.Exec(
-			"INSERT INTO tags (user_id, entity_type, entity_id, tag) VALUES ($1, $2, $3, $4)",
-			userID, entityType, entityID, tag,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
+	return d.SyncTags(context.Background(), userID, entityType, entityID, content)
 }
 
 // syncBacklinks stores raw normalized refs for a source. Resolution happens at read time.
