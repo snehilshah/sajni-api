@@ -108,7 +108,7 @@ func Enqueue(ctx context.Context, kind string, id int64, at time.Time) error {
 }
 
 func EnqueueTask(ctx context.Context, id int64, scheduledAt time.Time) error {
-	return Enqueue(ctx, KindTask, id, scheduledAt.Add(-5*time.Minute))
+	return Enqueue(ctx, KindTask, id, scheduledAt)
 }
 
 func EnqueueMulti(ctx context.Context, id int64, remindAt time.Time) error {

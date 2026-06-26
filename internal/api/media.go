@@ -501,12 +501,29 @@ func deleteMedia(deps Deps) http.HandlerFunc {
 }
 
 type SearchResult struct {
-	ExternalID string `json:"external_id"`
-	Title      string `json:"title"`
-	Year       string `json:"year"`
-	PosterURL  string `json:"poster_url"`
-	Overview   string `json:"overview"`
-	Genre      string `json:"genre"`
+	ExternalID   string `json:"external_id"`
+	Title        string `json:"title"`
+	Year         string `json:"year"`
+	ReleaseDate  string `json:"release_date,omitempty"`
+	ReleaseState string `json:"release_state,omitempty"` // "released" | "upcoming" | "unknown"
+	PosterURL    string `json:"poster_url"`
+	Overview     string `json:"overview"`
+	Genre        string `json:"genre"`
+}
+
+func releaseState(releaseDate string) string {
+	releaseDate = strings.TrimSpace(releaseDate)
+	if len(releaseDate) < len("2006-01-02") {
+		return "unknown"
+	}
+	releaseDate = releaseDate[:len("2006-01-02")]
+	if _, err := time.Parse("2006-01-02", releaseDate); err != nil {
+		return "unknown"
+	}
+	if releaseDate <= time.Now().Format("2006-01-02") {
+		return "released"
+	}
+	return "upcoming"
 }
 
 // searchMedia proxies searches to TMDB or Open Library.
@@ -598,15 +615,23 @@ func fetchTMDBList(endpoint, query, apiKey string) []SearchResult {
 			if v, ok := item["title"].(string); ok {
 				sr.Title = v
 			}
-			if v, ok := item["release_date"].(string); ok && len(v) >= 4 {
-				sr.Year = v[:4]
+			if v, ok := item["release_date"].(string); ok {
+				sr.ReleaseDate = v
+				sr.ReleaseState = releaseState(v)
+				if len(v) >= 4 {
+					sr.Year = v[:4]
+				}
 			}
 		} else {
 			if v, ok := item["name"].(string); ok {
 				sr.Title = v
 			}
-			if v, ok := item["first_air_date"].(string); ok && len(v) >= 4 {
-				sr.Year = v[:4]
+			if v, ok := item["first_air_date"].(string); ok {
+				sr.ReleaseDate = v
+				sr.ReleaseState = releaseState(v)
+				if len(v) >= 4 {
+					sr.Year = v[:4]
+				}
 			}
 		}
 		if v, ok := item["poster_path"].(string); ok && v != "" {
@@ -717,6 +742,8 @@ type MediaDetails struct {
 	Type           string             `json:"type"` // "show" | "movie"
 	Title          string             `json:"title"`
 	Year           string             `json:"year"`
+	ReleaseDate    string             `json:"release_date,omitempty"`
+	ReleaseState   string             `json:"release_state,omitempty"` // "released" | "upcoming" | "unknown"
 	PosterURL      string             `json:"poster_url"`
 	Genre          string             `json:"genre"`
 	Overview       string             `json:"overview"`
@@ -815,6 +842,8 @@ func fillShowDetails(out *MediaDetails, id, apiKey string) error {
 		return err
 	}
 	out.Title = d.Name
+	out.ReleaseDate = d.FirstAirDate
+	out.ReleaseState = releaseState(d.FirstAirDate)
 	if len(d.FirstAirDate) >= 4 {
 		out.Year = d.FirstAirDate[:4]
 	}
@@ -886,6 +915,8 @@ func fillMovieDetails(out *MediaDetails, id, apiKey string) error {
 		return err
 	}
 	out.Title = d.Title
+	out.ReleaseDate = d.ReleaseDate
+	out.ReleaseState = releaseState(d.ReleaseDate)
 	if len(d.ReleaseDate) >= 4 {
 		out.Year = d.ReleaseDate[:4]
 	}

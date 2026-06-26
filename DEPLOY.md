@@ -259,8 +259,8 @@ same idempotency gates.
 
 ## Weekly / monthly task digests
 
-Week and month tasks have no `scheduled_at`, so the 5-min reminder never
-fires for them. A once-daily sweep at **10:00 IST** posts to
+Week and month tasks have no `scheduled_at`, so the scheduled-time reminder
+never fires for them. A once-daily sweep at **10:00 IST** posts to
 `/internal/reminders/digest` (same `REMINDER_CRON_SECRET` header). The
 endpoint self-gates: it emails the pending **week** tasks only on Fridays
 and the pending **month** tasks only on the last calendar day of the month,

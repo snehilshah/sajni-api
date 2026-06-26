@@ -16,27 +16,15 @@ import (
 )
 
 // Reminders ride on tasks: a task with remind=TRUE and a scheduled_at gets
-// one email RemindLead before its event time. The send is driven by
-// Cloud Tasks (POST /internal/reminders/fire). The old sweep endpoint remains
-// as a low-frequency safety net because Cloud Run scales to zero between
-// requests. reminded_at is the idempotency gate.
-
-// RemindLead is how far ahead of scheduled_at the email goes out. Fixed by
-// product spec; promote to a per-task column later without a data migration
-// (default the column to this value).
-const RemindLead = 5 * time.Minute
+// one reminder at its scheduled time. The send is driven by Cloud Tasks
+// (POST /internal/reminders/fire). The old sweep endpoint remains as a
+// low-frequency safety net because Cloud Run scales to zero between requests.
+// reminded_at is the idempotency gate.
 
 // reminderGrace is the lower bound on how stale a reminder may be and still
 // send. Without it, recovering from a multi-hour outage would blast every
 // reminder whose window elapsed while we were down.
 const reminderGrace = 30 * time.Minute
-
-// reminderSkew widens the single-fire window's upper bound. Cloud Tasks
-// dispatches at-or-after schedule_time on Google's clock, but the window is
-// evaluated against Postgres's NOW(); if Postgres runs a few seconds behind,
-// an exact bound would no-op the fire with a 200 and the reminder would never
-// retry. Worst case under the allowance: the email lands reminderSkew early.
-const reminderSkew = 60 * time.Second
 
 // defaultTZ is the fallback zone when a user's timezone is unset/unparseable.
 // Every Sajni user is IST (see the users.timezone backfill in db.migrate), so
@@ -187,9 +175,8 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 		return 0, nil // no delivery channel configured
 	}
 
-	// Window: send-time (scheduled_at - lead) has arrived, the event isn't
-	// stale beyond the grace floor, the task is still open, and we haven't
-	// sent yet. make_interval keeps the lead a bound param, not string-built.
+	// Window: scheduled_at has arrived, the event isn't stale beyond the grace
+	// floor, the task is still open, and we haven't sent yet.
 	rows, err := d.QueryContext(ctx, `
 		SELECT t.id, t.title, t.scheduled_at, u.id, u.email, u.name, COALESCE(u.timezone,''),
 		       COALESCE(t.notify_emails, '[]'::jsonb)
@@ -199,10 +186,10 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 		   AND t.reminded_at IS NULL
 		   AND t.status NOT IN ('done','scratched')
 		   AND t.scheduled_at IS NOT NULL
-		   AND t.scheduled_at <= NOW() + make_interval(secs => $1)
-		   AND t.scheduled_at >= NOW() - make_interval(secs => $2)
+		   AND t.scheduled_at <= NOW()
+		   AND t.scheduled_at >= NOW() - make_interval(secs => $1)
 		   AND u.deleted_at IS NULL`,
-		int(RemindLead.Seconds()), int(reminderGrace.Seconds()))
+		int(reminderGrace.Seconds()))
 	if err != nil {
 		return 0, err
 	}
@@ -283,10 +270,10 @@ func sendSingleTaskReminder(ctx context.Context, deps Deps, id int64) (bool, err
 		   AND t.reminded_at IS NULL
 		   AND t.status NOT IN ('done','scratched')
 		   AND t.scheduled_at IS NOT NULL
-		   AND t.scheduled_at <= NOW() + make_interval(secs => $2)
-		   AND t.scheduled_at >= NOW() - make_interval(secs => $3)
+		   AND t.scheduled_at <= NOW()
+		   AND t.scheduled_at >= NOW() - make_interval(secs => $2)
 		   AND u.deleted_at IS NULL`,
-		id, int((RemindLead+reminderSkew).Seconds()), int(reminderGrace.Seconds())).
+		id, int(reminderGrace.Seconds())).
 		Scan(&x.id, &x.title, &x.scheduledAt, &x.uid, &x.email, &x.name, &x.tz, &emailsRaw)
 	if err == sql.ErrNoRows {
 		return false, nil
@@ -410,10 +397,10 @@ func sendSingleMultiReminder(ctx context.Context, deps Deps, id int64) (bool, er
 		 WHERE r.id = $1
 		   AND r.sent_at IS NULL
 		   AND t.status NOT IN ('done','scratched')
-		   AND r.remind_at <= NOW() + make_interval(secs => $2)
-		   AND r.remind_at >= NOW() - make_interval(secs => $3)
+		   AND r.remind_at <= NOW()
+		   AND r.remind_at >= NOW() - make_interval(secs => $2)
 		   AND u.deleted_at IS NULL`,
-		id, int(reminderSkew.Seconds()), int(reminderGrace.Seconds())).
+		id, int(reminderGrace.Seconds())).
 		Scan(&x.rid, &x.tid, &x.title, &x.scheduledAt, &x.remindAt, &x.uid, &x.email, &x.name, &x.tz, &emailsRaw)
 	if err == sql.ErrNoRows {
 		return false, nil

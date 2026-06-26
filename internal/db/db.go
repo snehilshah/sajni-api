@@ -810,8 +810,8 @@ func (d *DB) migrate() error {
 	-- the count and validates each address on write.
 	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notify_emails JSONB NOT NULL DEFAULT '[]'::jsonb;
 	-- digested_at stamps the last weekly/monthly *digest* nudge for a week/month
-	-- task. Distinct from reminded_at (the 5-min single-task path): week/month
-	-- tasks have no scheduled_at so they never use reminded_at. The Friday-10am /
+	-- task. Distinct from reminded_at (the scheduled-time single-task path):
+	-- week/month tasks have no scheduled_at so they never use reminded_at. The Friday-10am /
 	-- month-end-10am sweep re-includes a task once digested_at falls before the
 	-- current cycle's day boundary, so a still-pending task is nudged each cycle
 	-- and a task added after a fire is caught on the next one.

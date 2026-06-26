@@ -13,7 +13,7 @@ import (
 )
 
 // Weekly & monthly task digests. Week/month tasks carry no scheduled_at, so
-// the 5-min single-task reminder never fires for them. Instead a once-a-day
+// the scheduled-time single-task reminder never fires for them. Instead a once-a-day
 // Cloud Scheduler sweep (10:00 IST) hits /internal/reminders/digest; on a
 // Friday it emails each user their still-pending week tasks, and on the last
 // calendar day of the month their still-pending month tasks.

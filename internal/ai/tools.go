@@ -327,7 +327,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "tmdb_search",
-			Description: "Search TMDB for real movie or show metadata (title, year, poster, overview). Use this before recommending media so the suggestion comes with real data and an external_id you can pass to add_media.",
+			Description: "Search TMDB for real movie or show metadata (title, year, release_date, release_state, poster, overview). Use this before recommending media so the suggestion comes with real data and an external_id you can pass to add_media.",
 			Schema: obj(map[string]*genai.Schema{
 				"q":    str("Movie or show title to search."),
 				"type": str("'movie' or 'show'. Defaults to movie."),
@@ -353,7 +353,7 @@ func (s *Service) buildTools() []Tool {
 		// ---------------- WRITE ----------------
 		{
 			Name:        "create_task",
-			Description: "Create a new task. Resolve relative dates ('tomorrow', 'next monday') against get_current_context first. Use list_task_lists to look up list_id by name; use list_tasks to find a parent_task_id when nesting. For 'remind me to X at <time>' requests, set scheduled_at to the event time AND remind=true — Sajni emails the user ~5 min before.",
+			Description: "Create a new task. Resolve relative dates ('tomorrow', 'next monday') against get_current_context first. Use list_task_lists to look up list_id by name; use list_tasks to find a parent_task_id when nesting. For 'remind me to X at <time>' requests, set scheduled_at to the requested reminder time AND remind=true — Sajni emails the user at that time.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"title":            str("Required. Short title."),
@@ -363,7 +363,7 @@ func (s *Service) buildTools() []Tool {
 				"week_of":          str("Optional. Makes this a week-scoped task with no specific day — pass the ISO Monday date (YYYY-MM-DD) of the target week. Shows in the 'This Week' list. Mutually exclusive with due_date."),
 				"month_of":         str("Optional. Makes this a month goal with no specific day — pass the ISO 1st-of-month date (YYYY-MM-DD), e.g. 2026-06-01. Shows in the 'This Month' list; the user breaks it into dated child sessions (create them with parent_task_id + due_date). Mutually exclusive with due_date and week_of. Don't invent session dates — create only the goal unless the user gives a schedule."),
 				"scheduled_at":     str("Optional ISO timestamp with offset, e.g. 2026-05-30T17:00:00+05:30. The event/reminder time."),
-				"remind":           boolean("Optional. If true, email the user ~5 min before scheduled_at. Requires scheduled_at."),
+				"remind":           boolean("Optional. If true, email the user at scheduled_at. Requires scheduled_at."),
 				"notify_emails":    arrayOf(str(""), "Optional. Extra email addresses to also notify when this task's reminders fire (e.g. a friend for a meet-up). Max 3."),
 				"duration_minutes": intg("Optional. Default 30."),
 				"list_id":          intg("Optional. Place the task inside this user list."),
@@ -463,7 +463,7 @@ func (s *Service) buildTools() []Tool {
 				"id":           intg("Required. Task id (use list_tasks, smart='missed' to find overdue ones)."),
 				"due_date":     str("New due date, ISO YYYY-MM-DD."),
 				"scheduled_at": str("Optional new event time, ISO with offset e.g. 2026-06-06T17:00:00+05:30. Re-arms the reminder."),
-				"remind":       boolean("Optional. Email the user ~5 min before scheduled_at."),
+				"remind":       boolean("Optional. Email the user at scheduled_at."),
 			}, "id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return rescheduleTaskTool(ctx, d, uid, args)
@@ -1427,6 +1427,21 @@ func runSearchTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
 
+func tmdbReleaseState(releaseDate string) string {
+	releaseDate = strings.TrimSpace(releaseDate)
+	if len(releaseDate) < len("2006-01-02") {
+		return "unknown"
+	}
+	releaseDate = releaseDate[:len("2006-01-02")]
+	if _, err := time.Parse("2006-01-02", releaseDate); err != nil {
+		return "unknown"
+	}
+	if releaseDate <= time.Now().Format("2006-01-02") {
+		return "released"
+	}
+	return "upcoming"
+}
+
 func tmdbSearchTool(ctx context.Context, query, mediaType string) (any, map[string]any, error) {
 	apiKey := os.Getenv("TMDB_API_KEY")
 	if apiKey == "" {
@@ -1476,11 +1491,13 @@ func tmdbSearchTool(ctx context.Context, query, mediaType string) (any, map[stri
 		overview, _ := item["overview"].(string)
 		var idRaw any = item["id"]
 		out = append(out, map[string]any{
-			"external_id": fmt.Sprintf("tmdb:%s:%v", endpoint, idRaw),
-			"title":       title,
-			"year":        year,
-			"poster_url":  poster,
-			"overview":    overview,
+			"external_id":   fmt.Sprintf("tmdb:%s:%v", endpoint, idRaw),
+			"title":         title,
+			"year":          year,
+			"release_date":  release,
+			"release_state": tmdbReleaseState(release),
+			"poster_url":    poster,
+			"overview":      overview,
 		})
 	}
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
