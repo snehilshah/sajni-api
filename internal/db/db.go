@@ -192,6 +192,7 @@ func (d *DB) migrate() error {
 		platform         TEXT        NOT NULL DEFAULT '',
 		poster_url       TEXT        NOT NULL DEFAULT '',
 		year             INTEGER,
+		release_date     DATE,
 		genre            TEXT        NOT NULL DEFAULT '',
 		external_id      TEXT        NOT NULL DEFAULT '',
 		episodes_watched INTEGER     NOT NULL DEFAULT 0,
@@ -620,6 +621,8 @@ func (d *DB) migrate() error {
 	-- Lives in Postgres (not the GCS body blob) so the list endpoint can render
 	-- it without N blob fetches. Empty for existing notes until edited.
 	ALTER TABLE notes ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
+	-- TMDB release / first-air date, used to render upcoming media after save.
+	ALTER TABLE media ADD COLUMN IF NOT EXISTS release_date DATE;
 	-- Hot path for the reminder cron: only the un-sent, remind-on rows.
 	CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(scheduled_at)
 		WHERE remind = TRUE AND reminded_at IS NULL;

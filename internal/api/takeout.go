@@ -225,7 +225,7 @@ func exportHabitLogs(ctx context.Context, zw *zip.Writer, deps Deps, uid string)
 func exportMedia(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx, `
 		SELECT id, title, type, status, COALESCE(rating,0), notes, platform, poster_url,
-		       COALESCE(year,0), genre, external_id, episodes_watched, episodes_total,
+		       COALESCE(year,0), COALESCE(release_date::text,''), genre, external_id, episodes_watched, episodes_total,
 		       seasons_watched, seasons_total, collection_id, collection_name,
 		       created_at, updated_at
 		FROM media WHERE user_id = $1 ORDER BY created_at`, uid)
@@ -235,7 +235,7 @@ func exportMedia(ctx context.Context, zw *zip.Writer, deps Deps, uid string) err
 	defer rows.Close()
 	return writeCSV(zw, "media.csv",
 		[]string{
-			"id", "title", "type", "status", "rating", "notes", "platform", "poster_url", "year",
+			"id", "title", "type", "status", "rating", "notes", "platform", "poster_url", "year", "release_date",
 			"genre", "external_id", "episodes_watched", "episodes_total", "seasons_watched", "seasons_total",
 			"collection_id", "collection_name", "created_at", "updated_at",
 		},
@@ -243,13 +243,13 @@ func exportMedia(ctx context.Context, zw *zip.Writer, deps Deps, uid string) err
 			for rows.Next() {
 				var id int64
 				var rating, year, ew, et, sw, st int
-				var title, kind, status, notes, platform, poster, genre, ext, colID, colName string
+				var title, kind, status, notes, platform, poster, releaseDate, genre, ext, colID, colName string
 				var created, updated time.Time
 				if err := rows.Scan(&id, &title, &kind, &status, &rating, &notes, &platform, &poster,
-					&year, &genre, &ext, &ew, &et, &sw, &st, &colID, &colName, &created, &updated); err == nil {
+					&year, &releaseDate, &genre, &ext, &ew, &et, &sw, &st, &colID, &colName, &created, &updated); err == nil {
 					emit([]string{
 						strconv.FormatInt(id, 10), title, kind, status, strconv.Itoa(rating), notes,
-						platform, poster, strconv.Itoa(year), genre, ext,
+						platform, poster, strconv.Itoa(year), releaseDate, genre, ext,
 						strconv.Itoa(ew), strconv.Itoa(et), strconv.Itoa(sw), strconv.Itoa(st),
 						colID, colName, created.Format(time.RFC3339), updated.Format(time.RFC3339),
 					})
@@ -727,17 +727,27 @@ func importMedia(ctx context.Context, deps Deps, uid string, body []byte) int {
 	}
 	n := 0
 	for _, r := range rows {
-		// id,title,type,status,rating,notes,platform,poster_url,year,genre,external_id,
+		// Current header:
+		// id,title,type,status,rating,notes,platform,poster_url,year,release_date,genre,external_id,
 		// episodes_watched,episodes_total,seasons_watched,seasons_total,collection_id,collection_name,created_at,updated_at
+		// Older exports do not have release_date; keep their column offsets working.
 		if len(r) < 17 {
 			continue
 		}
+		offset := 0
+		var releaseDateArg any
+		if len(r) >= 20 {
+			offset = 1
+			if strings.TrimSpace(r[9]) != "" {
+				releaseDateArg = strings.TrimSpace(r[9])
+			}
+		}
 		rating, _ := strconv.Atoi(r[4])
 		year, _ := strconv.Atoi(r[8])
-		ew, _ := strconv.Atoi(r[11])
-		et, _ := strconv.Atoi(r[12])
-		sw, _ := strconv.Atoi(r[13])
-		st, _ := strconv.Atoi(r[14])
+		ew, _ := strconv.Atoi(r[11+offset])
+		et, _ := strconv.Atoi(r[12+offset])
+		sw, _ := strconv.Atoi(r[13+offset])
+		st, _ := strconv.Atoi(r[14+offset])
 		var ratingArg any = rating
 		if rating == 0 {
 			ratingArg = nil
@@ -748,11 +758,11 @@ func importMedia(ctx context.Context, deps Deps, uid string, body []byte) int {
 		}
 		_, err := deps.DB.ExecContext(ctx, `
 			INSERT INTO media(user_id, title, type, status, rating, notes, platform, poster_url,
-			                  year, genre, external_id, episodes_watched, episodes_total,
+			                  year, release_date, genre, external_id, episodes_watched, episodes_total,
 			                  seasons_watched, seasons_total, collection_id, collection_name)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
 			uid, r[1], r[2], r[3], ratingArg, r[5], r[6], r[7],
-			yearArg, r[9], r[10], ew, et, sw, st, r[15], r[16])
+			yearArg, releaseDateArg, r[9+offset], r[10+offset], ew, et, sw, st, r[15+offset], r[16+offset])
 		if err == nil {
 			n++
 		}

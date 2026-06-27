@@ -621,17 +621,18 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "add_media",
-			Description: "Add a movie / show / book to the user's library. Call this whenever the user mentions a title they have consumed, are consuming, or plan to consume. Status mapping: 'done' for past-tense (\"I watched\", \"already saw\", \"finished\", \"just read\"), 'watching' for in-progress (\"halfway through\", \"on episode 4\"), 'pending' for intent (\"want to watch\", \"need to read\"). If you have an external_id from tmdb_search, pass it along with poster_url, year, genre to fully populate the entry.",
+			Description: "Add a movie / show / book to the user's library. Call this whenever the user mentions a title they have consumed, are consuming, or plan to consume. Status mapping: 'done' for past-tense (\"I watched\", \"already saw\", \"finished\", \"just read\"), 'watching' for in-progress (\"halfway through\", \"on episode 4\"), 'pending' for intent (\"want to watch\", \"need to read\"). If you have an external_id from tmdb_search, pass it along with poster_url, year, release_date, and genre to fully populate the entry.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"title":       str("Required. Exact title."),
-				"type":        str("'movie' | 'show' | 'book'."),
-				"status":      str("'pending' | 'watching' | 'done'. Pick based on the user's wording — past tense ⇒ 'done'. Default 'pending' only when unclear."),
-				"external_id": str("Optional TMDB external id from tmdb_search."),
-				"year":        intg("Optional release year."),
-				"genre":       str("Optional."),
-				"poster_url":  str("Optional."),
-				"rating":      intg("Optional 1–5 star rating, only when user expressed one."),
+				"title":        str("Required. Exact title."),
+				"type":         str("'movie' | 'show' | 'book'."),
+				"status":       str("'pending' | 'watching' | 'done'. Pick based on the user's wording — past tense ⇒ 'done'. Default 'pending' only when unclear."),
+				"external_id":  str("Optional TMDB external id from tmdb_search."),
+				"year":         intg("Optional release year."),
+				"release_date": str("Optional release date from tmdb_search, YYYY-MM-DD."),
+				"genre":        str("Optional."),
+				"poster_url":   str("Optional."),
+				"rating":       intg("Optional 1–5 star rating, only when user expressed one."),
 			}, "title", "type"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return addMediaTool(ctx, d, uid, args)
@@ -2146,6 +2147,7 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	extID := argStr(args, "external_id")
 	genre := argStr(args, "genre")
 	poster := argStr(args, "poster_url")
+	releaseDate := normalizeReleaseDate(argStr(args, "release_date"))
 	var seasonsTotal, episodesTotal int
 	var seasonEpisodes []int
 	if extID == "" {
@@ -2156,6 +2158,9 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		}
 		if genre == "" {
 			genre = meta.Genre
+		}
+		if releaseDate == "" {
+			releaseDate = meta.ReleaseDate
 		}
 		if year == 0 && meta.Year > 0 {
 			year = int64(meta.Year)
@@ -2169,15 +2174,19 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 			seJSON = b
 		}
 	}
+	var releaseDateArg any
+	if releaseDate != "" {
+		releaseDateArg = releaseDate
+	}
 
 	var id int64
 	err := d.QueryRowContext(ctx, `
 		INSERT INTO media (user_id, title, type, status, external_id, year, genre, poster_url, rating,
-		                   seasons_total, episodes_total, season_episodes)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb) RETURNING id`,
+		                   release_date, seasons_total, episodes_total, season_episodes)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb) RETURNING id`,
 		uid, title, mtype, status,
 		extID, yearArg, genre, poster, ratingArg,
-		seasonsTotal, episodesTotal, string(seJSON)).Scan(&id)
+		releaseDateArg, seasonsTotal, episodesTotal, string(seJSON)).Scan(&id)
 	if err != nil {
 		return nil, nil, err
 	}

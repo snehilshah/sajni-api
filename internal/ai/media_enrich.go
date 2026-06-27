@@ -19,6 +19,7 @@ type mediaMeta struct {
 	ExternalID     string
 	PosterURL      string
 	Year           int
+	ReleaseDate    string
 	Genre          string
 	SeasonsTotal   int
 	EpisodesTotal  int
@@ -84,6 +85,7 @@ func enrichTMDB(ctx context.Context, title, mtype string) mediaMeta {
 	if release == "" {
 		release = top.FirstAirDate
 	}
+	m.ReleaseDate = normalizeReleaseDate(release)
 	if len(release) >= 4 {
 		fmt.Sscanf(release[:4], "%d", &m.Year)
 	}
@@ -121,6 +123,17 @@ func enrichTMDB(ctx context.Context, title, mtype string) mediaMeta {
 		}
 	}
 	return m
+}
+
+func normalizeReleaseDate(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= len("2006-01-02") {
+		s = s[:len("2006-01-02")]
+	}
+	if _, err := time.Parse("2006-01-02", s); err != nil {
+		return ""
+	}
+	return s
 }
 
 // enrichBook resolves a book via Open Library's free search API (no key).

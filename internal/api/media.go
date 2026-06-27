@@ -173,6 +173,7 @@ type Media struct {
 	Platform        string `json:"platform"`
 	PosterURL       string `json:"poster_url"`
 	Year            *int   `json:"year"`
+	ReleaseDate     string `json:"release_date"`
 	Genre           string `json:"genre"`
 	ExternalID      string `json:"external_id"`
 	EpisodesWatched int    `json:"episodes_watched"`
@@ -219,7 +220,7 @@ func listMedia(deps Deps) http.HandlerFunc {
 		}
 
 		q := `SELECT m.id, m.title, m.type, m.status, m.rating, m.notes, m.platform, m.poster_url,
-		       m.year, m.genre, m.external_id, m.episodes_watched, m.episodes_total,
+		       m.year, COALESCE(m.release_date::text, ''), m.genre, m.external_id, m.episodes_watched, m.episodes_total,
 		       m.seasons_watched, m.seasons_total,
 		       COALESCE(m.season_episodes::text, '[]'),
 		       m.collection_id, m.collection_name,
@@ -252,7 +253,7 @@ func listMedia(deps Deps) http.HandlerFunc {
 			var m Media
 			var seRaw string
 			if err := rows.Scan(&m.ID, &m.Title, &m.Type, &m.Status, &m.Rating, &m.Notes,
-				&m.Platform, &m.PosterURL, &m.Year, &m.Genre, &m.ExternalID,
+				&m.Platform, &m.PosterURL, &m.Year, &m.ReleaseDate, &m.Genre, &m.ExternalID,
 				&m.EpisodesWatched, &m.EpisodesTotal,
 				&m.SeasonsWatched, &m.SeasonsTotal,
 				&seRaw, &m.CollectionID, &m.CollectionName,
@@ -294,6 +295,7 @@ func createMedia(deps Deps) http.HandlerFunc {
 			Platform        string `json:"platform"`
 			PosterURL       string `json:"poster_url"`
 			Year            *int   `json:"year"`
+			ReleaseDate     string `json:"release_date"`
 			Genre           string `json:"genre"`
 			ExternalID      string `json:"external_id"`
 			EpisodesWatched int    `json:"episodes_watched"`
@@ -321,11 +323,11 @@ func createMedia(deps Deps) http.HandlerFunc {
 		var id int64
 		err := d.QueryRow(
 			`INSERT INTO media (user_id, title, type, status, rating, notes, platform, poster_url,
-			 year, genre, external_id, episodes_watched, episodes_total, seasons_watched, seasons_total,
+			 year, release_date, genre, external_id, episodes_watched, episodes_total, seasons_watched, seasons_total,
 			 season_episodes, collection_id, collection_name)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17, $18) RETURNING id`,
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18, $19) RETURNING id`,
 			uid, body.Title, body.Type, body.Status, body.Rating, body.Notes,
-			body.Platform, body.PosterURL, body.Year, body.Genre, body.ExternalID,
+			body.Platform, body.PosterURL, body.Year, mediaDateArg(body.ReleaseDate), body.Genre, body.ExternalID,
 			body.EpisodesWatched, body.EpisodesTotal, body.SeasonsWatched, body.SeasonsTotal,
 			string(seJSON), body.CollectionID, body.CollectionName,
 		).Scan(&id)
@@ -391,7 +393,7 @@ func updateMedia(deps Deps) http.HandlerFunc {
 		allowed := map[string]bool{
 			"title": true, "type": true, "status": true, "rating": true,
 			"notes": true, "platform": true, "poster_url": true, "year": true,
-			"genre": true, "external_id": true,
+			"genre": true, "external_id": true, "release_date": true,
 			"episodes_watched": true, "episodes_total": true,
 			"seasons_watched": true, "seasons_total": true,
 			"collection_id": true, "collection_name": true,
@@ -402,6 +404,12 @@ func updateMedia(deps Deps) http.HandlerFunc {
 		ph := 1
 		for k, v := range body {
 			if allowed[k] {
+				if k == "release_date" {
+					sets = append(sets, fmt.Sprintf("%s = $%d", k, ph))
+					args = append(args, mediaDateArg(v))
+					ph++
+					continue
+				}
 				sets = append(sets, fmt.Sprintf("%s = $%d", k, ph))
 				args = append(args, v)
 				ph++
@@ -762,11 +770,13 @@ type CollectionPayload struct {
 }
 
 type CollectionPart struct {
-	ExternalID string `json:"external_id"`
-	Title      string `json:"title"`
-	Year       string `json:"year"`
-	PosterURL  string `json:"poster_url"`
-	Overview   string `json:"overview"`
+	ExternalID   string `json:"external_id"`
+	Title        string `json:"title"`
+	Year         string `json:"year"`
+	ReleaseDate  string `json:"release_date,omitempty"`
+	ReleaseState string `json:"release_state,omitempty"`
+	PosterURL    string `json:"poster_url"`
+	Overview     string `json:"overview"`
 }
 
 // mediaDetails fetches a single TMDB title's full record so we can fill
@@ -993,8 +1003,10 @@ func collectionDetails() http.HandlerFunc {
 				Title:      p.Title,
 				Overview:   p.Overview,
 			}
-			if len(p.ReleaseDate) >= 4 {
-				cp.Year = p.ReleaseDate[:4]
+			cp.ReleaseDate = normalizeMediaDate(p.ReleaseDate)
+			cp.ReleaseState = releaseState(cp.ReleaseDate)
+			if len(cp.ReleaseDate) >= 4 {
+				cp.Year = cp.ReleaseDate[:4]
 			}
 			if p.PosterPath != "" {
 				cp.PosterURL = "https://image.tmdb.org/t/p/w300" + p.PosterPath
@@ -1018,6 +1030,15 @@ func sortCollectionParts(parts []CollectionPart) {
 }
 
 func partLess(a, b CollectionPart) bool {
+	if a.ReleaseDate != b.ReleaseDate {
+		if a.ReleaseDate == "" {
+			return false
+		}
+		if b.ReleaseDate == "" {
+			return true
+		}
+		return a.ReleaseDate < b.ReleaseDate
+	}
 	if a.Year != b.Year {
 		if a.Year == "" {
 			return false
@@ -1028,4 +1049,31 @@ func partLess(a, b CollectionPart) bool {
 		return a.Year < b.Year
 	}
 	return a.Title < b.Title
+}
+
+func mediaDateArg(v any) any {
+	switch x := v.(type) {
+	case string:
+		if d := normalizeMediaDate(x); d != "" {
+			return d
+		}
+	case *string:
+		if x != nil {
+			if d := normalizeMediaDate(*x); d != "" {
+				return d
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeMediaDate(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= len("2006-01-02") {
+		s = s[:len("2006-01-02")]
+	}
+	if _, err := time.Parse("2006-01-02", s); err != nil {
+		return ""
+	}
+	return s
 }
