@@ -2109,6 +2109,7 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		return nil, nil, fmt.Errorf("missing title or type")
 	}
 	status := argStr(args, "status")
+	statusSpecified := status != ""
 	if status == "" {
 		status = "pending"
 	}
@@ -2177,6 +2178,16 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	var releaseDateArg any
 	if releaseDate != "" {
 		releaseDateArg = releaseDate
+		if !statusSpecified || status == "pending" {
+			nowStr := time.Now().Format("2006-01-02")
+			cleanDate := strings.TrimSpace(releaseDate)
+			if len(cleanDate) >= 10 {
+				cleanDate = cleanDate[:10]
+				if _, err := time.Parse("2006-01-02", cleanDate); err == nil && cleanDate > nowStr {
+					status = "upcoming"
+				}
+			}
+		}
 	}
 
 	var id int64
