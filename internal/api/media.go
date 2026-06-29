@@ -3,14 +3,18 @@ package api
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"sajni/internal/db"
 )
@@ -51,6 +55,15 @@ func cacheSet(key string, val any, ttl time.Duration) {
 	tmdbCacheMu.Lock()
 	defer tmdbCacheMu.Unlock()
 	tmdbCache[key] = cacheEntry{val: val, exp: time.Now().Add(ttl)}
+}
+
+func tmdbErrorJSON(w http.ResponseWriter, err error) {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		errJSON(w, http.StatusGatewayTimeout, "tmdb request timed out")
+		return
+	}
+	errJSON(w, http.StatusBadGateway, "tmdb request failed")
 }
 
 func registerMediaRoutes(mux *http.ServeMux, deps Deps) {
@@ -191,6 +204,16 @@ type Media struct {
 	LastCompletedAt string `json:"last_completed_at"`
 }
 
+type mediaDupCandidate struct {
+	ID          int64
+	Title       string
+	Type        string
+	Status      string
+	Year        int
+	ReleaseDate string
+	ExternalID  string
+}
+
 func listMedia(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -316,12 +339,28 @@ func createMedia(deps Deps) http.HandlerFunc {
 		if body.Status == "" {
 			body.Status = "pending"
 		}
+		dup, err := findMediaDuplicate(d, uid, mediaDupCandidate{
+			Title:       body.Title,
+			Type:        body.Type,
+			Status:      body.Status,
+			Year:        intPtrValue(body.Year),
+			ReleaseDate: body.ReleaseDate,
+			ExternalID:  body.ExternalID,
+		}, 0)
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		if dup != nil {
+			errJSON(w, http.StatusConflict, mediaDuplicateMessage(*dup))
+			return
+		}
 		seJSON, _ := json.Marshal(body.SeasonEpisodes)
 		if len(body.SeasonEpisodes) == 0 {
 			seJSON = []byte("[]")
 		}
 		var id int64
-		err := d.QueryRow(
+		err = d.QueryRow(
 			`INSERT INTO media (user_id, title, type, status, rating, notes, platform, poster_url,
 			 year, release_date, genre, external_id, episodes_watched, episodes_total, seasons_watched, seasons_total,
 			 season_episodes, collection_id, collection_name)
@@ -380,15 +419,43 @@ func updateMedia(deps Deps) http.HandlerFunc {
 			prevSeasWatch  int
 			prevRating     sql.NullInt64
 			prevType       string
+			prevTitle      string
+			prevYear       int
+			prevRelease    string
+			prevExternalID string
 		)
 		var prevSEraw string
 		var prevEpsTotal int
 		_ = d.QueryRow(`SELECT status, COALESCE(episodes_watched,0), COALESCE(seasons_watched,0),
 		                       rating, type, COALESCE(season_episodes::text,'[]'),
-		                       COALESCE(episodes_total,0)
+		                       COALESCE(episodes_total,0), title, COALESCE(year,0),
+		                       COALESCE(release_date::text,''), external_id
 		                  FROM media WHERE id=$1 AND user_id=$2`, id, uid).
-			Scan(&prevStatus, &prevEpsWatched, &prevSeasWatch, &prevRating, &prevType, &prevSEraw, &prevEpsTotal)
+			Scan(&prevStatus, &prevEpsWatched, &prevSeasWatch, &prevRating, &prevType, &prevSEraw, &prevEpsTotal,
+				&prevTitle, &prevYear, &prevRelease, &prevExternalID)
 		prevSeasonEps := decodeIntArray(prevSEraw)
+
+		if mediaDupKeysChanged(body) && prevType != "" {
+			cand := mediaDupCandidate{
+				ID:          id,
+				Title:       prevTitle,
+				Type:        prevType,
+				Status:      prevStatus,
+				Year:        prevYear,
+				ReleaseDate: prevRelease,
+				ExternalID:  prevExternalID,
+			}
+			applyMediaDupPatch(&cand, body)
+			dup, err := findMediaDuplicate(d, uid, cand, id)
+			if err != nil {
+				errJSON(w, 500, err.Error())
+				return
+			}
+			if dup != nil {
+				errJSON(w, http.StatusConflict, mediaDuplicateMessage(*dup))
+				return
+			}
+		}
 
 		allowed := map[string]bool{
 			"title": true, "type": true, "status": true, "rating": true,
@@ -808,13 +875,13 @@ func mediaDetails() http.HandlerFunc {
 		if kind == "tv" {
 			out.Type = "show"
 			if err := fillShowDetails(&out, id, apiKey); err != nil {
-				errJSON(w, 502, err.Error())
+				tmdbErrorJSON(w, err)
 				return
 			}
 		} else {
 			out.Type = "movie"
 			if err := fillMovieDetails(&out, id, apiKey); err != nil {
-				errJSON(w, 502, err.Error())
+				tmdbErrorJSON(w, err)
 				return
 			}
 		}
@@ -973,10 +1040,18 @@ func collectionDetails() http.HandlerFunc {
 		u := fmt.Sprintf("https://api.themoviedb.org/3/collection/%s?api_key=%s", raw, apiKey)
 		resp, err := httpClient.Get(u)
 		if err != nil {
-			errJSON(w, 502, err.Error())
+			tmdbErrorJSON(w, err)
 			return
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			errJSON(w, http.StatusNotFound, "tmdb collection not found")
+			return
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			errJSON(w, http.StatusBadGateway, "tmdb request failed")
+			return
+		}
 		body, _ := io.ReadAll(resp.Body)
 		var d struct {
 			ID    int    `json:"id"`
@@ -1076,4 +1151,147 @@ func normalizeMediaDate(s string) string {
 		return ""
 	}
 	return s
+}
+
+func intPtrValue(v *int) int {
+	if v == nil || *v < 1 {
+		return 0
+	}
+	return *v
+}
+
+func normalizeMediaTitleAPI(value string) string {
+	var b strings.Builder
+	lastSpace := true
+	for _, r := range strings.ToLower(strings.TrimSpace(value)) {
+		if r == '\'' || r == '’' {
+			continue
+		}
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			b.WriteRune(r)
+			lastSpace = false
+			continue
+		}
+		if !lastSpace {
+			b.WriteByte(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func mediaYearFromRelease(value string) int {
+	value = strings.TrimSpace(value)
+	if len(value) < 4 {
+		return 0
+	}
+	y, err := strconv.Atoi(value[:4])
+	if err != nil || y < 1 {
+		return 0
+	}
+	return y
+}
+
+func mediaCandidateYear(c mediaDupCandidate) int {
+	if c.Year > 0 {
+		return c.Year
+	}
+	return mediaYearFromRelease(c.ReleaseDate)
+}
+
+func findMediaDuplicate(d *db.DB, uid string, cand mediaDupCandidate, skipID int64) (*mediaDupCandidate, error) {
+	cand.Type = strings.TrimSpace(cand.Type)
+	ext := strings.TrimSpace(cand.ExternalID)
+	title := normalizeMediaTitleAPI(cand.Title)
+	if cand.Type == "" || (ext == "" && title == "") {
+		return nil, nil
+	}
+
+	rows, err := d.Query(
+		`SELECT id, title, type, status, COALESCE(year,0), COALESCE(release_date::text,''), external_id
+		   FROM media
+		  WHERE user_id = $1 AND type = $2 AND ($3::bigint = 0 OR id <> $3)`,
+		uid, cand.Type, skipID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	candYear := mediaCandidateYear(cand)
+	for rows.Next() {
+		var item mediaDupCandidate
+		if err := rows.Scan(&item.ID, &item.Title, &item.Type, &item.Status, &item.Year, &item.ReleaseDate, &item.ExternalID); err != nil {
+			return nil, err
+		}
+		if ext != "" && strings.TrimSpace(item.ExternalID) == ext {
+			return &item, nil
+		}
+		if title == "" || normalizeMediaTitleAPI(item.Title) != title {
+			continue
+		}
+		itemYear := mediaCandidateYear(item)
+		if candYear == 0 || itemYear == 0 || candYear == itemYear {
+			return &item, nil
+		}
+	}
+	return nil, rows.Err()
+}
+
+func mediaDuplicateMessage(item mediaDupCandidate) string {
+	title := strings.TrimSpace(item.Title)
+	if title == "" {
+		title = "item"
+	}
+	if year := mediaCandidateYear(item); year > 0 {
+		return fmt.Sprintf("Already in library: %s (%d)", title, year)
+	}
+	return "Already in library: " + title
+}
+
+func mediaDupKeysChanged(body map[string]any) bool {
+	for _, key := range []string{"title", "type", "year", "release_date", "external_id"} {
+		if _, ok := body[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func applyMediaDupPatch(c *mediaDupCandidate, body map[string]any) {
+	if v, ok := body["title"].(string); ok {
+		c.Title = v
+	}
+	if v, ok := body["type"].(string); ok {
+		c.Type = v
+	}
+	if v, ok := body["release_date"].(string); ok {
+		c.ReleaseDate = v
+	}
+	if v, ok := body["external_id"].(string); ok {
+		c.ExternalID = v
+	}
+	if v, ok := body["year"]; ok {
+		c.Year = intFromJSON(v)
+	}
+}
+
+func intFromJSON(v any) int {
+	switch n := v.(type) {
+	case nil:
+		return 0
+	case int:
+		if n > 0 {
+			return n
+		}
+	case int64:
+		if n > 0 {
+			return int(n)
+		}
+	case float64:
+		if n > 0 {
+			return int(n)
+		}
+	}
+	return 0
 }
