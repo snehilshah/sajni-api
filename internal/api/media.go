@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	"sajni/internal/db"
+	mediastatus "sajni/internal/media"
 )
 
 // httpClient bounds every outbound TMDB / Open Library call. The stdlib
@@ -229,8 +230,13 @@ func listMedia(deps Deps) http.HandlerFunc {
 			ph++
 		}
 		if s := queryParam(r, "status"); s != "" {
+			status, ok := mediastatus.NormalizeStatus(s)
+			if !ok {
+				errJSON(w, 400, "invalid status")
+				return
+			}
 			clauses = append(clauses, "status = $"+itoa(ph))
-			args = append(args, s)
+			args = append(args, string(status))
 			ph++
 		}
 
@@ -339,6 +345,12 @@ func createMedia(deps Deps) http.HandlerFunc {
 		if body.Status == "" {
 			body.Status = "pending"
 		}
+		status, ok := mediastatus.NormalizeStatus(body.Status)
+		if !ok {
+			errJSON(w, 400, "invalid status")
+			return
+		}
+		body.Status = string(status)
 		dup, err := findMediaDuplicate(d, uid, mediaDupCandidate{
 			Title:       body.Title,
 			Type:        body.Type,
@@ -408,6 +420,10 @@ func updateMedia(deps Deps) http.HandlerFunc {
 		var body map[string]any
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
+			return
+		}
+		if err := normalizeMediaStatusPatch(body); err != nil {
+			errJSON(w, 400, err.Error())
 			return
 		}
 
@@ -559,6 +575,23 @@ func updateMedia(deps Deps) http.HandlerFunc {
 
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
+}
+
+func normalizeMediaStatusPatch(body map[string]any) error {
+	raw, ok := body["status"]
+	if !ok {
+		return nil
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return fmt.Errorf("invalid status")
+	}
+	status, valid := mediastatus.NormalizeStatus(s)
+	if !valid {
+		return fmt.Errorf("invalid status")
+	}
+	body["status"] = string(status)
+	return nil
 }
 
 func deleteMedia(deps Deps) http.HandlerFunc {

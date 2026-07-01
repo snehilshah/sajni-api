@@ -17,6 +17,7 @@ import (
 	"google.golang.org/genai"
 
 	"sajni/internal/db"
+	mediastatus "sajni/internal/media"
 	"sajni/internal/reminderqueue"
 	"sajni/internal/storage"
 )
@@ -244,7 +245,7 @@ func (s *Service) buildTools() []Tool {
 			Name:        "list_media",
 			Description: "List the user's media library. Use to avoid recommending things they already have.",
 			Schema: obj(map[string]*genai.Schema{
-				"status": str("'pending', 'watching', 'done', etc."),
+				"status": str("Canonical media status: 'pending', 'in_progress', 'complete', 'waiting', 'upcoming', 'dropped', 'scratched', or 'archived'."),
 				"type":   str("'movie', 'show', 'book'."),
 				"limit":  intg("Default 30."),
 			}),
@@ -621,12 +622,12 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "add_media",
-			Description: "Add a movie / show / book to the user's library. Call this whenever the user mentions a title they have consumed, are consuming, or plan to consume. Status mapping: 'done' for past-tense (\"I watched\", \"already saw\", \"finished\", \"just read\"), 'watching' for in-progress (\"halfway through\", \"on episode 4\"), 'pending' for intent (\"want to watch\", \"need to read\"). If you have an external_id from tmdb_search, pass it along with poster_url, year, release_date, and genre to fully populate the entry.",
+			Description: "Add a movie / show / book to the user's library. Call this whenever the user mentions a title they have consumed, are consuming, or plan to consume. Status mapping: 'complete' for past-tense (\"I watched\", \"already saw\", \"finished\", \"just read\"), 'in_progress' for current consumption (\"halfway through\", \"on episode 4\"), 'pending' for intent (\"want to watch\", \"need to read\"). Do not use task status 'done' for media. If you have an external_id from tmdb_search, pass it along with poster_url, year, release_date, and genre to fully populate the entry.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"title":        str("Required. Exact title."),
 				"type":         str("'movie' | 'show' | 'book'."),
-				"status":       str("'pending' | 'watching' | 'done'. Pick based on the user's wording — past tense ⇒ 'done'. Default 'pending' only when unclear."),
+				"status":       str("'pending' | 'in_progress' | 'complete' | 'waiting' | 'upcoming' | 'dropped' | 'scratched' | 'archived'. Pick based on the user's wording — past tense ⇒ 'complete'. Default 'pending' only when unclear."),
 				"external_id":  str("Optional TMDB external id from tmdb_search."),
 				"year":         intg("Optional release year."),
 				"release_date": str("Optional release date from tmdb_search, YYYY-MM-DD."),
@@ -1277,8 +1278,12 @@ func listMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	clauses := []string{"user_id=$1"}
 	vals := []any{uid}
 	if s := argStr(args, "status"); s != "" {
+		status, ok := mediastatus.NormalizeStatus(s)
+		if !ok {
+			return nil, nil, fmt.Errorf("invalid media status: %s", s)
+		}
 		clauses = append(clauses, fmt.Sprintf("status=$%d", len(vals)+1))
-		vals = append(vals, s)
+		vals = append(vals, string(status))
 	}
 	if t := argStr(args, "type"); t != "" {
 		clauses = append(clauses, fmt.Sprintf("type=$%d", len(vals)+1))
@@ -2102,17 +2107,43 @@ func createFolderTool(ctx context.Context, d *db.DB, uid string, args map[string
 		map[string]any{"kind": "folder_created", "title": path, "route": "/notes"}, nil
 }
 
+func logAIMediaEvent(ctx context.Context, d *db.DB, uid string, mediaID int64, kind string, meta map[string]any) {
+	raw := []byte("{}")
+	if meta != nil {
+		if b, err := json.Marshal(meta); err == nil {
+			raw = b
+		}
+	}
+	_, _ = d.ExecContext(ctx,
+		`INSERT INTO media_events (user_id, media_id, kind, meta) VALUES ($1, $2, $3, $4::jsonb)`,
+		uid, mediaID, kind, string(raw),
+	)
+}
+
+func logAIMediaStatusEvent(ctx context.Context, d *db.DB, uid string, mediaID int64, status string) {
+	switch status {
+	case string(mediastatus.StatusInProgress):
+		logAIMediaEvent(ctx, d, uid, mediaID, "started", nil)
+	case string(mediastatus.StatusComplete):
+		logAIMediaEvent(ctx, d, uid, mediaID, "completed", nil)
+	case string(mediastatus.StatusDropped):
+		logAIMediaEvent(ctx, d, uid, mediaID, "dropped", nil)
+	}
+}
+
 func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	title := argStr(args, "title")
 	mtype := argStr(args, "type")
 	if title == "" || mtype == "" {
 		return nil, nil, fmt.Errorf("missing title or type")
 	}
-	status := argStr(args, "status")
-	statusSpecified := status != ""
-	if status == "" {
-		status = "pending"
+	rawStatus := argStr(args, "status")
+	statusSpecified := strings.TrimSpace(rawStatus) != ""
+	statusValue, ok := mediastatus.NormalizeStatus(rawStatus)
+	if !ok {
+		return nil, nil, fmt.Errorf("invalid media status: %s", rawStatus)
 	}
+	status := string(statusValue)
 	year := argInt(args, "year", 0)
 	var yearArg any
 	if year > 0 {
@@ -2127,9 +2158,10 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	// status instead of inserting a duplicate. Lite tier sometimes
 	// triggers add_media twice for the same title in one round.
 	var existingID int64
+	var existingStatus string
 	d.QueryRowContext(ctx,
-		`SELECT id FROM media WHERE user_id=$1 AND LOWER(title)=LOWER($2) AND type=$3 LIMIT 1`,
-		uid, title, mtype).Scan(&existingID)
+		`SELECT id, status FROM media WHERE user_id=$1 AND LOWER(title)=LOWER($2) AND type=$3 LIMIT 1`,
+		uid, title, mtype).Scan(&existingID, &existingStatus)
 	if existingID > 0 {
 		_, err := d.ExecContext(ctx,
 			`UPDATE media SET status=$1, rating=COALESCE($2, rating), updated_at=NOW()
@@ -2137,6 +2169,9 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 			status, ratingArg, existingID, uid)
 		if err != nil {
 			return nil, nil, err
+		}
+		if status != existingStatus {
+			logAIMediaStatusEvent(ctx, d, uid, existingID, status)
 		}
 		return map[string]any{"id": existingID, "title": title, "updated": true},
 			map[string]any{"kind": "media_added", "id": existingID, "title": title, "route": "/media"}, nil
@@ -2184,7 +2219,7 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 			if len(cleanDate) >= 10 {
 				cleanDate = cleanDate[:10]
 				if _, err := time.Parse("2006-01-02", cleanDate); err == nil && cleanDate > nowStr {
-					status = "upcoming"
+					status = string(mediastatus.StatusUpcoming)
 				}
 			}
 		}
@@ -2201,6 +2236,12 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	if err != nil {
 		return nil, nil, err
 	}
+	logAIMediaEvent(ctx, d, uid, id, "added", map[string]any{
+		"title":  title,
+		"type":   mtype,
+		"status": status,
+	})
+	logAIMediaStatusEvent(ctx, d, uid, id, status)
 	return map[string]any{"id": id, "title": title},
 		map[string]any{"kind": "media_added", "id": id, "title": title, "route": "/media"}, nil
 }

@@ -623,6 +623,42 @@ func (d *DB) migrate() error {
 	ALTER TABLE notes ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
 	-- TMDB release / first-air date, used to render upcoming media after save.
 	ALTER TABLE media ADD COLUMN IF NOT EXISTS release_date DATE;
+	-- Canonical media statuses. Older AI prompts used task-style statuses
+	-- ("done", "watching"); normalize them before the app reads the library.
+	UPDATE media SET status = 'pending'
+		WHERE lower(trim(status)) IN ('', 'pending', 'planned', 'plan', 'queue', 'queued', 'want_to_watch', 'want-to-watch')
+		  AND status <> 'pending';
+	UPDATE media SET status = 'in_progress'
+		WHERE lower(trim(status)) IN ('in_progress', 'in progress', 'in-progress', 'watching', 'reading', 'started')
+		  AND status <> 'in_progress';
+	UPDATE media SET status = 'waiting'
+		WHERE lower(trim(status)) = 'waiting'
+		  AND status <> 'waiting';
+	INSERT INTO media_events (user_id, media_id, kind, meta, created_at)
+		SELECT m.user_id, m.id, 'completed',
+		       jsonb_build_object('status', 'complete', 'source', 'status_normalization'),
+		       m.updated_at
+		  FROM media m
+		 WHERE lower(trim(m.status)) IN ('completed', 'done', 'finished', 'watched', 'read')
+		   AND NOT EXISTS (
+		     SELECT 1 FROM media_events e
+		      WHERE e.user_id = m.user_id AND e.media_id = m.id AND e.kind = 'completed'
+		   );
+	UPDATE media SET status = 'complete'
+		WHERE lower(trim(status)) IN ('complete', 'completed', 'done', 'finished', 'watched', 'read')
+		  AND status <> 'complete';
+	UPDATE media SET status = 'upcoming'
+		WHERE lower(trim(status)) = 'upcoming'
+		  AND status <> 'upcoming';
+	UPDATE media SET status = 'dropped'
+		WHERE lower(trim(status)) IN ('dropped', 'drop')
+		  AND status <> 'dropped';
+	UPDATE media SET status = 'scratched'
+		WHERE lower(trim(status)) IN ('scratched', 'scratch')
+		  AND status <> 'scratched';
+	UPDATE media SET status = 'archived'
+		WHERE lower(trim(status)) IN ('archived', 'archive')
+		  AND status <> 'archived';
 	-- Hot path for the reminder cron: only the un-sent, remind-on rows.
 	CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(scheduled_at)
 		WHERE remind = TRUE AND reminded_at IS NULL;
