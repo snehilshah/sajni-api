@@ -479,6 +479,15 @@ func (s *Service) handleEmailVerify(w http.ResponseWriter, r *http.Request) {
 // ─── Refresh / Logout ────────────────────────────────────────────────
 
 func (s *Service) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	if s.devAuthBypassAllowed(r) {
+		resp, err := s.issueDevBypassSession(r.Context(), w)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
 	cookie, err := r.Cookie(refreshCookie)
 	if err != nil {
 		writeErr(w, http.StatusUnauthorized, "no refresh token")

@@ -57,6 +57,14 @@ type Service struct {
 	// Resend
 	ResendAPIKey string
 	EmailFrom    string
+
+	// DevAuthBypass mints a normal session from /auth/refresh for
+	// local/private-origin requests. It is intentionally env-gated and
+	// request-gated so setting it accidentally in production is not enough
+	// to disable auth for public traffic.
+	DevAuthBypass bool
+	DevAuthEmail  string
+	DevAuthName   string
 }
 
 // NewService reads required env, returns an error if anything load-bearing
@@ -74,6 +82,14 @@ func NewService(database *db.DB) (*Service, error) {
 	if apiBase == "" {
 		apiBase = "http://localhost:8080"
 	}
+	devAuthEmail := strings.ToLower(strings.TrimSpace(os.Getenv("DEV_AUTH_BYPASS_EMAIL")))
+	if devAuthEmail == "" {
+		devAuthEmail = "dev@sajni.local"
+	}
+	devAuthName := strings.TrimSpace(os.Getenv("DEV_AUTH_BYPASS_NAME"))
+	if devAuthName == "" {
+		devAuthName = "Sajni Dev"
+	}
 	return &Service{
 		DB:                 database,
 		JWTSecret:          []byte(secret),
@@ -86,6 +102,9 @@ func NewService(database *db.DB) (*Service, error) {
 		GithubClientSecret: os.Getenv("GITHUB_OAUTH_CLIENT_SECRET"),
 		ResendAPIKey:       os.Getenv("RESEND_API_KEY"),
 		EmailFrom:          os.Getenv("EMAIL_FROM"),
+		DevAuthBypass:      os.Getenv("DEV_AUTH_BYPASS") == "1",
+		DevAuthEmail:       devAuthEmail,
+		DevAuthName:        devAuthName,
 	}, nil
 }
 

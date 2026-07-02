@@ -458,6 +458,14 @@ These are worth knowing because they show up as opaque
   direct Cloud Run fallback.
   Current DNS redirects `ohmysajni.com` to `www.ohmysajni.com`, so prod
   `APP_URL` should be `https://www.ohmysajni.com`.
+- **Local auth bypass**: `DEV_AUTH_BYPASS=1` makes
+  `/api/auth/refresh` mint a normal session for
+  `DEV_AUTH_BYPASS_EMAIL` (default `dev@sajni.local`) when the request
+  comes from `localhost`, `.local`, or a private-network origin such as
+  `http://192.168.x.x:5173`. This is for local demos, AI agents, and
+  phone testing through `vite --host`; never set it in production. In
+  this mode CORS also reflects localhost/private-network origins so
+  direct LAN API calls work when `CORS_ORIGIN` is pinned.
 - **Env vars on the web**: `VITE_API_URL` only. The frontend never
   needs the OAuth client ids.
 - **Schema reset**: `DROP_AND_RESEED=1 go run ./cmd/...` wipes the
