@@ -49,6 +49,7 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	apiMux.HandleFunc("POST /api/auth/profile", deps.Auth.HandleUpdateProfile)
 	apiMux.HandleFunc("POST /api/auth/onboarded", deps.Auth.HandleOnboarded)
 	apiMux.HandleFunc("POST /api/auth/timezone", deps.Auth.HandleSetTimezone)
+	apiMux.HandleFunc("POST /api/auth/notify-channel", deps.Auth.HandleSetNotifyChannel)
 	registerMemoRoutes(apiMux, deps)
 	registerTaskRoutes(apiMux, deps)
 	registerTaskListRoutes(apiMux, deps)

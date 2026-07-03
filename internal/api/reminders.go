@@ -127,11 +127,13 @@ func (e errInvalidReminderKind) Error() string {
 	return "invalid reminder kind: " + string(e)
 }
 
-// deliverTaskReminder ships one task nudge over BOTH channels: push to every
-// registered device and the reminder email. Succeeds when at least one channel
-// delivered, so the idempotency stamp still sets and the next tick doesn't
-// re-nudge a user who already got one of the two.
-func deliverTaskReminder(ctx context.Context, deps Deps, uid, email, name, title, whenLabel string, notifyEmails []string) error {
+// deliverTaskReminder ships one task nudge over the user's chosen channels
+// (users.notify_channel: email | push | both). notifyPush enforces the push
+// side; the owner email is skipped only when the user is push-only AND a push
+// actually landed — otherwise email goes out as the fallback. Succeeds when at
+// least one channel delivered, so the idempotency stamp still sets and the
+// next tick doesn't re-nudge a user who already got one.
+func deliverTaskReminder(ctx context.Context, deps Deps, uid, email, name, channel, title, whenLabel string, notifyEmails []string) error {
 	pushed := notifyPush(ctx, deps, uid, push.Notification{
 		Title: "Task reminder",
 		Body:  title + " — " + whenLabel,
@@ -140,7 +142,8 @@ func deliverTaskReminder(ctx context.Context, deps Deps, uid, email, name, title
 
 	// Custom recipients (e.g. a friend for a meet-up) get an email-only,
 	// friendlier copy naming the owner. Best-effort and independent of the
-	// owner's own delivery below — a guest failure never blocks the owner.
+	// owner's own delivery below — a guest failure never blocks the owner,
+	// and the owner's channel choice never mutes their guests.
 	if deps.Auth != nil {
 		for _, addr := range notifyEmails {
 			if err := deps.Auth.SendGuestTaskReminder(ctx, addr, name, title, whenLabel, "/tasks"); err != nil {
@@ -154,6 +157,9 @@ func deliverTaskReminder(ctx context.Context, deps Deps, uid, email, name, title
 			return nil
 		}
 		return errors.New("no delivery channel configured")
+	}
+	if !channelWantsEmail(channel, pushed) {
+		return nil // push-only user, push delivered
 	}
 	if err := deps.Auth.SendTaskReminder(ctx, email, name, title, whenLabel, "/tasks"); err != nil {
 		if pushed {
@@ -179,6 +185,7 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 	// floor, the task is still open, and we haven't sent yet.
 	rows, err := d.QueryContext(ctx, `
 		SELECT t.id, t.title, t.scheduled_at, u.id, u.email, u.name, COALESCE(u.timezone,''),
+		       COALESCE(u.notify_channel,'both'),
 		       COALESCE(t.notify_emails, '[]'::jsonb)
 		  FROM tasks t
 		  JOIN users u ON u.id = t.user_id
@@ -202,13 +209,14 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 		uid         string
 		email, name string
 		tz          string
+		channel     string
 		notify      []string
 	}
 	var pending []due
 	for rows.Next() {
 		var x due
 		var emailsRaw []byte
-		if err := rows.Scan(&x.id, &x.title, &x.scheduledAt, &x.uid, &x.email, &x.name, &x.tz, &emailsRaw); err != nil {
+		if err := rows.Scan(&x.id, &x.title, &x.scheduledAt, &x.uid, &x.email, &x.name, &x.tz, &x.channel, &emailsRaw); err != nil {
 			continue
 		}
 		x.notify = decodeEmails(emailsRaw)
@@ -225,7 +233,7 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 		if name == "" {
 			name = x.email
 		}
-		if err := deliverTaskReminder(ctx, deps, x.uid, x.email, name, x.title, whenLabel, x.notify); err != nil {
+		if err := deliverTaskReminder(ctx, deps, x.uid, x.email, name, x.channel, x.title, whenLabel, x.notify); err != nil {
 			// Leave reminded_at NULL so the next tick retries this one.
 			log.Warn().Err(err).Int64("task", x.id).Msg("reminder delivery failed")
 			continue
@@ -256,12 +264,14 @@ func sendSingleTaskReminder(ctx context.Context, deps Deps, id int64) (bool, err
 		uid         string
 		email, name string
 		tz          string
+		channel     string
 		notify      []string
 	}
 	var x due
 	var emailsRaw []byte
 	err := d.QueryRowContext(ctx, `
 		SELECT t.id, t.title, t.scheduled_at, u.id, u.email, u.name, COALESCE(u.timezone,''),
+		       COALESCE(u.notify_channel,'both'),
 		       COALESCE(t.notify_emails, '[]'::jsonb)
 		  FROM tasks t
 		  JOIN users u ON u.id = t.user_id
@@ -274,7 +284,7 @@ func sendSingleTaskReminder(ctx context.Context, deps Deps, id int64) (bool, err
 		   AND t.scheduled_at >= NOW() - make_interval(secs => $2)
 		   AND u.deleted_at IS NULL`,
 		id, int(reminderGrace.Seconds())).
-		Scan(&x.id, &x.title, &x.scheduledAt, &x.uid, &x.email, &x.name, &x.tz, &emailsRaw)
+		Scan(&x.id, &x.title, &x.scheduledAt, &x.uid, &x.email, &x.name, &x.tz, &x.channel, &emailsRaw)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
@@ -287,7 +297,7 @@ func sendSingleTaskReminder(ctx context.Context, deps Deps, id int64) (bool, err
 	if name == "" {
 		name = x.email
 	}
-	if err := deliverTaskReminder(ctx, deps, x.uid, x.email, name, x.title, formatReminderWhen(x.scheduledAt, x.tz), x.notify); err != nil {
+	if err := deliverTaskReminder(ctx, deps, x.uid, x.email, name, x.channel, x.title, formatReminderWhen(x.scheduledAt, x.tz), x.notify); err != nil {
 		log.Warn().Err(err).Int64("task", x.id).Msg("single reminder delivery failed")
 		return false, err
 	}
@@ -307,6 +317,7 @@ func processTaskReminders(ctx context.Context, deps Deps) int {
 	rows, err := d.QueryContext(ctx, `
 		SELECT r.id, t.id, t.title, t.scheduled_at, r.remind_at,
 		       u.id, u.email, u.name, COALESCE(u.timezone,''),
+		       COALESCE(u.notify_channel,'both'),
 		       COALESCE(t.notify_emails, '[]'::jsonb)
 		  FROM task_reminders r
 		  JOIN tasks t ON t.id = r.task_id AND t.user_id = r.user_id
@@ -331,13 +342,14 @@ func processTaskReminders(ctx context.Context, deps Deps) int {
 		uid         string
 		email, name string
 		tz          string
+		channel     string
 		notify      []string
 	}
 	var pending []due
 	for rows.Next() {
 		var x due
 		var emailsRaw []byte
-		if err := rows.Scan(&x.rid, &x.tid, &x.title, &x.scheduledAt, &x.remindAt, &x.uid, &x.email, &x.name, &x.tz, &emailsRaw); err != nil {
+		if err := rows.Scan(&x.rid, &x.tid, &x.title, &x.scheduledAt, &x.remindAt, &x.uid, &x.email, &x.name, &x.tz, &x.channel, &emailsRaw); err != nil {
 			continue
 		}
 		x.notify = decodeEmails(emailsRaw)
@@ -357,7 +369,7 @@ func processTaskReminders(ctx context.Context, deps Deps) int {
 		if name == "" {
 			name = x.email
 		}
-		if err := deliverTaskReminder(ctx, deps, x.uid, x.email, name, x.title, formatReminderWhen(when, x.tz), x.notify); err != nil {
+		if err := deliverTaskReminder(ctx, deps, x.uid, x.email, name, x.channel, x.title, formatReminderWhen(when, x.tz), x.notify); err != nil {
 			log.Warn().Err(err).Int64("reminder", x.rid).Msg("task reminder delivery failed")
 			continue
 		}
@@ -383,6 +395,7 @@ func sendSingleMultiReminder(ctx context.Context, deps Deps, id int64) (bool, er
 		uid         string
 		email, name string
 		tz          string
+		channel     string
 		notify      []string
 	}
 	var x due
@@ -390,6 +403,7 @@ func sendSingleMultiReminder(ctx context.Context, deps Deps, id int64) (bool, er
 	err := d.QueryRowContext(ctx, `
 		SELECT r.id, t.id, t.title, t.scheduled_at, r.remind_at,
 		       u.id, u.email, u.name, COALESCE(u.timezone,''),
+		       COALESCE(u.notify_channel,'both'),
 		       COALESCE(t.notify_emails, '[]'::jsonb)
 		  FROM task_reminders r
 		  JOIN tasks t ON t.id = r.task_id AND t.user_id = r.user_id
@@ -401,7 +415,7 @@ func sendSingleMultiReminder(ctx context.Context, deps Deps, id int64) (bool, er
 		   AND r.remind_at >= NOW() - make_interval(secs => $2)
 		   AND u.deleted_at IS NULL`,
 		id, int(reminderGrace.Seconds())).
-		Scan(&x.rid, &x.tid, &x.title, &x.scheduledAt, &x.remindAt, &x.uid, &x.email, &x.name, &x.tz, &emailsRaw)
+		Scan(&x.rid, &x.tid, &x.title, &x.scheduledAt, &x.remindAt, &x.uid, &x.email, &x.name, &x.tz, &x.channel, &emailsRaw)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
@@ -418,7 +432,7 @@ func sendSingleMultiReminder(ctx context.Context, deps Deps, id int64) (bool, er
 	if name == "" {
 		name = x.email
 	}
-	if err := deliverTaskReminder(ctx, deps, x.uid, x.email, name, x.title, formatReminderWhen(when, x.tz), x.notify); err != nil {
+	if err := deliverTaskReminder(ctx, deps, x.uid, x.email, name, x.channel, x.title, formatReminderWhen(when, x.tz), x.notify); err != nil {
 		log.Warn().Err(err).Int64("reminder", x.rid).Msg("single task reminder delivery failed")
 		return false, err
 	}

@@ -855,6 +855,10 @@ func (d *DB) migrate() error {
 	-- current cycle's day boundary, so a still-pending task is nudged each cycle
 	-- and a task added after a fire is caught on the next one.
 	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS digested_at TIMESTAMPTZ;
+	-- Per-user delivery channel for reminders/digests/auto-pay notices:
+	-- 'email' | 'push' | 'both'. push-only still falls back to email when no
+	-- push delivery lands (dead/no tokens), so nudges never silently vanish.
+	ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_channel TEXT NOT NULL DEFAULT 'both';
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err

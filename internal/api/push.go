@@ -68,10 +68,18 @@ func unregisterPushDevice(deps Deps) http.HandlerFunc {
 }
 
 // notifyPush pushes to every live device of uid and reports whether at least
-// one delivery landed. Callers send email regardless; the bool only matters
-// for "did ANY channel deliver" success accounting.
+// one delivery landed. It enforces the user's notify_channel here — every
+// push send in the codebase funnels through this — so an 'email'-only user
+// never gets a device buzz. Email gating stays with the callers (they hold
+// the channel + the pushed result); see channelWantsEmail.
 func notifyPush(ctx context.Context, deps Deps, uid string, n push.Notification) bool {
 	if deps.Push == nil {
+		return false
+	}
+	var channel string
+	if err := deps.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(notify_channel,'both') FROM users WHERE id = $1`, uid,
+	).Scan(&channel); err == nil && channel == "email" {
 		return false
 	}
 	sent, err := deps.Push.SendToUser(ctx, deps.DB, uid, n)
@@ -80,4 +88,12 @@ func notifyPush(ctx context.Context, deps Deps, uid string, n push.Notification)
 		return false
 	}
 	return sent > 0
+}
+
+// channelWantsEmail reports whether the user's email copy should go out,
+// given their notify_channel and whether push already delivered. push-only
+// users still get the email when no device delivery landed (no/dead tokens):
+// a reminder must never silently vanish. Unknown values behave like 'both'.
+func channelWantsEmail(channel string, pushed bool) bool {
+	return channel != "push" || !pushed
 }

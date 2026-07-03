@@ -81,6 +81,7 @@ type digestRow struct {
 
 type userDigest struct {
 	uid, email, name string
+	channel          string
 	tasks            []digestRow
 }
 
@@ -90,7 +91,7 @@ func processWeeklyDigests(ctx context.Context, deps Deps, now, boundary time.Tim
 	monday := mondayOf(now)
 	mondayKey := monday.Format("2006-01-02")
 	rows, err := deps.DB.QueryContext(ctx, `
-		SELECT t.id, t.title, u.id, u.email, COALESCE(u.name,'')
+		SELECT t.id, t.title, u.id, u.email, COALESCE(u.name,''), COALESCE(u.notify_channel,'both')
 		  FROM tasks t
 		  JOIN users u ON u.id = t.user_id
 		 WHERE t.week_of IS NOT NULL
@@ -117,7 +118,7 @@ func processMonthlyDigests(ctx context.Context, deps Deps, now, boundary time.Ti
 	first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, defaultLoc)
 	firstKey := first.Format("2006-01-02")
 	rows, err := deps.DB.QueryContext(ctx, `
-		SELECT t.id, t.title, u.id, u.email, COALESCE(u.name,'')
+		SELECT t.id, t.title, u.id, u.email, COALESCE(u.name,''), COALESCE(u.notify_channel,'both')
 		  FROM tasks t
 		  JOIN users u ON u.id = t.user_id
 		 WHERE t.month_of IS NOT NULL
@@ -147,13 +148,13 @@ func scanDigestRows(rows interface {
 	byUID := map[string]*userDigest{}
 	for rows.Next() {
 		var id int64
-		var title, uid, email, name string
-		if err := rows.Scan(&id, &title, &uid, &email, &name); err != nil {
+		var title, uid, email, name, channel string
+		if err := rows.Scan(&id, &title, &uid, &email, &name, &channel); err != nil {
 			continue
 		}
 		u := byUID[uid]
 		if u == nil {
-			u = &userDigest{uid: uid, email: email, name: name}
+			u = &userDigest{uid: uid, email: email, name: name, channel: channel}
 			byUID[uid] = u
 			out = append(out, u)
 		}
@@ -189,7 +190,7 @@ func deliverDigests(ctx context.Context, deps Deps, users []*userDigest, kind, p
 		})
 
 		emailed := false
-		if deps.Auth != nil {
+		if deps.Auth != nil && channelWantsEmail(u.channel, pushed) {
 			if err := deps.Auth.SendTaskDigest(ctx, u.email, name, kind, periodLabel, titles, "/tasks"); err != nil {
 				log.Warn().Err(err).Str("user", u.uid).Str("kind", kind).Msg("digest email failed")
 			} else {

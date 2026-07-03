@@ -100,13 +100,14 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux) {
 
 // userResponse mirrors the shape /me + auth-success bodies use.
 type userResponse struct {
-	ID          string             `json:"id"`
-	Email       string             `json:"email"`
-	Name        string             `json:"name"`
-	Timezone    string             `json:"timezone"`
-	OnboardedAt *string            `json:"onboarded_at"`
-	Identities  []identityResponse `json:"identities"`
-	DeletedAt   *string            `json:"deleted_at,omitempty"`
+	ID            string             `json:"id"`
+	Email         string             `json:"email"`
+	Name          string             `json:"name"`
+	Timezone      string             `json:"timezone"`
+	NotifyChannel string             `json:"notify_channel"`
+	OnboardedAt   *string            `json:"onboarded_at"`
+	Identities    []identityResponse `json:"identities"`
+	DeletedAt     *string            `json:"deleted_at,omitempty"`
 }
 
 type identityResponse struct {
@@ -133,16 +134,17 @@ func (s *Service) loadUser(ctx context.Context, id string) (*userResponse, error
 	var (
 		email, name string
 		tz          sql.NullString
+		channel     string
 		onboarded   sql.NullTime
 		deleted     sql.NullTime
 	)
 	err := s.DB.QueryRowContext(ctx,
-		`SELECT email, name, timezone, onboarded_at, deleted_at FROM users WHERE id=$1`, id,
-	).Scan(&email, &name, &tz, &onboarded, &deleted)
+		`SELECT email, name, timezone, COALESCE(notify_channel,'both'), onboarded_at, deleted_at FROM users WHERE id=$1`, id,
+	).Scan(&email, &name, &tz, &channel, &onboarded, &deleted)
 	if err != nil {
 		return nil, err
 	}
-	resp := &userResponse{ID: id, Email: email, Name: name, Timezone: tz.String, Identities: []identityResponse{}}
+	resp := &userResponse{ID: id, Email: email, Name: name, Timezone: tz.String, NotifyChannel: channel, Identities: []identityResponse{}}
 	if onboarded.Valid {
 		v := onboarded.Time.UTC().Format(time.RFC3339)
 		resp.OnboardedAt = &v
@@ -586,6 +588,32 @@ func (s *Service) HandleOnboarded(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// HandleSetNotifyChannel stores how reminder/digest/auto-pay nudges reach the
+// user: 'email' | 'push' | 'both'. Push-only keeps an email fallback in the
+// senders when no device delivery lands, so nothing silently vanishes.
+func (s *Service) HandleSetNotifyChannel(w http.ResponseWriter, r *http.Request) {
+	id := MustUserID(r.Context())
+	var body struct {
+		Channel string `json:"channel"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	ch := strings.TrimSpace(body.Channel)
+	if ch != "email" && ch != "push" && ch != "both" {
+		writeErr(w, http.StatusBadRequest, "channel must be email, push or both")
+		return
+	}
+	if _, err := s.DB.ExecContext(r.Context(),
+		`UPDATE users SET notify_channel=$2 WHERE id=$1`, id, ch,
+	); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "channel": ch})
 }
 
 // canonicalTZ collapses deprecated IANA aliases to their canonical name so the

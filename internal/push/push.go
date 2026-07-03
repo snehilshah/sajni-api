@@ -2,7 +2,7 @@
 //
 // It speaks the FCM HTTP v1 API directly with an ADC token source instead of
 // pulling the firebase-admin SDK: on Cloud Run the runtime service account
-// (granted roles/firebasemessaging.admin) is the credential, locally it's
+// (granted roles/firebasecloudmessaging.admin) is the credential, locally it's
 // whatever `gcloud auth application-default login` set up. Disabled (nil
 // sender) when FIREBASE_PROJECT_ID is unset, so dev environments without
 // Firebase keep working on the email-only path.

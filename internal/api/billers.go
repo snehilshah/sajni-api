@@ -576,11 +576,12 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 }
 
 // notifyVariableAutoPay tells the user a variable biller was auto-paid with
-// an estimated (last-known) amount, so they can verify and adjust. Sent over
-// BOTH channels (push to registered devices + email). Best effort either
+// an estimated (last-known) amount, so they can verify and adjust. Channels
+// follow users.notify_channel (push gate lives in notifyPush; the email is
+// skipped only when a push-only user's push landed). Best effort either
 // way: the in-app auto_paid_variable alert is the durable record.
 func notifyVariableAutoPay(ctx context.Context, deps Deps, uid, billerName string, amount float64, dueDate string) {
-	notifyPush(ctx, deps, uid, push.Notification{
+	pushed := notifyPush(ctx, deps, uid, push.Notification{
 		Title: "Auto-paid " + billerName,
 		Body:  fmt.Sprintf("₹%.2f (estimated, due %s) — verify and adjust if it differs", amount, dueDate),
 		Route: "/finance",
@@ -588,9 +589,12 @@ func notifyVariableAutoPay(ctx context.Context, deps Deps, uid, billerName strin
 	if deps.Auth == nil {
 		return
 	}
-	var email, name string
-	if err := deps.DB.QueryRowContext(ctx, `SELECT email, name FROM users WHERE id = $1`, uid).Scan(&email, &name); err != nil || email == "" {
+	var email, name, channel string
+	if err := deps.DB.QueryRowContext(ctx, `SELECT email, name, COALESCE(notify_channel,'both') FROM users WHERE id = $1`, uid).Scan(&email, &name, &channel); err != nil || email == "" {
 		return
+	}
+	if !channelWantsEmail(channel, pushed) {
+		return // push-only user, push delivered
 	}
 	if name == "" {
 		name = email
