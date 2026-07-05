@@ -375,13 +375,6 @@ func (s *Service) oauthCallback(name string) http.HandlerFunc {
 	}
 }
 
-func (s *Service) sameSite() http.SameSite {
-	if s.CookieInsecure {
-		return http.SameSiteLaxMode
-	}
-	return http.SameSiteNoneMode
-}
-
 // ─── Email TOTP ───────────────────────────────────────────────────────
 
 type emailStartBody struct {

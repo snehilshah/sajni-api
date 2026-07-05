@@ -60,12 +60,19 @@ func (d *DB) migrate() error {
 	-- name + email are mandatory; password_hash is gone (auth is now
 	-- OAuth + email-TOTP).
 	CREATE TABLE IF NOT EXISTS users (
-		id            UUID         PRIMARY KEY,
-		email         CITEXT       NOT NULL UNIQUE,
-		name          TEXT         NOT NULL DEFAULT '',
-		onboarded_at  TIMESTAMPTZ,
-		created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-		deleted_at    TIMESTAMPTZ
+		id             UUID         PRIMARY KEY,
+		email          CITEXT       NOT NULL UNIQUE,
+		name           TEXT         NOT NULL DEFAULT '',
+		-- IANA timezone captured from the browser once, used to render
+		-- reminder emails in the user's local clock. NULL until captured.
+		timezone       TEXT,
+		-- Delivery channel for reminders/digests/auto-pay notices:
+		-- 'email' | 'push' | 'both'. push-only still falls back to email
+		-- when no push delivery lands, so nudges never silently vanish.
+		notify_channel TEXT         NOT NULL DEFAULT 'both',
+		onboarded_at   TIMESTAMPTZ,
+		created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+		deleted_at     TIMESTAMPTZ
 	);
 	CREATE INDEX IF NOT EXISTS idx_users_deleted_at ON users(deleted_at) WHERE deleted_at IS NOT NULL;
 
@@ -140,6 +147,14 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_task_lists_user ON task_lists(user_id);
 
+	-- Reminders ride on tasks rather than a separate model: scheduled_at is
+	-- the event instant, remind gates the nudge, reminded_at is the
+	-- sent-sentinel (NULL = unsent; clearing on edit re-arms). week_of
+	-- (Monday-anchored, IST) marks a "week task"; month_of (1st-anchored)
+	-- a "month goal" — the three scopes (day/week/month) stay mutually
+	-- exclusive. notify_emails = extra email-only reminder recipients
+	-- (JSONB array, API caps + validates). digested_at stamps the last
+	-- weekly/monthly digest nudge for week/month tasks.
 	CREATE TABLE IF NOT EXISTS tasks (
 		id               BIGSERIAL   PRIMARY KEY,
 		user_id          UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -148,7 +163,13 @@ func (d *DB) migrate() error {
 		status           TEXT        NOT NULL DEFAULT 'todo',
 		priority         TEXT        NOT NULL DEFAULT 'medium',
 		due_date         DATE,
+		week_of          DATE,
+		month_of         DATE,
 		scheduled_at     TIMESTAMPTZ,
+		remind           BOOLEAN     NOT NULL DEFAULT FALSE,
+		reminded_at      TIMESTAMPTZ,
+		digested_at      TIMESTAMPTZ,
+		notify_emails    JSONB       NOT NULL DEFAULT '[]'::jsonb,
 		duration_minutes INTEGER     NOT NULL DEFAULT 30,
 		list_id          BIGINT      REFERENCES task_lists(id) ON DELETE SET NULL,
 		parent_task_id   BIGINT      REFERENCES tasks(id) ON DELETE CASCADE,
@@ -161,6 +182,11 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_list ON tasks(list_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
+	-- Hot path for the reminder cron: only the un-sent, remind-on rows.
+	CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(scheduled_at)
+		WHERE remind = TRUE AND reminded_at IS NULL;
+	CREATE INDEX IF NOT EXISTS idx_tasks_week_of ON tasks(user_id, week_of) WHERE week_of IS NOT NULL;
+	CREATE INDEX IF NOT EXISTS idx_tasks_month_of ON tasks(user_id, month_of) WHERE month_of IS NOT NULL;
 
 	CREATE TABLE IF NOT EXISTS habits (
 		id         BIGSERIAL   PRIMARY KEY,
@@ -288,14 +314,18 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_journal_monthly_user ON journal_monthly(user_id, cal_year DESC, cal_month DESC);
 
+	-- description: short user-authored summary shown on the Notes atlas
+	-- cards. Lives in Postgres (not the GCS body blob) so the list endpoint
+	-- renders it without N blob fetches.
 	CREATE TABLE IF NOT EXISTS notes (
-		id         BIGSERIAL   PRIMARY KEY,
-		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		title      TEXT        NOT NULL DEFAULT '',
-		blob_key   TEXT        NOT NULL DEFAULT '',
-		folder     TEXT        NOT NULL DEFAULT '',
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		id          BIGSERIAL   PRIMARY KEY,
+		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		title       TEXT        NOT NULL DEFAULT '',
+		description TEXT        NOT NULL DEFAULT '',
+		blob_key    TEXT        NOT NULL DEFAULT '',
+		folder      TEXT        NOT NULL DEFAULT '',
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id);
 
@@ -341,6 +371,10 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_backlinks_source ON backlinks(user_id, source_type, source_id);
 
 	-- ─── Finance ─────────────────────────────────────────────────────
+	-- salary_amount/salary_day: a 'salary' account stores the expected
+	-- monthly inflow + landing day for one-tap "Credit salary".
+	-- match_hints: comma-separated identifiers (last-4 / bank name) seen in
+	-- this account's bank/UPI SMS so ingest can auto-pick the account.
 	CREATE TABLE IF NOT EXISTS fin_accounts (
 		id              BIGSERIAL   PRIMARY KEY,
 		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -354,6 +388,9 @@ func (d *DB) migrate() error {
 		due_day         INTEGER,
 		cashback_type   TEXT        NOT NULL DEFAULT 'none',
 		cashback_value  NUMERIC(8,2) NOT NULL DEFAULT 0,
+		salary_amount   NUMERIC(14,2) NOT NULL DEFAULT 0,
+		salary_day      INT,
+		match_hints     TEXT        NOT NULL DEFAULT '',
 		color           TEXT        NOT NULL DEFAULT '#2D5A4F',
 		archived        BOOLEAN     NOT NULL DEFAULT FALSE,
 		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -380,6 +417,7 @@ func (d *DB) migrate() error {
 		type            TEXT        NOT NULL DEFAULT 'expense',
 		amount          NUMERIC(14,2) NOT NULL DEFAULT 0,
 		description     TEXT        NOT NULL DEFAULT '',
+		note            TEXT        NOT NULL DEFAULT '',
 		txn_at          TIMESTAMPTZ NOT NULL,
 		transfer_pair   BIGINT,
 		linked_account  BIGINT      REFERENCES fin_accounts(id) ON DELETE SET NULL,
@@ -388,8 +426,7 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_user ON fin_transactions(user_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_account ON fin_transactions(account_id);
-	-- idx on txn_at created after the txn_date→txn_at migration below (the
-	-- column doesn't exist yet on an upgrading DB at this point in the script).
+	CREATE INDEX IF NOT EXISTS idx_fin_transactions_at ON fin_transactions(user_id, txn_at);
 
 	CREATE TABLE IF NOT EXISTS fin_budgets (
 		id          BIGSERIAL   PRIMARY KEY,
@@ -424,6 +461,21 @@ func (d *DB) migrate() error {
 		start_date      DATE,
 		maturity_date   DATE,
 		expected_return NUMERIC(8,4) NOT NULL DEFAULT 0,
+		-- Trading holdings: quantity/avg_buy_price track remaining cost
+		-- basis, realized_pl accumulates booked gains, status flips to
+		-- 'closed' at qty 0. symbol+exchange (NSE=.NS/BSE=.BO) identify the
+		-- instrument to the Yahoo price fetcher; last_price/price_at/
+		-- price_error track the lazy refresh (see prices.go).
+		quantity        NUMERIC(18,6) NOT NULL DEFAULT 0,
+		avg_buy_price   NUMERIC(18,6) NOT NULL DEFAULT 0,
+		realized_pl     NUMERIC(14,2) NOT NULL DEFAULT 0,
+		status          TEXT          NOT NULL DEFAULT 'open',
+		sold_at         TIMESTAMPTZ,
+		symbol          TEXT          NOT NULL DEFAULT '',
+		exchange        TEXT          NOT NULL DEFAULT 'NSE',
+		last_price      NUMERIC(18,6) NOT NULL DEFAULT 0,
+		price_error     TEXT          NOT NULL DEFAULT '',
+		price_at        TIMESTAMPTZ,
 		notes           TEXT        NOT NULL DEFAULT '',
 		last_updated    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -442,17 +494,22 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_virtual_savings_user ON fin_virtual_savings(user_id);
 
+	-- previous_balance carries over the prior cycle; new_charges is this
+	-- cycle's spend; amount_due is the payable total (both may be negative
+	-- = credit).
 	CREATE TABLE IF NOT EXISTS fin_cc_statements (
-		id              BIGSERIAL   PRIMARY KEY,
-		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		account_id      BIGINT      NOT NULL REFERENCES fin_accounts(id) ON DELETE CASCADE,
-		statement_date  DATE        NOT NULL,
-		due_date        DATE        NOT NULL,
-		amount_due      NUMERIC(14,2) NOT NULL DEFAULT 0,
-		cashback_earned NUMERIC(14,2) NOT NULL DEFAULT 0,
-		paid            BOOLEAN     NOT NULL DEFAULT FALSE,
-		paid_at         TIMESTAMPTZ,
-		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		id               BIGSERIAL   PRIMARY KEY,
+		user_id          UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		account_id       BIGINT      NOT NULL REFERENCES fin_accounts(id) ON DELETE CASCADE,
+		statement_date   DATE        NOT NULL,
+		due_date         DATE        NOT NULL,
+		amount_due       NUMERIC(14,2) NOT NULL DEFAULT 0,
+		previous_balance NUMERIC(14,2) NOT NULL DEFAULT 0,
+		new_charges      NUMERIC(14,2) NOT NULL DEFAULT 0,
+		cashback_earned  NUMERIC(14,2) NOT NULL DEFAULT 0,
+		paid             BOOLEAN     NOT NULL DEFAULT FALSE,
+		paid_at          TIMESTAMPTZ,
+		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_cc_statements_user ON fin_cc_statements(user_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_cc_statements_account ON fin_cc_statements(account_id);
@@ -468,6 +525,10 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_networth_user ON fin_networth_snapshots(user_id);
 
+	-- remind_task: opt-in — when on (and not auto_renew) the biller cron
+	-- spawns one bill-pay reminder task per due cycle. variable: amount
+	-- unknown upfront (e.g. electricity); with auto_renew the cron posts
+	-- the last paid amount and flags the alert loudly.
 	CREATE TABLE IF NOT EXISTS fin_billers (
 		id              BIGSERIAL   PRIMARY KEY,
 		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -479,6 +540,8 @@ func (d *DB) migrate() error {
 		category_id     BIGINT      REFERENCES fin_categories(id) ON DELETE SET NULL,
 		is_subscription BOOLEAN     NOT NULL DEFAULT FALSE,
 		auto_renew      BOOLEAN     NOT NULL DEFAULT FALSE,
+		remind_task     BOOLEAN     NOT NULL DEFAULT FALSE,
+		variable        BOOLEAN     NOT NULL DEFAULT FALSE,
 		alert_days      INTEGER     NOT NULL DEFAULT 3,
 		color           TEXT        NOT NULL DEFAULT '#2D5A4F',
 		notes           TEXT        NOT NULL DEFAULT '',
@@ -594,75 +657,6 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_thinking_cards_project ON thinking_cards(project_id, created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_thinking_cards_user ON thinking_cards(user_id);
 
-	-- ─── Reminders (extends tasks) ────────────────────────────────────
-	-- Reminders ride on tasks rather than a separate model: scheduled_at
-	-- (already present) is the event instant, remind gates the email, and
-	-- reminded_at is the sent-sentinel (NULL = unsent). Clearing it on edit
-	-- re-arms the reminder; Cloud Tasks and the safety sweep use it for
-	-- idempotency.
-	ALTER TABLE tasks       ADD COLUMN IF NOT EXISTS remind      BOOLEAN     NOT NULL DEFAULT FALSE;
-	ALTER TABLE tasks       ADD COLUMN IF NOT EXISTS reminded_at TIMESTAMPTZ;
-	-- IANA timezone captured from the browser once, used to render the
-	-- reminder email in the user's local clock time. NULL until captured.
-	ALTER TABLE users       ADD COLUMN IF NOT EXISTS timezone    TEXT;
-	-- Timezone backfill / normalization (idempotent; touches 0 rows once clean).
-	-- Every Sajni user is IST. Old accounts predate browser capture (NULL) and
-	-- early captures stored the deprecated 'Asia/Calcutta' alias; collapse both
-	-- to the canonical 'Asia/Kolkata' so the column is consistent. Same +05:30,
-	-- so this is zero behaviour change — purely a consistency fix.
-	UPDATE users SET timezone = 'Asia/Kolkata'
-		WHERE timezone IS NULL OR timezone = 'Asia/Calcutta';
-	-- Opt-in: when on (and the biller is not auto_renew) the biller cron
-	-- spawns one bill-pay reminder task per due cycle.
-	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS remind_task BOOLEAN     NOT NULL DEFAULT FALSE;
-	-- Free-text note on a transaction (separate from the one-line description).
-	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';
-	-- Short user-authored summary for a note, shown on the Notes atlas cards.
-	-- Lives in Postgres (not the GCS body blob) so the list endpoint can render
-	-- it without N blob fetches. Empty for existing notes until edited.
-	ALTER TABLE notes ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
-	-- TMDB release / first-air date, used to render upcoming media after save.
-	ALTER TABLE media ADD COLUMN IF NOT EXISTS release_date DATE;
-	-- Canonical media statuses. Older AI prompts used task-style statuses
-	-- ("done", "watching"); normalize them before the app reads the library.
-	UPDATE media SET status = 'pending'
-		WHERE lower(trim(status)) IN ('', 'pending', 'planned', 'plan', 'queue', 'queued', 'want_to_watch', 'want-to-watch')
-		  AND status <> 'pending';
-	UPDATE media SET status = 'in_progress'
-		WHERE lower(trim(status)) IN ('in_progress', 'in progress', 'in-progress', 'watching', 'reading', 'started')
-		  AND status <> 'in_progress';
-	UPDATE media SET status = 'waiting'
-		WHERE lower(trim(status)) = 'waiting'
-		  AND status <> 'waiting';
-	INSERT INTO media_events (user_id, media_id, kind, meta, created_at)
-		SELECT m.user_id, m.id, 'completed',
-		       jsonb_build_object('status', 'complete', 'source', 'status_normalization'),
-		       m.updated_at
-		  FROM media m
-		 WHERE lower(trim(m.status)) IN ('completed', 'done', 'finished', 'watched', 'read')
-		   AND NOT EXISTS (
-		     SELECT 1 FROM media_events e
-		      WHERE e.user_id = m.user_id AND e.media_id = m.id AND e.kind = 'completed'
-		   );
-	UPDATE media SET status = 'complete'
-		WHERE lower(trim(status)) IN ('complete', 'completed', 'done', 'finished', 'watched', 'read')
-		  AND status <> 'complete';
-	UPDATE media SET status = 'upcoming'
-		WHERE lower(trim(status)) = 'upcoming'
-		  AND status <> 'upcoming';
-	UPDATE media SET status = 'dropped'
-		WHERE lower(trim(status)) IN ('dropped', 'drop')
-		  AND status <> 'dropped';
-	UPDATE media SET status = 'scratched'
-		WHERE lower(trim(status)) IN ('scratched', 'scratch')
-		  AND status <> 'scratched';
-	UPDATE media SET status = 'archived'
-		WHERE lower(trim(status)) IN ('archived', 'archive')
-		  AND status <> 'archived';
-	-- Hot path for the reminder cron: only the un-sent, remind-on rows.
-	CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(scheduled_at)
-		WHERE remind = TRUE AND reminded_at IS NULL;
-
 	-- ─── Task audit trail ─────────────────────────────────────────────
 	-- One row per tracked mutation, surfaced as a GitHub-style timeline in
 	-- the task detail drawer. kind ∈ created|status|title|list. Note/body
@@ -678,90 +672,6 @@ func (d *DB) migrate() error {
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
-
-	-- ─── Finance: CC statement breakdown ──────────────────────────────
-	-- A statement now records the carried-over previous balance and this
-	-- cycle's new charges separately; amount_due is the payable total
-	-- (previous_balance + new_charges). Both may be negative (= credit).
-	ALTER TABLE fin_cc_statements ADD COLUMN IF NOT EXISTS previous_balance NUMERIC(14,2) NOT NULL DEFAULT 0;
-	ALTER TABLE fin_cc_statements ADD COLUMN IF NOT EXISTS new_charges      NUMERIC(14,2) NOT NULL DEFAULT 0;
-
-	-- ─── Finance: trading holdings ────────────────────────────────────
-	-- stock/etf/sip/mutual_fund are bought against a trading account and can
-	-- be partially sold. quantity/avg_buy_price track remaining cost basis,
-	-- realized_pl accumulates booked gains, status flips to 'closed' at qty 0.
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS quantity      NUMERIC(18,6) NOT NULL DEFAULT 0;
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS avg_buy_price NUMERIC(18,6) NOT NULL DEFAULT 0;
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS realized_pl   NUMERIC(14,2) NOT NULL DEFAULT 0;
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS status        TEXT          NOT NULL DEFAULT 'open';
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS sold_at       TIMESTAMPTZ;
-
-	-- ─── Finance: auto price fetch (stocks/ETFs) ──────────────────────
-	-- symbol+exchange identify the instrument to the price provider (Yahoo
-	-- Finance, NSE=.NS/BSE=.BO); lazy refresh (see prices.go) refreshes
-	-- last_price and recomputes current_value. price_error holds the
-	-- last fetch failure ('' = ok); price_at marks the last refresh attempt so
-	-- the cron picks the stalest holdings first.
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS symbol      TEXT NOT NULL DEFAULT '';
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS exchange    TEXT NOT NULL DEFAULT 'NSE';
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS last_price  NUMERIC(18,6) NOT NULL DEFAULT 0;
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS price_error TEXT NOT NULL DEFAULT '';
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS price_at    TIMESTAMPTZ;
-
-	-- ─── Finance: variable billers ────────────────────────────────────
-	-- e.g. electricity — amount unknown upfront. When also auto_renew, the
-	-- cron posts the last paid amount and flags the alert/email loudly.
-	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS variable BOOLEAN NOT NULL DEFAULT FALSE;
-
-	-- ─── Finance: salary accounts ─────────────────────────────────────
-	-- A 'salary' account stores the expected monthly inflow + the day it lands,
-	-- so the UI can offer a one-tap "Credit salary". Bonuses stay manual.
-	ALTER TABLE fin_accounts ADD COLUMN IF NOT EXISTS salary_amount NUMERIC(14,2) NOT NULL DEFAULT 0;
-	ALTER TABLE fin_accounts ADD COLUMN IF NOT EXISTS salary_day    INT;
-	-- Comma-separated identifiers (last-4 digits / bank name) seen in this
-	-- account's bank/UPI SMS, so the share-target confirm sheet can auto-pick
-	-- the right account from a parsed account_hint.
-	ALTER TABLE fin_accounts ADD COLUMN IF NOT EXISTS match_hints TEXT NOT NULL DEFAULT '';
-
-	-- ─── Finance: trading account backfill (breaking change) ──────────
-	-- Trades now require a 'trading' account. Every user who already owns a
-	-- trading-type holding gets one "Default Trading" account; those holdings
-	-- are relinked to it (catches stocks added on a personal account). The
-	-- relink is guarded so a holding the user later moves stays put.
-	INSERT INTO fin_accounts (user_id, name, type, color)
-	SELECT DISTINCT i.user_id, 'Default Trading', 'trading', '#4F6FA1'
-	FROM fin_investments i
-	WHERE i.type IN ('stock','etf','sip','mutual_fund')
-	  AND NOT EXISTS (SELECT 1 FROM fin_accounts a WHERE a.user_id = i.user_id AND a.type = 'trading');
-	UPDATE fin_investments i
-	SET account_id = (SELECT a.id FROM fin_accounts a WHERE a.user_id = i.user_id AND a.type = 'trading' ORDER BY a.id ASC LIMIT 1)
-	WHERE i.type IN ('stock','etf','sip','mutual_fund')
-	  AND (i.account_id IS NULL
-	       OR i.account_id NOT IN (SELECT a.id FROM fin_accounts a WHERE a.user_id = i.user_id AND a.type = 'trading'));
-
-	-- ─── Finance: collapse "Other" → "Others" (idempotent) ────────────
-	-- The seed once used "Other" while AI categorize emits the canonical
-	-- "Others", so both surfaced in the UI. Reassign anything pointing at a
-	-- per-user "Other" to that user's "Others" (when present), drop the dup,
-	-- then rename any lone "Other" so only "Others" remains. Category FKs are
-	-- ON DELETE SET NULL, so reassigning BEFORE the delete preserves bindings.
-	UPDATE fin_transactions t SET category_id = s.id
-	FROM fin_categories o
-	JOIN fin_categories s ON s.user_id = o.user_id AND s.kind = o.kind AND LOWER(s.name) = 'others'
-	WHERE t.category_id = o.id AND LOWER(o.name) = 'other';
-	UPDATE fin_budget_items bi SET category_id = s.id
-	FROM fin_categories o
-	JOIN fin_categories s ON s.user_id = o.user_id AND s.kind = o.kind AND LOWER(s.name) = 'others'
-	WHERE bi.category_id = o.id AND LOWER(o.name) = 'other';
-	UPDATE fin_billers b SET category_id = s.id
-	FROM fin_categories o
-	JOIN fin_categories s ON s.user_id = o.user_id AND s.kind = o.kind AND LOWER(s.name) = 'others'
-	WHERE b.category_id = o.id AND LOWER(o.name) = 'other';
-	DELETE FROM fin_categories o
-	WHERE LOWER(o.name) = 'other'
-	  AND EXISTS (SELECT 1 FROM fin_categories s
-	              WHERE s.user_id = o.user_id AND s.kind = o.kind AND LOWER(s.name) = 'others');
-	UPDATE fin_categories SET name = 'Others' WHERE LOWER(name) = 'other';
 
 	-- ─── Tasks: multiple reminders ────────────────────────────────────
 	-- The legacy single reminder (tasks.remind + scheduled_at) only fires on
@@ -794,26 +704,6 @@ func (d *DB) migrate() error {
 		PRIMARY KEY (user_id, merchant)
 	);
 
-	-- ─── Finance: transactions gain a time-of-day (txn_date → txn_at) ──
-	-- Was a bare DATE; now a full TIMESTAMPTZ so a transaction records when,
-	-- not just which day. Existing rows are backfilled to IST midnight (the
-	-- "add 00" rule) so day-bucketed queries stay put. Guarded on the old
-	-- column existing so this is a no-op on fresh installs (which already
-	-- create txn_at) and runs exactly once on an upgrading DB.
-	DO $$
-	BEGIN
-		IF EXISTS (SELECT 1 FROM information_schema.columns
-		           WHERE table_name = 'fin_transactions' AND column_name = 'txn_date') THEN
-			ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS txn_at TIMESTAMPTZ;
-			UPDATE fin_transactions
-				SET txn_at = (txn_date::timestamp AT TIME ZONE 'Asia/Kolkata')
-				WHERE txn_at IS NULL;
-			ALTER TABLE fin_transactions ALTER COLUMN txn_at SET NOT NULL;
-			ALTER TABLE fin_transactions DROP COLUMN txn_date;  -- cascades old idx
-		END IF;
-	END $$;
-	CREATE INDEX IF NOT EXISTS idx_fin_transactions_at ON fin_transactions(user_id, txn_at);
-
 	-- ─── Push devices (FCM) ───────────────────────────────────────────
 	-- One row per registered native device token. Notifications go to BOTH
 	-- channels: every live token gets push, email goes out regardless.
@@ -827,38 +717,6 @@ func (d *DB) migrate() error {
 		last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id);
-
-	-- ─── Tasks: week-scoped tasks + custom reminder recipients ─────────
-	-- week_of (Monday-anchored, IST) marks a "week task": it has no specific
-	-- day, surfaces in the "This Week" smart list + the journal weekly view,
-	-- and goes Missed once its week has fully passed. due_date stays NULL for
-	-- these, so they never leak into the day-based smart lists.
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS week_of DATE;
-	CREATE INDEX IF NOT EXISTS idx_tasks_week_of ON tasks(user_id, week_of) WHERE week_of IS NOT NULL;
-	-- month_of (1st-of-month-anchored, IST) marks a "month goal": a long agenda
-	-- with no specific day, broken into dated child sessions. Surfaces in the
-	-- "This Month" smart list; goes Missed once the month has fully passed. Its
-	-- child sessions carry their own due_date and are suppressed from Missed
-	-- (they roll up to the goal). due_date/week_of stay NULL on the goal row,
-	-- so the three scopes (day / week / month) stay mutually exclusive.
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS month_of DATE;
-	CREATE INDEX IF NOT EXISTS idx_tasks_month_of ON tasks(user_id, month_of) WHERE month_of IS NOT NULL;
-	-- Extra email recipients for a task's reminders (e.g. a friend for a
-	-- meet-up). The owner is always notified separately; these are email-only,
-	-- friendlier copy. JSONB array of addresses (mirrors steps) — the API caps
-	-- the count and validates each address on write.
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notify_emails JSONB NOT NULL DEFAULT '[]'::jsonb;
-	-- digested_at stamps the last weekly/monthly *digest* nudge for a week/month
-	-- task. Distinct from reminded_at (the scheduled-time single-task path):
-	-- week/month tasks have no scheduled_at so they never use reminded_at. The Friday-10am /
-	-- month-end-10am sweep re-includes a task once digested_at falls before the
-	-- current cycle's day boundary, so a still-pending task is nudged each cycle
-	-- and a task added after a fire is caught on the next one.
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS digested_at TIMESTAMPTZ;
-	-- Per-user delivery channel for reminders/digests/auto-pay notices:
-	-- 'email' | 'push' | 'both'. push-only still falls back to email when no
-	-- push delivery lands (dead/no tokens), so nudges never silently vanish.
-	ALTER TABLE users ADD COLUMN IF NOT EXISTS notify_channel TEXT NOT NULL DEFAULT 'both';
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err
