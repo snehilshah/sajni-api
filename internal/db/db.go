@@ -324,6 +324,7 @@ func (d *DB) migrate() error {
 		description TEXT        NOT NULL DEFAULT '',
 		blob_key    TEXT        NOT NULL DEFAULT '',
 		folder      TEXT        NOT NULL DEFAULT '',
+		pinned      BOOLEAN     NOT NULL DEFAULT FALSE,
 		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
@@ -332,9 +333,14 @@ func (d *DB) migrate() error {
 	CREATE TABLE IF NOT EXISTS note_folders (
 		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		path       TEXT        NOT NULL,
+		pinned     BOOLEAN     NOT NULL DEFAULT FALSE,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		PRIMARY KEY (user_id, path)
 	);
+	-- Safe adds for databases created before the pinned columns landed
+	-- (CREATE IF NOT EXISTS skips existing tables). Idempotent, no backfill.
+	ALTER TABLE notes        ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE;
+	ALTER TABLE note_folders ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE;
 
 	CREATE TABLE IF NOT EXISTS task_due_history (
 		id          BIGSERIAL   PRIMARY KEY,

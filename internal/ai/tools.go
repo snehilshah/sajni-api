@@ -621,6 +621,30 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "pin_note",
+			Description: "Pin or unpin a note so it sorts to the top of the notes list.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"note_id": intg("Note id."),
+				"pinned":  boolean("true to pin, false to unpin. Defaults to true."),
+			}, "note_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return pinNoteTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "pin_folder",
+			Description: "Pin or unpin a notes folder so it sorts to the top of the folder tree.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"path":   str("Folder path like 'work/q2'."),
+				"pinned": boolean("true to pin, false to unpin. Defaults to true."),
+			}, "path"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return pinFolderTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "add_media",
 			Description: "Add a movie / show / book to the user's library. Call this whenever the user mentions a title they have consumed, are consuming, or plan to consume. Status mapping: 'complete' for past-tense (\"I watched\", \"already saw\", \"finished\", \"just read\"), 'in_progress' for current consumption (\"halfway through\", \"on episode 4\"), 'pending' for intent (\"want to watch\", \"need to read\"). Do not use task status 'done' for media. If you have an external_id from tmdb_search, pass it along with poster_url, year, release_date, and genre to fully populate the entry.",
 			Mutating:    true,
@@ -2105,6 +2129,48 @@ func createFolderTool(ctx context.Context, d *db.DB, uid string, args map[string
 	}
 	return map[string]any{"path": path},
 		map[string]any{"kind": "folder_created", "title": path, "route": "/notes"}, nil
+}
+
+func pinNoteTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	id := argInt(args, "note_id", 0)
+	if id == 0 {
+		return nil, nil, fmt.Errorf("missing note_id")
+	}
+	pinned := argBool(args, "pinned", true)
+	var title string
+	err := d.QueryRowContext(ctx,
+		`UPDATE notes SET pinned = $1 WHERE id = $2 AND user_id = $3 RETURNING title`,
+		pinned, id, uid).Scan(&title)
+	if err != nil {
+		return nil, nil, fmt.Errorf("note not found")
+	}
+	kind := "note_pinned"
+	if !pinned {
+		kind = "note_unpinned"
+	}
+	return map[string]any{"id": id, "title": title, "pinned": pinned},
+		map[string]any{"kind": kind, "id": id, "title": title, "route": fmt.Sprintf("/notes?id=%d", id)}, nil
+}
+
+func pinFolderTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	path := normalizeAINoteFolder(argStr(args, "path"))
+	if path == "" {
+		return nil, nil, fmt.Errorf("missing path")
+	}
+	pinned := argBool(args, "pinned", true)
+	_, err := d.ExecContext(ctx,
+		`INSERT INTO note_folders (user_id, path, pinned) VALUES ($1, $2, $3)
+		 ON CONFLICT (user_id, path) DO UPDATE SET pinned = $3`,
+		uid, path, pinned)
+	if err != nil {
+		return nil, nil, err
+	}
+	kind := "folder_pinned"
+	if !pinned {
+		kind = "folder_unpinned"
+	}
+	return map[string]any{"path": path, "pinned": pinned},
+		map[string]any{"kind": kind, "title": path, "route": "/notes"}, nil
 }
 
 func logAIMediaEvent(ctx context.Context, d *db.DB, uid string, mediaID int64, kind string, meta map[string]any) {

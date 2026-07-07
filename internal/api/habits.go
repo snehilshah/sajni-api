@@ -197,6 +197,15 @@ func toggleHabitLogForDate(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "date required")
 			return
 		}
+		if _, err := time.Parse("2006-01-02", date); err != nil {
+			errJSON(w, 400, "invalid date")
+			return
+		}
+		// Backfilling past days is allowed; logging the future is not.
+		if date > userNow(d, uid).Format("2006-01-02") {
+			errJSON(w, 400, "cannot log a future date")
+			return
+		}
 		toggleLog(d, uid, id, date, w)
 	}
 }

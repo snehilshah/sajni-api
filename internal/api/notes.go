@@ -14,6 +14,7 @@ func registerNoteRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /api/notes/folders", createFolder(deps))
 	mux.HandleFunc("DELETE /api/notes/folders", deleteFolder(deps))
 	mux.HandleFunc("POST /api/notes/folders/rename", renameFolder(deps))
+	mux.HandleFunc("POST /api/notes/folders/pin", pinFolder(deps))
 
 	mux.HandleFunc("GET /api/notes", listNotes(deps))
 	mux.HandleFunc("GET /api/notes/{id}", getNote(deps))
@@ -67,7 +68,7 @@ func listNotes(deps Deps) http.HandlerFunc {
 		args := []any{uid}
 		clauses := []string{"n.user_id = $1"}
 		ph := 2
-		base := "SELECT n.id, n.title, n.folder, n.description, n.created_at, n.updated_at FROM notes n"
+		base := "SELECT n.id, n.title, n.folder, n.description, n.pinned, n.created_at, n.updated_at FROM notes n"
 
 		if s := queryParam(r, "search"); s != "" {
 			clauses = append(clauses, "n.title ILIKE $"+itoa(ph))
@@ -75,7 +76,7 @@ func listNotes(deps Deps) http.HandlerFunc {
 			ph++
 		}
 		if tag := queryParam(r, "tag"); tag != "" {
-			base = "SELECT n.id, n.title, n.folder, n.description, n.created_at, n.updated_at FROM notes n INNER JOIN tags t ON t.user_id = n.user_id AND t.entity_type = 'note' AND t.entity_id = n.id"
+			base = "SELECT n.id, n.title, n.folder, n.description, n.pinned, n.created_at, n.updated_at FROM notes n INNER JOIN tags t ON t.user_id = n.user_id AND t.entity_type = 'note' AND t.entity_id = n.id"
 			clauses = append(clauses, "t.tag = $"+itoa(ph))
 			args = append(args, tag)
 			ph++
@@ -86,7 +87,7 @@ func listNotes(deps Deps) http.HandlerFunc {
 			ph++
 		}
 
-		q := base + " WHERE " + strings.Join(clauses, " AND ") + " ORDER BY n.updated_at DESC"
+		q := base + " WHERE " + strings.Join(clauses, " AND ") + " ORDER BY n.pinned DESC, n.updated_at DESC"
 		rows, err := d.Query(q, args...)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -99,6 +100,7 @@ func listNotes(deps Deps) http.HandlerFunc {
 			Title       string   `json:"title"`
 			Folder      string   `json:"folder"`
 			Description string   `json:"description"`
+			Pinned      bool     `json:"pinned"`
 			Tags        []string `json:"tags"`
 			CreatedAt   string   `json:"created_at"`
 			UpdatedAt   string   `json:"updated_at"`
@@ -106,7 +108,7 @@ func listNotes(deps Deps) http.HandlerFunc {
 		var notes []Note
 		for rows.Next() {
 			var n Note
-			if err := rows.Scan(&n.ID, &n.Title, &n.Folder, &n.Description, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			if err := rows.Scan(&n.ID, &n.Title, &n.Folder, &n.Description, &n.Pinned, &n.CreatedAt, &n.UpdatedAt); err != nil {
 				errJSON(w, 500, err.Error())
 				return
 			}
@@ -146,6 +148,7 @@ func getNote(deps Deps) http.HandlerFunc {
 			Title       string         `json:"title"`
 			Folder      string         `json:"folder"`
 			Description string         `json:"description"`
+			Pinned      bool           `json:"pinned"`
 			Content     string         `json:"content"`
 			Tags        []string       `json:"tags"`
 			Backlinks   []BacklinkInfo `json:"backlinks"`
@@ -155,8 +158,8 @@ func getNote(deps Deps) http.HandlerFunc {
 
 		var n Note
 		var blobKey string
-		err = d.QueryRow("SELECT id, title, folder, description, blob_key, created_at, updated_at FROM notes WHERE id = $1 AND user_id = $2", id, uid).
-			Scan(&n.ID, &n.Title, &n.Folder, &n.Description, &blobKey, &n.CreatedAt, &n.UpdatedAt)
+		err = d.QueryRow("SELECT id, title, folder, description, pinned, blob_key, created_at, updated_at FROM notes WHERE id = $1 AND user_id = $2", id, uid).
+			Scan(&n.ID, &n.Title, &n.Folder, &n.Description, &n.Pinned, &blobKey, &n.CreatedAt, &n.UpdatedAt)
 		if err != nil {
 			errJSON(w, 404, "not found")
 			return
@@ -239,6 +242,7 @@ func updateNote(deps Deps) http.HandlerFunc {
 			Content     *string `json:"content"`
 			Folder      *string `json:"folder"`
 			Description *string `json:"description"`
+			Pinned      *bool   `json:"pinned"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -308,6 +312,12 @@ func updateNote(deps Deps) http.HandlerFunc {
 			d.Exec("UPDATE notes SET description = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Description, id, uid)
 		}
 
+		// Pinning is a metadata flip — deliberately does not touch updated_at
+		// so a pin doesn't shuffle the recency order within pinned/unpinned.
+		if body.Pinned != nil {
+			d.Exec("UPDATE notes SET pinned = $1 WHERE id = $2 AND user_id = $3", *body.Pinned, id, uid)
+		}
+
 		writeJSON(w, 200, map[string]any{"status": "ok", "folder": nextFolder, "title": nextTitle})
 	}
 }
@@ -339,12 +349,21 @@ func deleteNote(deps Deps) http.HandlerFunc {
 
 /* ---------- Folders ---------- */
 
+// FolderInfo is the folder-list payload: path + pinned flag. Pinned state
+// lives on note_folders rows; folders synthesized from note paths (no row
+// yet) report pinned=false until the user pins them (which upserts a row).
+type FolderInfo struct {
+	Path   string `json:"path"`
+	Pinned bool   `json:"pinned"`
+}
+
 func listFolders(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
 		seen := map[string]struct{}{}
-		var folders []string
+		pinnedSet := map[string]bool{}
+		var paths []string
 
 		rows, err := d.Query("SELECT DISTINCT folder FROM notes WHERE user_id = $1 AND folder != ''", uid)
 		if err == nil {
@@ -353,20 +372,22 @@ func listFolders(deps Deps) http.HandlerFunc {
 				rows.Scan(&f)
 				if _, dup := seen[f]; !dup {
 					seen[f] = struct{}{}
-					folders = append(folders, f)
+					paths = append(paths, f)
 				}
 			}
 			rows.Close()
 		}
 
-		rows2, err := d.Query("SELECT path FROM note_folders WHERE user_id = $1", uid)
+		rows2, err := d.Query("SELECT path, pinned FROM note_folders WHERE user_id = $1", uid)
 		if err == nil {
 			for rows2.Next() {
 				var p string
-				rows2.Scan(&p)
+				var pin bool
+				rows2.Scan(&p, &pin)
+				pinnedSet[p] = pin
 				if _, dup := seen[p]; !dup {
 					seen[p] = struct{}{}
-					folders = append(folders, p)
+					paths = append(paths, p)
 				}
 			}
 			rows2.Close()
@@ -379,22 +400,56 @@ func listFolders(deps Deps) http.HandlerFunc {
 				p := strings.Join(parts[:i], "/")
 				if _, dup := seen[p]; !dup {
 					seen[p] = struct{}{}
-					folders = append(folders, p)
+					paths = append(paths, p)
 				}
 			}
 		}
 
 		// Sort lexicographically.
-		for i := 1; i < len(folders); i++ {
-			for j := i; j > 0 && folders[j-1] > folders[j]; j-- {
-				folders[j-1], folders[j] = folders[j], folders[j-1]
+		for i := 1; i < len(paths); i++ {
+			for j := i; j > 0 && paths[j-1] > paths[j]; j-- {
+				paths[j-1], paths[j] = paths[j], paths[j-1]
 			}
 		}
 
-		if folders == nil {
-			folders = []string{}
+		folders := make([]FolderInfo, 0, len(paths))
+		for _, p := range paths {
+			folders = append(folders, FolderInfo{Path: p, Pinned: pinnedSet[p]})
 		}
 		writeJSON(w, 200, folders)
+	}
+}
+
+// pinFolder flips a folder's pinned flag. Upserts the note_folders row so
+// folders that only exist implicitly (derived from note paths) can be
+// pinned too.
+func pinFolder(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		var body struct {
+			Path   string `json:"path"`
+			Pinned bool   `json:"pinned"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			errJSON(w, 400, "invalid json")
+			return
+		}
+		path := normalizeFolder(body.Path)
+		if path == "" {
+			errJSON(w, 400, "empty path")
+			return
+		}
+		_, err := d.Exec(
+			`INSERT INTO note_folders (user_id, path, pinned) VALUES ($1, $2, $3)
+			 ON CONFLICT (user_id, path) DO UPDATE SET pinned = $3`,
+			uid, path, body.Pinned,
+		)
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"path": path, "pinned": body.Pinned})
 	}
 }
 
