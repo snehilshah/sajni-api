@@ -51,6 +51,63 @@ func decodeEmails(raw []byte) []string {
 	return out
 }
 
+func validTaskStatus(status string) bool {
+	switch status {
+	case "todo", "in_progress", "blocked", "done", "scratched":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateTaskBlocker(d *db.DB, uid string, taskID, blockerID int64) error {
+	if blockerID == 0 || blockerID == taskID {
+		return sql.ErrNoRows
+	}
+	var active bool
+	if err := d.QueryRow(`SELECT status NOT IN ('done','scratched') FROM tasks WHERE id=$1 AND user_id=$2`, blockerID, uid).Scan(&active); err != nil || !active {
+		return sql.ErrNoRows
+	}
+	if taskID == 0 {
+		return nil
+	}
+	var cycle bool
+	err := d.QueryRow(`
+		WITH RECURSIVE chain AS (
+			SELECT id, blocked_by_task_id FROM tasks WHERE id=$1 AND user_id=$2
+			UNION ALL
+			SELECT t.id, t.blocked_by_task_id
+			  FROM tasks t JOIN chain c ON t.id=c.blocked_by_task_id
+			 WHERE t.user_id=$2
+		)
+		SELECT EXISTS (SELECT 1 FROM chain WHERE id=$3)`, blockerID, uid, taskID).Scan(&cycle)
+	if err != nil || cycle {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func unblockDependents(d *db.DB, uid string, blockerID int64) {
+	rows, err := d.Query(`
+		UPDATE tasks SET status='todo', blocked_by_task_id=NULL, updated_at=NOW()
+		 WHERE user_id=$1 AND blocked_by_task_id=$2 AND status='blocked'
+		 RETURNING id`, uid, blockerID)
+	if err != nil {
+		return
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		logTaskEvent(d, uid, id, "status", "blocked", "todo")
+	}
+}
+
 // weekBounds returns this week's Monday and Sunday (YYYY-MM-DD) in the user's
 // tz. Weeks are Monday-anchored to match the journal weekly view; week_of on a
 // week task always stores the Monday.
@@ -104,7 +161,7 @@ func completeParentGoalIfDone(d *db.DB, uid string, childID int64) {
 	}
 	// All children done and parent is an open month goal → complete it.
 	res, _ := d.Exec(`
-		UPDATE tasks SET status='done', updated_at=NOW()
+		UPDATE tasks SET status='done', blocked_by_task_id=NULL, updated_at=NOW()
 		 WHERE id=$1 AND user_id=$2 AND month_of IS NOT NULL
 		   AND status NOT IN ('done','scratched')
 		   AND EXISTS (SELECT 1 FROM tasks c WHERE c.parent_task_id=$1 AND c.user_id=$2)`,
@@ -112,6 +169,7 @@ func completeParentGoalIfDone(d *db.DB, uid string, childID int64) {
 	if res != nil {
 		if n, _ := res.RowsAffected(); n > 0 {
 			logTaskEvent(d, uid, parentID.Int64, "status", "todo", "done")
+			unblockDependents(d, uid, parentID.Int64)
 		}
 	}
 }
@@ -152,7 +210,8 @@ func getTask(deps Deps) http.HandlerFunc {
 			SELECT t.id, t.title, t.description, t.status, t.priority,
 			       t.due_date::text, t.week_of::text, t.month_of::text, t.scheduled_at::text,
 			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
-			       t.list_id, t.parent_task_id, t.important, t.steps,
+			       t.list_id, t.parent_task_id, t.blocked_by_task_id,
+			       blocker.title, blocker.status, t.important, t.steps,
 			       COALESCE(t.sort_order, 0),
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
 			       t.created_at, t.updated_at
@@ -165,11 +224,13 @@ func getTask(deps Deps) http.HandlerFunc {
 				WHERE parent_task_id IS NOT NULL
 				GROUP BY parent_task_id
 			) c ON c.parent_task_id = t.id
+			LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
 			WHERE t.user_id = $1 AND t.id = $2`, uid, id).Scan(
 			&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority,
 			&t.DueDate, &t.WeekOf, &t.MonthOf, &t.ScheduledAt,
 			&t.Remind, &t.RemindedAt, &emailsRaw,
-			&t.ListID, &t.ParentTaskID, &t.Important, &stepsRaw,
+			&t.ListID, &t.ParentTaskID, &t.BlockedByTaskID,
+			&t.BlockedByTaskTitle, &t.BlockedByTaskStatus, &t.Important, &stepsRaw,
 			&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
 			&t.CreatedAt, &t.UpdatedAt,
 		)
@@ -200,26 +261,29 @@ func getTask(deps Deps) http.HandlerFunc {
 // subtask_count so the list-view can show the nested-tasks hint
 // without a separate request per row.
 type taskRow struct {
-	ID           int64    `json:"id"`
-	Title        string   `json:"title"`
-	Description  string   `json:"description"`
-	Status       string   `json:"status"`
-	Priority     string   `json:"priority"`
-	Tags         []string `json:"tags"`
-	DueDate      *string  `json:"due_date"`
-	WeekOf       *string  `json:"week_of"`
-	MonthOf      *string  `json:"month_of"`
-	ScheduledAt  *string  `json:"scheduled_at"`
-	Remind       bool     `json:"remind"`
-	RemindedAt   *string  `json:"reminded_at"`
-	NotifyEmails []string `json:"notify_emails"`
-	ListID       *int64   `json:"list_id"`
-	ParentTaskID *int64   `json:"parent_task_id"`
-	Important    bool     `json:"important"`
-	Steps        []Step   `json:"steps"`
-	SortOrder    int      `json:"sort_order"`
-	SubtaskCount int      `json:"subtask_count"`
-	SubtasksDone int      `json:"subtasks_done"`
+	ID                  int64    `json:"id"`
+	Title               string   `json:"title"`
+	Description         string   `json:"description"`
+	Status              string   `json:"status"`
+	Priority            string   `json:"priority"`
+	Tags                []string `json:"tags"`
+	DueDate             *string  `json:"due_date"`
+	WeekOf              *string  `json:"week_of"`
+	MonthOf             *string  `json:"month_of"`
+	ScheduledAt         *string  `json:"scheduled_at"`
+	Remind              bool     `json:"remind"`
+	RemindedAt          *string  `json:"reminded_at"`
+	NotifyEmails        []string `json:"notify_emails"`
+	ListID              *int64   `json:"list_id"`
+	ParentTaskID        *int64   `json:"parent_task_id"`
+	BlockedByTaskID     *int64   `json:"blocked_by_task_id"`
+	BlockedByTaskTitle  *string  `json:"blocked_by_task_title"`
+	BlockedByTaskStatus *string  `json:"blocked_by_task_status"`
+	Important           bool     `json:"important"`
+	Steps               []Step   `json:"steps"`
+	SortOrder           int      `json:"sort_order"`
+	SubtaskCount        int      `json:"subtask_count"`
+	SubtasksDone        int      `json:"subtasks_done"`
 	// Subtasks are embedded (brief shape) so the list view can render the
 	// nested children instantly on expand — no per-row /subtasks round-trip.
 	Subtasks  []subtaskBrief `json:"subtasks"`
@@ -230,14 +294,17 @@ type taskRow struct {
 // subtaskBrief is the lightweight child shape embedded in a task list row
 // and returned by the dedicated /subtasks endpoint.
 type subtaskBrief struct {
-	ID           int64   `json:"id"`
-	Title        string  `json:"title"`
-	Status       string  `json:"status"`
-	Priority     string  `json:"priority"`
-	DueDate      *string `json:"due_date"`
-	Important    bool    `json:"important"`
-	ParentTaskID *int64  `json:"parent_task_id"`
-	SortOrder    int     `json:"sort_order"`
+	ID                  int64   `json:"id"`
+	Title               string  `json:"title"`
+	Status              string  `json:"status"`
+	Priority            string  `json:"priority"`
+	DueDate             *string `json:"due_date"`
+	Important           bool    `json:"important"`
+	ParentTaskID        *int64  `json:"parent_task_id"`
+	BlockedByTaskID     *int64  `json:"blocked_by_task_id"`
+	BlockedByTaskTitle  *string `json:"blocked_by_task_title"`
+	BlockedByTaskStatus *string `json:"blocked_by_task_status"`
+	SortOrder           int     `json:"sort_order"`
 }
 
 // Step is one item on a task's inline checklist (Microsoft-Todo style).
@@ -277,6 +344,8 @@ func listTasks(deps Deps) http.HandlerFunc {
 			clauses = append(clauses, "t.due_date IS NOT NULL", active)
 		case "scheduled":
 			clauses = append(clauses, "t.scheduled_at IS NOT NULL", active)
+		case "blocked":
+			clauses = append(clauses, "t.status = 'blocked'")
 		case "week":
 			// Week-scoped tasks for the current (Monday-anchored) week.
 			mon, _ := weekBounds(d, uid)
@@ -387,7 +456,8 @@ func listTasks(deps Deps) http.HandlerFunc {
 			SELECT t.id, t.title, t.description, t.status, t.priority,
 			       t.due_date::text, t.week_of::text, t.month_of::text, t.scheduled_at::text,
 			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
-			       t.list_id, t.parent_task_id, t.important, t.steps,
+			       t.list_id, t.parent_task_id, t.blocked_by_task_id,
+			       blocker.title, blocker.status, t.important, t.steps,
 			       COALESCE(t.sort_order, 0),
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
 			       t.created_at, t.updated_at
@@ -400,6 +470,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 				WHERE parent_task_id IS NOT NULL
 				GROUP BY parent_task_id
 			) c ON c.parent_task_id = t.id
+			LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
 			WHERE ` + strings.Join(clauses, " AND ") + `
 			` + orderBy
 
@@ -418,7 +489,8 @@ func listTasks(deps Deps) http.HandlerFunc {
 				&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority,
 				&t.DueDate, &t.WeekOf, &t.MonthOf, &t.ScheduledAt,
 				&t.Remind, &t.RemindedAt, &emailsRaw,
-				&t.ListID, &t.ParentTaskID, &t.Important, &stepsRaw,
+				&t.ListID, &t.ParentTaskID, &t.BlockedByTaskID,
+				&t.BlockedByTaskTitle, &t.BlockedByTaskStatus, &t.Important, &stepsRaw,
 				&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
 				&t.CreatedAt, &t.UpdatedAt,
 			); err != nil {
@@ -457,16 +529,19 @@ func listTasks(deps Deps) http.HandlerFunc {
 				ph2 = append(ph2, "$"+itoa(len(cargs)))
 			}
 			crows, cerr := d.Query(`
-				SELECT id, title, status, priority, due_date::text,
-				       important, parent_task_id, COALESCE(sort_order, 0)
-				FROM tasks
-				WHERE user_id = $1 AND parent_task_id IN (`+strings.Join(ph2, ",")+`)
-				ORDER BY sort_order ASC, created_at ASC`, cargs...)
+				SELECT t.id, t.title, t.status, t.priority, t.due_date::text,
+				       t.important, t.parent_task_id, t.blocked_by_task_id,
+				       blocker.title, blocker.status, COALESCE(t.sort_order, 0)
+				FROM tasks t
+				LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
+				WHERE t.user_id = $1 AND t.parent_task_id IN (`+strings.Join(ph2, ",")+`)
+				ORDER BY t.sort_order ASC, t.created_at ASC`, cargs...)
 			if cerr == nil {
 				for crows.Next() {
 					var s subtaskBrief
 					if crows.Scan(&s.ID, &s.Title, &s.Status, &s.Priority, &s.DueDate,
-						&s.Important, &s.ParentTaskID, &s.SortOrder) == nil && s.ParentTaskID != nil {
+						&s.Important, &s.ParentTaskID, &s.BlockedByTaskID,
+						&s.BlockedByTaskTitle, &s.BlockedByTaskStatus, &s.SortOrder) == nil && s.ParentTaskID != nil {
 						if i, ok := idx[*s.ParentTaskID]; ok {
 							tasks[i].Subtasks = append(tasks[i].Subtasks, s)
 						}
@@ -490,29 +565,35 @@ func listSubtasks(deps Deps) http.HandlerFunc {
 			return
 		}
 		rows, err := d.Query(`
-			SELECT id, title, status, priority, due_date::text,
-			       important, COALESCE(sort_order, 0)
-			FROM tasks
-			WHERE user_id = $1 AND parent_task_id = $2
-			ORDER BY sort_order ASC, created_at ASC`, uid, id)
+			SELECT t.id, t.title, t.status, t.priority, t.due_date::text,
+			       t.important, t.blocked_by_task_id, blocker.title, blocker.status,
+			       COALESCE(t.sort_order, 0)
+			FROM tasks t
+			LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
+			WHERE t.user_id = $1 AND t.parent_task_id = $2
+			ORDER BY t.sort_order ASC, t.created_at ASC`, uid, id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
 		defer rows.Close()
 		type Sub struct {
-			ID        int64   `json:"id"`
-			Title     string  `json:"title"`
-			Status    string  `json:"status"`
-			Priority  string  `json:"priority"`
-			DueDate   *string `json:"due_date"`
-			Important bool    `json:"important"`
-			SortOrder int     `json:"sort_order"`
+			ID                  int64   `json:"id"`
+			Title               string  `json:"title"`
+			Status              string  `json:"status"`
+			Priority            string  `json:"priority"`
+			DueDate             *string `json:"due_date"`
+			Important           bool    `json:"important"`
+			BlockedByTaskID     *int64  `json:"blocked_by_task_id"`
+			BlockedByTaskTitle  *string `json:"blocked_by_task_title"`
+			BlockedByTaskStatus *string `json:"blocked_by_task_status"`
+			SortOrder           int     `json:"sort_order"`
 		}
 		out := []Sub{}
 		for rows.Next() {
 			var s Sub
-			rows.Scan(&s.ID, &s.Title, &s.Status, &s.Priority, &s.DueDate, &s.Important, &s.SortOrder)
+			rows.Scan(&s.ID, &s.Title, &s.Status, &s.Priority, &s.DueDate, &s.Important,
+				&s.BlockedByTaskID, &s.BlockedByTaskTitle, &s.BlockedByTaskStatus, &s.SortOrder)
 			out = append(out, s)
 		}
 		writeJSON(w, 200, out)
@@ -524,20 +605,21 @@ func createTask(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
 		var body struct {
-			Title        string   `json:"title"`
-			Description  string   `json:"description"`
-			Priority     string   `json:"priority"`
-			Status       string   `json:"status"`
-			DueDate      *string  `json:"due_date"`
-			WeekOf       *string  `json:"week_of"`
-			MonthOf      *string  `json:"month_of"`
-			ScheduledAt  *string  `json:"scheduled_at"`
-			Remind       bool     `json:"remind"`
-			NotifyEmails []string `json:"notify_emails"`
-			ListID       *int64   `json:"list_id"`
-			ParentTaskID *int64   `json:"parent_task_id"`
-			Important    bool     `json:"important"`
-			Steps        []Step   `json:"steps"`
+			Title           string   `json:"title"`
+			Description     string   `json:"description"`
+			Priority        string   `json:"priority"`
+			Status          string   `json:"status"`
+			DueDate         *string  `json:"due_date"`
+			WeekOf          *string  `json:"week_of"`
+			MonthOf         *string  `json:"month_of"`
+			ScheduledAt     *string  `json:"scheduled_at"`
+			Remind          bool     `json:"remind"`
+			NotifyEmails    []string `json:"notify_emails"`
+			ListID          *int64   `json:"list_id"`
+			ParentTaskID    *int64   `json:"parent_task_id"`
+			BlockedByTaskID *int64   `json:"blocked_by_task_id"`
+			Important       bool     `json:"important"`
+			Steps           []Step   `json:"steps"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -548,6 +630,18 @@ func createTask(deps Deps) http.HandlerFunc {
 		}
 		if body.Status == "" {
 			body.Status = "todo"
+		}
+		if !validTaskStatus(body.Status) {
+			errJSON(w, 400, "invalid task status")
+			return
+		}
+		if body.Status == "blocked" {
+			if body.BlockedByTaskID == nil || validateTaskBlocker(d, uid, 0, *body.BlockedByTaskID) != nil {
+				errJSON(w, 400, "blocked task requires an active blocker")
+				return
+			}
+		} else {
+			body.BlockedByTaskID = nil
 		}
 		stepsJSON, _ := json.Marshal(normalizeSteps(body.Steps))
 
@@ -625,11 +719,11 @@ func createTask(deps Deps) http.HandlerFunc {
 		var id int64
 		err := d.QueryRow(`
 			INSERT INTO tasks (user_id, title, description, priority, status, due_date, week_of, month_of, scheduled_at, remind,
-			                   notify_emails, list_id, parent_task_id, important, steps, sort_order)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15::jsonb, $16)
+			                   notify_emails, list_id, parent_task_id, blocked_by_task_id, important, steps, sort_order)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, $16::jsonb, $17)
 			RETURNING id`,
 			uid, body.Title, body.Description, body.Priority, body.Status, dueArg, weekArg, monthArg, schedArg, body.Remind,
-			string(notifyJSON), body.ListID, body.ParentTaskID, body.Important, stepsJSON, nextSort,
+			string(notifyJSON), body.ListID, body.ParentTaskID, body.BlockedByTaskID, body.Important, stepsJSON, nextSort,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -662,27 +756,29 @@ func updateTask(deps Deps) http.HandlerFunc {
 		// any field with a non-nil pointer is updated. due_date/list_id/parent
 		// also accept the JSON literal null to clear the column.
 		var body struct {
-			Title          *string   `json:"title"`
-			Description    *string   `json:"description"`
-			Status         *string   `json:"status"`
-			Priority       *string   `json:"priority"`
-			DueDate        *string   `json:"due_date"`
-			WeekOf         *string   `json:"week_of"`
-			MonthOf        *string   `json:"month_of"`
-			ScheduledAt    *string   `json:"scheduled_at"`
-			Remind         *bool     `json:"remind"`
-			NotifyEmails   *[]string `json:"notify_emails"`
-			ListID         *int64    `json:"list_id"`
-			ParentTaskID   *int64    `json:"parent_task_id"`
-			Important      *bool     `json:"important"`
-			Steps          *[]Step   `json:"steps"`
-			SortOrder      *int      `json:"sort_order"`
-			ClearList      bool      `json:"clear_list"`
-			ClearParent    bool      `json:"clear_parent"`
-			ClearScheduled bool      `json:"clear_scheduled"`
-			ClearDue       bool      `json:"clear_due"`
-			ClearWeek      bool      `json:"clear_week"`
-			ClearMonth     bool      `json:"clear_month"`
+			Title           *string   `json:"title"`
+			Description     *string   `json:"description"`
+			Status          *string   `json:"status"`
+			Priority        *string   `json:"priority"`
+			DueDate         *string   `json:"due_date"`
+			WeekOf          *string   `json:"week_of"`
+			MonthOf         *string   `json:"month_of"`
+			ScheduledAt     *string   `json:"scheduled_at"`
+			Remind          *bool     `json:"remind"`
+			NotifyEmails    *[]string `json:"notify_emails"`
+			ListID          *int64    `json:"list_id"`
+			ParentTaskID    *int64    `json:"parent_task_id"`
+			BlockedByTaskID *int64    `json:"blocked_by_task_id"`
+			Important       *bool     `json:"important"`
+			Steps           *[]Step   `json:"steps"`
+			SortOrder       *int      `json:"sort_order"`
+			ClearList       bool      `json:"clear_list"`
+			ClearParent     bool      `json:"clear_parent"`
+			ClearBlockedBy  bool      `json:"clear_blocked_by"`
+			ClearScheduled  bool      `json:"clear_scheduled"`
+			ClearDue        bool      `json:"clear_due"`
+			ClearWeek       bool      `json:"clear_week"`
+			ClearMonth      bool      `json:"clear_month"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -692,13 +788,37 @@ func updateTask(deps Deps) http.HandlerFunc {
 
 		// Lifecycle snapshot: due-date misses + audit-trail diffing.
 		var (
-			currentDueDate *string
-			currentStatus  string
-			currentTitle   string
-			currentListID  sql.NullInt64
+			currentDueDate   *string
+			currentStatus    string
+			currentTitle     string
+			currentListID    sql.NullInt64
+			currentBlockedBy sql.NullInt64
 		)
-		d.QueryRow("SELECT due_date::text, status, title, list_id FROM tasks WHERE id = $1 AND user_id = $2", id, uid).
-			Scan(&currentDueDate, &currentStatus, &currentTitle, &currentListID)
+		if err := d.QueryRow("SELECT due_date::text, status, title, list_id, blocked_by_task_id FROM tasks WHERE id = $1 AND user_id = $2", id, uid).
+			Scan(&currentDueDate, &currentStatus, &currentTitle, &currentListID, &currentBlockedBy); err != nil {
+			errJSON(w, 404, "not found")
+			return
+		}
+
+		proposedStatus := currentStatus
+		if body.Status != nil {
+			if !validTaskStatus(*body.Status) {
+				errJSON(w, 400, "invalid task status")
+				return
+			}
+			proposedStatus = *body.Status
+		}
+		proposedBlocker := currentBlockedBy
+		if body.BlockedByTaskID != nil && !body.ClearBlockedBy {
+			proposedBlocker = sql.NullInt64{Int64: *body.BlockedByTaskID, Valid: true}
+		}
+		if body.ClearBlockedBy || proposedStatus != "blocked" {
+			proposedBlocker = sql.NullInt64{}
+		}
+		if proposedStatus == "blocked" && (!proposedBlocker.Valid || validateTaskBlocker(d, uid, id, proposedBlocker.Int64) != nil) {
+			errJSON(w, 400, "blocked task requires an active, cycle-safe blocker")
+			return
+		}
 
 		var contentForTags string
 		if body.Title != nil {
@@ -725,14 +845,16 @@ func updateTask(deps Deps) http.HandlerFunc {
 			syncBacklinks(d, uid, "task", id, contentForTags)
 		}
 
-		if body.Status != nil {
-			d.Exec("UPDATE tasks SET status = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Status, id, uid)
-			if *body.Status != currentStatus {
-				logTaskEvent(d, uid, id, "status", currentStatus, *body.Status)
+		if body.Status != nil || body.BlockedByTaskID != nil || body.ClearBlockedBy {
+			d.Exec("UPDATE tasks SET status=$1, blocked_by_task_id=$2, updated_at=NOW() WHERE id=$3 AND user_id=$4", proposedStatus, proposedBlocker, id, uid)
+			if proposedStatus != currentStatus {
+				logTaskEvent(d, uid, id, "status", currentStatus, proposedStatus)
 			}
-			// Completing a month goal's session may finish the goal.
-			if *body.Status == "done" {
+			if proposedStatus == "done" {
 				completeParentGoalIfDone(d, uid, id)
+			}
+			if proposedStatus == "done" || proposedStatus == "scratched" {
+				unblockDependents(d, uid, id)
 			}
 		}
 		if body.Priority != nil {
@@ -913,6 +1035,7 @@ func deleteTask(deps Deps) http.HandlerFunc {
 			descRows.Close()
 		}
 		for _, x := range ids {
+			unblockDependents(d, uid, x)
 			d.Exec("DELETE FROM tags WHERE user_id=$1 AND entity_type='task' AND entity_id=$2", uid, x)
 			d.Exec("DELETE FROM backlinks WHERE user_id=$1 AND source_type='task' AND source_id=$2", uid, x)
 		}

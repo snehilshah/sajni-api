@@ -173,15 +173,21 @@ func (d *DB) migrate() error {
 		duration_minutes INTEGER     NOT NULL DEFAULT 30,
 		list_id          BIGINT      REFERENCES task_lists(id) ON DELETE SET NULL,
 		parent_task_id   BIGINT      REFERENCES tasks(id) ON DELETE CASCADE,
+		blocked_by_task_id BIGINT    REFERENCES tasks(id) ON DELETE SET NULL,
 		steps            JSONB       NOT NULL DEFAULT '[]'::jsonb,
 		important        BOOLEAN     NOT NULL DEFAULT FALSE,
 		sort_order       INTEGER     NOT NULL DEFAULT 0,
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
+	-- Existing databases skip CREATE TABLE, so add dependency column before
+	-- any index references it. Fresh databases already have it; IF NOT EXISTS
+	-- makes this path safe for both.
+	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS blocked_by_task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL;
 	CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_list ON tasks(list_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
+	CREATE INDEX IF NOT EXISTS idx_tasks_blocked_by ON tasks(blocked_by_task_id) WHERE blocked_by_task_id IS NOT NULL;
 	-- Hot path for the reminder cron: only the un-sent, remind-on rows.
 	CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(scheduled_at)
 		WHERE remind = TRUE AND reminded_at IS NULL;
@@ -723,6 +729,54 @@ func (d *DB) migrate() error {
 		last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id);
+
+	-- Merge duplicate finance categories before enforcing uniqueness. Names are
+	-- case-insensitive within each kind; legacy "Other" and "Others" are one
+	-- canonical bucket. Repoint every category FK before deleting duplicates.
+	WITH ranked AS (
+		SELECT id,
+		       MIN(id) OVER (PARTITION BY user_id, kind,
+		         CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END) AS keep_id
+		FROM fin_categories
+	), dup AS (SELECT id, keep_id FROM ranked WHERE id <> keep_id)
+	UPDATE fin_transactions t SET category_id=d.keep_id FROM dup d WHERE t.category_id=d.id;
+
+	WITH ranked AS (
+		SELECT id,
+		       MIN(id) OVER (PARTITION BY user_id, kind,
+		         CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END) AS keep_id
+		FROM fin_categories
+	), dup AS (SELECT id, keep_id FROM ranked WHERE id <> keep_id)
+	UPDATE fin_budget_items i SET category_id=d.keep_id FROM dup d WHERE i.category_id=d.id;
+
+	WITH ranked AS (
+		SELECT id,
+		       MIN(id) OVER (PARTITION BY user_id, kind,
+		         CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END) AS keep_id
+		FROM fin_categories
+	), dup AS (SELECT id, keep_id FROM ranked WHERE id <> keep_id)
+	UPDATE fin_billers b SET category_id=d.keep_id FROM dup d WHERE b.category_id=d.id;
+
+	WITH ranked AS (
+		SELECT id,
+		       MIN(id) OVER (PARTITION BY user_id, kind,
+		         CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END) AS keep_id
+		FROM fin_categories
+	), dup AS (SELECT id, keep_id FROM ranked WHERE id <> keep_id)
+	UPDATE fin_merchant_categories m SET category_id=d.keep_id FROM dup d WHERE m.category_id=d.id;
+
+	WITH ranked AS (
+		SELECT id,
+		       MIN(id) OVER (PARTITION BY user_id, kind,
+		         CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END) AS keep_id
+		FROM fin_categories
+	)
+	DELETE FROM fin_categories c USING ranked r WHERE c.id=r.id AND r.id <> r.keep_id;
+
+	UPDATE fin_categories SET name='Others' WHERE LOWER(BTRIM(name)) IN ('other','others');
+	CREATE UNIQUE INDEX IF NOT EXISTS uq_fin_categories_user_kind_name
+	ON fin_categories (user_id, kind,
+		(CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END));
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err

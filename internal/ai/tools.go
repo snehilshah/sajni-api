@@ -430,6 +430,18 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "block_task",
+			Description: "Mark a task blocked by one other active task. Use list_tasks to resolve both ids. Chains are allowed; self-links, terminal blockers, and cycles are rejected. Blocked tasks remain eligible for reminders and can become missed.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"id":         intg("Required. Task that cannot proceed."),
+				"blocker_id": intg("Required. Active task that must resolve first."),
+			}, "id", "blocker_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return blockTaskTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "complete_task",
 			Description: "Mark a task as done.",
 			Mutating:    true,
@@ -439,19 +451,23 @@ func (s *Service) buildTools() []Tool {
 				if id == 0 {
 					return nil, nil, fmt.Errorf("missing id")
 				}
-				_, err := d.Exec(`UPDATE tasks SET status='done', updated_at=NOW() WHERE id=$1 AND user_id=$2`, id, uid)
+				_, err := d.Exec(`UPDATE tasks SET status='done', blocked_by_task_id=NULL, updated_at=NOW() WHERE id=$1 AND user_id=$2`, id, uid)
 				if err != nil {
 					return nil, nil, err
 				}
+				unblockAITaskDependents(ctx, d, uid, id)
 				// Completing the last open session of a month goal finishes it.
-				d.Exec(`
-					UPDATE tasks g SET status='done', updated_at=NOW()
+				var completedGoal int64
+				if err := d.QueryRow(`
+					UPDATE tasks g SET status='done', blocked_by_task_id=NULL, updated_at=NOW()
 					 WHERE g.user_id=$2 AND g.month_of IS NOT NULL
 					   AND g.status NOT IN ('done','scratched')
 					   AND g.id = (SELECT parent_task_id FROM tasks WHERE id=$1 AND user_id=$2)
 					   AND EXISTS (SELECT 1 FROM tasks c WHERE c.parent_task_id=g.id AND c.user_id=$2)
-					   AND NOT EXISTS (SELECT 1 FROM tasks c WHERE c.parent_task_id=g.id AND c.user_id=$2 AND c.status NOT IN ('done','scratched'))`,
-					id, uid)
+					   AND NOT EXISTS (SELECT 1 FROM tasks c WHERE c.parent_task_id=g.id AND c.user_id=$2 AND c.status NOT IN ('done','scratched'))
+					 RETURNING g.id`, id, uid).Scan(&completedGoal); err == nil {
+					unblockAITaskDependents(ctx, d, uid, completedGoal)
+				}
 				return map[string]any{"id": id, "status": "done"},
 					map[string]any{"kind": "task_completed", "id": id}, nil
 			},
@@ -492,6 +508,7 @@ func (s *Service) buildTools() []Tool {
 				if id == 0 {
 					return nil, nil, fmt.Errorf("missing id")
 				}
+				unblockAITaskTreeDependents(ctx, d, uid, id)
 				_, err := d.Exec(`DELETE FROM tasks WHERE id=$1 AND user_id=$2`, id, uid)
 				if err != nil {
 					return nil, nil, err
@@ -927,6 +944,8 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
 		clauses = append(clauses, fmt.Sprintf("month_of = $%d", len(vals)+1), active)
 		vals = append(vals, first)
+	case "blocked":
+		clauses = append(clauses, "status='blocked'")
 	case "missed":
 		// Child sessions of a month goal roll up to the goal — never list them
 		// here individually (mirrors the REST Missed list).
@@ -976,7 +995,7 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	q := `SELECT id,title,COALESCE(description,''),status,priority,
 	             COALESCE(due_date::text,''),COALESCE(scheduled_at::text,''),
 	             COALESCE(duration_minutes,30),
-	             list_id,parent_task_id,important,
+	             list_id,parent_task_id,blocked_by_task_id,important,
 	             (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id = tasks.id)
 	      FROM tasks WHERE ` + strings.Join(clauses, " AND ") +
 		fmt.Sprintf(` ORDER BY (status='done') ASC, important DESC NULLS LAST, due_date NULLS LAST, created_at DESC LIMIT %d`, limit)
@@ -990,11 +1009,11 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		var id int64
 		var title, desc, status, priority, due, sched string
 		var dur int
-		var listID, parentID sql.NullInt64
+		var listID, parentID, blockedByID sql.NullInt64
 		var important bool
 		var subCount int
 		rows.Scan(&id, &title, &desc, &status, &priority, &due, &sched, &dur,
-			&listID, &parentID, &important, &subCount)
+			&listID, &parentID, &blockedByID, &important, &subCount)
 		row := map[string]any{
 			"id": id, "title": title, "description": desc,
 			"status": status, "priority": priority,
@@ -1006,6 +1025,9 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		}
 		if parentID.Valid {
 			row["parent_task_id"] = parentID.Int64
+		}
+		if blockedByID.Valid {
+			row["blocked_by_task_id"] = blockedByID.Int64
 		}
 		out = append(out, row)
 	}
@@ -1603,6 +1625,86 @@ func findFreeSlotsTool(ctx context.Context, d *db.DB, uid string, args map[strin
 
 // ----- write handlers -----
 
+func unblockAITaskDependents(ctx context.Context, d *db.DB, uid string, blockerID int64) {
+	rows, err := d.QueryContext(ctx, `
+		UPDATE tasks SET status='todo', blocked_by_task_id=NULL, updated_at=NOW()
+		 WHERE user_id=$1 AND blocked_by_task_id=$2 AND status='blocked'
+		 RETURNING id`, uid, blockerID)
+	if err != nil {
+		return
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		d.ExecContext(ctx, `INSERT INTO task_events (user_id,task_id,kind,from_val,to_val) VALUES ($1,$2,'status','blocked','todo')`, uid, id)
+	}
+}
+
+func unblockAITaskTreeDependents(ctx context.Context, d *db.DB, uid string, rootID int64) {
+	rows, err := d.QueryContext(ctx, `
+		WITH RECURSIVE tree AS (
+			SELECT id FROM tasks WHERE id=$1 AND user_id=$2
+			UNION ALL
+			SELECT t.id FROM tasks t JOIN tree ON t.parent_task_id=tree.id WHERE t.user_id=$2
+		)
+		UPDATE tasks SET status='todo',blocked_by_task_id=NULL,updated_at=NOW()
+		 WHERE user_id=$2 AND status='blocked' AND blocked_by_task_id IN (SELECT id FROM tree)
+		 RETURNING id`, rootID, uid)
+	if err != nil {
+		return
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		d.ExecContext(ctx, `INSERT INTO task_events (user_id,task_id,kind,from_val,to_val) VALUES ($1,$2,'status','blocked','todo')`, uid, id)
+	}
+}
+
+func blockTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	id := argInt(args, "id", 0)
+	blockerID := argInt(args, "blocker_id", 0)
+	if id == 0 || blockerID == 0 || id == blockerID {
+		return nil, nil, fmt.Errorf("invalid task or blocker id")
+	}
+	var active bool
+	if err := d.QueryRowContext(ctx, `SELECT status NOT IN ('done','scratched') FROM tasks WHERE id=$1 AND user_id=$2`, blockerID, uid).Scan(&active); err != nil || !active {
+		return nil, nil, fmt.Errorf("blocker must be an active task")
+	}
+	var current string
+	if err := d.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=$1 AND user_id=$2`, id, uid).Scan(&current); err != nil {
+		return nil, nil, fmt.Errorf("task not found")
+	}
+	var cycle bool
+	if err := d.QueryRowContext(ctx, `
+		WITH RECURSIVE chain AS (
+			SELECT id,blocked_by_task_id FROM tasks WHERE id=$1 AND user_id=$2
+			UNION ALL
+			SELECT t.id,t.blocked_by_task_id FROM tasks t JOIN chain c ON t.id=c.blocked_by_task_id WHERE t.user_id=$2
+		) SELECT EXISTS(SELECT 1 FROM chain WHERE id=$3)`, blockerID, uid, id).Scan(&cycle); err != nil || cycle {
+		return nil, nil, fmt.Errorf("blocking relationship would create a cycle")
+	}
+	if _, err := d.ExecContext(ctx, `UPDATE tasks SET status='blocked',blocked_by_task_id=$1,updated_at=NOW() WHERE id=$2 AND user_id=$3`, blockerID, id, uid); err != nil {
+		return nil, nil, err
+	}
+	if current != "blocked" {
+		d.ExecContext(ctx, `INSERT INTO task_events (user_id,task_id,kind,from_val,to_val) VALUES ($1,$2,'status',$3,'blocked')`, uid, id, current)
+	}
+	return map[string]any{"id": id, "status": "blocked", "blocked_by_task_id": blockerID},
+		map[string]any{"kind": "task_updated", "id": id, "route": "/tasks"}, nil
+}
+
 // sanitizeAITaskEmails mirrors the REST sanitizeNotifyEmails guard (trim,
 // RFC-validate, lowercase, de-dup, cap at 3) for the AI create path, which
 // lives in a different package and can't reach the api helper.
@@ -1839,10 +1941,13 @@ func scratchTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		next = "todo"
 	}
 	if cur != next {
-		if _, err := d.ExecContext(ctx, `UPDATE tasks SET status=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, next, id, uid); err != nil {
+		if _, err := d.ExecContext(ctx, `UPDATE tasks SET status=$1, blocked_by_task_id=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3`, next, id, uid); err != nil {
 			return nil, nil, err
 		}
 		d.ExecContext(ctx, `INSERT INTO task_events (user_id, task_id, kind, from_val, to_val) VALUES ($1,$2,'status',$3,$4)`, uid, id, cur, next)
+		if next == "scratched" {
+			unblockAITaskDependents(ctx, d, uid, id)
+		}
 	}
 	return map[string]any{"id": id, "status": next},
 		map[string]any{"kind": "task_updated", "id": id, "route": "/tasks"}, nil

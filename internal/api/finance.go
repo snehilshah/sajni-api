@@ -100,19 +100,53 @@ var defaultIncomeCategories = []struct {
 	{"Others", "#6B7280", "circle"},
 }
 
-func seedDefaultCategoriesIfEmpty(deps Deps, uid string) {
+func ensureDefaultCategories(deps Deps, uid string) {
 	d := deps.DB
-	var cnt int
-	d.QueryRow("SELECT COUNT(*) FROM fin_categories WHERE user_id = $1", uid).Scan(&cnt)
-	if cnt > 0 {
-		return
-	}
 	for _, c := range defaultExpenseCategories {
-		d.Exec("INSERT INTO fin_categories (user_id, name, kind, color, icon) VALUES ($1, $2, 'expense', $3, $4)", uid, c.Name, c.Color, c.Icon)
+		d.Exec("INSERT INTO fin_categories (user_id, name, kind, color, icon) VALUES ($1, $2, 'expense', $3, $4) ON CONFLICT DO NOTHING", uid, c.Name, c.Color, c.Icon)
 	}
 	for _, c := range defaultIncomeCategories {
-		d.Exec("INSERT INTO fin_categories (user_id, name, kind, color, icon) VALUES ($1, $2, 'income', $3, $4)", uid, c.Name, c.Color, c.Icon)
+		d.Exec("INSERT INTO fin_categories (user_id, name, kind, color, icon) VALUES ($1, $2, 'income', $3, $4) ON CONFLICT DO NOTHING", uid, c.Name, c.Color, c.Icon)
 	}
+}
+
+func categoryNameKey(name string) string {
+	key := strings.ToLower(strings.TrimSpace(name))
+	if key == "other" || key == "others" {
+		return "others"
+	}
+	return key
+}
+
+func isDefaultCategoryName(kind, name string) bool {
+	key := categoryNameKey(name)
+	var defaults []struct {
+		Name  string
+		Color string
+		Icon  string
+	}
+	if kind == "income" {
+		defaults = defaultIncomeCategories
+	} else if kind == "expense" {
+		defaults = defaultExpenseCategories
+	}
+	for _, category := range defaults {
+		if categoryNameKey(category.Name) == key {
+			return true
+		}
+	}
+	return false
+}
+
+func categoryNameExists(d *db.DB, uid, kind, name string, excludeID int64) bool {
+	var exists bool
+	d.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM fin_categories
+			 WHERE user_id=$1 AND kind=$2 AND id<>$3
+			   AND CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END = $4
+		)`, uid, kind, excludeID, categoryNameKey(name)).Scan(&exists)
+	return exists
 }
 
 // computeBalance returns the current signed balance of an account based on
@@ -350,7 +384,7 @@ func listCategories(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
-		seedDefaultCategoriesIfEmpty(deps, uid)
+		ensureDefaultCategories(deps, uid)
 		kind := queryParam(r, "kind")
 		args := []any{uid}
 		q := "SELECT id, name, kind, color, icon FROM fin_categories WHERE user_id = $1"
@@ -402,6 +436,19 @@ func createCategory(deps Deps) http.HandlerFunc {
 		if b.Kind == "" {
 			b.Kind = "expense"
 		}
+		b.Name = strings.TrimSpace(b.Name)
+		if b.Name == "" {
+			errJSON(w, 400, "category name is required")
+			return
+		}
+		if b.Kind != "expense" && b.Kind != "income" {
+			errJSON(w, 400, "category kind must be expense or income")
+			return
+		}
+		if isDefaultCategoryName(b.Kind, b.Name) || categoryNameExists(d, uid, b.Kind, b.Name, 0) {
+			errJSON(w, 409, "category already exists or is predefined for this type")
+			return
+		}
 		if b.Color == "" {
 			b.Color = "#6B7280"
 		}
@@ -411,7 +458,11 @@ func createCategory(deps Deps) http.HandlerFunc {
 			uid, b.Name, b.Kind, b.Color, b.Icon,
 		).Scan(&id)
 		if err != nil {
-			errJSON(w, 500, err.Error())
+			if categoryNameExists(d, uid, b.Kind, b.Name, 0) {
+				errJSON(w, 409, "category already exists for this type")
+			} else {
+				errJSON(w, 500, err.Error())
+			}
 			return
 		}
 		writeJSON(w, 201, map[string]int64{"id": id})
@@ -437,7 +488,28 @@ func updateCategory(deps Deps) http.HandlerFunc {
 			return
 		}
 		if b.Name != nil {
-			d.Exec("UPDATE fin_categories SET name = $1 WHERE id = $2 AND user_id = $3", *b.Name, id, uid)
+			var currentName, kind string
+			if err := d.QueryRow("SELECT name, kind FROM fin_categories WHERE id=$1 AND user_id=$2", id, uid).Scan(&currentName, &kind); err != nil {
+				errJSON(w, 404, "category not found")
+				return
+			}
+			name := strings.TrimSpace(*b.Name)
+			if name == "" {
+				errJSON(w, 400, "category name is required")
+				return
+			}
+			if categoryNameExists(d, uid, kind, name, id) || (categoryNameKey(currentName) != categoryNameKey(name) && isDefaultCategoryName(kind, name)) {
+				errJSON(w, 409, "category already exists or is predefined for this type")
+				return
+			}
+			if _, err := d.Exec("UPDATE fin_categories SET name = $1 WHERE id = $2 AND user_id = $3", name, id, uid); err != nil {
+				if categoryNameExists(d, uid, kind, name, id) {
+					errJSON(w, 409, "category already exists for this type")
+				} else {
+					errJSON(w, 500, err.Error())
+				}
+				return
+			}
 		}
 		if b.Color != nil {
 			d.Exec("UPDATE fin_categories SET color = $1 WHERE id = $2 AND user_id = $3", *b.Color, id, uid)

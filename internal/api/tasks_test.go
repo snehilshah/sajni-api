@@ -2,6 +2,19 @@ package api
 
 import "testing"
 
+func TestValidTaskStatus(t *testing.T) {
+	for _, status := range []string{"todo", "in_progress", "blocked", "done", "scratched"} {
+		if !validTaskStatus(status) {
+			t.Errorf("validTaskStatus(%q) = false", status)
+		}
+	}
+	for _, status := range []string{"", "missed", "cancelled", "BLOCKED"} {
+		if validTaskStatus(status) {
+			t.Errorf("validTaskStatus(%q) = true", status)
+		}
+	}
+}
+
 // rescheduleOutcome is the single source of truth for "did the user salvage a
 // lapsed task, or did the day stand as a miss?" — it drives both the task
 // lifecycle rows and what the Missed banner stops counting. today is the

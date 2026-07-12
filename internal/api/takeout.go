@@ -809,6 +809,7 @@ func importFinAccounts(ctx context.Context, deps Deps, uid string, body []byte) 
 
 func importFinCategories(ctx context.Context, deps Deps, uid string, body []byte) (int, map[int64]int64) {
 	idMap := map[int64]int64{}
+	ensureDefaultCategories(deps, uid)
 	rows, err := parseCSV(body)
 	if err != nil {
 		return 0, idMap
@@ -820,10 +821,27 @@ func importFinCategories(ctx context.Context, deps Deps, uid string, body []byte
 		}
 		oldID, _ := strconv.ParseInt(r[0], 10, 64)
 		var newID int64
+		name := strings.TrimSpace(r[1])
+		kind := strings.TrimSpace(r[2])
+		if name == "" || (kind != "income" && kind != "expense") {
+			continue
+		}
+		// Imports obey the same case-insensitive key as interactive creation.
+		// Map duplicate/predefined rows to the existing category so downstream
+		// transaction references remain intact instead of creating another row.
+		_ = deps.DB.QueryRowContext(ctx, `
+			SELECT id FROM fin_categories
+			 WHERE user_id=$1 AND kind=$2
+			   AND CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END=$3
+			 LIMIT 1`, uid, kind, categoryNameKey(name)).Scan(&newID)
+		if newID != 0 {
+			idMap[oldID] = newID
+			continue
+		}
 		err := deps.DB.QueryRowContext(ctx, `
 			INSERT INTO fin_categories(user_id, name, kind, color, icon)
 			VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-			uid, r[1], r[2], r[3], r[4]).Scan(&newID)
+			uid, name, kind, r[3], r[4]).Scan(&newID)
 		if err == nil {
 			idMap[oldID] = newID
 			n++
