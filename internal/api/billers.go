@@ -35,28 +35,28 @@ func registerBillerRoutes(mux *http.ServeMux, deps Deps) {
 // is_subscription/variable are legacy fields kept in the JSON until android
 // parity ships; variable is derived from kind so old clients keep working.
 type billerResp struct {
-	ID             int64   `json:"id"`
-	Name           string  `json:"name"`
-	Kind           string  `json:"kind"`
-	Amount         float64 `json:"amount"`
-	Frequency      string  `json:"frequency"`
-	NextDueDate    string  `json:"next_due_date"`
-	AccountID      *int64  `json:"account_id"`
-	AccountName    *string `json:"account_name"`
-	CategoryID     *int64  `json:"category_id"`
-	CategoryName   *string `json:"category_name"`
-	CategoryColor  *string `json:"category_color"`
-	IsSubscription bool    `json:"is_subscription"`
-	AutoRenew      bool    `json:"auto_renew"`
-	RemindTask     bool    `json:"remind_task"`
-	Variable       bool    `json:"variable"`
-	AlertDays      int     `json:"alert_days"`
-	Color          string  `json:"color"`
-	Notes          string  `json:"notes"`
-	Archived       bool    `json:"archived"`
-	LastPaidDate   *string `json:"last_paid_date"`
+	ID             int64    `json:"id"`
+	Name           string   `json:"name"`
+	Kind           string   `json:"kind"`
+	Amount         float64  `json:"amount"`
+	Frequency      string   `json:"frequency"`
+	NextDueDate    string   `json:"next_due_date"`
+	AccountID      *int64   `json:"account_id"`
+	AccountName    *string  `json:"account_name"`
+	CategoryID     *int64   `json:"category_id"`
+	CategoryName   *string  `json:"category_name"`
+	CategoryColor  *string  `json:"category_color"`
+	IsSubscription bool     `json:"is_subscription"`
+	AutoRenew      bool     `json:"auto_renew"`
+	RemindTask     bool     `json:"remind_task"`
+	Variable       bool     `json:"variable"`
+	AlertDays      int      `json:"alert_days"`
+	Color          string   `json:"color"`
+	Notes          string   `json:"notes"`
+	Archived       bool     `json:"archived"`
+	LastPaidDate   *string  `json:"last_paid_date"`
 	LastPaidAmount *float64 `json:"last_paid_amount"`
-	CreatedAt      string  `json:"created_at"`
+	CreatedAt      string   `json:"created_at"`
 }
 
 func validBillerKind(k string) bool {
