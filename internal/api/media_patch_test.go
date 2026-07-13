@@ -33,6 +33,20 @@ func TestMediaPatchPreservesNullAndAbsent(t *testing.T) {
 	}
 }
 
+func TestMediaPatchEmptyReleaseDateClears(t *testing.T) {
+	// Dateless items (e.g. books) send release_date:"" — treat as a clear
+	// (nil), matching the create path, not an "invalid release_date" error.
+	for _, raw := range []string{`{"release_date":""}`, `{"release_date":"  "}`} {
+		values, err := decodeMediaPatch(t, raw)
+		if err != nil {
+			t.Fatalf("%s: unexpected error %v", raw, err)
+		}
+		if value, exists := values["release_date"]; !exists || value != nil {
+			t.Fatalf("%s: release_date = %#v, exists=%v; want nil clear", raw, value, exists)
+		}
+	}
+}
+
 func TestMediaPatchValidation(t *testing.T) {
 	tests := []string{
 		`{}`,

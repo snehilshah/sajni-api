@@ -537,10 +537,16 @@ func validateMediaPatch(values map[string]any) error {
 	}
 	if raw, ok := values["release_date"]; ok && raw != nil {
 		date := raw.(string)
-		if normalizeMediaDate(date) == "" {
+		// Empty/whitespace clears the date (nil), matching the create path's
+		// mediaDateArg — the frontend sends release_date:"" for dateless items.
+		// Only a non-empty, unparseable value is a real error.
+		if strings.TrimSpace(date) == "" {
+			values["release_date"] = nil
+		} else if norm := normalizeMediaDate(date); norm == "" {
 			return fmt.Errorf("invalid release_date")
+		} else {
+			values["release_date"] = norm
 		}
-		values["release_date"] = normalizeMediaDate(date)
 	}
 	if episodes, ok := values["season_episodes"].([]int); ok {
 		for _, count := range episodes {
