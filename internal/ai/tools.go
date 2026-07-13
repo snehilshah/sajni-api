@@ -2763,9 +2763,18 @@ func listBudgetsTool(ctx context.Context, d *db.DB, uid string, args map[string]
 				itemRows.Scan(&itemID, &catID, &amt, &catName)
 				var spent float64
 				if catID.Valid {
-					d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-						WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
-						uid, catID.Int64, ws, we).Scan(&spent)
+					// Caps inherit the budget's pocket lens (mirrors
+					// api.categorySpent — duplicated for the import cycle).
+					if len(pocketIDs) > 0 {
+						d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+							WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND pocket_id = ANY($3)
+							AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $4 AND $5`,
+							uid, catID.Int64, pocketIDs, ws, we).Scan(&spent)
+					} else {
+						d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+							WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
+							uid, catID.Int64, ws, we).Scan(&spent)
+					}
 				}
 				item := map[string]any{
 					"id": itemID, "category_name": catName, "amount": amt, "spent": spent,

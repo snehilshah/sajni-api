@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"fmt"
 	"math"
@@ -936,6 +937,26 @@ func budgetSpent(d *db.DB, uid, from, to string, pocketIDs []int64) float64 {
 	return spent
 }
 
+// categorySpent computes a category cap's spend. A cap is a slice of its
+// budget, so it reads through the SAME pocket lens as the overall spent —
+// a trip budget's "Food" cap must not absorb General food spends that merely
+// share the date range. Mirrored in ai.listBudgetsTool and exportBudgetsCSV.
+func categorySpent(d *db.DB, uid string, catID int64, from, to string, pocketIDs []int64) float64 {
+	var spent float64
+	if len(pocketIDs) > 0 {
+		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+			WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND pocket_id = ANY($3)
+			AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $4 AND $5`,
+			uid, catID, pocketIDs, from, to).Scan(&spent)
+	} else {
+		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+			WHERE user_id = $1 AND type = 'expense' AND category_id = $2
+			AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
+			uid, catID, from, to).Scan(&spent)
+	}
+	return spent
+}
+
 func listBudgets(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -966,16 +987,14 @@ func listBudgets(deps Deps) http.HandlerFunc {
 				}
 				prows.Close()
 			}
-			// items (category caps — unaffected by the pocket filter)
+			// items (category caps — inherit the budget's pocket filter)
 			itemRows, _ := d.Query(`SELECT id, category_id, amount FROM fin_budget_items WHERE budget_id = $1`, b.ID)
 			if itemRows != nil {
 				for itemRows.Next() {
 					var it budgetItemResp
 					itemRows.Scan(&it.ID, &it.CategoryID, &it.Amount)
 					if it.CategoryID != nil {
-						d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-							WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
-							uid, *it.CategoryID, b.WindowStart, b.WindowEnd).Scan(&it.Spent)
+						it.Spent = categorySpent(d, uid, *it.CategoryID, b.WindowStart, b.WindowEnd, b.PocketIDs)
 					}
 					b.Items = append(b.Items, it)
 				}
@@ -2216,15 +2235,19 @@ func exportBudgetsCSV(deps Deps) http.HandlerFunc {
 					}
 					prows.Close()
 				}
-				irows, _ := d.Query(`SELECT COALESCE(c.name,''), bi.amount,
-					COALESCE((SELECT SUM(t.amount) FROM fin_transactions t WHERE t.user_id = $1 AND t.type = 'expense' AND t.category_id = bi.category_id AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3), 0)
+				irows, _ := d.Query(`SELECT COALESCE(c.name,''), bi.category_id, bi.amount
 					FROM fin_budget_items bi LEFT JOIN fin_categories c ON c.id = bi.category_id
-					WHERE bi.budget_id = $4`, uid, ws, we, bid)
+					WHERE bi.budget_id = $1`, bid)
 				if irows != nil {
 					for irows.Next() {
 						var cat string
+						var catID sql.NullInt64
 						var alloc, spent float64
-						irows.Scan(&cat, &alloc, &spent)
+						irows.Scan(&cat, &catID, &alloc)
+						if catID.Valid {
+							// caps inherit the budget's pocket lens
+							spent = categorySpent(d, uid, catID.Int64, ws, we, pocketIDs)
+						}
 						cw.Write([]string{
 							name, period, ws, we, strings.Join(pocketNames, ";"), cat,
 							strconv.FormatFloat(alloc, 'f', 2, 64),
