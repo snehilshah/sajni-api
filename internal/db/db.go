@@ -473,21 +473,11 @@ func (d *DB) migrate() error {
 		start_date      DATE,
 		maturity_date   DATE,
 		expected_return NUMERIC(8,4) NOT NULL DEFAULT 0,
-		-- Trading holdings: quantity/avg_buy_price track remaining cost
-		-- basis, realized_pl accumulates booked gains, status flips to
-		-- 'closed' at qty 0. symbol+exchange (NSE=.NS/BSE=.BO) identify the
-		-- instrument to the Yahoo price fetcher; last_price/price_at/
-		-- price_error track the lazy refresh (see prices.go).
-		quantity        NUMERIC(18,6) NOT NULL DEFAULT 0,
-		avg_buy_price   NUMERIC(18,6) NOT NULL DEFAULT 0,
-		realized_pl     NUMERIC(14,2) NOT NULL DEFAULT 0,
-		status          TEXT          NOT NULL DEFAULT 'open',
-		sold_at         TIMESTAMPTZ,
-		symbol          TEXT          NOT NULL DEFAULT '',
-		exchange        TEXT          NOT NULL DEFAULT 'NSE',
-		last_price      NUMERIC(18,6) NOT NULL DEFAULT 0,
-		price_error     TEXT          NOT NULL DEFAULT '',
-		price_at        TIMESTAMPTZ,
+		-- auto_debit: cron posts the contribution txn from account_id each
+		-- cycle (next_debit_date advances per frequency; see
+		-- investments_cron.go and fin_investment_contributions).
+		auto_debit      BOOLEAN     NOT NULL DEFAULT FALSE,
+		next_debit_date DATE,
 		notes           TEXT        NOT NULL DEFAULT '',
 		last_updated    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -537,14 +527,19 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_networth_user ON fin_networth_snapshots(user_id);
 
+	-- kind: 'subscription' (fixed amount, may auto_renew = cron posts the
+	-- txn) or 'bill' (variable amount unknown upfront, e.g. electricity —
+	-- amount is an optional estimate, user marks paid with the actual).
 	-- remind_task: opt-in — when on (and not auto_renew) the biller cron
-	-- spawns one bill-pay reminder task per due cycle. variable: amount
-	-- unknown upfront (e.g. electricity); with auto_renew the cron posts
-	-- the last paid amount and flags the alert loudly.
+	-- spawns one bill-pay reminder task per due cycle. variable /
+	-- is_subscription are legacy columns kept until android parity (the
+	-- kind backfill below reads variable — convert it to a column-exists
+	-- guard before ever dropping).
 	CREATE TABLE IF NOT EXISTS fin_billers (
 		id              BIGSERIAL   PRIMARY KEY,
 		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name            TEXT        NOT NULL DEFAULT '',
+		kind            TEXT        NOT NULL DEFAULT 'subscription',
 		amount          NUMERIC(14,2) NOT NULL DEFAULT 0,
 		frequency       TEXT        NOT NULL DEFAULT 'monthly',
 		next_due_date   DATE        NOT NULL,
@@ -590,6 +585,88 @@ func (d *DB) migrate() error {
 		UNIQUE(biller_id, kind, due_date)
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_biller_alerts_user ON fin_biller_alerts(user_id, seen);
+
+	-- Links payments to their transactions — both the txn a payment
+	-- created and any pre-existing txns the user attached instead.
+	-- fin_biller_payments.txn_id stays populated for created txns
+	-- (legacy/android read compat); reads should UNION both.
+	CREATE TABLE IF NOT EXISTS fin_biller_payment_txns (
+		payment_id BIGINT NOT NULL REFERENCES fin_biller_payments(id) ON DELETE CASCADE,
+		txn_id     BIGINT NOT NULL REFERENCES fin_transactions(id) ON DELETE CASCADE,
+		PRIMARY KEY (payment_id, txn_id)
+	);
+
+	-- ─── Pockets: curated spend contexts ──────────────────────────────
+	-- Exactly one pocket per transaction; NULL pocket_id = implicit
+	-- "General". is_active marks the user's active pocket: direct txn
+	-- creation paths (manual form, share capture, AI create_transaction)
+	-- default into it; system/cron txns (biller pay, auto-renew,
+	-- investment auto-debit) always write NULL.
+	CREATE TABLE IF NOT EXISTS fin_pockets (
+		id         BIGSERIAL   PRIMARY KEY,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		name       TEXT        NOT NULL DEFAULT '',
+		color      TEXT        NOT NULL DEFAULT '#2D5A4F',
+		is_active  BOOLEAN     NOT NULL DEFAULT FALSE,
+		archived   BOOLEAN     NOT NULL DEFAULT FALSE,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_pockets_user ON fin_pockets(user_id);
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_pockets_active
+		ON fin_pockets(user_id) WHERE is_active = TRUE;
+
+	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS
+		pocket_id BIGINT REFERENCES fin_pockets(id) ON DELETE SET NULL;
+	CREATE INDEX IF NOT EXISTS idx_fin_transactions_pocket
+		ON fin_transactions(user_id, pocket_id) WHERE pocket_id IS NOT NULL;
+
+	-- Optional pocket filter on a budget: overall spent counts only txns
+	-- in these pockets. No rows = count everything in the window.
+	CREATE TABLE IF NOT EXISTS fin_budget_pockets (
+		budget_id BIGINT NOT NULL REFERENCES fin_budgets(id) ON DELETE CASCADE,
+		pocket_id BIGINT NOT NULL REFERENCES fin_pockets(id) ON DELETE CASCADE,
+		PRIMARY KEY (budget_id, pocket_id)
+	);
+
+	-- One row per auto-debited investment cycle; UNIQUE key is the
+	-- idempotency gate (mirrors fin_biller_payments).
+	CREATE TABLE IF NOT EXISTS fin_investment_contributions (
+		id            BIGSERIAL   PRIMARY KEY,
+		user_id       UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		investment_id BIGINT      NOT NULL REFERENCES fin_investments(id) ON DELETE CASCADE,
+		txn_id        BIGINT      REFERENCES fin_transactions(id) ON DELETE SET NULL,
+		due_date      DATE        NOT NULL,
+		amount        NUMERIC(14,2) NOT NULL DEFAULT 0,
+		auto          BOOLEAN     NOT NULL DEFAULT TRUE,
+		created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		UNIQUE(investment_id, due_date)
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_inv_contrib_user ON fin_investment_contributions(user_id);
+
+	-- ─── Finance migrations for pre-existing DBs (idempotent) ─────────
+	-- Biller kind backfill (fresh DBs get kind via CREATE TABLE).
+	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT '';
+	UPDATE fin_billers SET kind = CASE WHEN variable THEN 'bill' ELSE 'subscription' END WHERE kind = '';
+	ALTER TABLE fin_billers ALTER COLUMN kind SET DEFAULT 'subscription';
+	-- Bills never auto-pay (auto_renew is a subscription-only concept now).
+	UPDATE fin_billers SET auto_renew = FALSE WHERE kind = 'bill' AND auto_renew;
+
+	-- Investment auto-debit columns (fresh DBs get them via CREATE TABLE).
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS auto_debit BOOLEAN NOT NULL DEFAULT FALSE;
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS next_debit_date DATE;
+
+	-- Trading purge (2026-07): market trading removed from the product.
+	-- Idempotent — the API no longer creates these types, so re-runs
+	-- match zero rows.
+	DELETE FROM fin_investments WHERE type IN ('stock','etf');
+	DELETE FROM fin_accounts WHERE type = 'trading';
+	DELETE FROM fin_transactions WHERE type IN ('buy','sell');
+	ALTER TABLE fin_investments
+		DROP COLUMN IF EXISTS quantity, DROP COLUMN IF EXISTS avg_buy_price,
+		DROP COLUMN IF EXISTS realized_pl, DROP COLUMN IF EXISTS status,
+		DROP COLUMN IF EXISTS sold_at, DROP COLUMN IF EXISTS symbol,
+		DROP COLUMN IF EXISTS exchange, DROP COLUMN IF EXISTS last_price,
+		DROP COLUMN IF EXISTS price_error, DROP COLUMN IF EXISTS price_at;
 
 	-- ─── Insights / Themes / AI ───────────────────────────────────────
 	CREATE TABLE IF NOT EXISTS insights (

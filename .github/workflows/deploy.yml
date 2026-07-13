@@ -119,7 +119,6 @@ jobs:
             GITHUB_OAUTH_CLIENT_SECRET=GITHUB_OAUTH_CLIENT_SECRET:latest
             RESEND_API_KEY=RESEND_API_KEY:latest
             REMINDER_CRON_SECRET=REMINDER_CRON_SECRET:latest
-            PRICE_CRON_SECRET=PRICE_CRON_SECRET:latest
           # Cheapest viable Cloud Run config:
           # - min-instances=0     → no idle cost (~1–2s cold start)
           # - max-instances=2     → caps blast radius if traffic spikes

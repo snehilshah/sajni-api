@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rs/zerolog/log"
-
 	"sajni/internal/db"
 )
 
@@ -34,6 +32,9 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("PUT /api/finance/transactions/{id}", updateTransaction(deps))
 	mux.HandleFunc("DELETE /api/finance/transactions/{id}", deleteTransaction(deps))
 
+	// Pockets (spend contexts)
+	registerPocketRoutes(mux, deps)
+
 	// Budgets
 	mux.HandleFunc("GET /api/finance/budgets", listBudgets(deps))
 	mux.HandleFunc("POST /api/finance/budgets", createBudget(deps))
@@ -45,7 +46,6 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /api/finance/investments", createInvestment(deps))
 	mux.HandleFunc("PUT /api/finance/investments/{id}", updateInvestment(deps))
 	mux.HandleFunc("DELETE /api/finance/investments/{id}", deleteInvestment(deps))
-	mux.HandleFunc("POST /api/finance/investments/{id}/sell", sellInvestment(deps))
 
 	// Virtual savings
 	mux.HandleFunc("GET /api/finance/savings", listSavings(deps))
@@ -150,24 +150,20 @@ func categoryNameExists(d *db.DB, uid, kind, name string, excludeID int64) bool 
 }
 
 // computeBalance returns the current signed balance of an account based on
-// opening_balance + income - expense + transfer_in - transfer_out - buy + sell.
-// For credit cards this comes out negative when money is owed. For trading
-// accounts `buy` debits cash (deploying into a holding) and `sell` credits it
-// (proceeds back); neither counts as income/expense in analytics.
+// opening_balance + income - expense + transfer_in - transfer_out.
+// For credit cards this comes out negative when money is owed.
 func computeBalance(deps Deps, uid string, accountID int64) float64 {
 	d := deps.DB
 	var opening float64
 	d.QueryRow("SELECT opening_balance FROM fin_accounts WHERE id = $1 AND user_id = $2", accountID, uid).Scan(&opening)
 
-	var income, expense, transferIn, transferOut, buy, sell float64
+	var income, expense, transferIn, transferOut float64
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'income'", uid, accountID).Scan(&income)
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'expense'", uid, accountID).Scan(&expense)
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_in'", uid, accountID).Scan(&transferIn)
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_out'", uid, accountID).Scan(&transferOut)
-	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'buy'", uid, accountID).Scan(&buy)
-	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'sell'", uid, accountID).Scan(&sell)
 
-	return opening + income - expense + transferIn - transferOut - buy + sell
+	return opening + income - expense + transferIn - transferOut
 }
 
 // --- accounts --------------------------------------------------------------
@@ -551,7 +547,29 @@ type txnResp struct {
 	TxnAt         string  `json:"txn_at"` // RFC3339 in IST (carries +05:30)
 	TransferPair  *int64  `json:"transfer_pair"`
 	LinkedAccount *int64  `json:"linked_account"`
+	PocketID      *int64  `json:"pocket_id"`   // NULL = General
+	PocketName    *string `json:"pocket_name"` // joined for display
 	CreatedAt     string  `json:"created_at"`
+}
+
+// resolvePocketID applies the tri-state pocket contract for txn creation:
+// field absent/null → the user's active pocket (old clients get the default
+// for free); 0 → explicit General (stored NULL); N → that pocket, validated
+// as owned + not archived. Returns (stored value, error message).
+func resolvePocketID(d *db.DB, uid string, requested *int64) (*int64, string) {
+	if requested == nil {
+		return activePocketID(d, uid), ""
+	}
+	if *requested == 0 {
+		return nil, ""
+	}
+	var ok bool
+	d.QueryRow(`SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2`,
+		*requested, uid).Scan(&ok)
+	if !ok {
+		return nil, "pocket not found"
+	}
+	return requested, ""
 }
 
 // istDateExpr is the SQL that projects a txn_at TIMESTAMPTZ down to its IST
@@ -628,6 +646,16 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			args = append(args, "%"+v+"%")
 			ph++
 		}
+		// pocket_id=N filters to that pocket; pocket_id=0 = General (NULL).
+		if v := queryParam(r, "pocket_id"); v != "" {
+			if v == "0" {
+				clauses = append(clauses, "t.pocket_id IS NULL")
+			} else {
+				clauses = append(clauses, "t.pocket_id = $"+itoa(ph))
+				args = append(args, v)
+				ph++
+			}
+		}
 
 		limit := 200
 		if v := queryParam(r, "limit"); v != "" {
@@ -637,10 +665,11 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		}
 
 		q := `SELECT t.id, t.account_id, a.name, t.category_id, c.name, c.color, t.type, t.amount,
-			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.created_at::text
+			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.pocket_id, p.name, t.created_at::text
 			  FROM fin_transactions t
 			  JOIN fin_accounts a ON a.id = t.account_id
 			  LEFT JOIN fin_categories c ON c.id = t.category_id
+			  LEFT JOIN fin_pockets p ON p.id = t.pocket_id
 			  WHERE ` + strings.Join(clauses, " AND ") +
 			` ORDER BY t.txn_at DESC, t.id DESC LIMIT ` + itoa(limit)
 
@@ -656,7 +685,7 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			var t txnResp
 			var at time.Time
 			rows.Scan(&t.ID, &t.AccountID, &t.AccountName, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
-				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount, &t.CreatedAt)
+				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount, &t.PocketID, &t.PocketName, &t.CreatedAt)
 			t.TxnAt = at.In(loc).Format(time.RFC3339)
 			out = append(out, t)
 		}
@@ -680,6 +709,7 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			Note          string  `json:"note"`
 			TxnAt         string  `json:"txn_at"` // RFC3339 (IST)
 			LinkedAccount *int64  `json:"linked_account"`
+			PocketID      *int64  `json:"pocket_id"` // absent → active pocket; 0 → General; N → pocket
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -691,6 +721,11 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		}
 		if b.Type == "" {
 			b.Type = "expense"
+		}
+		pocketID, perrMsg := resolvePocketID(d, uid, b.PocketID)
+		if perrMsg != "" {
+			errJSON(w, 400, perrMsg)
+			return
 		}
 		txnAt := resolveTxnAt(b.TxnAt, userNow(d, uid))
 
@@ -734,8 +769,8 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		}
 
 		var id int64
-		err := d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, note, txn_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-			uid, b.AccountID, b.CategoryID, b.Type, b.Amount, b.Description, b.Note, txnAt,
+		err := d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, note, txn_at, pocket_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+			uid, b.AccountID, b.CategoryID, b.Type, b.Amount, b.Description, b.Note, txnAt, pocketID,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -765,11 +800,27 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			Amount      *float64 `json:"amount"`
 			Description *string  `json:"description"`
 			Note        *string  `json:"note"`
-			TxnAt       *string  `json:"txn_at"` // RFC3339 (IST)
+			TxnAt       *string  `json:"txn_at"`    // RFC3339 (IST)
+			PocketID    *int64   `json:"pocket_id"` // 0 → General; N → pocket; absent → untouched
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
 			return
+		}
+		if b.PocketID != nil {
+			// No active-pocket default on edit — absent means "don't touch".
+			var stored *int64
+			if *b.PocketID != 0 {
+				var ok bool
+				d.QueryRow(`SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2`,
+					*b.PocketID, uid).Scan(&ok)
+				if !ok {
+					errJSON(w, 400, "pocket not found")
+					return
+				}
+				stored = b.PocketID
+			}
+			d.Exec("UPDATE fin_transactions SET pocket_id = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", stored, id, uid)
 		}
 		if b.AccountID != nil {
 			// Move the txn to another account. Balances are computed from
@@ -841,15 +892,56 @@ type budgetResp struct {
 	Period      string           `json:"period"`
 	StartDate   string           `json:"start_date"`
 	EndDate     string           `json:"end_date"`
+	WindowStart string           `json:"window_start"`
+	WindowEnd   string           `json:"window_end"`
 	TotalAmount float64          `json:"total_amount"`
 	Spent       float64          `json:"spent"`
+	PocketIDs   []int64          `json:"pocket_ids"`
 	Items       []budgetItemResp `json:"items"`
+}
+
+// budgetWindow resolves the date window spend is computed over. Monthly
+// budgets auto-roll: they ignore their stored dates and use the requested
+// IST month (monthParam "YYYY-MM", default = the current month). Custom
+// budgets use their stored range.
+func budgetWindow(period, startDate, endDate, monthParam string, now time.Time) (string, string) {
+	if period != "monthly" {
+		return startDate, endDate
+	}
+	first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	if monthParam != "" {
+		if m, err := time.Parse("2006-01", monthParam); err == nil {
+			first = m
+		}
+	}
+	last := first.AddDate(0, 1, -1)
+	return first.Format("2006-01-02"), last.Format("2006-01-02")
+}
+
+// budgetSpent computes the overall spend in a window, optionally restricted
+// to a pocket set. General (NULL pocket) txns never match a pocket filter.
+func budgetSpent(d *db.DB, uid, from, to string, pocketIDs []int64) float64 {
+	var spent float64
+	if len(pocketIDs) > 0 {
+		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+			WHERE user_id = $1 AND type = 'expense' AND pocket_id = ANY($2)
+			AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
+			uid, pocketIDs, from, to).Scan(&spent)
+	} else {
+		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+			WHERE user_id = $1 AND type = 'expense'
+			AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
+			uid, from, to).Scan(&spent)
+	}
+	return spent
 }
 
 func listBudgets(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
+		month := queryParam(r, "month") // YYYY-MM; monthly budgets only
+		now := userNow(d, uid)
 		rows, err := d.Query(`SELECT id, name, period, start_date::text, end_date::text, total_amount
 			FROM fin_budgets WHERE user_id = $1 ORDER BY start_date DESC`, uid)
 		if err != nil {
@@ -862,7 +954,19 @@ func listBudgets(deps Deps) http.HandlerFunc {
 		for rows.Next() {
 			var b budgetResp
 			rows.Scan(&b.ID, &b.Name, &b.Period, &b.StartDate, &b.EndDate, &b.TotalAmount)
-			// items
+			b.WindowStart, b.WindowEnd = budgetWindow(b.Period, b.StartDate, b.EndDate, month, now)
+			// pocket filter
+			b.PocketIDs = []int64{}
+			prows, _ := d.Query(`SELECT pocket_id FROM fin_budget_pockets WHERE budget_id = $1`, b.ID)
+			if prows != nil {
+				for prows.Next() {
+					var pid int64
+					prows.Scan(&pid)
+					b.PocketIDs = append(b.PocketIDs, pid)
+				}
+				prows.Close()
+			}
+			// items (category caps — unaffected by the pocket filter)
 			itemRows, _ := d.Query(`SELECT id, category_id, amount FROM fin_budget_items WHERE budget_id = $1`, b.ID)
 			if itemRows != nil {
 				for itemRows.Next() {
@@ -871,7 +975,7 @@ func listBudgets(deps Deps) http.HandlerFunc {
 					if it.CategoryID != nil {
 						d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
 							WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
-							uid, *it.CategoryID, b.StartDate, b.EndDate).Scan(&it.Spent)
+							uid, *it.CategoryID, b.WindowStart, b.WindowEnd).Scan(&it.Spent)
 					}
 					b.Items = append(b.Items, it)
 				}
@@ -880,9 +984,7 @@ func listBudgets(deps Deps) http.HandlerFunc {
 			if b.Items == nil {
 				b.Items = []budgetItemResp{}
 			}
-			d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-				WHERE user_id = $1 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
-				uid, b.StartDate, b.EndDate).Scan(&b.Spent)
+			b.Spent = budgetSpent(d, uid, b.WindowStart, b.WindowEnd, b.PocketIDs)
 			out = append(out, b)
 		}
 		if out == nil {
@@ -902,6 +1004,7 @@ func createBudget(deps Deps) http.HandlerFunc {
 			StartDate   string  `json:"start_date"`
 			EndDate     string  `json:"end_date"`
 			TotalAmount float64 `json:"total_amount"`
+			PocketIDs   []int64 `json:"pocket_ids"`
 			Items       []struct {
 				CategoryID *int64  `json:"category_id"`
 				Amount     float64 `json:"amount"`
@@ -914,6 +1017,11 @@ func createBudget(deps Deps) http.HandlerFunc {
 		if b.Period == "" {
 			b.Period = "monthly"
 		}
+		// Monthly budgets auto-roll — the stored dates are display-inert but
+		// kept populated (current month) for legacy readers.
+		if b.Period == "monthly" && (b.StartDate == "" || b.EndDate == "") {
+			b.StartDate, b.EndDate = budgetWindow("monthly", "", "", "", userNow(d, uid))
+		}
 		var id int64
 		err := d.QueryRow(`INSERT INTO fin_budgets (user_id, name, period, start_date, end_date, total_amount) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
 			uid, b.Name, b.Period, b.StartDate, b.EndDate, b.TotalAmount,
@@ -924,6 +1032,9 @@ func createBudget(deps Deps) http.HandlerFunc {
 		}
 		for _, it := range b.Items {
 			d.Exec(`INSERT INTO fin_budget_items (budget_id, category_id, amount) VALUES ($1,$2,$3)`, id, it.CategoryID, it.Amount)
+		}
+		for _, pid := range b.PocketIDs {
+			d.Exec(`INSERT INTO fin_budget_pockets (budget_id, pocket_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, pid)
 		}
 		writeJSON(w, 201, map[string]int64{"id": id})
 	}
@@ -940,9 +1051,11 @@ func updateBudget(deps Deps) http.HandlerFunc {
 		}
 		var b struct {
 			Name        *string  `json:"name"`
+			Period      *string  `json:"period"`
 			StartDate   *string  `json:"start_date"`
 			EndDate     *string  `json:"end_date"`
 			TotalAmount *float64 `json:"total_amount"`
+			PocketIDs   *[]int64 `json:"pocket_ids"`
 			Items       *[]struct {
 				CategoryID *int64  `json:"category_id"`
 				Amount     float64 `json:"amount"`
@@ -954,6 +1067,9 @@ func updateBudget(deps Deps) http.HandlerFunc {
 		}
 		if b.Name != nil {
 			d.Exec("UPDATE fin_budgets SET name = $1 WHERE id = $2 AND user_id = $3", *b.Name, id, uid)
+		}
+		if b.Period != nil {
+			d.Exec("UPDATE fin_budgets SET period = $1 WHERE id = $2 AND user_id = $3", *b.Period, id, uid)
 		}
 		if b.StartDate != nil {
 			d.Exec("UPDATE fin_budgets SET start_date = $1 WHERE id = $2 AND user_id = $3", *b.StartDate, id, uid)
@@ -968,6 +1084,12 @@ func updateBudget(deps Deps) http.HandlerFunc {
 			d.Exec("DELETE FROM fin_budget_items WHERE budget_id = $1", id)
 			for _, it := range *b.Items {
 				d.Exec("INSERT INTO fin_budget_items (budget_id, category_id, amount) VALUES ($1,$2,$3)", id, it.CategoryID, it.Amount)
+			}
+		}
+		if b.PocketIDs != nil {
+			d.Exec("DELETE FROM fin_budget_pockets WHERE budget_id = $1", id)
+			for _, pid := range *b.PocketIDs {
+				d.Exec("INSERT INTO fin_budget_pockets (budget_id, pocket_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", id, pid)
 			}
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
@@ -994,19 +1116,9 @@ func listInvestments(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
-		// Cap the lazy refresh so a hung price provider can't hold the page
-		// hostage — whatever doesn't finish stays stale until the next view.
-		refreshCtx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
-		if n, err := RefreshStaleUserPrices(refreshCtx, deps, uid); err != nil {
-			log.Warn().Err(err).Str("user", uid).Msg("lazy price refresh failed")
-		} else if n > 0 {
-			log.Info().Int("updated", n).Str("user", uid).Msg("lazy price refresh completed")
-		}
-		cancel()
 		rows, err := d.Query(`SELECT id, name, type, account_id, invested_amount, current_value, monthly_amount,
 			frequency, start_date::text, maturity_date::text, expected_return, notes, last_updated::text,
-			quantity, avg_buy_price, realized_pl, status,
-			symbol, exchange, last_price, price_error, price_at
+			auto_debit, next_debit_date::text
 			FROM fin_investments WHERE user_id = $1 ORDER BY created_at ASC`, uid)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -1027,29 +1139,15 @@ func listInvestments(deps Deps) http.HandlerFunc {
 			ExpectedReturn float64 `json:"expected_return"`
 			Notes          string  `json:"notes"`
 			LastUpdated    string  `json:"last_updated"`
-			Quantity       float64 `json:"quantity"`
-			AvgBuyPrice    float64 `json:"avg_buy_price"`
-			RealizedPL     float64 `json:"realized_pl"`
-			Status         string  `json:"status"`
-			Symbol         string  `json:"symbol"`
-			Exchange       string  `json:"exchange"`
-			LastPrice      float64 `json:"last_price"`
-			PriceError     string  `json:"price_error"`
-			PriceAt        *string `json:"price_at"`
+			AutoDebit      bool    `json:"auto_debit"`
+			NextDebitDate  *string `json:"next_debit_date"`
 		}
-		loc := userLocation(d, uid)
 		var out []Inv
 		for rows.Next() {
 			var i Inv
-			var priceAt *time.Time
 			rows.Scan(&i.ID, &i.Name, &i.Type, &i.AccountID, &i.InvestedAmount, &i.CurrentValue, &i.MonthlyAmount,
 				&i.Frequency, &i.StartDate, &i.MaturityDate, &i.ExpectedReturn, &i.Notes, &i.LastUpdated,
-				&i.Quantity, &i.AvgBuyPrice, &i.RealizedPL, &i.Status,
-				&i.Symbol, &i.Exchange, &i.LastPrice, &i.PriceError, &priceAt)
-			if priceAt != nil {
-				s := priceAt.In(loc).Format(time.RFC3339)
-				i.PriceAt = &s
-			}
+				&i.AutoDebit, &i.NextDebitDate)
 			out = append(out, i)
 		}
 		if out == nil {
@@ -1059,15 +1157,30 @@ func listInvestments(deps Deps) http.HandlerFunc {
 	}
 }
 
-// isTradingType reports whether a holding is a market instrument that lives in
-// the Trading tab and must be bought against a trading account. Everything else
-// (fd/rd/other) is a guaranteed instrument shown under Investments.
-func isTradingType(t string) bool {
+// validInvestmentType gates the manual instrument set (market trading was
+// removed from the product; sip/mutual_fund live on as manual entries).
+func validInvestmentType(t string) bool {
 	switch t {
-	case "stock", "etf", "sip", "mutual_fund":
+	case "sip", "mutual_fund", "fd", "rd", "other":
 		return true
 	}
 	return false
+}
+
+// validateAutoDebit enforces what the auto-debit cron needs: an account to
+// debit, a per-cycle amount, and a recurring frequency.
+func validateAutoDebit(accountID *int64, monthlyAmount float64, frequency string) string {
+	if accountID == nil {
+		return "auto-debit needs a linked account"
+	}
+	if monthlyAmount <= 0 {
+		return "auto-debit needs a per-cycle amount"
+	}
+	switch frequency {
+	case "monthly", "quarterly", "yearly":
+		return ""
+	}
+	return "auto-debit needs a recurring frequency (monthly/quarterly/yearly)"
 }
 
 func createInvestment(deps Deps) http.HandlerFunc {
@@ -1086,10 +1199,8 @@ func createInvestment(deps Deps) http.HandlerFunc {
 			MaturityDate   *string `json:"maturity_date"`
 			ExpectedReturn float64 `json:"expected_return"`
 			Notes          string  `json:"notes"`
-			Quantity       float64 `json:"quantity"`
-			AvgBuyPrice    float64 `json:"avg_buy_price"`
-			Symbol         string  `json:"symbol"`   // stocks/ETFs: market ticker for EOD auto-pricing
-			Exchange       string  `json:"exchange"` // NSE (default) / BSE
+			AutoDebit      bool    `json:"auto_debit"`
+			NextDebitDate  *string `json:"next_debit_date"`
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -1098,8 +1209,11 @@ func createInvestment(deps Deps) http.HandlerFunc {
 		if b.Type == "" {
 			b.Type = "sip"
 		}
-		// Default frequency depends on instrument: stocks/etfs are one-off
-		// (lumpsum), recurring contributions (sip/rd) default monthly.
+		if !validInvestmentType(b.Type) {
+			errJSON(w, 400, "invalid investment type")
+			return
+		}
+		// Recurring contributions (sip/rd) default monthly; the rest one-off.
 		if b.Frequency == "" {
 			switch b.Type {
 			case "sip", "rd":
@@ -1108,41 +1222,17 @@ func createInvestment(deps Deps) http.HandlerFunc {
 				b.Frequency = "lumpsum"
 			}
 		}
-
-		trading := isTradingType(b.Type)
-		if trading {
-			// A trade can only be placed against a trading account.
-			if b.AccountID == nil {
-				errJSON(w, 400, "a trading account is required to add stocks/ETFs/SIPs")
+		var nextDebit *string
+		if b.AutoDebit {
+			if msg := validateAutoDebit(b.AccountID, b.MonthlyAmount, b.Frequency); msg != "" {
+				errJSON(w, 400, msg)
 				return
 			}
-			var atype string
-			d.QueryRow("SELECT type FROM fin_accounts WHERE id = $1 AND user_id = $2", *b.AccountID, uid).Scan(&atype)
-			if atype != "trading" {
-				errJSON(w, 400, "trades must be linked to a trading account")
-				return
+			nextDebit = b.NextDebitDate
+			if nextDebit == nil || *nextDebit == "" {
+				nd := defaultNextDebitDate(b.StartDate, userNow(d, uid))
+				nextDebit = &nd
 			}
-		}
-		// Stocks/ETFs may carry a market symbol for EOD auto-pricing. When one is
-		// supplied, validate it once here (validate-on-submit) so a typo fails
-		// fast; when omitted the holding is created un-priced (manual value) —
-		// kept lenient so older clients that don't send a symbol still work. The
-		// web enforces presence for good UX. sip/mutual_fund stay manual.
-		if b.Type == "stock" || b.Type == "etf" {
-			b.Symbol = strings.ToUpper(strings.TrimSpace(b.Symbol))
-			if b.Symbol != "" {
-				if b.Exchange == "" {
-					b.Exchange = "NSE"
-				}
-				if err := validateSymbol(r.Context(), b.Symbol, b.Exchange); err != nil {
-					errJSON(w, 400, err.Error())
-					return
-				}
-			}
-		}
-		// Cost basis from units × price when supplied; else trust invested_amount.
-		if b.Quantity > 0 && b.AvgBuyPrice > 0 {
-			b.InvestedAmount = b.Quantity * b.AvgBuyPrice
 		}
 		if b.CurrentValue == 0 {
 			b.CurrentValue = b.InvestedAmount
@@ -1150,145 +1240,16 @@ func createInvestment(deps Deps) http.HandlerFunc {
 
 		var id int64
 		err := d.QueryRow(`INSERT INTO fin_investments
-			(user_id, name, type, account_id, invested_amount, current_value, monthly_amount, frequency, start_date, maturity_date, expected_return, notes, quantity, avg_buy_price, symbol, exchange, status)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'open') RETURNING id`,
+			(user_id, name, type, account_id, invested_amount, current_value, monthly_amount, frequency, start_date, maturity_date, expected_return, notes, auto_debit, next_debit_date)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
 			uid, b.Name, b.Type, b.AccountID, b.InvestedAmount, b.CurrentValue, b.MonthlyAmount, b.Frequency,
-			b.StartDate, b.MaturityDate, b.ExpectedReturn, b.Notes, b.Quantity, b.AvgBuyPrice, b.Symbol, b.Exchange,
+			b.StartDate, b.MaturityDate, b.ExpectedReturn, b.Notes, b.AutoDebit, nextDebit,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
-		// Buying deploys cash: debit the trading account so its balance reflects
-		// what's been spent. (Sells credit it back via the sell endpoint.)
-		if trading && b.AccountID != nil && b.InvestedAmount > 0 {
-			buyDate := userNow(d, uid).Format("2006-01-02")
-			if b.StartDate != nil && *b.StartDate != "" {
-				buyDate = *b.StartDate
-			}
-			d.Exec(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_at)
-				VALUES ($1,$2,'buy',$3,$4,($5::timestamp AT TIME ZONE 'Asia/Kolkata'))`, uid, *b.AccountID, b.InvestedAmount, "Buy "+b.Name, buyDate)
-		}
 		writeJSON(w, 201, map[string]int64{"id": id})
-	}
-}
-
-// sellInvestment books a (partial or full) sale of a trading holding: it
-// reduces the holding's units/cost basis, accumulates realized P/L, and posts
-// a `sell` transaction crediting the linked trading account with the proceeds.
-func sellInvestment(deps Deps) http.HandlerFunc {
-	d := deps.DB
-	return func(w http.ResponseWriter, r *http.Request) {
-		uid := userID(r.Context())
-		id, err := intParam(r, "id")
-		if err != nil {
-			errJSON(w, 400, "invalid id")
-			return
-		}
-		var b struct {
-			Units  float64 `json:"units"`  // units to sell; <=0 or >held => sell all
-			Price  float64 `json:"price"`  // sale price per unit
-			Amount float64 `json:"amount"` // alt: total proceeds when no units tracked
-			Date   string  `json:"date"`
-		}
-		if err := readJSON(r, &b); err != nil {
-			errJSON(w, 400, "invalid json")
-			return
-		}
-
-		var name string
-		var acctID *int64
-		var qty, avgPrice, invested, current, realized float64
-		var status string
-		err = d.QueryRow(`SELECT name, account_id, quantity, avg_buy_price, invested_amount, current_value, realized_pl, status
-			FROM fin_investments WHERE id = $1 AND user_id = $2`, id, uid).Scan(
-			&name, &acctID, &qty, &avgPrice, &invested, &current, &realized, &status)
-		if err != nil {
-			errJSON(w, 404, "not found")
-			return
-		}
-		if acctID == nil {
-			errJSON(w, 400, "holding has no trading account")
-			return
-		}
-		if status == "closed" {
-			errJSON(w, 400, "holding already sold")
-			return
-		}
-
-		date := b.Date
-		if date == "" {
-			date = userNow(d, uid).Format("2006-01-02")
-		}
-
-		// Determine proceeds + cost of the sold portion.
-		var proceeds, costSold, sellUnits float64
-		if qty > 0 {
-			sellUnits = b.Units
-			if sellUnits <= 0 || sellUnits > qty {
-				sellUnits = qty // default / clamp to a full exit
-			}
-			proceeds = sellUnits * b.Price
-			costSold = sellUnits * avgPrice
-		} else {
-			// Legacy holding with no unit tracking: full sell by total amount.
-			proceeds = b.Amount
-			if proceeds == 0 {
-				proceeds = b.Price
-			}
-			costSold = invested
-		}
-
-		newRealized := realized + (proceeds - costSold)
-		newQty := qty - sellUnits
-
-		var newInvested, newCurrent float64
-		newStatus := status
-		if qty > 0 && newQty > 0 {
-			frac := newQty / qty
-			newInvested = invested * frac
-			newCurrent = current * frac
-		} else {
-			newStatus = "closed" // nothing left (or untracked full sell)
-		}
-
-		tx, terr := d.Begin()
-		if terr != nil {
-			errJSON(w, 500, terr.Error())
-			return
-		}
-		if newStatus == "closed" {
-			if _, e := tx.Exec(`UPDATE fin_investments
-				SET quantity = 0, invested_amount = 0, current_value = 0, realized_pl = $1,
-				    status = 'closed', sold_at = NOW(), last_updated = NOW()
-				WHERE id = $2 AND user_id = $3`, newRealized, id, uid); e != nil {
-				tx.Rollback()
-				errJSON(w, 500, e.Error())
-				return
-			}
-		} else {
-			if _, e := tx.Exec(`UPDATE fin_investments
-				SET quantity = $1, invested_amount = $2, current_value = $3, realized_pl = $4, last_updated = NOW()
-				WHERE id = $5 AND user_id = $6`, newQty, newInvested, newCurrent, newRealized, id, uid); e != nil {
-				tx.Rollback()
-				errJSON(w, 500, e.Error())
-				return
-			}
-		}
-		if _, e := tx.Exec(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_at)
-			VALUES ($1,$2,'sell',$3,$4,($5::timestamp AT TIME ZONE 'Asia/Kolkata'))`, uid, *acctID, proceeds, "Sell "+name, date); e != nil {
-			tx.Rollback()
-			errJSON(w, 500, e.Error())
-			return
-		}
-		if err := tx.Commit(); err != nil {
-			errJSON(w, 500, err.Error())
-			return
-		}
-		writeJSON(w, 200, map[string]any{
-			"status": "ok", "proceeds": proceeds, "realized_pl": newRealized,
-			"remaining_units": newQty, "closed": newStatus == "closed",
-		})
 	}
 }
 
@@ -1313,14 +1274,51 @@ func updateInvestment(deps Deps) http.HandlerFunc {
 			MaturityDate   *string  `json:"maturity_date"`
 			ExpectedReturn *float64 `json:"expected_return"`
 			Notes          *string  `json:"notes"`
-			Quantity       *float64 `json:"quantity"`
-			AvgBuyPrice    *float64 `json:"avg_buy_price"`
-			Symbol         *string  `json:"symbol"`
-			Exchange       *string  `json:"exchange"`
+			AutoDebit      *bool    `json:"auto_debit"`
+			NextDebitDate  *string  `json:"next_debit_date"`
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
 			return
+		}
+		if b.Type != nil && !validInvestmentType(*b.Type) {
+			errJSON(w, 400, "invalid investment type")
+			return
+		}
+		// Enabling auto-debit re-validates against the row's effective state
+		// (patch value when sent, stored value otherwise).
+		if b.AutoDebit != nil && *b.AutoDebit {
+			var curAcct *int64
+			var curMonthly float64
+			var curFreq string
+			var curStart *string
+			if err := d.QueryRow(`SELECT account_id, monthly_amount, frequency, start_date::text
+				FROM fin_investments WHERE id = $1 AND user_id = $2`, id, uid).Scan(&curAcct, &curMonthly, &curFreq, &curStart); err != nil {
+				errJSON(w, 404, "not found")
+				return
+			}
+			acct, monthly, freq := curAcct, curMonthly, curFreq
+			if b.AccountID != nil {
+				acct = b.AccountID
+			}
+			if b.MonthlyAmount != nil {
+				monthly = *b.MonthlyAmount
+			}
+			if b.Frequency != nil {
+				freq = *b.Frequency
+			}
+			if msg := validateAutoDebit(acct, monthly, freq); msg != "" {
+				errJSON(w, 400, msg)
+				return
+			}
+			if b.NextDebitDate == nil || *b.NextDebitDate == "" {
+				start := curStart
+				if b.StartDate != nil {
+					start = b.StartDate
+				}
+				nd := defaultNextDebitDate(start, userNow(d, uid))
+				b.NextDebitDate = &nd
+			}
 		}
 		set := []string{"last_updated = NOW()"}
 		args := []any{}
@@ -1363,21 +1361,14 @@ func updateInvestment(deps Deps) http.HandlerFunc {
 		if b.Notes != nil {
 			add("notes", *b.Notes)
 		}
-		if b.Quantity != nil {
-			add("quantity", *b.Quantity)
+		if b.AutoDebit != nil {
+			add("auto_debit", *b.AutoDebit)
+			if !*b.AutoDebit {
+				set = append(set, "next_debit_date = NULL")
+			}
 		}
-		if b.AvgBuyPrice != nil {
-			add("avg_buy_price", *b.AvgBuyPrice)
-		}
-		// A symbol edit is lazily re-validated by the next price refresh: reset
-		// price_at (→ stalest, NULLS FIRST) and clear the stale error so the
-		// next ping re-fetches and re-proves it.
-		if b.Symbol != nil {
-			add("symbol", strings.ToUpper(strings.TrimSpace(*b.Symbol)))
-			set = append(set, "price_at = NULL", "price_error = ''")
-		}
-		if b.Exchange != nil {
-			add("exchange", *b.Exchange)
+		if b.NextDebitDate != nil && *b.NextDebitDate != "" {
+			add("next_debit_date", *b.NextDebitDate)
 		}
 		args = append(args, id, uid)
 		q := "UPDATE fin_investments SET " + strings.Join(set, ", ") + " WHERE id = $" + itoa(ph) + " AND user_id = $" + itoa(ph+1)
@@ -2199,31 +2190,55 @@ func exportBudgetsCSV(deps Deps) http.HandlerFunc {
 		writeCSVHeader(w, "sajni_budgets.csv")
 		cw := csv.NewWriter(w)
 		defer cw.Flush()
-		cw.Write([]string{"budget", "period", "start_date", "end_date", "category", "allocated", "spent"})
-		rows, _ := d.Query(`SELECT b.id, b.name, b.period, b.start_date::text, b.end_date::text
+		now := userNow(d, uid)
+		cw.Write([]string{"budget", "period", "window_start", "window_end", "pockets_filter", "category", "allocated", "spent"})
+		rows, _ := d.Query(`SELECT b.id, b.name, b.period, b.start_date::text, b.end_date::text, b.total_amount
 			FROM fin_budgets WHERE user_id = $1 ORDER BY b.start_date ASC`, uid)
 		if rows != nil {
 			for rows.Next() {
 				var bid int64
 				var name, period, sd, ed string
-				rows.Scan(&bid, &name, &period, &sd, &ed)
+				var total float64
+				rows.Scan(&bid, &name, &period, &sd, &ed, &total)
+				ws, we := budgetWindow(period, sd, ed, "", now)
+				// pocket filter (names for the CSV, ids for the spent query)
+				var pocketIDs []int64
+				var pocketNames []string
+				prows, _ := d.Query(`SELECT p.id, p.name FROM fin_budget_pockets bp
+					JOIN fin_pockets p ON p.id = bp.pocket_id WHERE bp.budget_id = $1`, bid)
+				if prows != nil {
+					for prows.Next() {
+						var pid int64
+						var pname string
+						prows.Scan(&pid, &pname)
+						pocketIDs = append(pocketIDs, pid)
+						pocketNames = append(pocketNames, pname)
+					}
+					prows.Close()
+				}
 				irows, _ := d.Query(`SELECT COALESCE(c.name,''), bi.amount,
 					COALESCE((SELECT SUM(t.amount) FROM fin_transactions t WHERE t.user_id = $1 AND t.type = 'expense' AND t.category_id = bi.category_id AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3), 0)
 					FROM fin_budget_items bi LEFT JOIN fin_categories c ON c.id = bi.category_id
-					WHERE bi.budget_id = $4`, uid, sd, ed, bid)
+					WHERE bi.budget_id = $4`, uid, ws, we, bid)
 				if irows != nil {
 					for irows.Next() {
 						var cat string
 						var alloc, spent float64
 						irows.Scan(&cat, &alloc, &spent)
 						cw.Write([]string{
-							name, period, sd, ed, cat,
+							name, period, ws, we, strings.Join(pocketNames, ";"), cat,
 							strconv.FormatFloat(alloc, 'f', 2, 64),
 							strconv.FormatFloat(spent, 'f', 2, 64),
 						})
 					}
 					irows.Close()
 				}
+				// overall row: the budget's filtered total spend
+				cw.Write([]string{
+					name, period, ws, we, strings.Join(pocketNames, ";"), "TOTAL",
+					strconv.FormatFloat(total, 'f', 2, 64),
+					strconv.FormatFloat(budgetSpent(d, uid, ws, we, pocketIDs), 'f', 2, 64),
+				})
 			}
 			rows.Close()
 		}

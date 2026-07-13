@@ -3,9 +3,9 @@ package api
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -14,10 +14,11 @@ import (
 	"sajni/internal/push"
 )
 
-// Billers + subscriptions live alongside finance: every biller schedules a
-// recurring expense against an account. The nightly tick (see
-// ProcessBillerCron) emits "upcoming" alerts before the due date and, for
-// auto-renew rows, posts the transaction once the date passes.
+// Billers live alongside finance in two kinds: 'subscription' (fixed amount,
+// may auto_renew — the cron posts the txn) and 'bill' (variable amount, e.g.
+// electricity — amount is an optional estimate; the user marks paid with the
+// actual). The hourly tick (see ProcessBillerCron) emits "upcoming" alerts
+// before the due date and posts auto-renew txns once the date passes.
 
 func registerBillerRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/finance/billers", listBillers(deps))
@@ -25,14 +26,18 @@ func registerBillerRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("PUT /api/finance/billers/{id}", updateBiller(deps))
 	mux.HandleFunc("DELETE /api/finance/billers/{id}", deleteBiller(deps))
 	mux.HandleFunc("POST /api/finance/billers/{id}/pay", payBiller(deps))
+	mux.HandleFunc("GET /api/finance/billers/{id}/payments", listBillerPayments(deps))
 
 	mux.HandleFunc("GET /api/finance/billers/alerts", listBillerAlerts(deps))
 	mux.HandleFunc("POST /api/finance/billers/alerts/{id}/seen", markBillerAlertSeen(deps))
 }
 
+// is_subscription/variable are legacy fields kept in the JSON until android
+// parity ships; variable is derived from kind so old clients keep working.
 type billerResp struct {
 	ID             int64   `json:"id"`
 	Name           string  `json:"name"`
+	Kind           string  `json:"kind"`
 	Amount         float64 `json:"amount"`
 	Frequency      string  `json:"frequency"`
 	NextDueDate    string  `json:"next_due_date"`
@@ -50,7 +55,12 @@ type billerResp struct {
 	Notes          string  `json:"notes"`
 	Archived       bool    `json:"archived"`
 	LastPaidDate   *string `json:"last_paid_date"`
+	LastPaidAmount *float64 `json:"last_paid_amount"`
 	CreatedAt      string  `json:"created_at"`
+}
+
+func validBillerKind(k string) bool {
+	return k == "subscription" || k == "bill"
 }
 
 // validFrequency keeps the schema strict (we lean on this in advanceDueDate).
@@ -82,10 +92,11 @@ func listBillers(deps Deps) http.HandlerFunc {
 		uid := userID(r.Context())
 		includeArchived := queryParam(r, "include_archived") == "true"
 
-		q := `SELECT b.id, b.name, b.amount, b.frequency, b.next_due_date::text,
+		q := `SELECT b.id, b.name, b.kind, b.amount, b.frequency, b.next_due_date::text,
 			b.account_id, a.name, b.category_id, c.name, c.color,
-			b.is_subscription, b.auto_renew, b.remind_task, b.variable, b.alert_days, b.color, b.notes, b.archived,
+			b.is_subscription, b.auto_renew, b.remind_task, b.alert_days, b.color, b.notes, b.archived,
 			(SELECT MAX(paid_date)::text FROM fin_biller_payments p WHERE p.biller_id = b.id),
+			(SELECT amount FROM fin_biller_payments p WHERE p.biller_id = b.id ORDER BY paid_date DESC, id DESC LIMIT 1),
 			b.created_at::text
 			FROM fin_billers b
 			LEFT JOIN fin_accounts a ON a.id = b.account_id
@@ -105,10 +116,11 @@ func listBillers(deps Deps) http.HandlerFunc {
 		out := []billerResp{}
 		for rows.Next() {
 			var b billerResp
-			rows.Scan(&b.ID, &b.Name, &b.Amount, &b.Frequency, &b.NextDueDate,
+			rows.Scan(&b.ID, &b.Name, &b.Kind, &b.Amount, &b.Frequency, &b.NextDueDate,
 				&b.AccountID, &b.AccountName, &b.CategoryID, &b.CategoryName, &b.CategoryColor,
-				&b.IsSubscription, &b.AutoRenew, &b.RemindTask, &b.Variable, &b.AlertDays, &b.Color, &b.Notes, &b.Archived,
-				&b.LastPaidDate, &b.CreatedAt)
+				&b.IsSubscription, &b.AutoRenew, &b.RemindTask, &b.AlertDays, &b.Color, &b.Notes, &b.Archived,
+				&b.LastPaidDate, &b.LastPaidAmount, &b.CreatedAt)
+			b.Variable = b.Kind == "bill"
 			out = append(out, b)
 		}
 		writeJSON(w, 200, out)
@@ -121,6 +133,7 @@ func createBiller(deps Deps) http.HandlerFunc {
 		uid := userID(r.Context())
 		var body struct {
 			Name           string  `json:"name"`
+			Kind           string  `json:"kind"`
 			Amount         float64 `json:"amount"`
 			Frequency      string  `json:"frequency"`
 			NextDueDate    string  `json:"next_due_date"`
@@ -129,7 +142,7 @@ func createBiller(deps Deps) http.HandlerFunc {
 			IsSubscription bool    `json:"is_subscription"`
 			AutoRenew      bool    `json:"auto_renew"`
 			RemindTask     bool    `json:"remind_task"`
-			Variable       bool    `json:"variable"`
+			Variable       bool    `json:"variable"` // legacy clients: variable=true → kind=bill
 			AlertDays      *int    `json:"alert_days"`
 			Color          string  `json:"color"`
 			Notes          string  `json:"notes"`
@@ -141,6 +154,26 @@ func createBiller(deps Deps) http.HandlerFunc {
 		if strings.TrimSpace(body.Name) == "" {
 			errJSON(w, 400, "name required")
 			return
+		}
+		if body.Kind == "" {
+			if body.Variable {
+				body.Kind = "bill"
+			} else {
+				body.Kind = "subscription"
+			}
+		}
+		if !validBillerKind(body.Kind) {
+			errJSON(w, 400, "invalid kind")
+			return
+		}
+		// Subscriptions have a fixed price; bills carry an optional estimate.
+		if body.Kind == "subscription" && body.Amount <= 0 {
+			errJSON(w, 400, "subscription needs a fixed amount")
+			return
+		}
+		// Bills never auto-pay — the amount isn't known until the bill lands.
+		if body.Kind == "bill" {
+			body.AutoRenew = false
 		}
 		if body.Frequency == "" {
 			body.Frequency = "monthly"
@@ -165,11 +198,11 @@ func createBiller(deps Deps) http.HandlerFunc {
 		}
 		var id int64
 		err := d.QueryRow(`INSERT INTO fin_billers
-			(user_id, name, amount, frequency, next_due_date, account_id, category_id,
+			(user_id, name, kind, amount, frequency, next_due_date, account_id, category_id,
 			 is_subscription, auto_renew, remind_task, variable, alert_days, color, notes)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
-			uid, body.Name, body.Amount, body.Frequency, body.NextDueDate, body.AccountID, body.CategoryID,
-			body.IsSubscription, body.AutoRenew, body.RemindTask, body.Variable, alertDays, body.Color, body.Notes).Scan(&id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
+			uid, body.Name, body.Kind, body.Amount, body.Frequency, body.NextDueDate, body.AccountID, body.CategoryID,
+			body.IsSubscription, body.AutoRenew, body.RemindTask, body.Kind == "bill", alertDays, body.Color, body.Notes).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
@@ -189,6 +222,7 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		}
 		var body struct {
 			Name           *string  `json:"name"`
+			Kind           *string  `json:"kind"`
 			Amount         *float64 `json:"amount"`
 			Frequency      *string  `json:"frequency"`
 			NextDueDate    *string  `json:"next_due_date"`
@@ -197,7 +231,7 @@ func updateBiller(deps Deps) http.HandlerFunc {
 			IsSubscription *bool    `json:"is_subscription"`
 			AutoRenew      *bool    `json:"auto_renew"`
 			RemindTask     *bool    `json:"remind_task"`
-			Variable       *bool    `json:"variable"`
+			Variable       *bool    `json:"variable"` // legacy alias for kind
 			AlertDays      *int     `json:"alert_days"`
 			Color          *string  `json:"color"`
 			Notes          *string  `json:"notes"`
@@ -206,6 +240,42 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
 			return
+		}
+		if body.Kind == nil && body.Variable != nil {
+			k := "subscription"
+			if *body.Variable {
+				k = "bill"
+			}
+			body.Kind = &k
+		}
+		if body.Kind != nil && !validBillerKind(*body.Kind) {
+			errJSON(w, 400, "invalid kind")
+			return
+		}
+		// Re-validate the kind rules against the row's effective state.
+		var curKind string
+		var curAmount float64
+		if err := d.QueryRow(`SELECT kind, amount FROM fin_billers WHERE id = $1 AND user_id = $2`,
+			id, uid).Scan(&curKind, &curAmount); err != nil {
+			errJSON(w, 404, "biller not found")
+			return
+		}
+		effKind, effAmount := curKind, curAmount
+		if body.Kind != nil {
+			effKind = *body.Kind
+		}
+		if body.Amount != nil {
+			effAmount = *body.Amount
+		}
+		if effKind == "subscription" && effAmount <= 0 {
+			errJSON(w, 400, "subscription needs a fixed amount")
+			return
+		}
+		if effKind == "bill" {
+			// Bills never auto-pay; force it off on any edit that lands in
+			// (or stays in) bill kind.
+			f := false
+			body.AutoRenew = &f
 		}
 		set := []string{"updated_at = NOW()"}
 		args := []any{}
@@ -217,6 +287,10 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		}
 		if body.Name != nil {
 			add("name", *body.Name)
+		}
+		if body.Kind != nil {
+			add("kind", *body.Kind)
+			add("variable", *body.Kind == "bill")
 		}
 		if body.Amount != nil {
 			add("amount", *body.Amount)
@@ -245,9 +319,6 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		}
 		if body.RemindTask != nil {
 			add("remind_task", *body.RemindTask)
-		}
-		if body.Variable != nil {
-			add("variable", *body.Variable)
 		}
 		if body.AlertDays != nil {
 			add("alert_days", *body.AlertDays)
@@ -286,8 +357,15 @@ func deleteBiller(deps Deps) http.HandlerFunc {
 	}
 }
 
-// payBiller posts a transaction for the biller's current due cycle and
-// rolls next_due_date forward. Idempotent on (biller_id, due_date).
+// payBiller records the biller's current due cycle and rolls next_due_date
+// forward. Two modes:
+//   - record (default): posts an expense txn like before; `amount` overrides
+//     the stored amount (a Bill's mark-paid asks the actual).
+//   - attach (attach_txn_ids set): links pre-existing txns to the cycle and
+//     creates NO txn — no account needed since nothing posts.
+//
+// Idempotent on (biller_id, due_date); a second pay of the same cycle
+// returns already_paid instead of double-posting.
 func payBiller(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -298,8 +376,9 @@ func payBiller(deps Deps) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			PaidDate string   `json:"paid_date"`
-			Amount   *float64 `json:"amount"`
+			PaidDate     string   `json:"paid_date"`
+			Amount       *float64 `json:"amount"`
+			AttachTxnIDs []int64  `json:"attach_txn_ids"`
 		}
 		readJSON(r, &body)
 
@@ -314,10 +393,6 @@ func payBiller(deps Deps) http.HandlerFunc {
 			errJSON(w, 404, "biller not found")
 			return
 		}
-		if !accountID.Valid {
-			errJSON(w, 400, "biller has no account; assign one before paying")
-			return
-		}
 		if body.Amount != nil {
 			amount = *body.Amount
 		}
@@ -326,11 +401,26 @@ func payBiller(deps Deps) http.HandlerFunc {
 			paidDate = userNow(d, uid).Format("2006-01-02")
 		}
 
-		txnID, perr := postBillerTxn(r.Context(), deps, uid, id, accountID.Int64, categoryID,
-			name, amount, paidDate, dueDate, false)
-		if perr != nil {
-			errJSON(w, 500, perr.Error())
-			return
+		var txnID int64
+		var alreadyPaid bool
+		if len(body.AttachTxnIDs) > 0 {
+			alreadyPaid, err = attachBillerTxns(r.Context(), deps, uid, id, body.AttachTxnIDs,
+				body.Amount, paidDate, dueDate)
+			if err != nil {
+				errJSON(w, 400, err.Error())
+				return
+			}
+		} else {
+			if !accountID.Valid {
+				errJSON(w, 400, "biller has no account; assign one before paying")
+				return
+			}
+			txnID, alreadyPaid, err = postBillerTxn(r.Context(), deps, uid, id, accountID.Int64, categoryID,
+				name, amount, paidDate, dueDate, false)
+			if err != nil {
+				errJSON(w, 500, err.Error())
+				return
+			}
 		}
 
 		due, _ := time.Parse("2006-01-02", dueDate)
@@ -341,47 +431,190 @@ func payBiller(deps Deps) http.HandlerFunc {
 		writeJSON(w, 200, map[string]any{
 			"status":        "ok",
 			"txn_id":        txnID,
+			"already_paid":  alreadyPaid,
 			"next_due_date": next.Format("2006-01-02"),
 		})
 	}
 }
 
-// postBillerTxn inserts the transaction row, links it to the biller via
-// fin_biller_payments, and is idempotent on (biller_id, due_date). Returns
-// the txn id (0 if a duplicate payment row already existed).
+// postBillerTxn posts one biller cycle inside a single DB transaction,
+// payment-row-FIRST so the UNIQUE(biller_id, due_date) key gates the txn
+// insert — concurrent manual pay + cron can never double-post a cycle.
+// Returns (0, true, nil) when the cycle was already recorded.
 func postBillerTxn(ctx context.Context, deps Deps, uid string, billerID, accountID int64,
 	categoryID sql.NullInt64, name string, amount float64, paidDate, dueDate string, auto bool,
-) (int64, error) {
-	d := deps.DB
-	// Skip if already posted for this cycle.
-	var exists int
-	d.QueryRowContext(ctx, `SELECT 1 FROM fin_biller_payments WHERE biller_id = $1 AND due_date = $2`,
-		billerID, dueDate).Scan(&exists)
-	if exists == 1 {
-		return 0, nil
+) (int64, bool, error) {
+	tx, err := deps.DB.Begin()
+	if err != nil {
+		return 0, false, err
+	}
+	defer tx.Rollback()
+
+	var paymentID int64
+	err = tx.QueryRowContext(ctx,
+		`INSERT INTO fin_biller_payments (user_id, biller_id, due_date, paid_date, amount, auto)
+		 VALUES ($1,$2,$3,$4,$5,$6)
+		 ON CONFLICT (biller_id, due_date) DO NOTHING RETURNING id`,
+		uid, billerID, dueDate, paidDate, amount, auto).Scan(&paymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, true, tx.Commit() // cycle already recorded
+		}
+		return 0, false, err
 	}
 
 	desc := name
 	if auto {
 		desc = name + " (auto)"
 	}
-	var txnID int64
 	var catArg any
 	if categoryID.Valid {
 		catArg = categoryID.Int64
 	}
-	err := d.QueryRowContext(ctx,
+	// System-posted txn: no pocket (biller money is ambient — General).
+	var txnID int64
+	if err := tx.QueryRowContext(ctx,
 		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_at)
 		 VALUES ($1,$2,$3,'expense',$4,$5,($6::timestamp AT TIME ZONE 'Asia/Kolkata')) RETURNING id`,
-		uid, accountID, catArg, amount, desc, paidDate).Scan(&txnID)
-	if err != nil {
-		return 0, err
+		uid, accountID, catArg, amount, desc, paidDate).Scan(&txnID); err != nil {
+		return 0, false, err
 	}
-	_, err = d.ExecContext(ctx,
-		`INSERT INTO fin_biller_payments (user_id, biller_id, txn_id, due_date, paid_date, amount, auto)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (biller_id, due_date) DO NOTHING`,
-		uid, billerID, txnID, dueDate, paidDate, amount, auto)
-	return txnID, err
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE fin_biller_payments SET txn_id = $1 WHERE id = $2`, txnID, paymentID); err != nil {
+		return 0, false, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO fin_biller_payment_txns (payment_id, txn_id) VALUES ($1,$2)`,
+		paymentID, txnID); err != nil {
+		return 0, false, err
+	}
+	return txnID, false, tx.Commit()
+}
+
+// attachBillerTxns records a cycle as paid by linking pre-existing txns to
+// it (no new txn). Payment amount = the explicit override or the sum of the
+// attached txns. Returns alreadyPaid=true when the cycle was recorded before.
+func attachBillerTxns(ctx context.Context, deps Deps, uid string, billerID int64,
+	txnIDs []int64, amountOverride *float64, paidDate, dueDate string,
+) (bool, error) {
+	d := deps.DB
+	// Verify ownership + sum in one shot; a count mismatch means a foreign
+	// or missing txn id.
+	var cnt int
+	var sum float64
+	if err := d.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(amount),0)
+		FROM fin_transactions WHERE user_id = $1 AND id = ANY($2)`,
+		uid, txnIDs).Scan(&cnt, &sum); err != nil {
+		return false, err
+	}
+	if cnt != len(txnIDs) {
+		return false, errors.New("one or more transactions not found")
+	}
+	amount := sum
+	if amountOverride != nil {
+		amount = *amountOverride
+	}
+
+	tx, err := d.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var paymentID int64
+	err = tx.QueryRowContext(ctx,
+		`INSERT INTO fin_biller_payments (user_id, biller_id, due_date, paid_date, amount, auto)
+		 VALUES ($1,$2,$3,$4,$5,FALSE)
+		 ON CONFLICT (biller_id, due_date) DO NOTHING RETURNING id`,
+		uid, billerID, dueDate, paidDate, amount).Scan(&paymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, tx.Commit()
+		}
+		return false, err
+	}
+	for _, tid := range txnIDs {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO fin_biller_payment_txns (payment_id, txn_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+			paymentID, tid); err != nil {
+			return false, err
+		}
+	}
+	return false, tx.Commit()
+}
+
+// listBillerPayments returns the payment history for one biller with each
+// cycle's linked txns (the link table plus the legacy single txn_id).
+func listBillerPayments(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		type payTxn struct {
+			ID          int64   `json:"id"`
+			Amount      float64 `json:"amount"`
+			Description string  `json:"description"`
+			TxnAt       string  `json:"txn_at"`
+			AccountName *string `json:"account_name"`
+		}
+		type payment struct {
+			ID       int64    `json:"id"`
+			DueDate  string   `json:"due_date"`
+			PaidDate string   `json:"paid_date"`
+			Amount   float64  `json:"amount"`
+			Auto     bool     `json:"auto"`
+			Txns     []payTxn `json:"txns"`
+		}
+		rows, err := d.Query(`SELECT id, due_date::text, paid_date::text, amount, auto
+			FROM fin_biller_payments WHERE biller_id = $1 AND user_id = $2
+			ORDER BY due_date DESC LIMIT 24`, id, uid)
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		out := []payment{}
+		ids := []int64{}
+		for rows.Next() {
+			var p payment
+			rows.Scan(&p.ID, &p.DueDate, &p.PaidDate, &p.Amount, &p.Auto)
+			p.Txns = []payTxn{}
+			out = append(out, p)
+			ids = append(ids, p.ID)
+		}
+		rows.Close()
+		if len(ids) > 0 {
+			trows, terr := d.Query(`SELECT l.payment_id, t.id, t.amount, t.description, t.txn_at::text, a.name
+				FROM (
+					SELECT payment_id, txn_id FROM fin_biller_payment_txns WHERE payment_id = ANY($1)
+					UNION
+					SELECT p.id, p.txn_id FROM fin_biller_payments p
+					WHERE p.id = ANY($1) AND p.txn_id IS NOT NULL
+				) l
+				JOIN fin_transactions t ON t.id = l.txn_id
+				LEFT JOIN fin_accounts a ON a.id = t.account_id
+				ORDER BY t.txn_at DESC`, ids)
+			if terr == nil {
+				byPayment := map[int64][]payTxn{}
+				for trows.Next() {
+					var pid int64
+					var t payTxn
+					trows.Scan(&pid, &t.ID, &t.Amount, &t.Description, &t.TxnAt, &t.AccountName)
+					byPayment[pid] = append(byPayment[pid], t)
+				}
+				trows.Close()
+				for i := range out {
+					if txns, ok := byPayment[out[i].ID]; ok {
+						out[i].Txns = txns
+					}
+				}
+			}
+		}
+		writeJSON(w, 200, out)
+	}
 }
 
 // --- alerts ---
@@ -452,7 +685,7 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 	today := time.Now().In(defaultLoc).Format("2006-01-02")
 
 	rows, err := d.QueryContext(ctx, `SELECT id, user_id, name, amount, frequency, next_due_date::text,
-		account_id, category_id, auto_renew, remind_task, variable, alert_days
+		account_id, category_id, auto_renew, remind_task, alert_days
 		FROM fin_billers WHERE archived = FALSE`)
 	if err != nil {
 		return 0, 0, err
@@ -467,14 +700,13 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 		accountID, categoryID sql.NullInt64
 		autoRenew             bool
 		remindTask            bool
-		variable              bool
 		alertDays             int
 	}
 	var bills []bill
 	for rows.Next() {
 		var b bill
 		rows.Scan(&b.id, &b.userID, &b.name, &b.amount, &b.freq, &b.dueDate,
-			&b.accountID, &b.categoryID, &b.autoRenew, &b.remindTask, &b.variable, &b.alertDays)
+			&b.accountID, &b.categoryID, &b.autoRenew, &b.remindTask, &b.alertDays)
 		bills = append(bills, b)
 	}
 
@@ -484,42 +716,23 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 		if perr != nil {
 			continue
 		}
-		// 1) auto-renew: catch up every cycle whose due date is <= today.
+		// 1) auto-renew (subscriptions only — bills never carry the flag):
+		// catch up every cycle whose due date is <= today. A cycle the user
+		// already paid manually just skips (alreadyPaid) and keeps rolling.
 		if b.autoRenew && b.accountID.Valid {
 			for !due.After(todayT) {
-				// Variable billers (e.g. electricity) have no fixed amount, so
-				// auto-pay the most recent paid amount, falling back to the
-				// estimate on the very first cycle.
-				amt := b.amount
-				if b.variable {
-					var last sql.NullFloat64
-					d.QueryRowContext(ctx, `SELECT amount FROM fin_biller_payments
-						WHERE biller_id = $1 ORDER BY paid_date DESC, id DESC LIMIT 1`, b.id).Scan(&last)
-					if last.Valid && last.Float64 > 0 {
-						amt = last.Float64
-					}
-				}
-				_, terr := postBillerTxn(ctx, deps, b.userID, b.id, b.accountID.Int64, b.categoryID,
-					b.name, amt, today, due.Format("2006-01-02"), true)
+				_, alreadyPaid, terr := postBillerTxn(ctx, deps, b.userID, b.id, b.accountID.Int64, b.categoryID,
+					b.name, b.amount, today, due.Format("2006-01-02"), true)
 				if terr != nil {
 					log.Warn().Err(terr).Int64("biller", b.id).Msg("biller auto-post failed")
 					break
 				}
-				// Notify the user the auto-charge happened. Variable bills get a
-				// distinct kind so the UI + email can flag the estimated amount.
-				kind := "auto_paid"
-				if b.variable {
-					kind = "auto_paid_variable"
+				if !alreadyPaid {
+					d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
+						VALUES ($1,$2,'auto_paid',$3) ON CONFLICT DO NOTHING`,
+						b.userID, b.id, due.Format("2006-01-02"))
+					autoPosted++
 				}
-				res, _ := d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
-					VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
-					b.userID, b.id, kind, due.Format("2006-01-02"))
-				if b.variable {
-					if n, _ := res.RowsAffected(); n == 1 {
-						notifyVariableAutoPay(ctx, deps, b.userID, b.name, amt, due.Format("2006-01-02"))
-					}
-				}
-				autoPosted++
 				due = advanceDueDate(due, b.freq)
 			}
 			d.ExecContext(ctx, `UPDATE fin_billers SET next_due_date = $1, last_run_at = NOW() WHERE id = $2`,
@@ -573,42 +786,6 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 		}
 	}
 	return autoPosted, upcomingNoticed, nil
-}
-
-// notifyVariableAutoPay tells the user a variable biller was auto-paid with
-// an estimated (last-known) amount, so they can verify and adjust. Channels
-// follow users.notify_channel (push gate lives in notifyPush; the email is
-// skipped only when a push-only user's push landed). Best effort either
-// way: the in-app auto_paid_variable alert is the durable record.
-func notifyVariableAutoPay(ctx context.Context, deps Deps, uid, billerName string, amount float64, dueDate string) {
-	pushed := notifyPush(ctx, deps, uid, push.Notification{
-		Title: "Auto-paid " + billerName,
-		Body:  fmt.Sprintf("₹%.2f (estimated, due %s) — verify and adjust if it differs", amount, dueDate),
-		Route: "/finance",
-	})
-	if deps.Auth == nil {
-		return
-	}
-	var email, name, channel string
-	if err := deps.DB.QueryRowContext(ctx, `SELECT email, name, COALESCE(notify_channel,'both') FROM users WHERE id = $1`, uid).Scan(&email, &name, &channel); err != nil || email == "" {
-		return
-	}
-	if !channelWantsEmail(channel, pushed) {
-		return // push-only user, push delivered
-	}
-	if name == "" {
-		name = email
-	}
-	subject := "Auto-paid " + billerName + " (variable amount)"
-	html := "<p>Hi " + name + ",</p>" +
-		"<p>Your variable bill <strong>" + billerName + "</strong> (due " + dueDate + ") was auto-paid " +
-		"using the <strong>last known amount</strong> of <strong>₹" +
-		strconv.FormatFloat(amount, 'f', 2, 64) + "</strong>, since its exact amount isn't known upfront.</p>" +
-		"<p><strong>Please verify the actual bill and adjust the transaction in Sajni if it differs.</strong></p>" +
-		"<p>— Sajni</p>"
-	if err := deps.Auth.SendEmail(ctx, email, subject, html); err != nil {
-		log.Warn().Err(err).Str("biller", billerName).Msg("variable auto-pay email failed")
-	}
 }
 
 // spawnBillerTask creates a "Pay {name}" reminder task for a biller's due

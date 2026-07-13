@@ -133,7 +133,6 @@ echo -n "https://sajni-api-REGION-HASH.a.run.app" | gcloud secrets create API_BA
 echo -n "Sajni <hello@ohmysajni.com>"  | gcloud secrets create EMAIL_FROM     --data-file=-
 echo -n "info"                         | gcloud secrets create LOG_LEVEL      --data-file=-
 openssl rand -hex 32                   | gcloud secrets create REMINDER_CRON_SECRET --data-file=-
-openssl rand -hex 32                   | gcloud secrets create PRICE_CRON_SECRET    --data-file=-
 ```
 
 For OAuth providers, register the same-origin callback URLs that hit
@@ -245,12 +244,13 @@ gcloud scheduler jobs update http REMINDER_JOB_NAME \
   --time-zone="Asia/Kolkata"
 ```
 
-Prices are lazy-refreshed by `GET /api/finance/investments` when a
-stock/ETF price is older than one hour. Delete the old price scheduler
-job after this revision is deployed:
+Trading (and with it stock/ETF price fetching) was removed in 2026-07.
+Delete the old price scheduler job and its secret after this revision
+is deployed:
 
 ```sh
 gcloud scheduler jobs delete PRICE_JOB_NAME --location="$REGION"
+gcloud secrets delete PRICE_CRON_SECRET
 ```
 
 After a month of clean reminder logs, you can delete the daily reminder

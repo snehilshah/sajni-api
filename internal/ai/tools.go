@@ -129,6 +129,26 @@ func argStrSlice(args map[string]any, k string) []string {
 	return nil
 }
 
+func argInt64Slice(args map[string]any, k string) []int64 {
+	if v, ok := args[k]; ok && v != nil {
+		if arr, ok := v.([]any); ok {
+			out := make([]int64, 0, len(arr))
+			for _, x := range arr {
+				switch n := x.(type) {
+				case float64:
+					out = append(out, int64(n))
+				case int64:
+					out = append(out, n)
+				case int:
+					out = append(out, int64(n))
+				}
+			}
+			return out
+		}
+	}
+	return nil
+}
+
 // nullableStr returns nil for empty strings so we get NULL in DB instead of "".
 func nullableStr(s string) any {
 	if s == "" {
@@ -284,15 +304,24 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_finance_transactions",
-			Description: "List finance transactions with filters. Each transaction includes its category_id and category_name.",
+			Description: "List finance transactions with filters. Each transaction includes its category_id/category_name and pocket_id/pocket_name (pocket = spend context like a trip; no pocket = General).",
 			Schema: obj(map[string]*genai.Schema{
 				"account_id": intg("Filter by account."),
+				"pocket_id":  intg("Filter by pocket. 0 = General (no pocket)."),
 				"date_from":  str("ISO date."),
 				"date_to":    str("ISO date."),
 				"limit":      intg("Default 50."),
 			}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listTxnsTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "list_pockets",
+			Description: "List the user's pockets (spend contexts like 'Goa Trip') with this month's spend per pocket, the General (unpocketed) spend, and which pocket is active. New expenses default into the active pocket.",
+			Schema:      obj(map[string]*genai.Schema{}),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return listPocketsTool(ctx, d, uid)
 			},
 		},
 		{
@@ -307,8 +336,9 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_finance_budgets",
-			Description: "List the user's budgets with their period, start and end dates, total budget amount, total actual spent, and category breakdown (target vs spent). Use this to see if the user is over budget or analyzing spending.",
+			Description: "List the user's budgets with their computed window (monthly budgets roll automatically), total budget amount, total actual spent, pocket filter, and category breakdown (target vs spent). Use this to see if the user is over budget or analyzing spending.",
 			Schema: obj(map[string]*genai.Schema{
+				"month": str("Optional YYYY-MM to view a past month's spend for monthly budgets. Default: current month."),
 				"limit": intg("Maximum budgets to return (default 10)."),
 			}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
@@ -710,7 +740,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_billers",
-			Description: "List the user's billers / subscriptions with next due date, amount, account, and auto-renew flag. Use this to answer 'what bills are coming up?' or before creating a transaction the user might be paying via a biller.",
+			Description: "List the user's billers with kind ('subscription' = fixed amount, may auto-renew; 'bill' = variable amount like electricity), next due date, amount/estimate, account, and auto-renew flag. Use this to answer 'what bills are coming up?' or before creating a transaction the user might be paying via a biller.",
 			Schema: obj(map[string]*genai.Schema{
 				"include_archived": boolean("Include archived rows."),
 			}),
@@ -720,36 +750,60 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "create_biller",
-			Description: "Create a recurring bill or subscription. Resolve frequency to one of weekly | fortnightly | monthly | bimonthly. If auto_renew=true an account_id is required; the cron will post the expense automatically each cycle.",
+			Description: "Create a biller. kind='subscription' (fixed amount required, e.g. Netflix — may auto_renew) or kind='bill' (variable amount like electricity — amount is an optional estimate; the user records the actual when marking paid; never auto-renews). Resolve frequency to one of weekly | fortnightly | monthly | bimonthly. If auto_renew=true an account_id is required; the cron will post the expense automatically each cycle.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"name":            str("Required. e.g. 'Netflix' or 'Electricity'."),
-				"amount":          num("Required positive amount."),
-				"frequency":       str("weekly | fortnightly | monthly | bimonthly. Default monthly."),
-				"next_due_date":   str("ISO date for the next charge. Defaults to today."),
-				"account_id":      intg("Account that pays this. Required when auto_renew=true."),
-				"category_id":     intg("Optional expense category."),
-				"is_subscription": boolean("True for streaming-type recurring services."),
-				"auto_renew":      boolean("If true, cron posts the expense automatically on/after due date."),
-				"remind_task":     boolean("If true (and not auto_renew), the biller cron spawns a 'Pay {name}' reminder task each cycle that emails the user."),
-				"alert_days":      intg("Days before due_date to alert (default 3)."),
-				"notes":           str("Optional."),
-			}, "name", "amount"),
+				"name":          str("Required. e.g. 'Netflix' or 'Electricity'."),
+				"kind":          str("'subscription' (default) or 'bill'."),
+				"amount":        num("Required for subscriptions; optional estimate for bills."),
+				"frequency":     str("weekly | fortnightly | monthly | bimonthly. Default monthly."),
+				"next_due_date": str("ISO date for the next charge. Defaults to today."),
+				"account_id":    intg("Account that pays this. Required when auto_renew=true."),
+				"category_id":   intg("Optional expense category."),
+				"auto_renew":    boolean("Subscriptions only: cron posts the expense automatically on/after due date."),
+				"remind_task":   boolean("If true (and not auto_renew), the biller cron spawns a 'Pay {name}' reminder task each cycle that emails the user."),
+				"alert_days":    intg("Days before due_date to alert (default 3)."),
+				"notes":         str("Optional."),
+			}, "name"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createBillerTool(ctx, d, uid, args)
 			},
 		},
 		{
 			Name:        "pay_biller",
-			Description: "Mark a biller as paid for its current cycle: posts an expense transaction against the biller's account and rolls next_due_date forward by one period. Idempotent per (biller, due_date).",
+			Description: "Mark a biller paid for its current cycle and roll next_due_date forward. Default: posts an expense transaction against the biller's account (pass amount for the actual, e.g. a variable bill). Alternative: pass attach_txn_ids to link already-recorded transactions to the cycle instead — no new transaction is created. Idempotent per (biller, due_date); already_paid=true means the cycle was recorded before.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"biller_id": intg("Required."),
-				"amount":    num("Override the biller's amount for this cycle."),
-				"paid_date": str("ISO date. Defaults to today."),
+				"biller_id":      intg("Required."),
+				"amount":         num("Override the biller's amount for this cycle (the actual for a variable bill)."),
+				"paid_date":      str("ISO date. Defaults to today."),
+				"attach_txn_ids": arrayOf(intg(""), "Existing transaction ids to link as this cycle's payment (no new txn is posted)."),
 			}, "biller_id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return payBillerTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "create_pocket",
+			Description: "Create a pocket — a spend context like 'Goa Trip' or 'Wedding' that transactions can be filed into (each txn lives in exactly one pocket; none = General). Budgets can count spend from selected pockets.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"name":  str("Required. e.g. 'Goa Trip'."),
+				"color": str("Optional hex color."),
+			}, "name"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return createPocketTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "set_active_pocket",
+			Description: "Set or clear the user's active pocket. While a pocket is active, every new expense (manual, shared SMS, or created by you) defaults into it — e.g. activate 'Goa Trip' when the trip starts. Pass pocket_id=0 or omit to clear.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"pocket_id": intg("Pocket to activate; 0/omitted clears the active pocket."),
+			}),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return setActivePocketTool(ctx, d, uid, args)
 			},
 		},
 		{
@@ -854,7 +908,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "create_transaction",
-			Description: "Record a finance transaction against an existing account and assign a category. Use list_finance_accounts to get account_id. Specify either category_id or category_name; if category_name is specified, the backend will auto-match it to the closest existing category.",
+			Description: "Record a finance transaction against an existing account and assign a category. Use list_finance_accounts to get account_id. Specify either category_id or category_name; if category_name is specified, the backend will auto-match it to the closest existing category. Pockets: omit pocket_id to file under the user's active pocket (if any); pass 0 to force General; otherwise a pocket id from list_pockets.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"account_id":    intg("Required. The target account ID."),
@@ -864,6 +918,7 @@ func (s *Service) buildTools() []Tool {
 				"amount":        num("Positive amount."),
 				"description":   str("What it was for."),
 				"date":          str("ISO date. Defaults to today."),
+				"pocket_id":     intg("Omit → active pocket; 0 → General; N → that pocket."),
 			}, "account_id", "amount"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createTxnTool(ctx, d, uid, args)
@@ -871,7 +926,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "update_transaction",
-			Description: "Update an existing finance transaction by id — change its account, category, amount, type, description, or date. To move it to another account pass account_id (balances recompute automatically). To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. Use list_finance_transactions to find the id first.",
+			Description: "Update an existing finance transaction by id — change its account, category, pocket, amount, type, description, or date. To move it to another account pass account_id (balances recompute automatically). To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. To move it between pockets pass pocket_id (0 = General). Use list_finance_transactions to find the id first.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"id":            intg("Required. Transaction id to update."),
@@ -882,9 +937,24 @@ func (s *Service) buildTools() []Tool {
 				"amount":        num("Optional positive amount."),
 				"description":   str("Optional new description."),
 				"date":          str("Optional ISO date YYYY-MM-DD."),
+				"pocket_id":     intg("Optional. Move to this pocket; 0 = General. Omitted = untouched."),
 			}, "id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return updateTxnTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "set_investment_auto_debit",
+			Description: "Enable or disable auto-debit on a recurring investment (SIP/RD): when on, the cron posts the contribution from the linked account each cycle (monthly/quarterly/yearly) and notifies the user. Requires the investment to have a linked account and a per-cycle amount.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"investment_id":   intg("Required."),
+				"enabled":         boolean("Required. true = enable auto-debit."),
+				"account_id":      intg("Optionally (re)link this account."),
+				"next_debit_date": str("Optional ISO date for the first/next debit. Defaults to a projection of the start date."),
+			}, "investment_id", "enabled"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return setInvestmentAutoDebitTool(ctx, d, uid, args)
 			},
 		},
 	}
@@ -1391,10 +1461,20 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		clauses = append(clauses, fmt.Sprintf("(t.txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $%d", len(vals)+1))
 		vals = append(vals, dt)
 	}
+	// pocket_id=N filters to that pocket; 0 = General (no pocket).
+	if v, ok := args["pocket_id"]; ok && v != nil {
+		if p := argInt(args, "pocket_id", 0); p > 0 {
+			clauses = append(clauses, fmt.Sprintf("t.pocket_id=$%d", len(vals)+1))
+			vals = append(vals, p)
+		} else {
+			clauses = append(clauses, "t.pocket_id IS NULL")
+		}
+	}
 	limit := argInt(args, "limit", 50)
-	q := `SELECT t.id, t.account_id, t.type, t.amount, t.description, (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date::text, t.category_id, COALESCE(c.name, '')
+	q := `SELECT t.id, t.account_id, t.type, t.amount, t.description, (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date::text, t.category_id, COALESCE(c.name, ''), t.pocket_id, COALESCE(p.name, '')
 	      FROM fin_transactions t
 	      LEFT JOIN fin_categories c ON c.id = t.category_id
+	      LEFT JOIN fin_pockets p ON p.id = t.pocket_id
 	      WHERE ` + strings.Join(clauses, " AND ") +
 		fmt.Sprintf(` ORDER BY t.txn_at DESC LIMIT %d`, limit)
 	rows, err := d.QueryContext(ctx, q, vals...)
@@ -1407,15 +1487,19 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		var id, acct int64
 		var ttype, desc, date string
 		var amount float64
-		var catID sql.NullInt64
-		var catName string
-		rows.Scan(&id, &acct, &ttype, &amount, &desc, &date, &catID, &catName)
+		var catID, pocketID sql.NullInt64
+		var catName, pocketName string
+		rows.Scan(&id, &acct, &ttype, &amount, &desc, &date, &catID, &catName, &pocketID, &pocketName)
 		row := map[string]any{
 			"id": id, "account_id": acct, "type": ttype, "amount": amount,
 			"description": desc, "date": date, "category_name": catName,
 		}
 		if catID.Valid {
 			row["category_id"] = catID.Int64
+		}
+		if pocketID.Valid {
+			row["pocket_id"] = pocketID.Int64
+			row["pocket_name"] = pocketName
 		}
 		out = append(out, row)
 	}
@@ -2455,18 +2539,37 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		catArg = catID
 	}
 
+	// Pocket tri-state (mirrors api.resolvePocketID; duplicated to avoid an
+	// import cycle): omitted → active pocket; 0 → General; N → that pocket.
+	var pocketArg any = nil
+	if v, ok := args["pocket_id"]; ok && v != nil {
+		if p := argInt(args, "pocket_id", 0); p > 0 {
+			var okPocket bool
+			d.QueryRowContext(ctx, `SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2`, p, uid).Scan(&okPocket)
+			if !okPocket {
+				return nil, nil, fmt.Errorf("pocket not found")
+			}
+			pocketArg = p
+		}
+	} else {
+		var active int64
+		if err := d.QueryRowContext(ctx, `SELECT id FROM fin_pockets WHERE user_id = $1 AND is_active AND NOT archived`, uid).Scan(&active); err == nil {
+			pocketArg = active
+		}
+	}
+
 	// txn_at: a model-supplied date is read as IST midnight; absent → now (so a
 	// chat-logged "spent 200 on lunch" gets a real time, not midnight).
-	insArgs := []any{uid, acct, catArg, ttype, amount, desc}
+	insArgs := []any{uid, acct, catArg, ttype, amount, desc, pocketArg}
 	txnCol := "NOW()"
 	if date != "" {
-		txnCol = "($7::timestamp AT TIME ZONE 'Asia/Kolkata')"
+		txnCol = "($8::timestamp AT TIME ZONE 'Asia/Kolkata')"
 		insArgs = append(insArgs, date)
 	}
 	var id int64
 	err := d.QueryRowContext(ctx,
-		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,`+txnCol+`) RETURNING id`,
+		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, pocket_id, txn_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,`+txnCol+`) RETURNING id`,
 		insArgs...).Scan(&id)
 	if err != nil {
 		return nil, nil, err
@@ -2537,6 +2640,19 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		vals = append(vals, dt)
 		ph++
 	}
+	// pocket_id: 0 = General (NULL), N = that pocket, omitted = untouched.
+	if v, ok := args["pocket_id"]; ok && v != nil {
+		if p := argInt(args, "pocket_id", 0); p > 0 {
+			var okPocket bool
+			d.QueryRowContext(ctx, `SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2`, p, uid).Scan(&okPocket)
+			if !okPocket {
+				return nil, nil, fmt.Errorf("pocket not found")
+			}
+			add("pocket_id", p)
+		} else {
+			add("pocket_id", nil)
+		}
+	}
 	if len(sets) == 1 {
 		return nil, nil, fmt.Errorf("nothing to update")
 	}
@@ -2584,12 +2700,24 @@ func listCategoriesTool(ctx context.Context, d *db.DB, uid string, args map[stri
 
 func listBudgetsTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	limit := argInt(args, "limit", 10)
-	rows, err := d.QueryContext(ctx, `SELECT id, name, period, start_date::text, end_date::text, total_amount 
+	rows, err := d.QueryContext(ctx, `SELECT id, name, period, start_date::text, end_date::text, total_amount
 		FROM fin_budgets WHERE user_id = $1 ORDER BY start_date DESC LIMIT $2`, uid, limit)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
+
+	// Monthly budgets auto-roll: their window is the requested (or current)
+	// IST month, not their stored dates. Mirrors api.budgetWindow.
+	now := userTZNow(ctx, d, uid)
+	monthFirst := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	if m := argStr(args, "month"); m != "" {
+		if t, err := time.Parse("2006-01", m); err == nil {
+			monthFirst = t
+		}
+	}
+	monthStart := monthFirst.Format("2006-01-02")
+	monthEnd := monthFirst.AddDate(0, 1, -1).Format("2006-01-02")
 
 	out := []map[string]any{}
 	for rows.Next() {
@@ -2597,6 +2725,27 @@ func listBudgetsTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		var name, period, startDate, endDate string
 		var totalAmount float64
 		rows.Scan(&id, &name, &period, &startDate, &endDate, &totalAmount)
+
+		ws, we := startDate, endDate
+		if period == "monthly" {
+			ws, we = monthStart, monthEnd
+		}
+
+		// pocket filter: overall spent counts only txns in these pockets
+		var pocketIDs []int64
+		var pocketNames []string
+		prows, _ := d.QueryContext(ctx, `SELECT p.id, p.name FROM fin_budget_pockets bp
+			JOIN fin_pockets p ON p.id = bp.pocket_id WHERE bp.budget_id = $1`, id)
+		if prows != nil {
+			for prows.Next() {
+				var pid int64
+				var pname string
+				prows.Scan(&pid, &pname)
+				pocketIDs = append(pocketIDs, pid)
+				pocketNames = append(pocketNames, pname)
+			}
+			prows.Close()
+		}
 
 		// Fetch items breakdown
 		items := []map[string]any{}
@@ -2616,7 +2765,7 @@ func listBudgetsTool(ctx context.Context, d *db.DB, uid string, args map[string]
 				if catID.Valid {
 					d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
 						WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
-						uid, catID.Int64, startDate, endDate).Scan(&spent)
+						uid, catID.Int64, ws, we).Scan(&spent)
 				}
 				item := map[string]any{
 					"id": itemID, "category_name": catName, "amount": amt, "spent": spent,
@@ -2630,15 +2779,27 @@ func listBudgetsTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		}
 
 		var totalSpent float64
-		d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
-			uid, startDate, endDate).Scan(&totalSpent)
+		if len(pocketIDs) > 0 {
+			d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+				WHERE user_id = $1 AND type = 'expense' AND pocket_id = ANY($2) AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
+				uid, pocketIDs, ws, we).Scan(&totalSpent)
+		} else {
+			d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+				WHERE user_id = $1 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
+				uid, ws, we).Scan(&totalSpent)
+		}
 
-		out = append(out, map[string]any{
-			"id": id, "name": name, "period": period, "start_date": startDate,
-			"end_date": endDate, "total_amount": totalAmount, "spent": totalSpent,
+		row := map[string]any{
+			"id": id, "name": name, "period": period,
+			"window_start": ws, "window_end": we,
+			"total_amount": totalAmount, "spent": totalSpent,
 			"items": items,
-		})
+		}
+		if len(pocketNames) > 0 {
+			row["pocket_ids"] = pocketIDs
+			row["pocket_names"] = pocketNames
+		}
+		out = append(out, row)
 	}
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }

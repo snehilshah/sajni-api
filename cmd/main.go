@@ -123,6 +123,7 @@ func main() {
 	//
 	//   hourly  — purge soft-deleted users past the 7d window
 	//           — process billers (post auto-renew txns, raise upcoming alerts)
+	//           — process investment auto-debits (post contribution txns)
 	//   daily   — generate per-window insights (1w / 2w / 1m / 6m / 1y)
 	go func() {
 		// Run a pass at boot so a long downtime doesn't leave the queue stale.
@@ -131,6 +132,9 @@ func main() {
 		}
 		if posted, alerts, err := api.ProcessBillerCron(context.Background(), deps); err == nil && (posted+alerts) > 0 {
 			log.Info().Int("auto_posted", posted).Int("upcoming", alerts).Msg("billers processed at boot")
+		}
+		if posted, err := api.ProcessInvestmentDebits(context.Background(), deps); err == nil && posted > 0 {
+			log.Info().Int("debits", posted).Msg("investment auto-debits posted at boot")
 		}
 
 		hourly := time.NewTicker(time.Hour)
@@ -149,6 +153,11 @@ func main() {
 					log.Warn().Err(err).Msg("biller cron failed")
 				} else if posted+alerts > 0 {
 					log.Info().Int("auto_posted", posted).Int("upcoming", alerts).Msg("billers processed")
+				}
+				if posted, err := api.ProcessInvestmentDebits(context.Background(), deps); err != nil {
+					log.Warn().Err(err).Msg("investment debit cron failed")
+				} else if posted > 0 {
+					log.Info().Int("debits", posted).Msg("investment auto-debits posted")
 				}
 			case <-daily.C:
 				if n, err := api.RunDailyInsightCron(context.Background(), deps); err != nil {
