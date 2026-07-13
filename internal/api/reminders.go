@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"time"
@@ -25,6 +26,7 @@ import (
 // send. Without it, recovering from a multi-hour outage would blast every
 // reminder whose window elapsed while we were down.
 const reminderGrace = 30 * time.Minute
+const reminderClaimLease = 5 * time.Minute
 
 // defaultTZ is the fallback zone when a user's timezone is unset/unparseable.
 // Every Sajni user is IST (see the users.timezone backfill in db.migrate), so
@@ -184,19 +186,27 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 	// Window: scheduled_at has arrived, the event isn't stale beyond the grace
 	// floor, the task is still open, and we haven't sent yet.
 	rows, err := d.QueryContext(ctx, `
-		SELECT t.id, t.title, t.scheduled_at, u.id, u.email, u.name, COALESCE(u.timezone,''),
-		       COALESCE(u.notify_channel,'both'),
-		       COALESCE(t.notify_emails, '[]'::jsonb)
-		  FROM tasks t
-		  JOIN users u ON u.id = t.user_id
-		 WHERE t.remind = TRUE
-		   AND t.reminded_at IS NULL
-		   AND t.status NOT IN ('done','scratched')
-		   AND t.scheduled_at IS NOT NULL
-		   AND t.scheduled_at <= NOW()
-		   AND t.scheduled_at >= NOW() - make_interval(secs => $1)
-		   AND u.deleted_at IS NULL`,
-		int(reminderGrace.Seconds()))
+		WITH due AS (
+			SELECT t.id
+			  FROM tasks t
+			  JOIN users u ON u.id = t.user_id
+			 WHERE t.remind = TRUE
+			   AND t.reminded_at IS NULL
+			   AND (t.reminder_claimed_until IS NULL OR t.reminder_claimed_until < NOW())
+			   AND t.status NOT IN ('done','scratched')
+			   AND t.scheduled_at IS NOT NULL
+			   AND t.scheduled_at <= NOW()
+			   AND t.scheduled_at >= NOW() - make_interval(secs => $1)
+			   AND u.deleted_at IS NULL
+			 FOR UPDATE OF t SKIP LOCKED
+		)
+		UPDATE tasks t
+		   SET reminder_claimed_until = NOW() + make_interval(secs => $2)
+		  FROM due, users u
+		 WHERE t.id = due.id AND u.id = t.user_id
+		RETURNING t.id, t.title, t.scheduled_at, u.id, u.email, u.name, COALESCE(u.timezone,''),
+		          COALESCE(u.notify_channel,'both'), COALESCE(t.notify_emails, '[]'::jsonb)`,
+		int(reminderGrace.Seconds()), int(reminderClaimLease.Seconds()))
 	if err != nil {
 		return 0, err
 	}
@@ -234,11 +244,13 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 			name = x.email
 		}
 		if err := deliverTaskReminder(ctx, deps, x.uid, x.email, name, x.channel, x.title, whenLabel, x.notify); err != nil {
-			// Leave reminded_at NULL so the next tick retries this one.
+			if _, releaseErr := d.ExecContext(ctx, `UPDATE tasks SET reminder_claimed_until = NULL WHERE id = $1`, x.id); releaseErr != nil {
+				log.Warn().Err(releaseErr).Int64("task", x.id).Msg("reminder claim release failed")
+			}
 			log.Warn().Err(err).Int64("task", x.id).Msg("reminder delivery failed")
 			continue
 		}
-		if _, err := d.ExecContext(ctx, `UPDATE tasks SET reminded_at = NOW() WHERE id = $1`, x.id); err != nil {
+		if _, err := d.ExecContext(ctx, `UPDATE tasks SET reminded_at = NOW(), reminder_claimed_until = NULL WHERE id = $1`, x.id); err != nil {
 			log.Warn().Err(err).Int64("task", x.id).Msg("reminder stamp failed")
 			continue
 		}
@@ -248,8 +260,11 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 	// Second pass: explicit multi-reminders (task_reminders). These fire AT
 	// their own remind_at (no lead) and can sit on any date, independent of
 	// the task's own time. sent_at is the idempotency stamp.
-	sent += processTaskReminders(ctx, deps)
-	return sent, nil
+	multiSent, err := processTaskReminders(ctx, deps)
+	if err != nil {
+		return sent, err
+	}
+	return sent + multiSent, nil
 }
 
 func sendSingleTaskReminder(ctx context.Context, deps Deps, id int64) (bool, error) {
@@ -270,20 +285,26 @@ func sendSingleTaskReminder(ctx context.Context, deps Deps, id int64) (bool, err
 	var x due
 	var emailsRaw []byte
 	err := d.QueryRowContext(ctx, `
+		WITH claimed AS (
+			UPDATE tasks
+			   SET reminder_claimed_until = NOW() + make_interval(secs => $3)
+			 WHERE id = $1
+			   AND remind = TRUE
+			   AND reminded_at IS NULL
+			   AND (reminder_claimed_until IS NULL OR reminder_claimed_until < NOW())
+			   AND status NOT IN ('done','scratched')
+			   AND scheduled_at IS NOT NULL
+			   AND scheduled_at <= NOW()
+			   AND scheduled_at >= NOW() - make_interval(secs => $2)
+			 RETURNING *
+		)
 		SELECT t.id, t.title, t.scheduled_at, u.id, u.email, u.name, COALESCE(u.timezone,''),
 		       COALESCE(u.notify_channel,'both'),
 		       COALESCE(t.notify_emails, '[]'::jsonb)
-		  FROM tasks t
+		  FROM claimed t
 		  JOIN users u ON u.id = t.user_id
-		 WHERE t.id = $1
-		   AND t.remind = TRUE
-		   AND t.reminded_at IS NULL
-		   AND t.status NOT IN ('done','scratched')
-		   AND t.scheduled_at IS NOT NULL
-		   AND t.scheduled_at <= NOW()
-		   AND t.scheduled_at >= NOW() - make_interval(secs => $2)
-		   AND u.deleted_at IS NULL`,
-		id, int(reminderGrace.Seconds())).
+		 WHERE u.deleted_at IS NULL`,
+		id, int(reminderGrace.Seconds()), int(reminderClaimLease.Seconds())).
 		Scan(&x.id, &x.title, &x.scheduledAt, &x.uid, &x.email, &x.name, &x.tz, &x.channel, &emailsRaw)
 	if err == sql.ErrNoRows {
 		return false, nil
@@ -298,10 +319,11 @@ func sendSingleTaskReminder(ctx context.Context, deps Deps, id int64) (bool, err
 		name = x.email
 	}
 	if err := deliverTaskReminder(ctx, deps, x.uid, x.email, name, x.channel, x.title, formatReminderWhen(x.scheduledAt, x.tz), x.notify); err != nil {
+		_, _ = d.ExecContext(ctx, `UPDATE tasks SET reminder_claimed_until = NULL WHERE id = $1`, x.id)
 		log.Warn().Err(err).Int64("task", x.id).Msg("single reminder delivery failed")
 		return false, err
 	}
-	res, err := d.ExecContext(ctx, `UPDATE tasks SET reminded_at = NOW() WHERE id = $1 AND reminded_at IS NULL`, x.id)
+	res, err := d.ExecContext(ctx, `UPDATE tasks SET reminded_at = NOW(), reminder_claimed_until = NULL WHERE id = $1 AND reminded_at IS NULL`, x.id)
 	if err != nil {
 		log.Warn().Err(err).Int64("task", x.id).Msg("single reminder stamp failed")
 		return false, err
@@ -312,25 +334,33 @@ func sendSingleTaskReminder(ctx context.Context, deps Deps, id int64) (bool, err
 
 // processTaskReminders emails every due, un-sent row in task_reminders and
 // stamps sent_at. Same window/grace/idempotency model as the legacy path.
-func processTaskReminders(ctx context.Context, deps Deps) int {
+func processTaskReminders(ctx context.Context, deps Deps) (int, error) {
 	d := deps.DB
 	rows, err := d.QueryContext(ctx, `
-		SELECT r.id, t.id, t.title, t.scheduled_at, r.remind_at,
+		WITH due AS (
+			SELECT r.id
+			  FROM task_reminders r
+			  JOIN tasks t ON t.id = r.task_id AND t.user_id = r.user_id
+			  JOIN users u ON u.id = r.user_id
+			 WHERE r.sent_at IS NULL
+			   AND (r.claimed_until IS NULL OR r.claimed_until < NOW())
+			   AND t.status NOT IN ('done','scratched')
+			   AND r.remind_at <= NOW()
+			   AND r.remind_at >= NOW() - make_interval(secs => $1)
+			   AND u.deleted_at IS NULL
+			 FOR UPDATE OF r SKIP LOCKED
+		)
+		UPDATE task_reminders r
+		   SET claimed_until = NOW() + make_interval(secs => $2)
+		  FROM due, tasks t, users u
+		 WHERE r.id = due.id AND t.id = r.task_id AND t.user_id = r.user_id AND u.id = r.user_id
+		RETURNING r.id, t.id, t.title, t.scheduled_at, r.remind_at,
 		       u.id, u.email, u.name, COALESCE(u.timezone,''),
 		       COALESCE(u.notify_channel,'both'),
-		       COALESCE(t.notify_emails, '[]'::jsonb)
-		  FROM task_reminders r
-		  JOIN tasks t ON t.id = r.task_id AND t.user_id = r.user_id
-		  JOIN users u ON u.id = r.user_id
-		 WHERE r.sent_at IS NULL
-		   AND t.status NOT IN ('done','scratched')
-		   AND r.remind_at <= NOW()
-		   AND r.remind_at >= NOW() - make_interval(secs => $1)
-		   AND u.deleted_at IS NULL`,
-		int(reminderGrace.Seconds()))
+		       COALESCE(t.notify_emails, '[]'::jsonb)`,
+		int(reminderGrace.Seconds()), int(reminderClaimLease.Seconds()))
 	if err != nil {
-		log.Warn().Err(err).Msg("task_reminders query failed")
-		return 0
+		return 0, fmt.Errorf("claim task reminders: %w", err)
 	}
 	defer rows.Close()
 
@@ -350,10 +380,13 @@ func processTaskReminders(ctx context.Context, deps Deps) int {
 		var x due
 		var emailsRaw []byte
 		if err := rows.Scan(&x.rid, &x.tid, &x.title, &x.scheduledAt, &x.remindAt, &x.uid, &x.email, &x.name, &x.tz, &x.channel, &emailsRaw); err != nil {
-			continue
+			return 0, fmt.Errorf("scan task reminder: %w", err)
 		}
 		x.notify = decodeEmails(emailsRaw)
 		pending = append(pending, x)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate task reminders: %w", err)
 	}
 	rows.Close()
 
@@ -370,16 +403,17 @@ func processTaskReminders(ctx context.Context, deps Deps) int {
 			name = x.email
 		}
 		if err := deliverTaskReminder(ctx, deps, x.uid, x.email, name, x.channel, x.title, formatReminderWhen(when, x.tz), x.notify); err != nil {
+			_, _ = d.ExecContext(ctx, `UPDATE task_reminders SET claimed_until = NULL WHERE id = $1`, x.rid)
 			log.Warn().Err(err).Int64("reminder", x.rid).Msg("task reminder delivery failed")
 			continue
 		}
-		if _, err := d.ExecContext(ctx, `UPDATE task_reminders SET sent_at = NOW() WHERE id = $1`, x.rid); err != nil {
+		if _, err := d.ExecContext(ctx, `UPDATE task_reminders SET sent_at = NOW(), claimed_until = NULL WHERE id = $1`, x.rid); err != nil {
 			log.Warn().Err(err).Int64("reminder", x.rid).Msg("task reminder stamp failed")
 			continue
 		}
 		sent++
 	}
-	return sent
+	return sent, nil
 }
 
 func sendSingleMultiReminder(ctx context.Context, deps Deps, id int64) (bool, error) {
@@ -401,20 +435,26 @@ func sendSingleMultiReminder(ctx context.Context, deps Deps, id int64) (bool, er
 	var x due
 	var emailsRaw []byte
 	err := d.QueryRowContext(ctx, `
+		WITH claimed AS (
+			UPDATE task_reminders
+			   SET claimed_until = NOW() + make_interval(secs => $3)
+			 WHERE id = $1
+			   AND sent_at IS NULL
+			   AND (claimed_until IS NULL OR claimed_until < NOW())
+			   AND remind_at <= NOW()
+			   AND remind_at >= NOW() - make_interval(secs => $2)
+			 RETURNING *
+		)
 		SELECT r.id, t.id, t.title, t.scheduled_at, r.remind_at,
 		       u.id, u.email, u.name, COALESCE(u.timezone,''),
 		       COALESCE(u.notify_channel,'both'),
 		       COALESCE(t.notify_emails, '[]'::jsonb)
-		  FROM task_reminders r
+		  FROM claimed r
 		  JOIN tasks t ON t.id = r.task_id AND t.user_id = r.user_id
 		  JOIN users u ON u.id = r.user_id
-		 WHERE r.id = $1
-		   AND r.sent_at IS NULL
-		   AND t.status NOT IN ('done','scratched')
-		   AND r.remind_at <= NOW()
-		   AND r.remind_at >= NOW() - make_interval(secs => $2)
+		 WHERE t.status NOT IN ('done','scratched')
 		   AND u.deleted_at IS NULL`,
-		id, int(reminderGrace.Seconds())).
+		id, int(reminderGrace.Seconds()), int(reminderClaimLease.Seconds())).
 		Scan(&x.rid, &x.tid, &x.title, &x.scheduledAt, &x.remindAt, &x.uid, &x.email, &x.name, &x.tz, &x.channel, &emailsRaw)
 	if err == sql.ErrNoRows {
 		return false, nil
@@ -433,10 +473,11 @@ func sendSingleMultiReminder(ctx context.Context, deps Deps, id int64) (bool, er
 		name = x.email
 	}
 	if err := deliverTaskReminder(ctx, deps, x.uid, x.email, name, x.channel, x.title, formatReminderWhen(when, x.tz), x.notify); err != nil {
+		_, _ = d.ExecContext(ctx, `UPDATE task_reminders SET claimed_until = NULL WHERE id = $1`, x.rid)
 		log.Warn().Err(err).Int64("reminder", x.rid).Msg("single task reminder delivery failed")
 		return false, err
 	}
-	res, err := d.ExecContext(ctx, `UPDATE task_reminders SET sent_at = NOW() WHERE id = $1 AND sent_at IS NULL`, x.rid)
+	res, err := d.ExecContext(ctx, `UPDATE task_reminders SET sent_at = NOW(), claimed_until = NULL WHERE id = $1 AND sent_at IS NULL`, x.rid)
 	if err != nil {
 		log.Warn().Err(err).Int64("reminder", x.rid).Msg("single task reminder stamp failed")
 		return false, err

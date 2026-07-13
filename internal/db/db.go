@@ -168,6 +168,7 @@ func (d *DB) migrate() error {
 		scheduled_at     TIMESTAMPTZ,
 		remind           BOOLEAN     NOT NULL DEFAULT FALSE,
 		reminded_at      TIMESTAMPTZ,
+		reminder_claimed_until TIMESTAMPTZ,
 		digested_at      TIMESTAMPTZ,
 		notify_emails    JSONB       NOT NULL DEFAULT '[]'::jsonb,
 		duration_minutes INTEGER     NOT NULL DEFAULT 30,
@@ -184,6 +185,7 @@ func (d *DB) migrate() error {
 	-- any index references it. Fresh databases already have it; IF NOT EXISTS
 	-- makes this path safe for both.
 	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS blocked_by_task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL;
+	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reminder_claimed_until TIMESTAMPTZ;
 	CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_list ON tasks(list_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
@@ -455,6 +457,7 @@ func (d *DB) migrate() error {
 	CREATE TABLE IF NOT EXISTS fin_budget_items (
 		id          BIGSERIAL PRIMARY KEY,
 		budget_id   BIGINT    NOT NULL REFERENCES fin_budgets(id) ON DELETE CASCADE,
+		user_id     UUID      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		category_id BIGINT    REFERENCES fin_categories(id) ON DELETE SET NULL,
 		amount      NUMERIC(14,2) NOT NULL DEFAULT 0
 	);
@@ -478,6 +481,7 @@ func (d *DB) migrate() error {
 		-- investments_cron.go and fin_investment_contributions).
 		auto_debit      BOOLEAN     NOT NULL DEFAULT FALSE,
 		next_debit_date DATE,
+		anchor_day      INTEGER,
 		notes           TEXT        NOT NULL DEFAULT '',
 		last_updated    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -543,6 +547,7 @@ func (d *DB) migrate() error {
 		amount          NUMERIC(14,2) NOT NULL DEFAULT 0,
 		frequency       TEXT        NOT NULL DEFAULT 'monthly',
 		next_due_date   DATE        NOT NULL,
+		anchor_day      INTEGER,
 		account_id      BIGINT      REFERENCES fin_accounts(id) ON DELETE SET NULL,
 		category_id     BIGINT      REFERENCES fin_categories(id) ON DELETE SET NULL,
 		is_subscription BOOLEAN     NOT NULL DEFAULT FALSE,
@@ -624,6 +629,7 @@ func (d *DB) migrate() error {
 	-- in these pockets. No rows = count everything in the window.
 	CREATE TABLE IF NOT EXISTS fin_budget_pockets (
 		budget_id BIGINT NOT NULL REFERENCES fin_budgets(id) ON DELETE CASCADE,
+		user_id   UUID   NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		pocket_id BIGINT NOT NULL REFERENCES fin_pockets(id) ON DELETE CASCADE,
 		PRIMARY KEY (budget_id, pocket_id)
 	);
@@ -643,6 +649,54 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_inv_contrib_user ON fin_investment_contributions(user_id);
 
+	-- Tenant-consistent finance references. Backfill child ownership from the
+	-- parent budget, then stop migration if any direct reference crosses users.
+	ALTER TABLE fin_budget_items ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE CASCADE;
+	UPDATE fin_budget_items i SET user_id=b.user_id FROM fin_budgets b WHERE i.budget_id=b.id AND i.user_id IS NULL;
+	ALTER TABLE fin_budget_items ALTER COLUMN user_id SET NOT NULL;
+	ALTER TABLE fin_budget_pockets ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE CASCADE;
+	UPDATE fin_budget_pockets p SET user_id=b.user_id FROM fin_budgets b WHERE p.budget_id=b.id AND p.user_id IS NULL;
+	ALTER TABLE fin_budget_pockets ALTER COLUMN user_id SET NOT NULL;
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_accounts_user_id ON fin_accounts(user_id,id);
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_categories_user_id ON fin_categories(user_id,id);
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_pockets_user_id ON fin_pockets(user_id,id);
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_budgets_user_id ON fin_budgets(user_id,id);
+	DO $$
+	DECLARE bad_count BIGINT;
+	BEGIN
+		SELECT COUNT(*) INTO bad_count FROM fin_transactions t JOIN fin_accounts a ON a.id=t.account_id WHERE t.user_id<>a.user_id;
+		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_transactions.account_id count=%', bad_count; END IF;
+		SELECT COUNT(*) INTO bad_count FROM fin_transactions t JOIN fin_accounts a ON a.id=t.linked_account WHERE t.linked_account IS NOT NULL AND t.user_id<>a.user_id;
+		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_transactions.linked_account count=%', bad_count; END IF;
+		SELECT COUNT(*) INTO bad_count FROM fin_transactions t JOIN fin_categories c ON c.id=t.category_id WHERE t.category_id IS NOT NULL AND t.user_id<>c.user_id;
+		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_transactions.category_id count=%', bad_count; END IF;
+		SELECT COUNT(*) INTO bad_count FROM fin_transactions t JOIN fin_pockets p ON p.id=t.pocket_id WHERE t.pocket_id IS NOT NULL AND t.user_id<>p.user_id;
+		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_transactions.pocket_id count=%', bad_count; END IF;
+		SELECT COUNT(*) INTO bad_count FROM fin_budget_items i JOIN fin_categories c ON c.id=i.category_id WHERE i.category_id IS NOT NULL AND i.user_id<>c.user_id;
+		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_budget_items.category_id count=%', bad_count; END IF;
+		SELECT COUNT(*) INTO bad_count FROM fin_budget_pockets b JOIN fin_pockets p ON p.id=b.pocket_id WHERE b.user_id<>p.user_id;
+		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_budget_pockets.pocket_id count=%', bad_count; END IF;
+		SELECT COUNT(*) INTO bad_count FROM fin_investments i JOIN fin_accounts a ON a.id=i.account_id WHERE i.account_id IS NOT NULL AND i.user_id<>a.user_id;
+		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_investments.account_id count=%', bad_count; END IF;
+		SELECT COUNT(*) INTO bad_count FROM fin_billers b JOIN fin_accounts a ON a.id=b.account_id WHERE b.account_id IS NOT NULL AND b.user_id<>a.user_id;
+		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_billers.account_id count=%', bad_count; END IF;
+		SELECT COUNT(*) INTO bad_count FROM fin_billers b JOIN fin_categories c ON c.id=b.category_id WHERE b.category_id IS NOT NULL AND b.user_id<>c.user_id;
+		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_billers.category_id count=%', bad_count; END IF;
+	END $$;
+	DO $$ BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_account_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE CASCADE; END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_linked_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_linked_user FOREIGN KEY(user_id,linked_account) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (linked_account); END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_category_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id); END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_pocket_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_pocket_user FOREIGN KEY(user_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE SET NULL (pocket_id); END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_item_budget_user') THEN ALTER TABLE fin_budget_items ADD CONSTRAINT fk_fin_budget_item_budget_user FOREIGN KEY(user_id,budget_id) REFERENCES fin_budgets(user_id,id) ON DELETE CASCADE; END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_item_category_user') THEN ALTER TABLE fin_budget_items ADD CONSTRAINT fk_fin_budget_item_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id); END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_pocket_budget_user') THEN ALTER TABLE fin_budget_pockets ADD CONSTRAINT fk_fin_budget_pocket_budget_user FOREIGN KEY(user_id,budget_id) REFERENCES fin_budgets(user_id,id) ON DELETE CASCADE; END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_pocket_user') THEN ALTER TABLE fin_budget_pockets ADD CONSTRAINT fk_fin_budget_pocket_user FOREIGN KEY(user_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE CASCADE; END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_investment_account_user') THEN ALTER TABLE fin_investments ADD CONSTRAINT fk_fin_investment_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (account_id); END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_biller_account_user') THEN ALTER TABLE fin_billers ADD CONSTRAINT fk_fin_biller_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (account_id); END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_biller_category_user') THEN ALTER TABLE fin_billers ADD CONSTRAINT fk_fin_biller_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id); END IF;
+	END $$;
+
 	-- ─── Finance migrations for pre-existing DBs (idempotent) ─────────
 	-- Biller kind backfill (fresh DBs get kind via CREATE TABLE).
 	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT '';
@@ -654,6 +708,14 @@ func (d *DB) migrate() error {
 	-- Investment auto-debit columns (fresh DBs get them via CREATE TABLE).
 	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS auto_debit BOOLEAN NOT NULL DEFAULT FALSE;
 	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS next_debit_date DATE;
+	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS anchor_day INTEGER;
+	UPDATE fin_investments
+	   SET anchor_day = EXTRACT(DAY FROM COALESCE(start_date, next_debit_date))::INTEGER
+	 WHERE anchor_day IS NULL AND COALESCE(start_date, next_debit_date) IS NOT NULL;
+	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS anchor_day INTEGER;
+	UPDATE fin_billers
+	   SET anchor_day = EXTRACT(DAY FROM next_due_date)::INTEGER
+	 WHERE anchor_day IS NULL;
 
 	-- Trading purge (2026-07): market trading removed from the product.
 	-- Idempotent — the API no longer creates these types, so re-runs
@@ -774,8 +836,10 @@ func (d *DB) migrate() error {
 		task_id    BIGINT      NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
 		remind_at  TIMESTAMPTZ NOT NULL,
 		sent_at    TIMESTAMPTZ,
+		claimed_until TIMESTAMPTZ,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
+	ALTER TABLE task_reminders ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMPTZ;
 	CREATE INDEX IF NOT EXISTS idx_task_reminders_task ON task_reminders(task_id);
 	CREATE INDEX IF NOT EXISTS idx_task_reminders_due  ON task_reminders(remind_at) WHERE sent_at IS NULL;
 

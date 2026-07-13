@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -61,10 +62,16 @@ func ProcessDigestCron(ctx context.Context, deps Deps) (weekly, monthly int, err
 	boundary := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, defaultLoc)
 
 	if now.Weekday() == time.Friday {
-		weekly = processWeeklyDigests(ctx, deps, now, boundary)
+		weekly, err = processWeeklyDigests(ctx, deps, now, boundary)
+		if err != nil {
+			return 0, 0, err
+		}
 	}
 	if isLastDayOfMonth(now) {
-		monthly = processMonthlyDigests(ctx, deps, now, boundary)
+		monthly, err = processMonthlyDigests(ctx, deps, now, boundary)
+		if err != nil {
+			return weekly, 0, err
+		}
 	}
 	return weekly, monthly, nil
 }
@@ -87,7 +94,7 @@ type userDigest struct {
 
 // processWeeklyDigests emails each user their pending week tasks (week_of <=
 // this Monday) and stamps digested_at. periodLabel reads e.g. "Jun 16–22".
-func processWeeklyDigests(ctx context.Context, deps Deps, now, boundary time.Time) int {
+func processWeeklyDigests(ctx context.Context, deps Deps, now, boundary time.Time) (int, error) {
 	monday := mondayOf(now)
 	mondayKey := monday.Format("2006-01-02")
 	rows, err := deps.DB.QueryContext(ctx, `
@@ -102,19 +109,22 @@ func processWeeklyDigests(ctx context.Context, deps Deps, now, boundary time.Tim
 		 ORDER BY u.id, t.week_of, t.id`,
 		mondayKey, boundary)
 	if err != nil {
-		log.Warn().Err(err).Msg("weekly digest query failed")
-		return 0
+		return 0, fmt.Errorf("query weekly digests: %w", err)
 	}
-	users := scanDigestRows(rows)
-	rows.Close()
+	defer rows.Close()
+	users, err := scanDigestRows(rows)
+	if err != nil {
+		return 0, fmt.Errorf("scan weekly digests: %w", err)
+	}
 
 	periodLabel := monday.Format("Jan 2") + "–" + monday.AddDate(0, 0, 6).Format("Jan 2")
-	return deliverDigests(ctx, deps, users, "week", periodLabel)
+	sent := deliverDigests(ctx, deps, users, "week", periodLabel)
+	return sent, nil
 }
 
 // processMonthlyDigests emails each user their pending month tasks (month_of <=
 // this month's 1st) and stamps digested_at. periodLabel reads e.g. "June 2026".
-func processMonthlyDigests(ctx context.Context, deps Deps, now, boundary time.Time) int {
+func processMonthlyDigests(ctx context.Context, deps Deps, now, boundary time.Time) (int, error) {
 	first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, defaultLoc)
 	firstKey := first.Format("2006-01-02")
 	rows, err := deps.DB.QueryContext(ctx, `
@@ -129,13 +139,16 @@ func processMonthlyDigests(ctx context.Context, deps Deps, now, boundary time.Ti
 		 ORDER BY u.id, t.month_of, t.id`,
 		firstKey, boundary)
 	if err != nil {
-		log.Warn().Err(err).Msg("monthly digest query failed")
-		return 0
+		return 0, fmt.Errorf("query monthly digests: %w", err)
 	}
-	users := scanDigestRows(rows)
-	rows.Close()
+	defer rows.Close()
+	users, err := scanDigestRows(rows)
+	if err != nil {
+		return 0, fmt.Errorf("scan monthly digests: %w", err)
+	}
 
-	return deliverDigests(ctx, deps, users, "month", first.Format("January 2006"))
+	sent := deliverDigests(ctx, deps, users, "month", first.Format("January 2006"))
+	return sent, nil
 }
 
 // scanDigestRows folds the (task × user) join into one userDigest per user,
@@ -143,14 +156,15 @@ func processMonthlyDigests(ctx context.Context, deps Deps, now, boundary time.Ti
 func scanDigestRows(rows interface {
 	Next() bool
 	Scan(...any) error
-}) []*userDigest {
+	Err() error
+}) ([]*userDigest, error) {
 	var out []*userDigest
 	byUID := map[string]*userDigest{}
 	for rows.Next() {
 		var id int64
 		var title, uid, email, name, channel string
 		if err := rows.Scan(&id, &title, &uid, &email, &name, &channel); err != nil {
-			continue
+			return nil, err
 		}
 		u := byUID[uid]
 		if u == nil {
@@ -160,7 +174,10 @@ func scanDigestRows(rows interface {
 		}
 		u.tasks = append(u.tasks, digestRow{id: id, title: title})
 	}
-	return out
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // deliverDigests sends one email + one summary push per user, then stamps every

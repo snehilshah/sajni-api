@@ -66,23 +66,25 @@ func validBillerKind(k string) bool {
 // validFrequency keeps the schema strict (we lean on this in advanceDueDate).
 func validFrequency(f string) bool {
 	switch f {
-	case "weekly", "fortnightly", "monthly", "bimonthly":
+	case "weekly", "fortnightly", "monthly", "bimonthly", "quarterly":
 		return true
 	}
 	return false
 }
 
 // advanceDueDate rolls a due date forward by one period.
-func advanceDueDate(d time.Time, freq string) time.Time {
+func advanceDueDate(d time.Time, freq string, anchorDay int) time.Time {
 	switch freq {
 	case "weekly":
 		return d.AddDate(0, 0, 7)
 	case "fortnightly":
 		return d.AddDate(0, 0, 14)
 	case "bimonthly":
-		return d.AddDate(0, 2, 0)
+		return advanceRecurringMonth(d, 2, anchorDay)
+	case "quarterly":
+		return advanceRecurringMonth(d, 3, anchorDay)
 	default: // monthly
-		return d.AddDate(0, 1, 0)
+		return advanceRecurringMonth(d, 1, anchorDay)
 	}
 }
 
@@ -185,6 +187,11 @@ func createBiller(deps Deps) http.HandlerFunc {
 		if body.NextDueDate == "" {
 			body.NextDueDate = userNow(d, uid).Format("2006-01-02")
 		}
+		due, err := time.Parse("2006-01-02", body.NextDueDate)
+		if err != nil {
+			errJSON(w, 400, "invalid next_due_date")
+			return
+		}
 		if body.Color == "" {
 			body.Color = "#2D5A4F"
 		}
@@ -196,12 +203,23 @@ func createBiller(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "auto_renew requires account_id")
 			return
 		}
+		for _, ref := range []struct {
+			table string
+			id    *int64
+		}{{"fin_accounts", body.AccountID}, {"fin_categories", body.CategoryID}} {
+			if ref.id != nil {
+				if err := requireOwnedFinanceRef(r.Context(), d, ref.table, uid, *ref.id); err != nil {
+					errJSON(w, 404, "not found")
+					return
+				}
+			}
+		}
 		var id int64
-		err := d.QueryRow(`INSERT INTO fin_billers
-			(user_id, name, kind, amount, frequency, next_due_date, account_id, category_id,
+		err = d.QueryRow(`INSERT INTO fin_billers
+			(user_id, name, kind, amount, frequency, next_due_date, anchor_day, account_id, category_id,
 			 is_subscription, auto_renew, remind_task, variable, alert_days, color, notes)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
-			uid, body.Name, body.Kind, body.Amount, body.Frequency, body.NextDueDate, body.AccountID, body.CategoryID,
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+			uid, body.Name, body.Kind, body.Amount, body.Frequency, body.NextDueDate, due.Day(), body.AccountID, body.CategoryID,
 			body.IsSubscription, body.AutoRenew, body.RemindTask, body.Kind == "bill", alertDays, body.Color, body.Notes).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -251,6 +269,17 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		if body.Kind != nil && !validBillerKind(*body.Kind) {
 			errJSON(w, 400, "invalid kind")
 			return
+		}
+		for _, ref := range []struct {
+			table string
+			id    *int64
+		}{{"fin_accounts", body.AccountID}, {"fin_categories", body.CategoryID}} {
+			if ref.id != nil {
+				if err := requireOwnedFinanceRef(r.Context(), d, ref.table, uid, *ref.id); err != nil {
+					errJSON(w, 404, "not found")
+					return
+				}
+			}
 		}
 		// Re-validate the kind rules against the row's effective state.
 		var curKind string
@@ -303,7 +332,13 @@ func updateBiller(deps Deps) http.HandlerFunc {
 			add("frequency", *body.Frequency)
 		}
 		if body.NextDueDate != nil {
+			due, err := time.Parse("2006-01-02", *body.NextDueDate)
+			if err != nil {
+				errJSON(w, 400, "invalid next_due_date")
+				return
+			}
 			add("next_due_date", *body.NextDueDate)
+			add("anchor_day", due.Day())
 		}
 		if body.AccountID != nil {
 			add("account_id", *body.AccountID)
@@ -385,10 +420,11 @@ func payBiller(deps Deps) http.HandlerFunc {
 		var name, freq string
 		var amount float64
 		var dueDate string
+		var anchorDay int
 		var accountID, categoryID sql.NullInt64
-		err = d.QueryRow(`SELECT name, amount, frequency, next_due_date::text, account_id, category_id
+		err = d.QueryRow(`SELECT name, amount, frequency, next_due_date::text, COALESCE(anchor_day, EXTRACT(DAY FROM next_due_date)::INTEGER), account_id, category_id
 			FROM fin_billers WHERE id = $1 AND user_id = $2`,
-			id, uid).Scan(&name, &amount, &freq, &dueDate, &accountID, &categoryID)
+			id, uid).Scan(&name, &amount, &freq, &dueDate, &anchorDay, &accountID, &categoryID)
 		if err != nil {
 			errJSON(w, 404, "biller not found")
 			return
@@ -424,7 +460,7 @@ func payBiller(deps Deps) http.HandlerFunc {
 		}
 
 		due, _ := time.Parse("2006-01-02", dueDate)
-		next := advanceDueDate(due, freq)
+		next := advanceDueDate(due, freq, anchorDay)
 		d.Exec(`UPDATE fin_billers SET next_due_date = $1, updated_at = NOW(), last_run_at = NOW()
 			WHERE id = $2 AND user_id = $3`, next.Format("2006-01-02"), id, uid)
 
@@ -685,6 +721,7 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 	today := time.Now().In(defaultLoc).Format("2006-01-02")
 
 	rows, err := d.QueryContext(ctx, `SELECT id, user_id, name, amount, frequency, next_due_date::text,
+		COALESCE(anchor_day, EXTRACT(DAY FROM next_due_date)::INTEGER),
 		account_id, category_id, auto_renew, remind_task, alert_days
 		FROM fin_billers WHERE archived = FALSE`)
 	if err != nil {
@@ -701,42 +738,63 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 		autoRenew             bool
 		remindTask            bool
 		alertDays             int
+		anchorDay             int
 	}
 	var bills []bill
 	for rows.Next() {
 		var b bill
-		rows.Scan(&b.id, &b.userID, &b.name, &b.amount, &b.freq, &b.dueDate,
-			&b.accountID, &b.categoryID, &b.autoRenew, &b.remindTask, &b.alertDays)
+		if err := rows.Scan(&b.id, &b.userID, &b.name, &b.amount, &b.freq, &b.dueDate, &b.anchorDay,
+			&b.accountID, &b.categoryID, &b.autoRenew, &b.remindTask, &b.alertDays); err != nil {
+			return 0, 0, fmt.Errorf("scan biller cron row: %w", err)
+		}
 		bills = append(bills, b)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, fmt.Errorf("iterate biller cron rows: %w", err)
 	}
 
 	todayT, _ := time.Parse("2006-01-02", today)
+	var jobErrors []error
 	for _, b := range bills {
 		due, perr := time.Parse("2006-01-02", b.dueDate)
 		if perr != nil {
+			jobErrors = append(jobErrors, fmt.Errorf("biller %d has invalid next_due_date: %w", b.id, perr))
 			continue
 		}
 		// 1) auto-renew (subscriptions only — bills never carry the flag):
 		// catch up every cycle whose due date is <= today. A cycle the user
 		// already paid manually just skips (alreadyPaid) and keeps rolling.
 		if b.autoRenew && b.accountID.Valid {
+			failed := false
 			for !due.After(todayT) {
 				_, alreadyPaid, terr := postBillerTxn(ctx, deps, b.userID, b.id, b.accountID.Int64, b.categoryID,
 					b.name, b.amount, today, due.Format("2006-01-02"), true)
 				if terr != nil {
 					log.Warn().Err(terr).Int64("biller", b.id).Msg("biller auto-post failed")
+					jobErrors = append(jobErrors, fmt.Errorf("post biller %d cycle: %w", b.id, terr))
+					failed = true
 					break
 				}
 				if !alreadyPaid {
-					d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
+					if _, err := d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
 						VALUES ($1,$2,'auto_paid',$3) ON CONFLICT DO NOTHING`,
-						b.userID, b.id, due.Format("2006-01-02"))
+						b.userID, b.id, due.Format("2006-01-02")); err != nil {
+						jobErrors = append(jobErrors, fmt.Errorf("record biller %d auto-paid alert: %w", b.id, err))
+						failed = true
+						break
+					}
 					autoPosted++
 				}
-				due = advanceDueDate(due, b.freq)
+				due = advanceDueDate(due, b.freq, b.anchorDay)
 			}
-			d.ExecContext(ctx, `UPDATE fin_billers SET next_due_date = $1, last_run_at = NOW() WHERE id = $2`,
-				due.Format("2006-01-02"), b.id)
+			if failed {
+				continue
+			}
+			if _, err := d.ExecContext(ctx, `UPDATE fin_billers SET next_due_date = $1, last_run_at = NOW() WHERE id = $2`,
+				due.Format("2006-01-02"), b.id); err != nil {
+				jobErrors = append(jobErrors, fmt.Errorf("advance biller %d due date: %w", b.id, err))
+				continue
+			}
 			b.dueDate = due.Format("2006-01-02")
 		}
 		// 2) upcoming alert: due within alert_days but still in the future
@@ -754,21 +812,39 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 				// insert actually took, so re-runs don't duplicate it. The
 				// task itself carries the nudge, so we skip the 'upcoming'
 				// alert for these billers.
-				res, _ := d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
+				res, err := d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
 					VALUES ($1,$2,'reminder_task',$3) ON CONFLICT DO NOTHING`,
 					b.userID, b.id, due.Format("2006-01-02"))
-				if n, _ := res.RowsAffected(); n == 1 {
+				if err != nil {
+					jobErrors = append(jobErrors, fmt.Errorf("record biller %d reminder alert: %w", b.id, err))
+					continue
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					jobErrors = append(jobErrors, fmt.Errorf("read biller %d reminder alert result: %w", b.id, err))
+					continue
+				}
+				if n == 1 {
 					spawnBillerTask(ctx, deps, b.userID, b.name, due)
 					upcomingNoticed++
 				}
 			} else {
-				res, _ := d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
+				res, err := d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
 					VALUES ($1,$2,'upcoming',$3) ON CONFLICT DO NOTHING`,
 					b.userID, b.id, due.Format("2006-01-02"))
+				if err != nil {
+					jobErrors = append(jobErrors, fmt.Errorf("record biller %d upcoming alert: %w", b.id, err))
+					continue
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					jobErrors = append(jobErrors, fmt.Errorf("read biller %d upcoming alert result: %w", b.id, err))
+					continue
+				}
 				// First time this cycle's alert lands, nudge any registered
 				// device. The in-app alert row stays the durable record; there
 				// was never an email for this kind, so push is best-effort only.
-				if n, _ := res.RowsAffected(); n == 1 {
+				if n == 1 {
 					when := "today"
 					if gap == 1 {
 						when = "tomorrow"
@@ -785,7 +861,7 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 			}
 		}
 	}
-	return autoPosted, upcomingNoticed, nil
+	return autoPosted, upcomingNoticed, errors.Join(jobErrors...)
 }
 
 // spawnBillerTask creates a "Pay {name}" reminder task for a biller's due

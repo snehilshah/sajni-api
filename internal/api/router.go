@@ -179,20 +179,15 @@ func (sw *statusWriter) Flush() {
 // so the refresh-token cookie can travel across origins.
 func withCORS(h http.Handler) http.Handler {
 	allowed := os.Getenv("CORS_ORIGIN")
+	allowLocal := os.Getenv("ALLOW_LOCAL_CORS") == "1"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if allowed != "" && origin == allowed {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
-		} else if allowed == "" && origin != "" {
-			// Dev fallback: reflect any origin when no allow-list is configured.
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
-		} else if os.Getenv("DEV_AUTH_BYPASS") == "1" && corsLocalPrivateOrigin(origin) {
-			// Local phone/demo mode: allow Vite served from a LAN IP even when
-			// CORS_ORIGIN is pinned to localhost in the developer's env.
+		} else if allowLocal && corsLocalPrivateOrigin(origin) {
+			// Explicit local-only mode for Vite or a phone on the development LAN.
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
@@ -253,7 +248,19 @@ func queryParam(r *http.Request, name string) string {
 }
 
 func errJSON(w http.ResponseWriter, status int, msg string) {
+	if status >= http.StatusInternalServerError {
+		msg = "internal error"
+	}
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func internalError(w http.ResponseWriter, r *http.Request, operation string, err error) {
+	log.Error().Err(err).
+		Str("operation", operation).
+		Str("method", r.Method).
+		Str("path", r.URL.Path).
+		Msg("request failed")
+	errJSON(w, http.StatusInternalServerError, "internal error")
 }
 
 func intParam(r *http.Request, name string) (int64, error) {

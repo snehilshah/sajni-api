@@ -171,19 +171,33 @@ func setInvestmentAutoDebitTool(ctx context.Context, d *db.DB, uid string, args 
 				if !s.Before(today) {
 					next = s.Format("2006-01-02")
 				} else {
-					cand := time.Date(today.Year(), today.Month(), s.Day(), 0, 0, 0, 0, time.UTC)
+					anchor := s.Day()
+					cand := anchoredMonthDate(today.Year(), today.Month(), anchor)
 					if cand.Before(today) {
-						cand = cand.AddDate(0, 1, 0)
+						nextMonth := time.Date(today.Year(), today.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+						cand = anchoredMonthDate(nextMonth.Year(), nextMonth.Month(), anchor)
 					}
 					next = cand.Format("2006-01-02")
 				}
 			}
 		}
 	}
-	if _, err := d.ExecContext(ctx, `UPDATE fin_investments SET auto_debit = TRUE, next_debit_date = $1, last_updated = NOW()
-		WHERE id = $2 AND user_id = $3`, next, id, uid); err != nil {
+	nextDate, err := time.Parse("2006-01-02", next)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid next_debit_date")
+	}
+	if _, err := d.ExecContext(ctx, `UPDATE fin_investments SET auto_debit = TRUE, next_debit_date = $1, anchor_day = $2, last_updated = NOW()
+		WHERE id = $3 AND user_id = $4`, next, nextDate.Day(), id, uid); err != nil {
 		return nil, nil, err
 	}
 	return map[string]any{"id": id, "auto_debit": true, "next_debit_date": next},
 		map[string]any{"kind": "investment_updated", "id": id, "title": name, "route": "/finance/investments"}, nil
+}
+
+func anchoredMonthDate(year int, month time.Month, day int) time.Time {
+	last := time.Date(year, month+1, 0, 0, 0, 0, 0, time.UTC).Day()
+	if day > last {
+		day = last
+	}
+	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
 }

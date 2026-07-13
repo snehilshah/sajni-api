@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	sharednote "sajni/internal/note"
 	"sajni/internal/storage"
 )
 
@@ -39,25 +40,6 @@ func normalizeFolder(p string) string {
 		out = append(out, seg)
 	}
 	return strings.Join(out, "/")
-}
-
-func safeFileName(title string) string {
-	safe := strings.ReplaceAll(title, "/", "_")
-	safe = strings.ReplaceAll(safe, "\\", "_")
-	if safe == "" {
-		safe = "untitled"
-	}
-	return safe
-}
-
-// noteKey produces the storage object key for a given note.
-func noteKey(uid string, folder, title string) string {
-	parts := []string{"notes"}
-	if folder != "" {
-		parts = append(parts, folder)
-	}
-	parts = append(parts, safeFileName(title)+".md")
-	return storage.UserKey(uid, parts...)
 }
 
 func listNotes(deps Deps) http.HandlerFunc {
@@ -205,22 +187,14 @@ func createNote(deps Deps) http.HandlerFunc {
 		}
 
 		folder := normalizeFolder(body.Folder)
-		key := noteKey(uid, folder, body.Title)
-
-		if err := deps.Storage.Put(r.Context(), key, []byte(body.Content), "text/markdown"); err != nil {
-			errJSON(w, 500, "store note: "+err.Error())
-			return
-		}
-
-		var id int64
-		err := d.QueryRow(
-			"INSERT INTO notes (user_id, title, blob_key, folder, description) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-			uid, body.Title, key, folder, body.Description,
-		).Scan(&id)
+		created, err := sharednote.Create(r.Context(), d, deps.Storage, sharednote.CreateInput{
+			UserID: uid, Title: body.Title, Content: body.Content, Folder: folder, Description: body.Description,
+		})
 		if err != nil {
-			errJSON(w, 500, err.Error())
+			internalError(w, r, "create note", err)
 			return
 		}
+		id := created.ID
 		syncTags(d, uid, "note", id, body.Content)
 		syncBacklinks(d, uid, "note", id, body.Content)
 		writeJSON(w, 201, map[string]any{"id": id, "folder": folder})
@@ -270,27 +244,9 @@ func updateNote(deps Deps) http.HandlerFunc {
 		}
 
 		if nextTitle != currentTitle || nextFolder != currentFolder {
-			newKey := noteKey(uid, nextFolder, nextTitle)
-			if newKey != blobKey {
-				// "Move" by re-uploading content under the new key, then deleting the old one.
-				var content []byte
-				if blobKey != "" {
-					if data, _, gerr := deps.Storage.Get(r.Context(), blobKey); gerr == nil {
-						content = data
-					}
-				}
-				if err := deps.Storage.Put(r.Context(), newKey, content, "text/markdown"); err != nil {
-					errJSON(w, 500, "rename note: "+err.Error())
-					return
-				}
-				if blobKey != "" {
-					_ = deps.Storage.Delete(r.Context(), blobKey)
-				}
-				blobKey = newKey
-			}
 			d.Exec(
-				"UPDATE notes SET title = $1, folder = $2, blob_key = $3, updated_at = NOW() WHERE id = $4 AND user_id = $5",
-				nextTitle, nextFolder, blobKey, id, uid,
+				"UPDATE notes SET title = $1, folder = $2, updated_at = NOW() WHERE id = $3 AND user_id = $4",
+				nextTitle, nextFolder, id, uid,
 			)
 		}
 

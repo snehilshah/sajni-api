@@ -57,6 +57,9 @@ type Service struct {
 	// Resend
 	ResendAPIKey string
 	EmailFrom    string
+	// DevLogEmailCodes permits the local email fallback to print one-time
+	// codes. It must be explicitly enabled; production fails closed.
+	DevLogEmailCodes bool
 
 	// DevAuthBypass mints a normal session from /auth/refresh for
 	// local/private-origin requests. It is intentionally env-gated and
@@ -90,6 +93,11 @@ func NewService(database *db.DB) (*Service, error) {
 	if devAuthName == "" {
 		devAuthName = "Sajni Dev"
 	}
+	resendAPIKey := os.Getenv("RESEND_API_KEY")
+	devLogEmailCodes := os.Getenv("AUTH_DEV_CODE_LOG") == "1"
+	if resendAPIKey == "" && !devLogEmailCodes {
+		return nil, errors.New("RESEND_API_KEY is required unless AUTH_DEV_CODE_LOG=1")
+	}
 	return &Service{
 		DB:                 database,
 		JWTSecret:          []byte(secret),
@@ -100,8 +108,9 @@ func NewService(database *db.DB) (*Service, error) {
 		GoogleClientSecret: os.Getenv("GOOGLE_OAUTH_CLIENT_SECRET"),
 		GithubClientID:     os.Getenv("GITHUB_OAUTH_CLIENT_ID"),
 		GithubClientSecret: os.Getenv("GITHUB_OAUTH_CLIENT_SECRET"),
-		ResendAPIKey:       os.Getenv("RESEND_API_KEY"),
+		ResendAPIKey:       resendAPIKey,
 		EmailFrom:          os.Getenv("EMAIL_FROM"),
+		DevLogEmailCodes:   devLogEmailCodes,
 		DevAuthBypass:      os.Getenv("DEV_AUTH_BYPASS") == "1",
 		DevAuthEmail:       devAuthEmail,
 		DevAuthName:        devAuthName,

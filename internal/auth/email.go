@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -109,15 +110,18 @@ func (s *Service) renderTOTPEmail(email, name, code, purpose string) (string, st
 	return subject, buf.String(), nil
 }
 
-// deliverCodeEmail renders the TOTP email and ships it. When
-// RESEND_API_KEY is unset we log the code and no-op so local dev works.
+// deliverCodeEmail renders and sends the TOTP email. Code logging exists only
+// behind AUTH_DEV_CODE_LOG=1.
 func (s *Service) deliverCodeEmail(ctx context.Context, to, name, code, purpose string) error {
 	subject, html, err := s.renderTOTPEmail(to, name, code, purpose)
 	if err != nil {
 		return err
 	}
 	if s.ResendAPIKey == "" {
-		// Dev fallback: print the code to logs.
+		if !s.DevLogEmailCodes {
+			return errors.New("email delivery is not configured")
+		}
+		// Explicit development fallback. Never enabled implicitly.
 		fmt.Printf("[auth/email] (dev) RESEND_API_KEY unset — code for %s: %s\n", to, code)
 		return nil
 	}
@@ -126,8 +130,8 @@ func (s *Service) deliverCodeEmail(ctx context.Context, to, name, code, purpose 
 
 // SendEmail ships an already-rendered HTML email through the Resend HTTP
 // API. Generic sibling of deliverCodeEmail for non-auth senders (task
-// reminders, etc). Dev fallback logs and no-ops when RESEND_API_KEY is
-// unset so local dev never hard-fails on a missing key.
+// reminders, etc). NewService rejects missing Resend configuration outside
+// explicit auth-code development mode.
 func (s *Service) SendEmail(ctx context.Context, to, subject, html string) error {
 	if s.ResendAPIKey == "" {
 		fmt.Printf("[email] (dev) RESEND_API_KEY unset — would send %q to %s\n", subject, to)
@@ -257,7 +261,13 @@ type consumedCode struct {
 }
 
 func (s *Service) consumeEmailCode(ctx context.Context, email, code string) (*consumedCode, error) {
-	row := s.DB.QueryRowContext(ctx, `
+	tx, err := s.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin email code consume: %w", err)
+	}
+	defer tx.Rollback()
+
+	row := tx.QueryRowContext(ctx, `
 		SELECT id, code_hash, purpose,
 		       COALESCE(link_user_id::text,''),
 		       COALESCE(link_provider,''),
@@ -266,7 +276,8 @@ func (s *Service) consumeEmailCode(ctx context.Context, email, code string) (*co
 		       attempts, expires_at
 		  FROM email_codes
 		 WHERE email=$1 AND consumed_at IS NULL
-		 ORDER BY created_at DESC LIMIT 1`, email)
+		 ORDER BY created_at DESC LIMIT 1
+		 FOR UPDATE`, email)
 	var (
 		id, purpose, luid, lprov, lsub, lname string
 		stored                                []byte
@@ -283,20 +294,33 @@ func (s *Service) consumeEmailCode(ctx context.Context, email, code string) (*co
 		return nil, errors.New("too many attempts")
 	}
 	if !bytesEqual(stored, hashCode(code)) {
-		s.DB.ExecContext(ctx, `UPDATE email_codes SET attempts = attempts + 1 WHERE id=$1`, id)
+		if _, err := tx.ExecContext(ctx, `UPDATE email_codes SET attempts = attempts + 1 WHERE id=$1`, id); err != nil {
+			return nil, fmt.Errorf("increment email code attempts: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit email code attempt: %w", err)
+		}
 		return nil, errors.New("wrong code")
 	}
-	if _, err := s.DB.ExecContext(ctx, `UPDATE email_codes SET consumed_at=NOW() WHERE id=$1`, id); err != nil {
-		return nil, err
+	result, err := tx.ExecContext(ctx, `UPDATE email_codes SET consumed_at=NOW() WHERE id=$1 AND consumed_at IS NULL`, id)
+	if err != nil {
+		return nil, fmt.Errorf("consume email code: %w", err)
 	}
-	return &consumedCode{
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return nil, errors.New("code already consumed")
+	}
+	consumed := &consumedCode{
 		ID:           id,
 		Purpose:      purpose,
 		LinkUserID:   luid,
 		LinkProvider: lprov,
 		LinkSubject:  lsub,
 		LinkName:     lname,
-	}, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit email code consume: %w", err)
+	}
+	return consumed, nil
 }
 
 // bytesEqual is a constant-time-ish compare; not strictly needed for

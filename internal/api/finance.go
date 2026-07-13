@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -13,6 +14,36 @@ import (
 
 	"sajni/internal/db"
 )
+
+var errFinanceReferenceNotFound = errors.New("finance reference not found")
+
+// dbtx is deliberately the small SQL surface used by finance mutations. Both
+// *db.DB and *sql.Tx satisfy it.
+type dbtx interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func requireOwnedFinanceRef(ctx context.Context, q dbtx, table, userID string, id int64) error {
+	if id == 0 {
+		return errFinanceReferenceNotFound
+	}
+	allowed := map[string]bool{
+		"fin_accounts": true, "fin_categories": true, "fin_pockets": true,
+		"fin_budgets": true, "fin_transactions": true,
+	}
+	if !allowed[table] {
+		return fmt.Errorf("unsupported finance reference %q", table)
+	}
+	var owned bool
+	if err := q.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM "+table+" WHERE id=$1 AND user_id=$2)", id, userID).Scan(&owned); err != nil {
+		return fmt.Errorf("check %s ownership: %w", table, err)
+	}
+	if !owned {
+		return errFinanceReferenceNotFound
+	}
+	return nil
+}
 
 func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	// Accounts
@@ -720,6 +751,34 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "account_id required")
 			return
 		}
+		ctx := r.Context()
+		refs := []struct {
+			table string
+			id    *int64
+		}{
+			{"fin_accounts", &b.AccountID},
+			{"fin_categories", b.CategoryID},
+			{"fin_accounts", b.LinkedAccount},
+		}
+		if b.PocketID != nil && *b.PocketID != 0 {
+			refs = append(refs, struct {
+				table string
+				id    *int64
+			}{"fin_pockets", b.PocketID})
+		}
+		for _, ref := range refs {
+			if ref.id == nil {
+				continue
+			}
+			if err := requireOwnedFinanceRef(ctx, d, ref.table, uid, *ref.id); err != nil {
+				if errors.Is(err, errFinanceReferenceNotFound) {
+					errJSON(w, 404, "not found")
+				} else {
+					internalError(w, r, "validate transaction reference", err)
+				}
+				return
+			}
+		}
 		if b.Type == "" {
 			b.Type = "expense"
 		}
@@ -738,29 +797,29 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			}
 			tx, err := d.Begin()
 			if err != nil {
-				errJSON(w, 500, err.Error())
+				internalError(w, r, "begin transfer", err)
 				return
 			}
 			var outID, inID int64
 			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_at, linked_account) VALUES ($1,$2,'transfer_out',$3,$4,$5,$6,$7) RETURNING id`,
 				uid, b.AccountID, b.Amount, b.Description, b.Note, txnAt, *b.LinkedAccount).Scan(&outID); err != nil {
 				tx.Rollback()
-				errJSON(w, 500, err.Error())
+				internalError(w, r, "insert transfer debit", err)
 				return
 			}
 			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_at, linked_account, transfer_pair) VALUES ($1,$2,'transfer_in',$3,$4,$5,$6,$7,$8) RETURNING id`,
 				uid, *b.LinkedAccount, b.Amount, b.Description, b.Note, txnAt, b.AccountID, outID).Scan(&inID); err != nil {
 				tx.Rollback()
-				errJSON(w, 500, err.Error())
+				internalError(w, r, "insert transfer credit", err)
 				return
 			}
 			if _, err := tx.Exec("UPDATE fin_transactions SET transfer_pair = $1 WHERE id = $2", inID, outID); err != nil {
 				tx.Rollback()
-				errJSON(w, 500, err.Error())
+				internalError(w, r, "link transfer pair", err)
 				return
 			}
 			if err := tx.Commit(); err != nil {
-				errJSON(w, 500, err.Error())
+				internalError(w, r, "commit transfer", err)
 				return
 			}
 			// Index #hashtags from the note (the out leg carries the txn id).
@@ -808,54 +867,118 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid json")
 			return
 		}
-		if b.PocketID != nil {
-			// No active-pocket default on edit — absent means "don't touch".
-			var stored *int64
-			if *b.PocketID != 0 {
-				var ok bool
-				d.QueryRow(`SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2`,
-					*b.PocketID, uid).Scan(&ok)
-				if !ok {
-					errJSON(w, 400, "pocket not found")
+		ctx := r.Context()
+		tx, err := d.BeginTx(ctx, nil)
+		if err != nil {
+			internalError(w, r, "begin transaction edit", err)
+			return
+		}
+		defer tx.Rollback()
+		if err := requireOwnedFinanceRef(ctx, tx, "fin_transactions", uid, id); err != nil {
+			if errors.Is(err, errFinanceReferenceNotFound) {
+				errJSON(w, 404, "not found")
+			} else {
+				internalError(w, r, "find transaction", err)
+			}
+			return
+		}
+		for _, ref := range []struct {
+			table string
+			id    *int64
+		}{{"fin_accounts", b.AccountID}, {"fin_categories", b.CategoryID}} {
+			if ref.id != nil {
+				if err := requireOwnedFinanceRef(ctx, tx, ref.table, uid, *ref.id); err != nil {
+					if errors.Is(err, errFinanceReferenceNotFound) {
+						errJSON(w, 404, "not found")
+					} else {
+						internalError(w, r, "validate transaction edit", err)
+					}
 					return
 				}
-				stored = b.PocketID
 			}
-			d.Exec("UPDATE fin_transactions SET pocket_id = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", stored, id, uid)
+		}
+		if b.PocketID != nil && *b.PocketID != 0 {
+			if err := requireOwnedFinanceRef(ctx, tx, "fin_pockets", uid, *b.PocketID); err != nil {
+				if errors.Is(err, errFinanceReferenceNotFound) {
+					errJSON(w, 404, "not found")
+				} else {
+					internalError(w, r, "validate transaction pocket", err)
+				}
+				return
+			}
+		}
+
+		var mainSets, pairSets []string
+		var mainArgs, pairArgs []any
+		add := func(sets *[]string, args *[]any, column string, value any) {
+			*args = append(*args, value)
+			*sets = append(*sets, fmt.Sprintf("%s=$%d", column, len(*args)))
+		}
+		if b.PocketID != nil {
+			var value any
+			if *b.PocketID != 0 {
+				value = *b.PocketID
+			}
+			add(&mainSets, &mainArgs, "pocket_id", value)
 		}
 		if b.AccountID != nil {
-			// Move the txn to another account. Balances are computed from
-			// account_id, so this rebalances both sides for free. For a
-			// transfer the paired leg points back via linked_account — keep
-			// it in sync so the other side still references this account.
-			d.Exec("UPDATE fin_transactions SET account_id = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.AccountID, id, uid)
-			d.Exec("UPDATE fin_transactions SET linked_account = $1, updated_at = NOW() WHERE transfer_pair = $2 AND user_id = $3", *b.AccountID, id, uid)
+			add(&mainSets, &mainArgs, "account_id", *b.AccountID)
+			add(&pairSets, &pairArgs, "linked_account", *b.AccountID)
 		}
 		if b.CategoryID != nil {
-			d.Exec("UPDATE fin_transactions SET category_id = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.CategoryID, id, uid)
+			add(&mainSets, &mainArgs, "category_id", *b.CategoryID)
 		}
-		if b.Amount != nil {
-			d.Exec("UPDATE fin_transactions SET amount = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.Amount, id, uid)
-			// keep transfer pair amount in sync
-			d.Exec("UPDATE fin_transactions SET amount = $1, updated_at = NOW() WHERE transfer_pair = $2 AND user_id = $3", *b.Amount, id, uid)
-		}
-		if b.Description != nil {
-			d.Exec("UPDATE fin_transactions SET description = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.Description, id, uid)
-			d.Exec("UPDATE fin_transactions SET description = $1, updated_at = NOW() WHERE transfer_pair = $2 AND user_id = $3", *b.Description, id, uid)
-		}
-		if b.Note != nil {
-			d.Exec("UPDATE fin_transactions SET note = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *b.Note, id, uid)
-			d.Exec("UPDATE fin_transactions SET note = $1, updated_at = NOW() WHERE transfer_pair = $2 AND user_id = $3", *b.Note, id, uid)
-			// Re-index #hashtags from the edited note.
-			syncTags(d, uid, "transaction", id, *b.Note)
+		for _, value := range []struct {
+			column string
+			value  any
+			set    bool
+		}{
+			{"amount", valueOrNil(b.Amount), b.Amount != nil},
+			{"description", valueOrNil(b.Description), b.Description != nil},
+			{"note", valueOrNil(b.Note), b.Note != nil},
+		} {
+			if value.set {
+				add(&mainSets, &mainArgs, value.column, value.value)
+				add(&pairSets, &pairArgs, value.column, value.value)
+			}
 		}
 		if b.TxnAt != nil {
-			txnAt := resolveTxnAt(*b.TxnAt, userNow(d, uid))
-			d.Exec("UPDATE fin_transactions SET txn_at = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", txnAt, id, uid)
-			d.Exec("UPDATE fin_transactions SET txn_at = $1, updated_at = NOW() WHERE transfer_pair = $2 AND user_id = $3", txnAt, id, uid)
+			value := resolveTxnAt(*b.TxnAt, userNow(d, uid))
+			add(&mainSets, &mainArgs, "txn_at", value)
+			add(&pairSets, &pairArgs, "txn_at", value)
+		}
+		if len(mainSets) > 0 {
+			mainArgs = append(mainArgs, id, uid)
+			query := fmt.Sprintf("UPDATE fin_transactions SET %s, updated_at=NOW() WHERE id=$%d AND user_id=$%d", strings.Join(mainSets, ","), len(mainArgs)-1, len(mainArgs))
+			if _, err := tx.ExecContext(ctx, query, mainArgs...); err != nil {
+				internalError(w, r, "update transaction", fmt.Errorf("update main row: %w", err))
+				return
+			}
+		}
+		if len(pairSets) > 0 {
+			pairArgs = append(pairArgs, id, uid)
+			query := fmt.Sprintf("UPDATE fin_transactions SET %s, updated_at=NOW() WHERE transfer_pair=$%d AND user_id=$%d", strings.Join(pairSets, ","), len(pairArgs)-1, len(pairArgs))
+			if _, err := tx.ExecContext(ctx, query, pairArgs...); err != nil {
+				internalError(w, r, "update transaction pair", fmt.Errorf("update paired row: %w", err))
+				return
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit transaction edit", err)
+			return
+		}
+		if b.Note != nil {
+			syncTags(d, uid, "transaction", id, *b.Note)
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
+}
+
+func valueOrNil[T any](value *T) any {
+	if value == nil {
+		return nil
+	}
+	return *value
 }
 
 func deleteTransaction(deps Deps) http.HandlerFunc {
@@ -1041,19 +1164,50 @@ func createBudget(deps Deps) http.HandlerFunc {
 		if b.Period == "monthly" && (b.StartDate == "" || b.EndDate == "") {
 			b.StartDate, b.EndDate = budgetWindow("monthly", "", "", "", userNow(d, uid))
 		}
+		ctx := r.Context()
+		tx, err := d.BeginTx(ctx, nil)
+		if err != nil {
+			internalError(w, r, "begin budget create", err)
+			return
+		}
+		defer tx.Rollback()
+		for _, item := range b.Items {
+			if item.CategoryID != nil {
+				if err := requireOwnedFinanceRef(ctx, tx, "fin_categories", uid, *item.CategoryID); err != nil {
+					errJSON(w, 404, "not found")
+					return
+				}
+			}
+		}
+		for _, pocketID := range b.PocketIDs {
+			if err := requireOwnedFinanceRef(ctx, tx, "fin_pockets", uid, pocketID); err != nil {
+				errJSON(w, 404, "not found")
+				return
+			}
+		}
 		var id int64
-		err := d.QueryRow(`INSERT INTO fin_budgets (user_id, name, period, start_date, end_date, total_amount) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+		err = tx.QueryRowContext(ctx, `INSERT INTO fin_budgets (user_id, name, period, start_date, end_date, total_amount) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
 			uid, b.Name, b.Period, b.StartDate, b.EndDate, b.TotalAmount,
 		).Scan(&id)
 		if err != nil {
-			errJSON(w, 500, err.Error())
+			internalError(w, r, "insert budget", err)
 			return
 		}
 		for _, it := range b.Items {
-			d.Exec(`INSERT INTO fin_budget_items (budget_id, category_id, amount) VALUES ($1,$2,$3)`, id, it.CategoryID, it.Amount)
+			if _, err := tx.ExecContext(ctx, `INSERT INTO fin_budget_items (budget_id, user_id, category_id, amount) VALUES ($1,$2,$3,$4)`, id, uid, it.CategoryID, it.Amount); err != nil {
+				internalError(w, r, "insert budget item", err)
+				return
+			}
 		}
 		for _, pid := range b.PocketIDs {
-			d.Exec(`INSERT INTO fin_budget_pockets (budget_id, pocket_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, pid)
+			if _, err := tx.ExecContext(ctx, `INSERT INTO fin_budget_pockets (budget_id, user_id, pocket_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, id, uid, pid); err != nil {
+				internalError(w, r, "insert budget pocket", err)
+				return
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit budget create", err)
+			return
 		}
 		writeJSON(w, 201, map[string]int64{"id": id})
 	}
@@ -1084,35 +1238,86 @@ func updateBudget(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid json")
 			return
 		}
-		if b.Name != nil {
-			d.Exec("UPDATE fin_budgets SET name = $1 WHERE id = $2 AND user_id = $3", *b.Name, id, uid)
+		ctx := r.Context()
+		tx, err := d.BeginTx(ctx, nil)
+		if err != nil {
+			internalError(w, r, "begin budget edit", err)
+			return
 		}
-		if b.Period != nil {
-			d.Exec("UPDATE fin_budgets SET period = $1 WHERE id = $2 AND user_id = $3", *b.Period, id, uid)
+		defer tx.Rollback()
+		if err := requireOwnedFinanceRef(ctx, tx, "fin_budgets", uid, id); err != nil {
+			errJSON(w, 404, "not found")
+			return
 		}
-		if b.StartDate != nil {
-			d.Exec("UPDATE fin_budgets SET start_date = $1 WHERE id = $2 AND user_id = $3", *b.StartDate, id, uid)
+		for _, item := range valueOrEmpty(b.Items) {
+			if item.CategoryID != nil {
+				if err := requireOwnedFinanceRef(ctx, tx, "fin_categories", uid, *item.CategoryID); err != nil {
+					errJSON(w, 404, "not found")
+					return
+				}
+			}
 		}
-		if b.EndDate != nil {
-			d.Exec("UPDATE fin_budgets SET end_date = $1 WHERE id = $2 AND user_id = $3", *b.EndDate, id, uid)
+		for _, pocketID := range valueOrEmpty(b.PocketIDs) {
+			if err := requireOwnedFinanceRef(ctx, tx, "fin_pockets", uid, pocketID); err != nil {
+				errJSON(w, 404, "not found")
+				return
+			}
 		}
-		if b.TotalAmount != nil {
-			d.Exec("UPDATE fin_budgets SET total_amount = $1 WHERE id = $2 AND user_id = $3", *b.TotalAmount, id, uid)
+		for _, update := range []struct {
+			query string
+			value any
+			set   bool
+		}{
+			{"UPDATE fin_budgets SET name=$1 WHERE id=$2 AND user_id=$3", valueOrNil(b.Name), b.Name != nil},
+			{"UPDATE fin_budgets SET period=$1 WHERE id=$2 AND user_id=$3", valueOrNil(b.Period), b.Period != nil},
+			{"UPDATE fin_budgets SET start_date=$1 WHERE id=$2 AND user_id=$3", valueOrNil(b.StartDate), b.StartDate != nil},
+			{"UPDATE fin_budgets SET end_date=$1 WHERE id=$2 AND user_id=$3", valueOrNil(b.EndDate), b.EndDate != nil},
+			{"UPDATE fin_budgets SET total_amount=$1 WHERE id=$2 AND user_id=$3", valueOrNil(b.TotalAmount), b.TotalAmount != nil},
+		} {
+			if update.set {
+				if _, err := tx.ExecContext(ctx, update.query, update.value, id, uid); err != nil {
+					internalError(w, r, "update budget", err)
+					return
+				}
+			}
 		}
 		if b.Items != nil {
-			d.Exec("DELETE FROM fin_budget_items WHERE budget_id = $1", id)
+			if _, err := tx.ExecContext(ctx, "DELETE FROM fin_budget_items WHERE budget_id=$1 AND user_id=$2", id, uid); err != nil {
+				internalError(w, r, "replace budget items", err)
+				return
+			}
 			for _, it := range *b.Items {
-				d.Exec("INSERT INTO fin_budget_items (budget_id, category_id, amount) VALUES ($1,$2,$3)", id, it.CategoryID, it.Amount)
+				if _, err := tx.ExecContext(ctx, "INSERT INTO fin_budget_items (budget_id,user_id,category_id,amount) VALUES ($1,$2,$3,$4)", id, uid, it.CategoryID, it.Amount); err != nil {
+					internalError(w, r, "replace budget item", err)
+					return
+				}
 			}
 		}
 		if b.PocketIDs != nil {
-			d.Exec("DELETE FROM fin_budget_pockets WHERE budget_id = $1", id)
-			for _, pid := range *b.PocketIDs {
-				d.Exec("INSERT INTO fin_budget_pockets (budget_id, pocket_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", id, pid)
+			if _, err := tx.ExecContext(ctx, "DELETE FROM fin_budget_pockets WHERE budget_id=$1 AND user_id=$2", id, uid); err != nil {
+				internalError(w, r, "replace budget pockets", err)
+				return
 			}
+			for _, pid := range *b.PocketIDs {
+				if _, err := tx.ExecContext(ctx, "INSERT INTO fin_budget_pockets (budget_id,user_id,pocket_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", id, uid, pid); err != nil {
+					internalError(w, r, "replace budget pocket", err)
+					return
+				}
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit budget edit", err)
+			return
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
+}
+
+func valueOrEmpty[T any](value *[]T) []T {
+	if value == nil {
+		return nil
+	}
+	return *value
 }
 
 func deleteBudget(deps Deps) http.HandlerFunc {
@@ -1256,13 +1461,28 @@ func createInvestment(deps Deps) http.HandlerFunc {
 		if b.CurrentValue == 0 {
 			b.CurrentValue = b.InvestedAmount
 		}
+		if b.AccountID != nil {
+			if err := requireOwnedFinanceRef(r.Context(), d, "fin_accounts", uid, *b.AccountID); err != nil {
+				errJSON(w, 404, "not found")
+				return
+			}
+		}
+		var anchorDay any
+		if nextDebit != nil && *nextDebit != "" {
+			next, err := time.Parse("2006-01-02", *nextDebit)
+			if err != nil {
+				errJSON(w, 400, "invalid next_debit_date")
+				return
+			}
+			anchorDay = next.Day()
+		}
 
 		var id int64
 		err := d.QueryRow(`INSERT INTO fin_investments
-			(user_id, name, type, account_id, invested_amount, current_value, monthly_amount, frequency, start_date, maturity_date, expected_return, notes, auto_debit, next_debit_date)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+			(user_id, name, type, account_id, invested_amount, current_value, monthly_amount, frequency, start_date, maturity_date, expected_return, notes, auto_debit, next_debit_date, anchor_day)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
 			uid, b.Name, b.Type, b.AccountID, b.InvestedAmount, b.CurrentValue, b.MonthlyAmount, b.Frequency,
-			b.StartDate, b.MaturityDate, b.ExpectedReturn, b.Notes, b.AutoDebit, nextDebit,
+			b.StartDate, b.MaturityDate, b.ExpectedReturn, b.Notes, b.AutoDebit, nextDebit, anchorDay,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -1303,6 +1523,12 @@ func updateInvestment(deps Deps) http.HandlerFunc {
 		if b.Type != nil && !validInvestmentType(*b.Type) {
 			errJSON(w, 400, "invalid investment type")
 			return
+		}
+		if b.AccountID != nil {
+			if err := requireOwnedFinanceRef(r.Context(), d, "fin_accounts", uid, *b.AccountID); err != nil {
+				errJSON(w, 404, "not found")
+				return
+			}
 		}
 		// Enabling auto-debit re-validates against the row's effective state
 		// (patch value when sent, stored value otherwise).
@@ -1387,7 +1613,13 @@ func updateInvestment(deps Deps) http.HandlerFunc {
 			}
 		}
 		if b.NextDebitDate != nil && *b.NextDebitDate != "" {
+			next, err := time.Parse("2006-01-02", *b.NextDebitDate)
+			if err != nil {
+				errJSON(w, 400, "invalid next_debit_date")
+				return
+			}
 			add("next_debit_date", *b.NextDebitDate)
+			add("anchor_day", next.Day())
 		}
 		args = append(args, id, uid)
 		q := "UPDATE fin_investments SET " + strings.Join(set, ", ") + " WHERE id = $" + itoa(ph) + " AND user_id = $" + itoa(ph+1)

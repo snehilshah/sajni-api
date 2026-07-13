@@ -18,6 +18,7 @@ import (
 
 	"sajni/internal/db"
 	mediastatus "sajni/internal/media"
+	sharednote "sajni/internal/note"
 	"sajni/internal/reminderqueue"
 	"sajni/internal/storage"
 )
@@ -2277,28 +2278,13 @@ func createNoteTool(ctx context.Context, d *db.DB, store storage.Storage, uid st
 	}
 	folder := normalizeAINoteFolder(argStr(args, "folder"))
 
-	safe := strings.ReplaceAll(title, "/", "_")
-	safe = strings.ReplaceAll(safe, "\\", "_")
-	if safe == "" {
-		safe = "untitled"
-	}
-	parts := []string{fmt.Sprintf("user_%s", uid), "notes"}
-	if folder != "" {
-		parts = append(parts, folder)
-	}
-	parts = append(parts, safe+".md")
-	blobKey := strings.Join(parts, "/")
-
-	if err := store.Put(ctx, blobKey, []byte(content), "text/markdown"); err != nil {
-		return nil, nil, err
-	}
-	var id int64
-	err := d.QueryRowContext(ctx,
-		`INSERT INTO notes (user_id, title, blob_key, folder, description) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-		uid, title, blobKey, folder, argStr(args, "description")).Scan(&id)
+	created, err := sharednote.Create(ctx, d, store, sharednote.CreateInput{
+		UserID: uid, Title: title, Content: content, Folder: folder, Description: argStr(args, "description"),
+	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("create note: %w", err)
 	}
+	id := created.ID
 	for _, tag := range argStrSlice(args, "tags") {
 		d.ExecContext(ctx, `INSERT INTO tags (user_id, entity_type, entity_id, tag) VALUES ($1,'note',$2,$3)`, uid, id, tag)
 	}

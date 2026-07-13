@@ -60,7 +60,7 @@ func validTaskStatus(status string) bool {
 	}
 }
 
-func validateTaskBlocker(d *db.DB, uid string, taskID, blockerID int64) error {
+func validateTaskBlocker(d sqlRunner, uid string, taskID, blockerID int64) error {
 	if blockerID == 0 || blockerID == taskID {
 		return sql.ErrNoRows
 	}
@@ -87,7 +87,7 @@ func validateTaskBlocker(d *db.DB, uid string, taskID, blockerID int64) error {
 	return nil
 }
 
-func unblockDependents(d *db.DB, uid string, blockerID int64) {
+func unblockDependents(d sqlRunner, uid string, blockerID int64) {
 	rows, err := d.Query(`
 		UPDATE tasks SET status='todo', blocked_by_task_id=NULL, updated_at=NOW()
 		 WHERE user_id=$1 AND blocked_by_task_id=$2 AND status='blocked'
@@ -139,7 +139,7 @@ func notMonthGoalChild(alias string) string {
 // from sitting open (and so wrongly lingering in Missed after month-end). Only
 // rolls forward: reopening a child never reopens the goal. No-op when the task
 // has no parent or the parent isn't a month goal.
-func completeParentGoalIfDone(d *db.DB, uid string, childID int64) {
+func completeParentGoalIfDone(d sqlRunner, uid string, childID int64) {
 	var parentID sql.NullInt64
 	d.QueryRow(`SELECT parent_task_id FROM tasks WHERE id=$1 AND user_id=$2`, childID, uid).Scan(&parentID)
 	if !parentID.Valid {
@@ -784,6 +784,13 @@ func updateTask(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid json")
 			return
 		}
+		tx, err := d.BeginTx(r.Context(), nil)
+		if err != nil {
+			internalError(w, r, "begin task patch", err)
+			return
+		}
+		defer tx.Rollback()
+		var q sqlRunner = tx
 		reminderTimingChanged := body.ScheduledAt != nil || body.ClearScheduled || body.Remind != nil
 
 		// Lifecycle snapshot: due-date misses + audit-trail diffing.
@@ -794,7 +801,7 @@ func updateTask(deps Deps) http.HandlerFunc {
 			currentListID    sql.NullInt64
 			currentBlockedBy sql.NullInt64
 		)
-		if err := d.QueryRow("SELECT due_date::text, status, title, list_id, blocked_by_task_id FROM tasks WHERE id = $1 AND user_id = $2", id, uid).
+		if err := q.QueryRow("SELECT due_date::text, status, title, list_id, blocked_by_task_id FROM tasks WHERE id = $1 AND user_id = $2 FOR UPDATE", id, uid).
 			Scan(&currentDueDate, &currentStatus, &currentTitle, &currentListID, &currentBlockedBy); err != nil {
 			errJSON(w, 404, "not found")
 			return
@@ -815,50 +822,50 @@ func updateTask(deps Deps) http.HandlerFunc {
 		if body.ClearBlockedBy || proposedStatus != "blocked" {
 			proposedBlocker = sql.NullInt64{}
 		}
-		if proposedStatus == "blocked" && (!proposedBlocker.Valid || validateTaskBlocker(d, uid, id, proposedBlocker.Int64) != nil) {
+		if proposedStatus == "blocked" && (!proposedBlocker.Valid || validateTaskBlocker(q, uid, id, proposedBlocker.Int64) != nil) {
 			errJSON(w, 400, "blocked task requires an active, cycle-safe blocker")
 			return
 		}
 
 		var contentForTags string
 		if body.Title != nil {
-			d.Exec("UPDATE tasks SET title = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Title, id, uid)
+			q.Exec("UPDATE tasks SET title = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Title, id, uid)
 			contentForTags += *body.Title + " "
 			if *body.Title != currentTitle {
-				logTaskEvent(d, uid, id, "title", currentTitle, *body.Title)
+				logTaskEvent(q, uid, id, "title", currentTitle, *body.Title)
 			}
 		} else {
 			var t string
-			d.QueryRow("SELECT title FROM tasks WHERE id = $1 AND user_id = $2", id, uid).Scan(&t)
+			q.QueryRow("SELECT title FROM tasks WHERE id = $1 AND user_id = $2", id, uid).Scan(&t)
 			contentForTags += t + " "
 		}
 		if body.Description != nil {
-			d.Exec("UPDATE tasks SET description = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Description, id, uid)
+			q.Exec("UPDATE tasks SET description = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Description, id, uid)
 			contentForTags += *body.Description
 		} else {
 			var dDesc string
-			d.QueryRow("SELECT description FROM tasks WHERE id = $1 AND user_id = $2", id, uid).Scan(&dDesc)
+			q.QueryRow("SELECT description FROM tasks WHERE id = $1 AND user_id = $2", id, uid).Scan(&dDesc)
 			contentForTags += dDesc
 		}
 		if body.Title != nil || body.Description != nil {
-			syncTags(d, uid, "task", id, contentForTags)
-			syncBacklinks(d, uid, "task", id, contentForTags)
+			syncTags(q, uid, "task", id, contentForTags)
+			syncBacklinks(q, uid, "task", id, contentForTags)
 		}
 
 		if body.Status != nil || body.BlockedByTaskID != nil || body.ClearBlockedBy {
-			d.Exec("UPDATE tasks SET status=$1, blocked_by_task_id=$2, updated_at=NOW() WHERE id=$3 AND user_id=$4", proposedStatus, proposedBlocker, id, uid)
+			q.Exec("UPDATE tasks SET status=$1, blocked_by_task_id=$2, updated_at=NOW() WHERE id=$3 AND user_id=$4", proposedStatus, proposedBlocker, id, uid)
 			if proposedStatus != currentStatus {
-				logTaskEvent(d, uid, id, "status", currentStatus, proposedStatus)
+				logTaskEvent(q, uid, id, "status", currentStatus, proposedStatus)
 			}
 			if proposedStatus == "done" {
-				completeParentGoalIfDone(d, uid, id)
+				completeParentGoalIfDone(q, uid, id)
 			}
 			if proposedStatus == "done" || proposedStatus == "scratched" {
-				unblockDependents(d, uid, id)
+				unblockDependents(q, uid, id)
 			}
 		}
 		if body.Priority != nil {
-			d.Exec("UPDATE tasks SET priority = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Priority, id, uid)
+			q.Exec("UPDATE tasks SET priority = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Priority, id, uid)
 		}
 		if body.DueDate != nil {
 			oldDate := ""
@@ -874,27 +881,27 @@ func updateTask(deps Deps) http.HandlerFunc {
 				today := userNow(d, uid).Format("2006-01-02")
 				outcome, rescheduled := rescheduleOutcome(oldDate, newDate, today)
 				var cnt int
-				d.QueryRow(
+				q.QueryRow(
 					"SELECT COUNT(*) FROM task_due_history WHERE user_id = $1 AND task_id = $2 AND due_date = $3",
 					uid, id, oldDate,
 				).Scan(&cnt)
 				if cnt == 0 {
-					d.Exec(
+					q.Exec(
 						"INSERT INTO task_due_history (user_id, task_id, due_date, outcome) VALUES ($1, $2, $3, $4)",
 						uid, id, oldDate, outcome,
 					)
 				} else if rescheduled {
 					// Promote a prior bare "missed" row for this date to "rescheduled".
-					d.Exec(
+					q.Exec(
 						"UPDATE task_due_history SET outcome = 'rescheduled' WHERE user_id = $1 AND task_id = $2 AND due_date = $3",
 						uid, id, oldDate,
 					)
 				}
 				if rescheduled {
-					logTaskEvent(d, uid, id, "rescheduled", oldDate, newDate)
+					logTaskEvent(q, uid, id, "rescheduled", oldDate, newDate)
 				}
 			}
-			d.Exec("UPDATE tasks SET due_date = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", newDate, id, uid)
+			q.Exec("UPDATE tasks SET due_date = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", newDate, id, uid)
 			// Day and week scope are mutually exclusive. Setting a real due_date
 			// (e.g. rescheduling a lapsed week task from the Missed banner)
 			// converts it to a day task — clear any stale week_of so it drops out
@@ -902,11 +909,11 @@ func updateTask(deps Deps) http.HandlerFunc {
 			// is explicitly driving week_of itself (the form sends week_of /
 			// clear_week), so we don't fight an intentional scope set.
 			if strings.TrimSpace(newDate) != "" && body.WeekOf == nil && !body.ClearWeek {
-				d.Exec("UPDATE tasks SET week_of = NULL WHERE id = $1 AND user_id = $2", id, uid)
+				q.Exec("UPDATE tasks SET week_of = NULL WHERE id = $1 AND user_id = $2", id, uid)
 			}
 			// Likewise a real due_date converts a month goal to a day task.
 			if strings.TrimSpace(newDate) != "" && body.MonthOf == nil && !body.ClearMonth {
-				d.Exec("UPDATE tasks SET month_of = NULL WHERE id = $1 AND user_id = $2", id, uid)
+				q.Exec("UPDATE tasks SET month_of = NULL WHERE id = $1 AND user_id = $2", id, uid)
 			}
 		}
 		if body.ListID != nil || body.ClearList {
@@ -914,26 +921,26 @@ func updateTask(deps Deps) http.HandlerFunc {
 			if body.ListID != nil && !body.ClearList {
 				// Validate list ownership.
 				var ok int
-				d.QueryRow("SELECT 1 FROM task_lists WHERE id=$1 AND user_id=$2", *body.ListID, uid).Scan(&ok)
+				q.QueryRow("SELECT 1 FROM task_lists WHERE id=$1 AND user_id=$2", *body.ListID, uid).Scan(&ok)
 				if ok == 1 {
 					v = sql.NullInt64{Int64: *body.ListID, Valid: true}
 				}
 			}
-			d.Exec("UPDATE tasks SET list_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
+			q.Exec("UPDATE tasks SET list_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
 			if v.Int64 != currentListID.Int64 || v.Valid != currentListID.Valid {
-				logTaskEvent(d, uid, id, "list", listLabel(d, uid, currentListID), listLabel(d, uid, v))
+				logTaskEvent(q, uid, id, "list", listLabel(q, uid, currentListID), listLabel(q, uid, v))
 			}
 		}
 		if body.ParentTaskID != nil || body.ClearParent {
 			var v sql.NullInt64
 			if body.ParentTaskID != nil && !body.ClearParent && *body.ParentTaskID != id {
 				var ok int
-				d.QueryRow("SELECT 1 FROM tasks WHERE id=$1 AND user_id=$2", *body.ParentTaskID, uid).Scan(&ok)
+				q.QueryRow("SELECT 1 FROM tasks WHERE id=$1 AND user_id=$2", *body.ParentTaskID, uid).Scan(&ok)
 				if ok == 1 {
 					v = sql.NullInt64{Int64: *body.ParentTaskID, Valid: true}
 				}
 			}
-			d.Exec("UPDATE tasks SET parent_task_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
+			q.Exec("UPDATE tasks SET parent_task_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
 		}
 		// scheduled_at: set or clear the event time. Either change clears
 		// reminded_at so the reminder re-arms (an edited time should fire
@@ -944,19 +951,19 @@ func updateTask(deps Deps) http.HandlerFunc {
 			if body.ScheduledAt != nil && !body.ClearScheduled && strings.TrimSpace(*body.ScheduledAt) != "" {
 				schedArg = *body.ScheduledAt
 			}
-			d.Exec("UPDATE tasks SET scheduled_at=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3", schedArg, id, uid)
+			q.Exec("UPDATE tasks SET scheduled_at=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3", schedArg, id, uid)
 			if s, ok := schedArg.(string); ok && body.DueDate == nil {
 				if t, err := time.Parse(time.RFC3339, s); err == nil {
-					d.Exec("UPDATE tasks SET due_date=$1 WHERE id=$2 AND user_id=$3", t.In(userLocation(d, uid)).Format("2006-01-02"), id, uid)
+					q.Exec("UPDATE tasks SET due_date=$1 WHERE id=$2 AND user_id=$3", t.In(userLocation(d, uid)).Format("2006-01-02"), id, uid)
 				}
 			}
 		}
 		if body.Remind != nil {
 			// Toggling remind re-arms too (turning it back on should re-send).
-			d.Exec("UPDATE tasks SET remind=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.Remind, id, uid)
+			q.Exec("UPDATE tasks SET remind=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.Remind, id, uid)
 		}
 		if body.Important != nil {
-			d.Exec("UPDATE tasks SET important=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.Important, id, uid)
+			q.Exec("UPDATE tasks SET important=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.Important, id, uid)
 		}
 		// week_of: set/clear the Monday anchor of a week task. Switching a task
 		// between "day" and "week" scope is the form sending week_of + clear_due
@@ -966,10 +973,10 @@ func updateTask(deps Deps) http.HandlerFunc {
 			if body.WeekOf != nil && !body.ClearWeek && strings.TrimSpace(*body.WeekOf) != "" {
 				v = *body.WeekOf
 			}
-			d.Exec("UPDATE tasks SET week_of=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
+			q.Exec("UPDATE tasks SET week_of=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
 			// Week scope is exclusive with month scope.
 			if v != nil && body.MonthOf == nil && !body.ClearMonth {
-				d.Exec("UPDATE tasks SET month_of=NULL WHERE id=$1 AND user_id=$2", id, uid)
+				q.Exec("UPDATE tasks SET month_of=NULL WHERE id=$1 AND user_id=$2", id, uid)
 			}
 		}
 		// month_of: set/clear the 1st-of-month anchor of a month goal. Mirrors
@@ -980,24 +987,28 @@ func updateTask(deps Deps) http.HandlerFunc {
 			if body.MonthOf != nil && !body.ClearMonth && strings.TrimSpace(*body.MonthOf) != "" {
 				v = *body.MonthOf
 			}
-			d.Exec("UPDATE tasks SET month_of=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
+			q.Exec("UPDATE tasks SET month_of=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
 			if v != nil {
-				d.Exec("UPDATE tasks SET due_date=NULL, week_of=NULL, scheduled_at=NULL WHERE id=$1 AND user_id=$2", id, uid)
+				q.Exec("UPDATE tasks SET due_date=NULL, week_of=NULL, scheduled_at=NULL WHERE id=$1 AND user_id=$2", id, uid)
 			}
 		}
 		if body.ClearDue {
-			d.Exec("UPDATE tasks SET due_date=NULL, updated_at=NOW() WHERE id=$1 AND user_id=$2", id, uid)
+			q.Exec("UPDATE tasks SET due_date=NULL, updated_at=NOW() WHERE id=$1 AND user_id=$2", id, uid)
 		}
 		if body.NotifyEmails != nil {
 			b, _ := json.Marshal(sanitizeNotifyEmails(*body.NotifyEmails))
-			d.Exec("UPDATE tasks SET notify_emails=$1::jsonb, updated_at=NOW() WHERE id=$2 AND user_id=$3", string(b), id, uid)
+			q.Exec("UPDATE tasks SET notify_emails=$1::jsonb, updated_at=NOW() WHERE id=$2 AND user_id=$3", string(b), id, uid)
 		}
 		if body.Steps != nil {
 			stepsJSON, _ := json.Marshal(normalizeSteps(*body.Steps))
-			d.Exec("UPDATE tasks SET steps=$1::jsonb, updated_at=NOW() WHERE id=$2 AND user_id=$3", stepsJSON, id, uid)
+			q.Exec("UPDATE tasks SET steps=$1::jsonb, updated_at=NOW() WHERE id=$2 AND user_id=$3", stepsJSON, id, uid)
 		}
 		if body.SortOrder != nil {
-			d.Exec("UPDATE tasks SET sort_order=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.SortOrder, id, uid)
+			q.Exec("UPDATE tasks SET sort_order=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.SortOrder, id, uid)
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit task patch", err)
+			return
 		}
 		if reminderTimingChanged {
 			enqueueTaskReminderFromDB(r.Context(), d, uid, id)
@@ -1169,14 +1180,14 @@ func getTaskHistory(deps Deps) http.HandlerFunc {
 
 // logTaskEvent appends one audit-trail row. Best-effort: a failure here
 // must never block the mutation it records, so the error is swallowed.
-func logTaskEvent(d *db.DB, uid string, taskID int64, kind, from, to string) {
+func logTaskEvent(d sqlRunner, uid string, taskID int64, kind, from, to string) {
 	d.Exec(`INSERT INTO task_events (user_id, task_id, kind, from_val, to_val)
 	        VALUES ($1,$2,$3,$4,$5)`, uid, taskID, kind, from, to)
 }
 
 // listLabel resolves a nullable list_id to a human label for the audit
 // trail — "Inbox" when unfiled or the list can't be found.
-func listLabel(d *db.DB, uid string, v sql.NullInt64) string {
+func listLabel(d sqlRunner, uid string, v sql.NullInt64) string {
 	if !v.Valid {
 		return "Inbox"
 	}

@@ -24,6 +24,22 @@ jobs:
   verify:
     name: Lint, vet, build, test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: sajni_test
+          POSTGRES_PASSWORD: sajni_test
+          POSTGRES_DB: sajni_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sajni_test -d sajni_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://sajni_test:sajni_test@localhost:5432/sajni_test?sslmode=disable
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -85,12 +101,11 @@ jobs:
           image: ${{ env.IMAGE }}
           # Plain runtime config (not sensitive). GCS_BUCKET comes from
           # a GitHub repo Variable so it can rotate without a secret
-          # rewrite. GEMINI_MODEL is pinned in code-config because
-          # changes need a deploy anyway.
+          # rewrite. The Gemini model default is pinned in Go; GEMINI_MODEL
+          # remains an optional runtime override for deliberate A/B tests.
           env_vars: |
             STORAGE_BACKEND=gcs
             GCS_BUCKET=${{ vars.GCS_BUCKET }}
-            GEMINI_MODEL=gemini-2.5-flash
             CLOUD_TASKS_PROJECT=${{ vars.GCP_PROJECT_ID }}
             CLOUD_TASKS_LOCATION=${{ vars.GCP_REGION }}
             CLOUD_TASKS_QUEUE=${{ vars.CLOUD_TASKS_QUEUE }}
@@ -127,7 +142,6 @@ jobs:
           # - cpu-throttling default-on → only billed during requests
           # - cpu-boost           → free during cold starts, faster wake
           flags: |
-            --remove-env-vars=CORS_ORIGIN
             --allow-unauthenticated
             --ingress=all
             --default-url

@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"iter"
 	"os"
 	"regexp"
 	"strings"
@@ -75,9 +76,27 @@ func newEvent(t string, v any) Event {
 type Service struct {
 	db     *db.DB
 	store  storage.Storage
-	client *genai.Client
+	client modelClient
 	model  string
 	tools  []Tool
+}
+
+// modelClient is the part of Gemini consumed by Sajni. Keeping this interface
+// here makes the agent loop deterministic in tests without hiding the rest of
+// the application behind an SDK-shaped abstraction.
+type modelClient interface {
+	GenerateContent(context.Context, string, []*genai.Content, *genai.GenerateContentConfig) (*genai.GenerateContentResponse, error)
+	GenerateContentStream(context.Context, string, []*genai.Content, *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error]
+}
+
+type geminiModels struct{ models *genai.Models }
+
+func (g geminiModels) GenerateContent(ctx context.Context, model string, contents []*genai.Content, cfg *genai.GenerateContentConfig) (*genai.GenerateContentResponse, error) {
+	return g.models.GenerateContent(ctx, model, contents, cfg)
+}
+
+func (g geminiModels) GenerateContentStream(ctx context.Context, model string, contents []*genai.Content, cfg *genai.GenerateContentConfig) iter.Seq2[*genai.GenerateContentResponse, error] {
+	return g.models.GenerateContentStream(ctx, model, contents, cfg)
 }
 
 // NewService initializes a Gemini client. Returns (nil, nil) if no
@@ -101,7 +120,7 @@ func NewService(ctx context.Context, database *db.DB, store storage.Storage) (*S
 	s := &Service{
 		db:     database,
 		store:  store,
-		client: client,
+		client: geminiModels{models: client.Models},
 		model:  model,
 	}
 	s.tools = s.buildTools()
@@ -151,7 +170,7 @@ func (s *Service) QuickGenerate(ctx context.Context, system, user string) (strin
 		MaxOutputTokens:   maxOut,
 		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
 	}
-	resp, err := s.client.Models.GenerateContent(ctx, s.model, []*genai.Content{
+	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: user}}},
 	}, cfg)
 	if err != nil {
@@ -270,7 +289,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		// same call twice across stream chunks; without this guard we'd
 		// dispatch the tool twice and pollute history with two responses.
 		seenCalls := map[string]bool{}
-		for resp, err := range s.client.Models.GenerateContentStream(ctx, s.model, contents, cfg) {
+		for resp, err := range s.client.GenerateContentStream(ctx, s.model, contents, cfg) {
 			if err != nil {
 				streamErr = err
 				break
@@ -349,21 +368,41 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		contents = append(contents, &genai.Content{Role: "user", Parts: respParts})
 	}
 
-	// Agent ran the full tool budget without converging on a final text
-	// reply. If we have *any* partial text, send it as `done` so the
-	// palette/sidebar shows something useful instead of "no response
-	// yet". Otherwise surface a friendly error.
-	if finalText.Len() > 0 {
-		send("done", map[string]any{
-			"text":      finalText.String(),
-			"history":   contents,
-			"truncated": true,
-		})
+	// The last tool-capable round may legitimately end in a mutation. Give the
+	// model one final chance to explain the result, but make that turn incapable
+	// of calling another function. The tool budget therefore remains exactly six
+	// for palette and ten for chat.
+	synthesisCfg := *cfg
+	synthesisCfg.Tools = nil
+	synthesisCfg.ToolConfig = &genai.ToolConfig{
+		FunctionCallingConfig: &genai.FunctionCallingConfig{Mode: genai.FunctionCallingConfigModeNone},
+	}
+	var synthesisParts []*genai.Part
+	for resp, err := range s.client.GenerateContentStream(ctx, s.model, contents, &synthesisCfg) {
+		if err != nil {
+			send("error", map[string]string{"message": friendlyAIError(err)})
+			return
+		}
+		if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
+			continue
+		}
+		for _, part := range resp.Candidates[0].Content.Parts {
+			if part.Text == "" || part.Thought {
+				continue
+			}
+			finalText.WriteString(part.Text)
+			synthesisParts = append(synthesisParts, part)
+			send("delta", map[string]string{"text": part.Text})
+		}
+	}
+	if len(synthesisParts) > 0 {
+		contents = append(contents, &genai.Content{Role: "model", Parts: synthesisParts})
+	}
+	if finalText.Len() == 0 {
+		send("error", map[string]string{"message": "I couldn't finish that one in time."})
 		return
 	}
-	send("error", map[string]string{
-		"message": "I couldn't finish that one in time — try the sidebar chat for deeper questions.",
-	})
+	send("done", map[string]any{"text": finalText.String(), "history": contents})
 }
 
 // CategorizeExpense maps a short user-provided expense title to one of
@@ -425,7 +464,7 @@ Strict rules:
 
 	temp := float32(0.0)
 	maxOut := int32(32)
-	// Disable thinking — 2.5-flash otherwise burns the entire output
+	// Disable thinking so the model does not burn the entire output
 	// budget on internal reasoning tokens and returns empty text, which
 	// previously made every categorize call fall back to "Others".
 	thinkBudget := int32(0)
@@ -436,7 +475,7 @@ Strict rules:
 		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
 	}
 
-	resp, err := s.client.Models.GenerateContent(ctx, s.model, []*genai.Content{
+	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: prompt}}},
 	}, cfg)
 	if err != nil {
@@ -565,7 +604,7 @@ Rules:
 		MaxOutputTokens:   maxOut,
 		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
 	}
-	resp, err := s.client.Models.GenerateContent(ctx, s.model, []*genai.Content{
+	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: prompt}}},
 	}, cfg)
 	if err != nil {

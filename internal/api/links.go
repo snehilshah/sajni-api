@@ -2,11 +2,19 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"regexp"
 	"strings"
 
 	"sajni/internal/db"
 )
+
+type sqlRunner interface {
+	Exec(string, ...any) (sql.Result, error)
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	Query(string, ...any) (*sql.Rows, error)
+	QueryRow(string, ...any) *sql.Row
+}
 
 var (
 	backlinkRe = regexp.MustCompile(`\[\[([^\]\n|]+)(?:\|[^\]\n]*)?\]\]`)
@@ -19,13 +27,13 @@ func NormalizeRef(s string) string {
 }
 
 // syncTags deletes old tags for an entity and inserts fresh ones parsed from content.
-func syncTags(d *db.DB, userID string, entityType string, entityID int64, content string) error {
-	return d.SyncTags(context.Background(), userID, entityType, entityID, content)
+func syncTags(q sqlRunner, userID string, entityType string, entityID int64, content string) error {
+	return db.SyncTags(context.Background(), q, userID, entityType, entityID, content)
 }
 
 // syncBacklinks stores raw normalized refs for a source. Resolution happens at read time.
-func syncBacklinks(d *db.DB, userID string, sourceType string, sourceID int64, content string) error {
-	if _, err := d.Exec("DELETE FROM backlinks WHERE user_id = $1 AND source_type = $2 AND source_id = $3", userID, sourceType, sourceID); err != nil {
+func syncBacklinks(q sqlRunner, userID string, sourceType string, sourceID int64, content string) error {
+	if _, err := q.Exec("DELETE FROM backlinks WHERE user_id = $1 AND source_type = $2 AND source_id = $3", userID, sourceType, sourceID); err != nil {
 		return err
 	}
 	seen := map[string]bool{}
@@ -42,7 +50,7 @@ func syncBacklinks(d *db.DB, userID string, sourceType string, sourceID int64, c
 			continue
 		}
 		seen[ref] = true
-		if _, err := d.Exec(
+		if _, err := q.Exec(
 			"INSERT INTO backlinks (user_id, source_type, source_id, target_ref) VALUES ($1, $2, $3, $4)",
 			userID, sourceType, sourceID, ref,
 		); err != nil {

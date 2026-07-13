@@ -5,11 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"path/filepath"
 	"time"
 
 	"sajni/internal/storage"
+)
+
+const (
+	maxUploadBytes  int64 = 10 << 20
+	maxRequestBytes int64 = maxUploadBytes + 1<<20
 )
 
 func registerUploadRoutes(mux *http.ServeMux, deps Deps) {
@@ -20,8 +26,19 @@ func registerUploadRoutes(mux *http.ServeMux, deps Deps) {
 func uploadFile(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
-		// Limit to 10MB
-		r.ParseMultipartForm(10 << 20)
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) || errors.Is(err, multipart.ErrMessageTooLarge) {
+				errJSON(w, http.StatusRequestEntityTooLarge, "file exceeds 10 MiB limit")
+				return
+			}
+			errJSON(w, http.StatusBadRequest, "invalid multipart form")
+			return
+		}
+		if r.MultipartForm != nil {
+			defer r.MultipartForm.RemoveAll()
+		}
 
 		file, header, err := r.FormFile("file")
 		if err != nil {
@@ -30,9 +47,13 @@ func uploadFile(deps Deps) http.HandlerFunc {
 		}
 		defer file.Close()
 
-		data, err := io.ReadAll(file)
+		data, err := io.ReadAll(io.LimitReader(file, maxUploadBytes+1))
 		if err != nil {
-			errJSON(w, 500, "read file: "+err.Error())
+			internalError(w, r, "read upload", err)
+			return
+		}
+		if int64(len(data)) > maxUploadBytes {
+			errJSON(w, http.StatusRequestEntityTooLarge, "file exceeds 10 MiB limit")
 			return
 		}
 
@@ -46,7 +67,7 @@ func uploadFile(deps Deps) http.HandlerFunc {
 		key := storage.UserKey(uid, "uploads", filename)
 		ct := header.Header.Get("Content-Type")
 		if err := deps.Storage.Put(r.Context(), key, data, ct); err != nil {
-			errJSON(w, 500, "store file: "+err.Error())
+			internalError(w, r, "store upload", err)
 			return
 		}
 
@@ -74,7 +95,7 @@ func serveUpload(deps Deps) http.HandlerFunc {
 				http.NotFound(w, r)
 				return
 			}
-			errJSON(w, 500, err.Error())
+			internalError(w, r, "load upload", err)
 			return
 		}
 		if ct == "" {

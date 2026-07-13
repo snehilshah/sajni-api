@@ -52,6 +52,9 @@ Today's snapshot:
 // of the user's day. Lets the model answer trivial date/count
 // questions in one round.
 func (s *Service) buildSystemInstruction(ctx context.Context, uid string) string {
+	if s.db == nil {
+		return fmt.Sprintf(systemPromptTemplate, "- Live context unavailable")
+	}
 	now := userTZNow(ctx, s.db, uid)
 	today := now.Format("2006-01-02")
 	parts := []string{

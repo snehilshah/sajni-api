@@ -33,22 +33,22 @@ func defaultNextDebitDate(startDate *string, now time.Time) string {
 	if !start.Before(today) {
 		return start.Format("2006-01-02")
 	}
-	cand := time.Date(today.Year(), today.Month(), start.Day(), 0, 0, 0, 0, time.UTC)
+	cand := advanceRecurringMonth(time.Date(today.Year(), today.Month()-1, 1, 0, 0, 0, 0, time.UTC), 1, start.Day())
 	if cand.Before(today) {
-		cand = cand.AddDate(0, 1, 0)
+		cand = advanceRecurringMonth(cand, 1, start.Day())
 	}
 	return cand.Format("2006-01-02")
 }
 
 // advanceDebitDate rolls a debit date forward by one contribution cycle.
-func advanceDebitDate(d time.Time, freq string) time.Time {
+func advanceDebitDate(d time.Time, freq string, anchorDay int) time.Time {
 	switch freq {
 	case "quarterly":
-		return d.AddDate(0, 3, 0)
+		return advanceRecurringMonth(d, 3, anchorDay)
 	case "yearly":
-		return d.AddDate(1, 0, 0)
+		return advanceRecurringMonth(d, 12, anchorDay)
 	default: // monthly
-		return d.AddDate(0, 1, 0)
+		return advanceRecurringMonth(d, 1, anchorDay)
 	}
 }
 
@@ -62,7 +62,8 @@ func ProcessInvestmentDebits(ctx context.Context, deps Deps) (posted int, err er
 	today := time.Now().In(defaultLoc).Format("2006-01-02")
 	todayT, _ := time.Parse("2006-01-02", today)
 
-	rows, err := d.QueryContext(ctx, `SELECT id, user_id, name, account_id, monthly_amount, frequency, next_debit_date::text
+	rows, err := d.QueryContext(ctx, `SELECT id, user_id, name, account_id, monthly_amount, frequency, next_debit_date::text,
+		COALESCE(anchor_day, EXTRACT(DAY FROM next_debit_date)::INTEGER)
 		FROM fin_investments
 		WHERE auto_debit = TRUE AND account_id IS NOT NULL AND next_debit_date IS NOT NULL AND monthly_amount > 0`)
 	if err != nil {
@@ -78,39 +79,52 @@ func ProcessInvestmentDebits(ctx context.Context, deps Deps) (posted int, err er
 		amount    float64
 		freq      string
 		debitDate string
+		anchorDay int
 	}
 	var invs []inv
 	for rows.Next() {
 		var i inv
-		rows.Scan(&i.id, &i.userID, &i.name, &i.accountID, &i.amount, &i.freq, &i.debitDate)
+		if err := rows.Scan(&i.id, &i.userID, &i.name, &i.accountID, &i.amount, &i.freq, &i.debitDate, &i.anchorDay); err != nil {
+			return 0, fmt.Errorf("scan investment debit: %w", err)
+		}
 		invs = append(invs, i)
 	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate investment debits: %w", err)
+	}
 
+	var jobErrors []error
 	for _, i := range invs {
 		due, perr := time.Parse("2006-01-02", i.debitDate)
 		if perr != nil {
+			jobErrors = append(jobErrors, fmt.Errorf("investment %d has invalid next_debit_date: %w", i.id, perr))
 			continue
 		}
-		cycles := 0
+		failed := false
 		for !due.After(todayT) {
 			ok, derr := postInvestmentDebit(ctx, deps, i.userID, i.id, i.accountID, i.name, i.amount, due.Format("2006-01-02"))
 			if derr != nil {
 				log.Warn().Err(derr).Int64("investment", i.id).Msg("investment auto-debit failed")
+				jobErrors = append(jobErrors, fmt.Errorf("post investment %d debit: %w", i.id, derr))
+				failed = true
 				break
 			}
+			next := advanceDebitDate(due, i.freq, i.anchorDay)
 			if ok {
 				posted++
-				cycles++
-				notifyInvestmentDebit(ctx, deps, i.userID, i.name, i.amount,
-					advanceDebitDate(due, i.freq).Format("2006-01-02"))
+				notifyInvestmentDebit(ctx, deps, i.userID, i.name, i.amount, next.Format("2006-01-02"))
 			}
-			due = advanceDebitDate(due, i.freq)
+			due = next
 		}
-		d.ExecContext(ctx, `UPDATE fin_investments SET next_debit_date = $1, last_updated = NOW() WHERE id = $2`,
-			due.Format("2006-01-02"), i.id)
-		_ = cycles
+		if failed {
+			continue
+		}
+		if _, err := d.ExecContext(ctx, `UPDATE fin_investments SET next_debit_date = $1, last_updated = NOW() WHERE id = $2`,
+			due.Format("2006-01-02"), i.id); err != nil {
+			jobErrors = append(jobErrors, fmt.Errorf("advance investment %d debit date: %w", i.id, err))
+		}
 	}
-	return posted, nil
+	return posted, errors.Join(jobErrors...)
 }
 
 // postInvestmentDebit posts one contribution cycle inside a single DB txn,

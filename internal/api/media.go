@@ -407,6 +407,151 @@ func createMedia(deps Deps) http.HandlerFunc {
 	}
 }
 
+// optionalJSON preserves the three states a PATCH-style request needs:
+// omitted, explicit null, and a concrete value.
+type optionalJSON[T any] struct {
+	Set   bool
+	Null  bool
+	Value T
+}
+
+func (o *optionalJSON[T]) UnmarshalJSON(data []byte) error {
+	o.Set = true
+	if string(data) == "null" {
+		o.Null = true
+		return nil
+	}
+	return json.Unmarshal(data, &o.Value)
+}
+
+type mediaPatch struct {
+	Title           optionalJSON[string] `json:"title"`
+	Type            optionalJSON[string] `json:"type"`
+	Status          optionalJSON[string] `json:"status"`
+	Rating          optionalJSON[int]    `json:"rating"`
+	Notes           optionalJSON[string] `json:"notes"`
+	Platform        optionalJSON[string] `json:"platform"`
+	PosterURL       optionalJSON[string] `json:"poster_url"`
+	Year            optionalJSON[int]    `json:"year"`
+	Genre           optionalJSON[string] `json:"genre"`
+	ExternalID      optionalJSON[string] `json:"external_id"`
+	ReleaseDate     optionalJSON[string] `json:"release_date"`
+	EpisodesWatched optionalJSON[int]    `json:"episodes_watched"`
+	EpisodesTotal   optionalJSON[int]    `json:"episodes_total"`
+	SeasonsWatched  optionalJSON[int]    `json:"seasons_watched"`
+	SeasonsTotal    optionalJSON[int]    `json:"seasons_total"`
+	SeasonEpisodes  optionalJSON[[]int]  `json:"season_episodes"`
+	CollectionID    optionalJSON[string] `json:"collection_id"`
+	CollectionName  optionalJSON[string] `json:"collection_name"`
+}
+
+func (p *mediaPatch) values() (map[string]any, error) {
+	values := make(map[string]any)
+	putString := func(name string, field optionalJSON[string], nullable bool) error {
+		if !field.Set {
+			return nil
+		}
+		if field.Null {
+			if nullable {
+				values[name] = nil
+			} else {
+				values[name] = ""
+			}
+			return nil
+		}
+		values[name] = field.Value
+		return nil
+	}
+	for _, field := range []struct {
+		name     string
+		value    optionalJSON[string]
+		nullable bool
+	}{
+		{"title", p.Title, false}, {"type", p.Type, false}, {"status", p.Status, false},
+		{"notes", p.Notes, false}, {"platform", p.Platform, false}, {"poster_url", p.PosterURL, false},
+		{"genre", p.Genre, false}, {"external_id", p.ExternalID, false},
+		{"release_date", p.ReleaseDate, true}, {"collection_id", p.CollectionID, false},
+		{"collection_name", p.CollectionName, false},
+	} {
+		if err := putString(field.name, field.value, field.nullable); err != nil {
+			return nil, err
+		}
+	}
+	putInt := func(name string, field optionalJSON[int], nullable bool) {
+		if !field.Set {
+			return
+		}
+		if field.Null {
+			if nullable {
+				values[name] = nil
+			} else {
+				values[name] = 0
+			}
+		} else {
+			values[name] = field.Value
+		}
+	}
+	putInt("rating", p.Rating, true)
+	putInt("year", p.Year, true)
+	putInt("episodes_watched", p.EpisodesWatched, false)
+	putInt("episodes_total", p.EpisodesTotal, false)
+	putInt("seasons_watched", p.SeasonsWatched, false)
+	putInt("seasons_total", p.SeasonsTotal, false)
+	if p.SeasonEpisodes.Set {
+		if p.SeasonEpisodes.Null {
+			values["season_episodes"] = []int{}
+		} else {
+			values["season_episodes"] = p.SeasonEpisodes.Value
+		}
+	}
+	return values, validateMediaPatch(values)
+}
+
+func validateMediaPatch(values map[string]any) error {
+	if len(values) == 0 {
+		return fmt.Errorf("empty patch")
+	}
+	if title, ok := values["title"]; ok && strings.TrimSpace(title.(string)) == "" {
+		return fmt.Errorf("title cannot be empty")
+	}
+	if kind, ok := values["type"]; ok {
+		s, _ := kind.(string)
+		if s != "movie" && s != "show" && s != "book" {
+			return fmt.Errorf("invalid type")
+		}
+	}
+	if raw, ok := values["status"]; ok {
+		status, valid := mediastatus.NormalizeStatus(raw.(string))
+		if !valid {
+			return fmt.Errorf("invalid status")
+		}
+		values["status"] = string(status)
+	}
+	if rating, ok := values["rating"].(int); ok && (rating < 1 || rating > 10) {
+		return fmt.Errorf("rating must be between 1 and 10")
+	}
+	for _, key := range []string{"episodes_watched", "episodes_total", "seasons_watched", "seasons_total"} {
+		if value, ok := values[key].(int); ok && value < 0 {
+			return fmt.Errorf("%s cannot be negative", key)
+		}
+	}
+	if raw, ok := values["release_date"]; ok && raw != nil {
+		date := raw.(string)
+		if normalizeMediaDate(date) == "" {
+			return fmt.Errorf("invalid release_date")
+		}
+		values["release_date"] = normalizeMediaDate(date)
+	}
+	if episodes, ok := values["season_episodes"].([]int); ok {
+		for _, count := range episodes {
+			if count < 0 {
+				return fmt.Errorf("invalid season_episodes")
+			}
+		}
+	}
+	return nil
+}
+
 func updateMedia(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -417,12 +562,15 @@ func updateMedia(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		var body map[string]any
-		if err := readJSON(r, &body); err != nil {
+		var patch mediaPatch
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&patch); err != nil {
 			errJSON(w, 400, "invalid json")
 			return
 		}
-		if err := normalizeMediaStatusPatch(body); err != nil {
+		body, err := patch.values()
+		if err != nil {
 			errJSON(w, 400, err.Error())
 			return
 		}
@@ -433,6 +581,7 @@ func updateMedia(deps Deps) http.HandlerFunc {
 			prevStatus     string
 			prevEpsWatched int
 			prevSeasWatch  int
+			prevSeasTotal  int
 			prevRating     sql.NullInt64
 			prevType       string
 			prevTitle      string
@@ -442,14 +591,34 @@ func updateMedia(deps Deps) http.HandlerFunc {
 		)
 		var prevSEraw string
 		var prevEpsTotal int
-		_ = d.QueryRow(`SELECT status, COALESCE(episodes_watched,0), COALESCE(seasons_watched,0),
+		_ = d.QueryRow(`SELECT status, COALESCE(episodes_watched,0), COALESCE(seasons_watched,0), COALESCE(seasons_total,0),
 		                       rating, type, COALESCE(season_episodes::text,'[]'),
 		                       COALESCE(episodes_total,0), title, COALESCE(year,0),
 		                       COALESCE(release_date::text,''), external_id
 		                  FROM media WHERE id=$1 AND user_id=$2`, id, uid).
-			Scan(&prevStatus, &prevEpsWatched, &prevSeasWatch, &prevRating, &prevType, &prevSEraw, &prevEpsTotal,
+			Scan(&prevStatus, &prevEpsWatched, &prevSeasWatch, &prevSeasTotal, &prevRating, &prevType, &prevSEraw, &prevEpsTotal,
 				&prevTitle, &prevYear, &prevRelease, &prevExternalID)
 		prevSeasonEps := decodeIntArray(prevSEraw)
+		episodesWatched := prevEpsWatched
+		if value, ok := body["episodes_watched"].(int); ok {
+			episodesWatched = value
+		}
+		episodesTotal := prevEpsTotal
+		if value, ok := body["episodes_total"].(int); ok {
+			episodesTotal = value
+		}
+		seasonsWatched := prevSeasWatch
+		if value, ok := body["seasons_watched"].(int); ok {
+			seasonsWatched = value
+		}
+		seasonsTotal := prevSeasTotal
+		if value, ok := body["seasons_total"].(int); ok {
+			seasonsTotal = value
+		}
+		if (episodesTotal > 0 && episodesWatched > episodesTotal) || (seasonsTotal > 0 && seasonsWatched > seasonsTotal) {
+			errJSON(w, 400, "watched count exceeds total")
+			return
+		}
 
 		if mediaDupKeysChanged(body) && prevType != "" {
 			cand := mediaDupCandidate{
@@ -473,20 +642,11 @@ func updateMedia(deps Deps) http.HandlerFunc {
 			}
 		}
 
-		allowed := map[string]bool{
-			"title": true, "type": true, "status": true, "rating": true,
-			"notes": true, "platform": true, "poster_url": true, "year": true,
-			"genre": true, "external_id": true, "release_date": true,
-			"episodes_watched": true, "episodes_total": true,
-			"seasons_watched": true, "seasons_total": true,
-			"collection_id": true, "collection_name": true,
-		}
-
 		var sets []string
 		var args []any
 		ph := 1
 		for k, v := range body {
-			if allowed[k] {
+			if k != "season_episodes" {
 				if k == "release_date" {
 					sets = append(sets, fmt.Sprintf("%s = $%d", k, ph))
 					args = append(args, mediaDateArg(v))
@@ -507,10 +667,6 @@ func updateMedia(deps Deps) http.HandlerFunc {
 			sets = append(sets, fmt.Sprintf("season_episodes = $%d::jsonb", ph))
 			args = append(args, string(arr))
 			ph++
-		}
-		if len(sets) == 0 {
-			writeJSON(w, 200, map[string]string{"status": "ok"})
-			return
 		}
 		sets = append(sets, "updated_at = NOW()")
 		idPh := ph
@@ -575,23 +731,6 @@ func updateMedia(deps Deps) http.HandlerFunc {
 
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
-}
-
-func normalizeMediaStatusPatch(body map[string]any) error {
-	raw, ok := body["status"]
-	if !ok {
-		return nil
-	}
-	s, ok := raw.(string)
-	if !ok {
-		return fmt.Errorf("invalid status")
-	}
-	status, valid := mediastatus.NormalizeStatus(s)
-	if !valid {
-		return fmt.Errorf("invalid status")
-	}
-	body["status"] = string(status)
-	return nil
 }
 
 func deleteMedia(deps Deps) http.HandlerFunc {

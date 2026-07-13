@@ -32,7 +32,7 @@ run: build
 
 # --- format ---
 fmt:
-	gofumpt -w .
+	gofmt -w .
 
 # --- lint (read-only) ---
 lint:
