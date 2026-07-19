@@ -319,7 +319,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_pockets",
-			Description: "List the user's pockets (spend contexts like 'Goa Trip') with this month's spend per pocket, the General (unpocketed) spend, and which pocket is active. New expenses default into the active pocket.",
+			Description: "List the user's pockets (spend contexts like 'Goa Trip') with this month's spend per pocket, the General (unpocketed) spend, and which pocket is active. New expenses default into the active pocket. Also lists shared pockets (split expenses with other people) with member_count and my_balance — positive my_balance means others owe the user.",
 			Schema:      obj(map[string]*genai.Schema{}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listPocketsTool(ctx, d, uid)
@@ -805,6 +805,39 @@ func (s *Service) buildTools() []Tool {
 			}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return setActivePocketTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "add_shared_expense",
+			Description: "Record an expense the USER paid in a shared pocket, split equally. list_pockets gives shared pocket ids and each pocket's members (member_id + name) for participant_member_ids. Default split: everyone in the pocket. Pass account_id (from list_finance_accounts) to also record the full amount on the user's own ledger.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"pocket_id":              intg("Required. A shared pocket id from list_pockets."),
+				"amount":                 num("Required. Total amount the user paid."),
+				"description":            str("What it was for, e.g. 'Dinner'."),
+				"date":                   str("Optional ISO date; defaults to now."),
+				"participant_member_ids": arrayOf(intg(""), "Member ids to split among. Omit to split among everyone."),
+				"account_id":             intg("Optional: also record the full amount as an expense on this account of the user's ledger."),
+				"category_name":          str("Optional category for the user's ledger entry."),
+			}, "pocket_id", "amount"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return addSharedExpenseTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "record_settlement",
+			Description: "Record a settle-up in a shared pocket between the user and one other member. direction 'i_paid' (default) = the user paid them back; 'i_received' = they paid the user back. Pass account_id to also put the user's leg on their own ledger (expense when paid, income when received).",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"pocket_id":              intg("Required. A shared pocket id from list_pockets."),
+				"amount":                 num("Required."),
+				"counterparty_member_id": intg("Required. The other member's id."),
+				"direction":              str("'i_paid' | 'i_received'. Default i_paid."),
+				"account_id":             intg("Optional: echo the user's leg to this account."),
+				"date":                   str("Optional ISO date; defaults to now."),
+			}, "pocket_id", "amount", "counterparty_member_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return recordSettlementTool(ctx, d, uid, args)
 			},
 		},
 		{
@@ -2531,15 +2564,15 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	if v, ok := args["pocket_id"]; ok && v != nil {
 		if p := argInt(args, "pocket_id", 0); p > 0 {
 			var okPocket bool
-			d.QueryRowContext(ctx, `SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2`, p, uid).Scan(&okPocket)
+			d.QueryRowContext(ctx, `SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2 AND kind = 'personal'`, p, uid).Scan(&okPocket)
 			if !okPocket {
-				return nil, nil, fmt.Errorf("pocket not found")
+				return nil, nil, fmt.Errorf("pocket not found (shared pockets take expenses via add_shared_expense)")
 			}
 			pocketArg = p
 		}
 	} else {
 		var active int64
-		if err := d.QueryRowContext(ctx, `SELECT id FROM fin_pockets WHERE user_id = $1 AND is_active AND NOT archived`, uid).Scan(&active); err == nil {
+		if err := d.QueryRowContext(ctx, `SELECT id FROM fin_pockets WHERE user_id = $1 AND is_active AND NOT archived AND kind = 'personal'`, uid).Scan(&active); err == nil {
 			pocketArg = active
 		}
 	}
@@ -2586,9 +2619,16 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		return nil, nil, fmt.Errorf("missing id")
 	}
 	var owned int
-	d.QueryRowContext(ctx, `SELECT 1 FROM fin_transactions WHERE id=$1 AND user_id=$2`, id, uid).Scan(&owned)
+	var echoLinked bool
+	d.QueryRowContext(ctx, `SELECT 1, shared_expense_id IS NOT NULL OR settlement_id IS NOT NULL
+		FROM fin_transactions WHERE id=$1 AND user_id=$2`, id, uid).Scan(&owned, &echoLinked)
 	if owned != 1 {
 		return nil, nil, fmt.Errorf("transaction not found")
+	}
+	if echoLinked {
+		if argFloat(args, "amount") > 0 || argStr(args, "date") != "" || args["description"] != nil || args["pocket_id"] != nil || argStr(args, "type") != "" {
+			return nil, nil, fmt.Errorf("this transaction mirrors a shared-pocket entry — edit it in the shared pocket instead (only account/category/note can change here)")
+		}
 	}
 
 	sets := []string{"updated_at = NOW()"}
@@ -2630,7 +2670,7 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	if v, ok := args["pocket_id"]; ok && v != nil {
 		if p := argInt(args, "pocket_id", 0); p > 0 {
 			var okPocket bool
-			d.QueryRowContext(ctx, `SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2`, p, uid).Scan(&okPocket)
+			d.QueryRowContext(ctx, `SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2 AND kind = 'personal'`, p, uid).Scan(&okPocket)
 			if !okPocket {
 				return nil, nil, fmt.Errorf("pocket not found")
 			}

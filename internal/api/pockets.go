@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -18,12 +19,15 @@ func registerPocketRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("PUT /api/finance/pockets/{id}", updatePocket(deps))
 	mux.HandleFunc("DELETE /api/finance/pockets/{id}", deletePocket(deps))
 	mux.HandleFunc("POST /api/finance/pockets/active", setActivePocket(deps))
+	registerSharedPocketRoutes(mux, deps)
+	registerPocketInviteRoutes(mux, deps)
 }
 
-// activePocketID returns the user's active pocket id, nil when none.
+// activePocketID returns the user's active pocket id, nil when none. Only
+// personal pockets can be active — shared expenses need split info.
 func activePocketID(d *db.DB, uid string) *int64 {
 	var id int64
-	if err := d.QueryRow(`SELECT id FROM fin_pockets WHERE user_id = $1 AND is_active AND NOT archived`,
+	if err := d.QueryRow(`SELECT id FROM fin_pockets WHERE user_id = $1 AND is_active AND NOT archived AND kind = 'personal'`,
 		uid).Scan(&id); err != nil {
 		return nil
 	}
@@ -51,7 +55,7 @@ func listPockets(deps Deps) http.HandlerFunc {
 			TxnCount   int64   `json:"txn_count"`
 		}
 
-		q := `SELECT id, name, color, is_active, archived FROM fin_pockets WHERE user_id = $1`
+		q := `SELECT id, name, color, is_active, archived FROM fin_pockets WHERE user_id = $1 AND kind = 'personal'`
 		if !includeArchived {
 			q += " AND archived = FALSE"
 		}
@@ -109,12 +113,100 @@ func listPockets(deps Deps) http.HandlerFunc {
 			}
 		}
 
+		shared, err := listSharedPocketSummaries(r.Context(), d, uid, includeArchived)
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
 		writeJSON(w, 200, map[string]any{
 			"items":            items,
 			"general_spend":    generalSpend,
 			"active_pocket_id": activeID,
+			"shared":           shared,
+			"invites":          listMyPocketInvites(r.Context(), d, uid),
 		})
 	}
+}
+
+type sharedPocketSummary struct {
+	ID          int64   `json:"id"`
+	Name        string  `json:"name"`
+	Color       string  `json:"color"`
+	Archived    bool    `json:"archived"`
+	IsOwner     bool    `json:"is_owner"`
+	OwnerName   string  `json:"owner_name"`
+	MemberCount int64   `json:"member_count"`
+	MonthSpend  float64 `json:"month_spend"`
+	MyBalance   float64 `json:"my_balance"` // positive = others owe you
+}
+
+// listSharedPocketSummaries returns every shared pocket the user owns or is
+// an active member of, with this month's spend and their net balance.
+func listSharedPocketSummaries(ctx context.Context, d *db.DB, uid string, includeArchived bool) ([]sharedPocketSummary, error) {
+	now := userNow(d, uid)
+	from, to := budgetWindow("monthly", "", "", "", now)
+
+	q := `SELECT p.id, p.name, p.color, p.archived, p.user_id = $1,
+			COALESCE(om.display_name, ''),
+			(SELECT COUNT(*) FROM fin_pocket_members mm WHERE mm.pocket_id = p.id AND mm.left_at IS NULL)
+		FROM fin_pockets p
+		LEFT JOIN fin_pocket_members me ON me.pocket_id = p.id AND me.user_id = $1 AND me.left_at IS NULL
+		LEFT JOIN fin_pocket_members om ON om.pocket_id = p.id AND om.role = 'owner'
+		WHERE p.kind = 'shared' AND (p.user_id = $1 OR me.id IS NOT NULL)`
+	if !includeArchived {
+		q += " AND p.archived = FALSE"
+	}
+	q += " ORDER BY p.created_at ASC"
+	rows, err := d.QueryContext(ctx, q, uid)
+	if err != nil {
+		return nil, err
+	}
+	out := []sharedPocketSummary{}
+	idx := map[int64]int{}
+	var ids []int64
+	for rows.Next() {
+		var s sharedPocketSummary
+		rows.Scan(&s.ID, &s.Name, &s.Color, &s.Archived, &s.IsOwner, &s.OwnerName, &s.MemberCount)
+		idx[s.ID] = len(out)
+		ids = append(ids, s.ID)
+		out = append(out, s)
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return out, nil
+	}
+
+	srows, err := d.QueryContext(ctx, `SELECT pocket_id, COALESCE(SUM(amount),0)
+		FROM fin_shared_expenses
+		WHERE pocket_id = ANY($1) AND (spent_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3
+		GROUP BY pocket_id`, ids, from, to)
+	if err == nil {
+		for srows.Next() {
+			var pid int64
+			var sum float64
+			srows.Scan(&pid, &sum)
+			out[idx[pid]].MonthSpend = sum
+		}
+		srows.Close()
+	}
+
+	// Net balance of the caller's member row per pocket (paise-exact).
+	brows, err := d.QueryContext(ctx, `SELECT m.pocket_id,
+			COALESCE((SELECT SUM(ROUND(e.amount*100)::bigint) FROM fin_shared_expenses e WHERE e.paid_by = m.id),0)
+			- COALESCE((SELECT SUM(ROUND(s.amount*100)::bigint) FROM fin_expense_shares s WHERE s.member_id = m.id),0)
+			+ COALESCE((SELECT SUM(ROUND(st.amount*100)::bigint) FROM fin_pocket_settlements st WHERE st.from_member = m.id),0)
+			- COALESCE((SELECT SUM(ROUND(st.amount*100)::bigint) FROM fin_pocket_settlements st WHERE st.to_member = m.id),0)
+		FROM fin_pocket_members m
+		WHERE m.user_id = $1 AND m.left_at IS NULL AND m.pocket_id = ANY($2)`, uid, ids)
+	if err == nil {
+		for brows.Next() {
+			var pid, net int64
+			brows.Scan(&pid, &net)
+			out[idx[pid]].MyBalance = rupees(net)
+		}
+		brows.Close()
+	}
+	return out, nil
 }
 
 func createPocket(deps Deps) http.HandlerFunc {
@@ -202,8 +294,41 @@ func deletePocket(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid id")
 			return
 		}
-		// FK SET NULL moves its txns to General; budget filter rows cascade.
-		d.Exec(`DELETE FROM fin_pockets WHERE id = $1 AND user_id = $2`, id, uid)
+		ctx := r.Context()
+		var owned bool
+		d.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM fin_pockets WHERE id = $1 AND user_id = $2)`, id, uid).Scan(&owned)
+		if !owned {
+			errJSON(w, 404, "not found")
+			return
+		}
+		tx, err := d.BeginTx(ctx, nil)
+		if err != nil {
+			internalError(w, r, "begin pocket delete", err)
+			return
+		}
+		defer tx.Rollback()
+		// Shared pockets: unlink members' echo txns first (ledger history
+		// survives, only the pocket relation dies). No-op for personal.
+		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET shared_expense_id = NULL
+			WHERE shared_expense_id IN (SELECT id FROM fin_shared_expenses WHERE pocket_id = $1)`, id); err != nil {
+			internalError(w, r, "unlink expense echoes", err)
+			return
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET settlement_id = NULL
+			WHERE settlement_id IN (SELECT id FROM fin_pocket_settlements WHERE pocket_id = $1)`, id); err != nil {
+			internalError(w, r, "unlink settlement echoes", err)
+			return
+		}
+		// FK SET NULL moves personal txns to General; members, invites,
+		// expenses, settlements and activity cascade.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM fin_pockets WHERE id = $1 AND user_id = $2`, id, uid); err != nil {
+			internalError(w, r, "delete pocket", err)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit pocket delete", err)
+			return
+		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
 }
@@ -231,7 +356,7 @@ func setActivePocket(deps Deps) http.HandlerFunc {
 			return
 		}
 		if b.PocketID != nil && *b.PocketID > 0 {
-			res, err := tx.Exec(`UPDATE fin_pockets SET is_active = TRUE WHERE id = $1 AND user_id = $2 AND NOT archived`,
+			res, err := tx.Exec(`UPDATE fin_pockets SET is_active = TRUE WHERE id = $1 AND user_id = $2 AND NOT archived AND kind = 'personal'`,
 				*b.PocketID, uid)
 			if err != nil {
 				errJSON(w, 500, err.Error())

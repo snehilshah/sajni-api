@@ -45,6 +45,23 @@ func requireOwnedFinanceRef(ctx context.Context, q dbtx, table, userID string, i
 	return nil
 }
 
+// requirePersonalPocket is the pocket variant of requireOwnedFinanceRef:
+// personal-ledger machinery (txn pocket refs, budget filters, active pocket)
+// must never point at a shared pocket.
+func requirePersonalPocket(ctx context.Context, q dbtx, userID string, id int64) error {
+	if id == 0 {
+		return errFinanceReferenceNotFound
+	}
+	var ok bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_pockets WHERE id=$1 AND user_id=$2 AND kind='personal')`, id, userID).Scan(&ok); err != nil {
+		return fmt.Errorf("check personal pocket: %w", err)
+	}
+	if !ok {
+		return errFinanceReferenceNotFound
+	}
+	return nil
+}
+
 func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	// Accounts
 	mux.HandleFunc("GET /api/finance/accounts", listAccounts(deps))
@@ -579,15 +596,17 @@ type txnResp struct {
 	TxnAt         string  `json:"txn_at"` // RFC3339 in IST (carries +05:30)
 	TransferPair  *int64  `json:"transfer_pair"`
 	LinkedAccount *int64  `json:"linked_account"`
-	PocketID      *int64  `json:"pocket_id"`   // NULL = General
-	PocketName    *string `json:"pocket_name"` // joined for display
+	PocketID      *int64  `json:"pocket_id"`         // NULL = General
+	PocketName    *string `json:"pocket_name"`       // joined for display
+	SharedExpense *int64  `json:"shared_expense_id"` // echo of a shared-pocket expense
+	SettlementID  *int64  `json:"settlement_id"`     // echo of a shared-pocket settlement
 	CreatedAt     string  `json:"created_at"`
 }
 
 // resolvePocketID applies the tri-state pocket contract for txn creation:
 // field absent/null → the user's active pocket (old clients get the default
 // for free); 0 → explicit General (stored NULL); N → that pocket, validated
-// as owned + not archived. Returns (stored value, error message).
+// as owned + personal + not archived. Returns (stored value, error message).
 func resolvePocketID(d *db.DB, uid string, requested *int64) (*int64, string) {
 	if requested == nil {
 		return activePocketID(d, uid), ""
@@ -596,7 +615,7 @@ func resolvePocketID(d *db.DB, uid string, requested *int64) (*int64, string) {
 		return nil, ""
 	}
 	var ok bool
-	d.QueryRow(`SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2`,
+	d.QueryRow(`SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2 AND kind = 'personal'`,
 		*requested, uid).Scan(&ok)
 	if !ok {
 		return nil, "pocket not found"
@@ -697,7 +716,8 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		}
 
 		q := `SELECT t.id, t.account_id, a.name, t.category_id, c.name, c.color, t.type, t.amount,
-			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.pocket_id, p.name, t.created_at::text
+			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.pocket_id, p.name,
+			  t.shared_expense_id, t.settlement_id, t.created_at::text
 			  FROM fin_transactions t
 			  JOIN fin_accounts a ON a.id = t.account_id
 			  LEFT JOIN fin_categories c ON c.id = t.category_id
@@ -717,7 +737,8 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			var t txnResp
 			var at time.Time
 			rows.Scan(&t.ID, &t.AccountID, &t.AccountName, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
-				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount, &t.PocketID, &t.PocketName, &t.CreatedAt)
+				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount, &t.PocketID, &t.PocketName,
+				&t.SharedExpense, &t.SettlementID, &t.CreatedAt)
 			t.TxnAt = at.In(loc).Format(time.RFC3339)
 			out = append(out, t)
 		}
@@ -898,7 +919,7 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			}
 		}
 		if b.PocketID != nil && *b.PocketID != 0 {
-			if err := requireOwnedFinanceRef(ctx, tx, "fin_pockets", uid, *b.PocketID); err != nil {
+			if err := requirePersonalPocket(ctx, tx, uid, *b.PocketID); err != nil {
 				if errors.Is(err, errFinanceReferenceNotFound) {
 					errJSON(w, 404, "not found")
 				} else {
@@ -906,6 +927,20 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 				}
 				return
 			}
+		}
+
+		// Echo rows mirror a shared-pocket expense/settlement: their money
+		// fields are managed by the pocket, only account/category/note are
+		// the user's to edit here.
+		var echoLinked bool
+		if err := tx.QueryRowContext(ctx, `SELECT shared_expense_id IS NOT NULL OR settlement_id IS NOT NULL
+			FROM fin_transactions WHERE id = $1`, id).Scan(&echoLinked); err != nil {
+			internalError(w, r, "check echo link", err)
+			return
+		}
+		if echoLinked && (b.Amount != nil || b.Description != nil || b.TxnAt != nil || b.PocketID != nil) {
+			errJSON(w, 400, "amount, description and date are managed by the shared pocket")
+			return
 		}
 
 		var mainSets, pairSets []string
@@ -988,6 +1023,14 @@ func deleteTransaction(deps Deps) http.HandlerFunc {
 		id, err := intParam(r, "id")
 		if err != nil {
 			errJSON(w, 400, "invalid id")
+			return
+		}
+		// Echo rows die with their shared expense/settlement, not here.
+		var echoLinked bool
+		d.QueryRow(`SELECT shared_expense_id IS NOT NULL OR settlement_id IS NOT NULL
+			FROM fin_transactions WHERE id = $1 AND user_id = $2`, id, uid).Scan(&echoLinked)
+		if echoLinked {
+			errJSON(w, 400, "this entry is managed by a shared pocket — delete it there")
 			return
 		}
 		// delete pair if any
@@ -1180,7 +1223,7 @@ func createBudget(deps Deps) http.HandlerFunc {
 			}
 		}
 		for _, pocketID := range b.PocketIDs {
-			if err := requireOwnedFinanceRef(ctx, tx, "fin_pockets", uid, pocketID); err != nil {
+			if err := requirePersonalPocket(ctx, tx, uid, pocketID); err != nil {
 				errJSON(w, 404, "not found")
 				return
 			}
@@ -1258,7 +1301,7 @@ func updateBudget(deps Deps) http.HandlerFunc {
 			}
 		}
 		for _, pocketID := range valueOrEmpty(b.PocketIDs) {
-			if err := requireOwnedFinanceRef(ctx, tx, "fin_pockets", uid, pocketID); err != nil {
+			if err := requirePersonalPocket(ctx, tx, uid, pocketID); err != nil {
 				errJSON(w, 404, "not found")
 				return
 			}

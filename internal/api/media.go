@@ -820,6 +820,9 @@ func searchTMDB(query, mediaType string) []SearchResult {
 
 	// movie / show (and the empty default) get the combined, interleaved
 	// search; any other explicit type still hits its single endpoint.
+	// Full TMDB page 1 per endpoint (20 rows each). The old cap of 8 combined
+	// left ~4 movie slots, which buried same-title matches ranked below the
+	// popular namesakes (e.g. Highway 2014); the dropdown scrolls instead.
 	combined := mediaType == "movie" || mediaType == "show" || mediaType == ""
 	var results []SearchResult
 	if combined {
@@ -829,15 +832,15 @@ func searchTMDB(query, mediaType string) []SearchResult {
 		go func() { defer wg.Done(); movies = fetchTMDBList("movie", query, apiKey) }()
 		go func() { defer wg.Done(); shows = fetchTMDBList("tv", query, apiKey) }()
 		wg.Wait()
-		results = interleaveResults(movies, shows, 8)
+		results = interleaveResults(movies, shows, 40)
 	} else {
 		endpoint := "movie"
 		if mediaType == "show" {
 			endpoint = "tv"
 		}
 		results = fetchTMDBList(endpoint, query, apiKey)
-		if len(results) > 8 {
-			results = results[:8]
+		if len(results) > 20 {
+			results = results[:20]
 		}
 	}
 	cacheSet(cacheKey, results, 10*time.Minute)

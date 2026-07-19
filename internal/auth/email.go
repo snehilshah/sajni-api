@@ -248,6 +248,31 @@ func (s *Service) SendGuestTaskReminder(ctx context.Context, to, fromName, taskT
 	return s.SendEmail(ctx, to, subject, buf.String())
 }
 
+// SendPocketInvite ships a shared-pocket invitation to a (possibly non-user)
+// email. acceptURL carries the one-time claim token. Dev mode without a
+// Resend key: SendEmail prints a would-send line; the caller logs the URL.
+func (s *Service) SendPocketInvite(ctx context.Context, to, inviterName, pocketName, acceptURL string) error {
+	tpl, err := template.ParseFS(emailTemplatesFS, "email_templates/pocket_invite.html")
+	if err != nil {
+		return err
+	}
+	sender := strings.TrimSpace(inviterName)
+	if sender == "" {
+		sender = "Someone"
+	}
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, map[string]any{
+		"InviterName": sender,
+		"PocketName":  pocketName,
+		"AcceptURL":   acceptURL,
+		"AppURL":      strings.TrimRight(s.AppURL, "/"),
+	}); err != nil {
+		return err
+	}
+	subject := sender + " invited you to split expenses in " + pocketName
+	return s.SendEmail(ctx, to, subject, buf.String())
+}
+
 // consumeEmailCode verifies a 6-digit code for the given email + purpose.
 // On success returns the matched row's metadata so the handler can act
 // on link payloads. Increments attempts on mismatch; locks at 5.

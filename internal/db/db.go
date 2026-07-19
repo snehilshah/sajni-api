@@ -612,6 +612,7 @@ func (d *DB) migrate() error {
 		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name       TEXT        NOT NULL DEFAULT '',
 		color      TEXT        NOT NULL DEFAULT '#2D5A4F',
+		kind       TEXT        NOT NULL DEFAULT 'personal',
 		is_active  BOOLEAN     NOT NULL DEFAULT FALSE,
 		archived   BOOLEAN     NOT NULL DEFAULT FALSE,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -633,6 +634,112 @@ func (d *DB) migrate() error {
 		pocket_id BIGINT NOT NULL REFERENCES fin_pockets(id) ON DELETE CASCADE,
 		PRIMARY KEY (budget_id, pocket_id)
 	);
+
+	-- ─── Shared pockets: spliit-style expense splitting ───────────────
+	-- kind='shared' pockets carry participants and split expenses. These
+	-- tables are intentionally cross-tenant (members belong to different
+	-- users), so they are NOT in the tenant RAISE guard below; owner
+	-- consistency is enforced by composite FKs onto fin_pockets(user_id,id).
+	-- user_id NULL on a member = text-only person or invite not yet
+	-- accepted; acceptance fills it in.
+	CREATE TABLE IF NOT EXISTS fin_pocket_members (
+		id           BIGSERIAL   PRIMARY KEY,
+		owner_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		pocket_id    BIGINT      NOT NULL,
+		user_id      UUID        REFERENCES users(id) ON DELETE SET NULL,
+		display_name TEXT        NOT NULL DEFAULT '',
+		role         TEXT        NOT NULL DEFAULT 'member',
+		left_at      TIMESTAMPTZ,
+		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_pocket_members_pocket ON fin_pocket_members(pocket_id);
+	CREATE INDEX IF NOT EXISTS idx_fin_pocket_members_user ON fin_pocket_members(user_id) WHERE user_id IS NOT NULL;
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_pocket_members_active_user
+		ON fin_pocket_members(pocket_id, user_id) WHERE user_id IS NOT NULL AND left_at IS NULL;
+
+	CREATE TABLE IF NOT EXISTS fin_pocket_invites (
+		id          BIGSERIAL   PRIMARY KEY,
+		owner_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		pocket_id   BIGINT      NOT NULL,
+		member_id   BIGINT      NOT NULL REFERENCES fin_pocket_members(id) ON DELETE CASCADE,
+		email       CITEXT      NOT NULL,
+		token_hash  BYTEA       NOT NULL UNIQUE,
+		status      TEXT        NOT NULL DEFAULT 'pending',
+		expires_at  TIMESTAMPTZ NOT NULL,
+		accepted_at TIMESTAMPTZ,
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_pocket_invites_email ON fin_pocket_invites(email) WHERE status = 'pending';
+	CREATE INDEX IF NOT EXISTS idx_fin_pocket_invites_pocket ON fin_pocket_invites(pocket_id);
+
+	-- Shares are always materialized (equal splits included): the
+	-- remainder-paise rule is applied once at write time so balance math
+	-- never re-derives splits.
+	CREATE TABLE IF NOT EXISTS fin_shared_expenses (
+		id          BIGSERIAL   PRIMARY KEY,
+		owner_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		pocket_id   BIGINT      NOT NULL,
+		-- CASCADE so pocket deletion (members cascade off fin_pockets) can
+		-- proceed; a referenced member is never hard-deleted on its own —
+		-- the API soft-leaves (left_at) instead.
+		paid_by     BIGINT      NOT NULL REFERENCES fin_pocket_members(id) ON DELETE CASCADE,
+		amount      NUMERIC(14,2) NOT NULL DEFAULT 0,
+		description TEXT        NOT NULL DEFAULT '',
+		note        TEXT        NOT NULL DEFAULT '',
+		split       TEXT        NOT NULL DEFAULT 'equal',
+		spent_at    TIMESTAMPTZ NOT NULL,
+		created_by  UUID        REFERENCES users(id) ON DELETE SET NULL,
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_shared_expenses_pocket ON fin_shared_expenses(pocket_id, spent_at DESC);
+
+	CREATE TABLE IF NOT EXISTS fin_expense_shares (
+		expense_id BIGINT NOT NULL REFERENCES fin_shared_expenses(id) ON DELETE CASCADE,
+		member_id  BIGINT NOT NULL REFERENCES fin_pocket_members(id) ON DELETE CASCADE,
+		amount     NUMERIC(14,2) NOT NULL DEFAULT 0,
+		PRIMARY KEY (expense_id, member_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_expense_shares_member ON fin_expense_shares(member_id);
+
+	CREATE TABLE IF NOT EXISTS fin_pocket_settlements (
+		id          BIGSERIAL   PRIMARY KEY,
+		owner_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		pocket_id   BIGINT      NOT NULL,
+		from_member BIGINT      NOT NULL REFERENCES fin_pocket_members(id) ON DELETE CASCADE,
+		to_member   BIGINT      NOT NULL REFERENCES fin_pocket_members(id) ON DELETE CASCADE,
+		amount      NUMERIC(14,2) NOT NULL DEFAULT 0,
+		settled_at  TIMESTAMPTZ NOT NULL,
+		created_by  UUID        REFERENCES users(id) ON DELETE SET NULL,
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_pocket_settlements_pocket ON fin_pocket_settlements(pocket_id);
+
+	-- actor_name is a display-name snapshot: survives member removal and
+	-- never exposes emails or user ids to other members.
+	CREATE TABLE IF NOT EXISTS fin_pocket_activity (
+		id         BIGSERIAL   PRIMARY KEY,
+		owner_id   UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		pocket_id  BIGINT      NOT NULL,
+		actor_name TEXT        NOT NULL DEFAULT '',
+		kind       TEXT        NOT NULL,
+		detail     JSONB       NOT NULL DEFAULT '{}',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_pocket_activity_pocket ON fin_pocket_activity(pocket_id, id DESC);
+
+	-- Echo linkage: a shared expense/settlement may mirror into a member's
+	-- personal ledger as a normal fin_transactions row. Echo rows always
+	-- have pocket_id NULL (the link column is the pocket relation — a
+	-- member's txn can never reference another user's fin_pockets row).
+	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS
+		shared_expense_id BIGINT REFERENCES fin_shared_expenses(id) ON DELETE CASCADE;
+	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS
+		settlement_id BIGINT REFERENCES fin_pocket_settlements(id) ON DELETE CASCADE;
+	CREATE INDEX IF NOT EXISTS idx_fin_txn_shared_expense
+		ON fin_transactions(shared_expense_id) WHERE shared_expense_id IS NOT NULL;
+	CREATE INDEX IF NOT EXISTS idx_fin_txn_settlement
+		ON fin_transactions(settlement_id) WHERE settlement_id IS NOT NULL;
 
 	-- One row per auto-debited investment cycle; UNIQUE key is the
 	-- idempotency gate (mirrors fin_biller_payments).
@@ -695,9 +802,17 @@ func (d *DB) migrate() error {
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_investment_account_user') THEN ALTER TABLE fin_investments ADD CONSTRAINT fk_fin_investment_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (account_id); END IF;
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_biller_account_user') THEN ALTER TABLE fin_billers ADD CONSTRAINT fk_fin_biller_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (account_id); END IF;
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_biller_category_user') THEN ALTER TABLE fin_billers ADD CONSTRAINT fk_fin_biller_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id); END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_pocket_member_pocket_owner') THEN ALTER TABLE fin_pocket_members ADD CONSTRAINT fk_fin_pocket_member_pocket_owner FOREIGN KEY(owner_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE CASCADE; END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_pocket_invite_pocket_owner') THEN ALTER TABLE fin_pocket_invites ADD CONSTRAINT fk_fin_pocket_invite_pocket_owner FOREIGN KEY(owner_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE CASCADE; END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_shared_expense_pocket_owner') THEN ALTER TABLE fin_shared_expenses ADD CONSTRAINT fk_fin_shared_expense_pocket_owner FOREIGN KEY(owner_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE CASCADE; END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_pocket_settlement_pocket_owner') THEN ALTER TABLE fin_pocket_settlements ADD CONSTRAINT fk_fin_pocket_settlement_pocket_owner FOREIGN KEY(owner_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE CASCADE; END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_pocket_activity_pocket_owner') THEN ALTER TABLE fin_pocket_activity ADD CONSTRAINT fk_fin_pocket_activity_pocket_owner FOREIGN KEY(owner_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE CASCADE; END IF;
 	END $$;
 
 	-- ─── Finance migrations for pre-existing DBs (idempotent) ─────────
+	-- Pocket kind (fresh DBs get it via CREATE TABLE).
+	ALTER TABLE fin_pockets ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'personal';
+
 	-- Biller kind backfill (fresh DBs get kind via CREATE TABLE).
 	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT '';
 	UPDATE fin_billers SET kind = CASE WHEN variable THEN 'bill' ELSE 'subscription' END WHERE kind = '';
