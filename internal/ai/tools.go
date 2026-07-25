@@ -305,12 +305,12 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_finance_transactions",
-			Description: "List finance transactions with filters. Each transaction includes its category_id/category_name and pocket_id/pocket_name (pocket = spend context like a trip; no pocket = General).",
+			Description: "List finance transactions with filters. Each transaction includes its category_id/category_name and the slate it sits on. Filter by slate_id to see everything on one slate — that is how you answer 'what did the Goa trip cost'.",
 			Schema: obj(map[string]*genai.Schema{
 				"account_id": intg("Filter by account."),
-				"pocket_id":  intg("Filter by pocket. 0 = General (no pocket)."),
 				"date_from":  str("ISO date."),
 				"date_to":    str("ISO date."),
+				"slate_id":   intg("Filter to one slate, from list_slates. Plain is a real slate, so pass its id to see normal life only."),
 				"limit":      intg("Default 50."),
 			}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
@@ -318,11 +318,49 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
-			Name:        "list_pockets",
-			Description: "List the user's pockets (spend contexts like 'Goa Trip') with this month's spend per pocket, the General (unpocketed) spend, and which pocket is active. New expenses default into the active pocket. Also lists shared pockets (split expenses with other people) with member_count and my_balance — positive my_balance means others owe the user.",
+			Name:        "list_slates",
+			Description: "List the user's slates with each one's lifetime transaction count and total spend. A slate answers 'is this normal life or not?' — every transaction is in exactly one. 'Plain' (is_plain=true) is normal life and is where everything lands by default; every other slate is an outlier the user named, like a trip or a one-off purchase. Budgets ignore slates they do not explicitly name, which is what keeps the user's baseline spending clean.",
 			Schema:      obj(map[string]*genai.Schema{}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
-				return listPocketsTool(ctx, d, uid)
+				return listSlatesTool(ctx, d, uid)
+			},
+		},
+		{
+			Name:        "create_slate",
+			Description: "Create a slate — a named bundle of spending that sits outside normal life, like 'Goa Trip' or 'Fridge'. Transactions filed into it stop counting toward the user's ordinary budgets. Use move_transactions_to_slate afterwards to put existing transactions in it.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"name":  str("Required. e.g. 'Goa Trip'."),
+				"color": str("Optional hex color."),
+			}, "name"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return createSlateTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "update_slate",
+			Description: "Rename, recolor or archive a slate. Archiving keeps a finished trip out of the pickers without touching its transactions — budgets that name it keep counting them. Plain cannot be renamed or archived. To actually remove a slate's spending from itself, move the transactions back to Plain instead.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"slate_id": intg("Required. From list_slates."),
+				"name":     str("New name."),
+				"color":    str("New hex color."),
+				"archived": {Type: genai.TypeBoolean, Description: "true to archive, false to bring it back."},
+			}, "slate_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return updateSlateTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "move_transactions_to_slate",
+			Description: "Move existing transactions into a slate in one go — the retroactive sweep. Use this when the user realises after the fact that a run of spending was a trip or something unusual: get the ids from list_finance_transactions, then move them. Pass slate_id=0 to move them back to Plain (normal life).",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"transaction_ids": arrayOf(intg(""), "Required. Transaction ids from list_finance_transactions."),
+				"slate_id":        intg("Target slate from list_slates; 0 or omitted = Plain."),
+			}, "transaction_ids"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return moveToSlateTool(ctx, d, uid, args)
 			},
 		},
 		{
@@ -337,13 +375,28 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_finance_budgets",
-			Description: "List the user's budgets with their computed window (monthly budgets roll automatically), total budget amount, total actual spent, pocket filter, and category breakdown (target vs spent). Use this to see if the user is over budget or analyzing spending.",
+			Description: "List the user's budgets with their window, total budget amount, total actual spent, and category breakdown (target vs spent). A budget is a lens, not a container: several can read the same transaction, nothing resets, and each one owns the window it was created for (window_start/window_end may be empty, meaning no date bound). slate_names, when present, is the only spending it counts; when absent it counts Plain (normal life) only. Use this to see if the user is over budget or analyzing spending.",
 			Schema: obj(map[string]*genai.Schema{
-				"month": str("Optional YYYY-MM to view a past month's spend for monthly budgets. Default: current month."),
 				"limit": intg("Maximum budgets to return (default 10)."),
 			}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listBudgetsTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "create_budget",
+			Description: "Create a budget — a spending limit over a window, with optional per-category caps and an optional slate lens. Budgets never reset: to budget next month, create another one with the next window. Leave slate_ids empty to count normal life only (Plain), which is what the user wants for an ordinary budget; pass a single outlier slate to budget that trip or event instead.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"name":         str("Required. e.g. 'August household' or 'Goa trip'."),
+				"total_amount": num("Required. Overall limit."),
+				"start_date":   str("Optional ISO date. Omit both dates for no date bound."),
+				"end_date":     str("Optional ISO date."),
+				"slate_ids":    arrayOf(intg(""), "Optional slate ids from list_slates. Empty = Plain (normal life) only."),
+				"caps":         arrayOf(obj(map[string]*genai.Schema{"category_id": intg("From list_finance_categories."), "amount": num("Cap for that category.")}), "Optional soft per-category caps. They warn, they do not block."),
+			}, "name", "total_amount"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return createBudgetTool(ctx, d, uid, args)
 			},
 		},
 		{
@@ -785,62 +838,6 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
-			Name:        "create_pocket",
-			Description: "Create a pocket — a spend context like 'Goa Trip' or 'Wedding' that transactions can be filed into (each txn lives in exactly one pocket; none = General). Budgets can count spend from selected pockets.",
-			Mutating:    true,
-			Schema: obj(map[string]*genai.Schema{
-				"name":  str("Required. e.g. 'Goa Trip'."),
-				"color": str("Optional hex color."),
-			}, "name"),
-			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
-				return createPocketTool(ctx, d, uid, args)
-			},
-		},
-		{
-			Name:        "set_active_pocket",
-			Description: "Set or clear the user's active pocket. While a pocket is active, every new expense (manual, shared SMS, or created by you) defaults into it — e.g. activate 'Goa Trip' when the trip starts. Pass pocket_id=0 or omit to clear.",
-			Mutating:    true,
-			Schema: obj(map[string]*genai.Schema{
-				"pocket_id": intg("Pocket to activate; 0/omitted clears the active pocket."),
-			}),
-			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
-				return setActivePocketTool(ctx, d, uid, args)
-			},
-		},
-		{
-			Name:        "add_shared_expense",
-			Description: "Record an expense the USER paid in a shared pocket, split equally. list_pockets gives shared pocket ids and each pocket's members (member_id + name) for participant_member_ids. Default split: everyone in the pocket. Pass account_id (from list_finance_accounts) to also record the full amount on the user's own ledger.",
-			Mutating:    true,
-			Schema: obj(map[string]*genai.Schema{
-				"pocket_id":              intg("Required. A shared pocket id from list_pockets."),
-				"amount":                 num("Required. Total amount the user paid."),
-				"description":            str("What it was for, e.g. 'Dinner'."),
-				"date":                   str("Optional ISO date; defaults to now."),
-				"participant_member_ids": arrayOf(intg(""), "Member ids to split among. Omit to split among everyone."),
-				"account_id":             intg("Optional: also record the full amount as an expense on this account of the user's ledger."),
-				"category_name":          str("Optional category for the user's ledger entry."),
-			}, "pocket_id", "amount"),
-			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
-				return addSharedExpenseTool(ctx, d, uid, args)
-			},
-		},
-		{
-			Name:        "record_settlement",
-			Description: "Record a settle-up in a shared pocket between the user and one other member. direction 'i_paid' (default) = the user paid them back; 'i_received' = they paid the user back. Pass account_id to also put the user's leg on their own ledger (expense when paid, income when received).",
-			Mutating:    true,
-			Schema: obj(map[string]*genai.Schema{
-				"pocket_id":              intg("Required. A shared pocket id from list_pockets."),
-				"amount":                 num("Required."),
-				"counterparty_member_id": intg("Required. The other member's id."),
-				"direction":              str("'i_paid' | 'i_received'. Default i_paid."),
-				"account_id":             intg("Optional: echo the user's leg to this account."),
-				"date":                   str("Optional ISO date; defaults to now."),
-			}, "pocket_id", "amount", "counterparty_member_id"),
-			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
-				return recordSettlementTool(ctx, d, uid, args)
-			},
-		},
-		{
 			Name:        "time_travel",
 			Description: "Semantic event lookup across journals, memos, notes, transactions, media, and journal location pills. Use for 'when did I last X?', 'how long since I met Y?', 'what was that place I went to in March?'. Returns ranked matches with date + a short context excerpt.",
 			Schema: obj(map[string]*genai.Schema{
@@ -942,7 +939,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "create_transaction",
-			Description: "Record a finance transaction against an existing account and assign a category. Use list_finance_accounts to get account_id. Specify either category_id or category_name; if category_name is specified, the backend will auto-match it to the closest existing category. Pockets: omit pocket_id to file under the user's active pocket (if any); pass 0 to force General; otherwise a pocket id from list_pockets.",
+			Description: "Record a finance transaction against an existing account and assign a category. Use list_finance_accounts to get account_id. Specify either category_id or category_name; if category_name is specified, the backend will auto-match it to the closest existing category. Slates: omit slate_id and it files under Plain (normal life); pass a slate id from list_slates for an outlier like a trip.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"account_id":    intg("Required. The target account ID."),
@@ -952,7 +949,7 @@ func (s *Service) buildTools() []Tool {
 				"amount":        num("Positive amount."),
 				"description":   str("What it was for."),
 				"date":          str("ISO date. Defaults to today."),
-				"pocket_id":     intg("Omit → active pocket; 0 → General; N → that pocket."),
+				"slate_id":      intg("Omit → Plain (normal life); N → that slate."),
 			}, "account_id", "amount"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createTxnTool(ctx, d, uid, args)
@@ -960,7 +957,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "update_transaction",
-			Description: "Update an existing finance transaction by id — change its account, category, pocket, amount, type, description, or date. To move it to another account pass account_id (balances recompute automatically). To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. To move it between pockets pass pocket_id (0 = General). Use list_finance_transactions to find the id first.",
+			Description: "Update an existing finance transaction by id — change its account, category, slate, amount, type, description, or date. To move it to another account pass account_id (balances recompute automatically). To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. To move it between slates pass slate_id (0 = Plain). Use list_finance_transactions to find the id first.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"id":            intg("Required. Transaction id to update."),
@@ -971,7 +968,7 @@ func (s *Service) buildTools() []Tool {
 				"amount":        num("Optional positive amount."),
 				"description":   str("Optional new description."),
 				"date":          str("Optional ISO date YYYY-MM-DD."),
-				"pocket_id":     intg("Optional. Move to this pocket; 0 = General. Omitted = untouched."),
+				"slate_id":      intg("Optional. Move to this slate; 0 = Plain. Omitted = untouched."),
 			}, "id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return updateTxnTool(ctx, d, uid, args)
@@ -1495,20 +1492,16 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		clauses = append(clauses, fmt.Sprintf("(t.txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $%d", len(vals)+1))
 		vals = append(vals, dt)
 	}
-	// pocket_id=N filters to that pocket; 0 = General (no pocket).
-	if v, ok := args["pocket_id"]; ok && v != nil {
-		if p := argInt(args, "pocket_id", 0); p > 0 {
-			clauses = append(clauses, fmt.Sprintf("t.pocket_id=$%d", len(vals)+1))
-			vals = append(vals, p)
-		} else {
-			clauses = append(clauses, "t.pocket_id IS NULL")
-		}
+	// slate_id=N filters to that slate. Plain is a real row, so no sentinel.
+	if p := argInt(args, "slate_id", 0); p > 0 {
+		clauses = append(clauses, fmt.Sprintf("t.slate_id=$%d", len(vals)+1))
+		vals = append(vals, p)
 	}
 	limit := argInt(args, "limit", 50)
-	q := `SELECT t.id, t.account_id, t.type, t.amount, t.description, (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date::text, t.category_id, COALESCE(c.name, ''), t.pocket_id, COALESCE(p.name, '')
+	q := `SELECT t.id, t.account_id, t.type, t.amount, t.description, (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date::text, t.category_id, COALESCE(c.name, ''), t.slate_id, s.name
 	      FROM fin_transactions t
 	      LEFT JOIN fin_categories c ON c.id = t.category_id
-	      LEFT JOIN fin_pockets p ON p.id = t.pocket_id
+	      JOIN fin_slates s ON s.id = t.slate_id
 	      WHERE ` + strings.Join(clauses, " AND ") +
 		fmt.Sprintf(` ORDER BY t.txn_at DESC LIMIT %d`, limit)
 	rows, err := d.QueryContext(ctx, q, vals...)
@@ -1521,9 +1514,10 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		var id, acct int64
 		var ttype, desc, date string
 		var amount float64
-		var catID, pocketID sql.NullInt64
-		var catName, pocketName string
-		rows.Scan(&id, &acct, &ttype, &amount, &desc, &date, &catID, &catName, &pocketID, &pocketName)
+		var catID sql.NullInt64
+		var slateID int64
+		var catName, slateName string
+		rows.Scan(&id, &acct, &ttype, &amount, &desc, &date, &catID, &catName, &slateID, &slateName)
 		row := map[string]any{
 			"id": id, "account_id": acct, "type": ttype, "amount": amount,
 			"description": desc, "date": date, "category_name": catName,
@@ -1531,9 +1525,9 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		if catID.Valid {
 			row["category_id"] = catID.Int64
 		}
-		if pocketID.Valid {
-			row["pocket_id"] = pocketID.Int64
-			row["pocket_name"] = pocketName
+		if slateID > 0 {
+			row["slate_id"] = slateID
+			row["slate_name"] = slateName
 		}
 		out = append(out, row)
 	}
@@ -2558,28 +2552,24 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		catArg = catID
 	}
 
-	// Pocket tri-state (mirrors api.resolvePocketID; duplicated to avoid an
-	// import cycle): omitted → active pocket; 0 → General; N → that pocket.
-	var pocketArg any = nil
-	if v, ok := args["pocket_id"]; ok && v != nil {
-		if p := argInt(args, "pocket_id", 0); p > 0 {
-			var okPocket bool
-			d.QueryRowContext(ctx, `SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2 AND kind = 'personal'`, p, uid).Scan(&okPocket)
-			if !okPocket {
-				return nil, nil, fmt.Errorf("pocket not found (shared pockets take expenses via add_shared_expense)")
-			}
-			pocketArg = p
+	// Slate (mirrors api.resolveSlateID; duplicated to avoid an import cycle).
+	// No mode and no null state: absent or 0 means Plain, always.
+	var slateArg int64
+	if err := d.QueryRowContext(ctx, `SELECT id FROM fin_slates WHERE user_id = $1 AND is_plain`, uid).Scan(&slateArg); err != nil {
+		return nil, nil, fmt.Errorf("no slate available")
+	}
+	if p := argInt(args, "slate_id", 0); p > 0 {
+		var okSlate bool
+		d.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_slates WHERE id = $1 AND user_id = $2 AND NOT archived)`, p, uid).Scan(&okSlate)
+		if !okSlate {
+			return nil, nil, fmt.Errorf("slate not found")
 		}
-	} else {
-		var active int64
-		if err := d.QueryRowContext(ctx, `SELECT id FROM fin_pockets WHERE user_id = $1 AND is_active AND NOT archived AND kind = 'personal'`, uid).Scan(&active); err == nil {
-			pocketArg = active
-		}
+		slateArg = p
 	}
 
 	// txn_at: a model-supplied date is read as IST midnight; absent → now (so a
 	// chat-logged "spent 200 on lunch" gets a real time, not midnight).
-	insArgs := []any{uid, acct, catArg, ttype, amount, desc, pocketArg}
+	insArgs := []any{uid, acct, catArg, ttype, amount, desc, slateArg}
 	txnCol := "NOW()"
 	if date != "" {
 		txnCol = "($8::timestamp AT TIME ZONE 'Asia/Kolkata')"
@@ -2587,7 +2577,7 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	}
 	var id int64
 	err := d.QueryRowContext(ctx,
-		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, pocket_id, txn_at)
+		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, slate_id, txn_at)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,`+txnCol+`) RETURNING id`,
 		insArgs...).Scan(&id)
 	if err != nil {
@@ -2619,16 +2609,9 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		return nil, nil, fmt.Errorf("missing id")
 	}
 	var owned int
-	var echoLinked bool
-	d.QueryRowContext(ctx, `SELECT 1, shared_expense_id IS NOT NULL OR settlement_id IS NOT NULL
-		FROM fin_transactions WHERE id=$1 AND user_id=$2`, id, uid).Scan(&owned, &echoLinked)
+	d.QueryRowContext(ctx, `SELECT 1 FROM fin_transactions WHERE id=$1 AND user_id=$2`, id, uid).Scan(&owned)
 	if owned != 1 {
 		return nil, nil, fmt.Errorf("transaction not found")
-	}
-	if echoLinked {
-		if argFloat(args, "amount") > 0 || argStr(args, "date") != "" || args["description"] != nil || args["pocket_id"] != nil || argStr(args, "type") != "" {
-			return nil, nil, fmt.Errorf("this transaction mirrors a shared-pocket entry — edit it in the shared pocket instead (only account/category/note can change here)")
-		}
 	}
 
 	sets := []string{"updated_at = NOW()"}
@@ -2666,17 +2649,21 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		vals = append(vals, dt)
 		ph++
 	}
-	// pocket_id: 0 = General (NULL), N = that pocket, omitted = untouched.
-	if v, ok := args["pocket_id"]; ok && v != nil {
-		if p := argInt(args, "pocket_id", 0); p > 0 {
-			var okPocket bool
-			d.QueryRowContext(ctx, `SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2 AND kind = 'personal'`, p, uid).Scan(&okPocket)
-			if !okPocket {
-				return nil, nil, fmt.Errorf("pocket not found")
+	// slate_id: 0 = Plain, N = that slate, omitted = untouched. Never NULL.
+	if v, ok := args["slate_id"]; ok && v != nil {
+		p := argInt(args, "slate_id", 0)
+		if p > 0 {
+			var okSlate bool
+			d.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_slates WHERE id = $1 AND user_id = $2 AND NOT archived)`, p, uid).Scan(&okSlate)
+			if !okSlate {
+				return nil, nil, fmt.Errorf("slate not found")
 			}
-			add("pocket_id", p)
+			add("slate_id", p)
 		} else {
-			add("pocket_id", nil)
+			var plain int64
+			if err := d.QueryRowContext(ctx, `SELECT id FROM fin_slates WHERE user_id = $1 AND is_plain`, uid).Scan(&plain); err == nil {
+				add("slate_id", plain)
+			}
 		}
 	}
 	if len(sets) == 1 {
@@ -2726,51 +2713,37 @@ func listCategoriesTool(ctx context.Context, d *db.DB, uid string, args map[stri
 
 func listBudgetsTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	limit := argInt(args, "limit", 10)
-	rows, err := d.QueryContext(ctx, `SELECT id, name, period, start_date::text, end_date::text, total_amount
-		FROM fin_budgets WHERE user_id = $1 ORDER BY start_date DESC LIMIT $2`, uid, limit)
+	// Budgets have no period and their window is optional, so both dates come
+	// back as '' when unset — aiBudgetLens reads that as "no date bound".
+	rows, err := d.QueryContext(ctx, `SELECT id, name, COALESCE(start_date::text,''), COALESCE(end_date::text,''), total_amount
+		FROM fin_budgets WHERE user_id = $1 ORDER BY start_date DESC NULLS LAST, id DESC LIMIT $2`, uid, limit)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rows.Close()
 
-	// Monthly budgets auto-roll: their window is the requested (or current)
-	// IST month, not their stored dates. Mirrors api.budgetWindow.
-	now := userTZNow(ctx, d, uid)
-	monthFirst := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-	if m := argStr(args, "month"); m != "" {
-		if t, err := time.Parse("2006-01", m); err == nil {
-			monthFirst = t
-		}
-	}
-	monthStart := monthFirst.Format("2006-01-02")
-	monthEnd := monthFirst.AddDate(0, 1, -1).Format("2006-01-02")
-
 	out := []map[string]any{}
 	for rows.Next() {
 		var id int64
-		var name, period, startDate, endDate string
+		var name, ws, we string
 		var totalAmount float64
-		rows.Scan(&id, &name, &period, &startDate, &endDate, &totalAmount)
+		rows.Scan(&id, &name, &ws, &we, &totalAmount)
 
-		ws, we := startDate, endDate
-		if period == "monthly" {
-			ws, we = monthStart, monthEnd
-		}
-
-		// pocket filter: overall spent counts only txns in these pockets
-		var pocketIDs []int64
-		var pocketNames []string
-		prows, _ := d.QueryContext(ctx, `SELECT p.id, p.name FROM fin_budget_pockets bp
-			JOIN fin_pockets p ON p.id = bp.pocket_id WHERE bp.budget_id = $1`, id)
-		if prows != nil {
-			for prows.Next() {
-				var pid int64
-				var pname string
-				prows.Scan(&pid, &pname)
-				pocketIDs = append(pocketIDs, pid)
-				pocketNames = append(pocketNames, pname)
+		// Slate lens. No rows = Plain only (mirrors api.budgetLens —
+		// duplicated for the import cycle).
+		var slateIDs []int64
+		var slateNames []string
+		srows, _ := d.QueryContext(ctx, `SELECT s.id, s.name FROM fin_budget_slates bs
+			JOIN fin_slates s ON s.id = bs.slate_id WHERE bs.budget_id = $1`, id)
+		if srows != nil {
+			for srows.Next() {
+				var sid int64
+				var sname string
+				srows.Scan(&sid, &sname)
+				slateIDs = append(slateIDs, sid)
+				slateNames = append(slateNames, sname)
 			}
-			prows.Close()
+			srows.Close()
 		}
 
 		// Fetch items breakdown
@@ -2789,18 +2762,9 @@ func listBudgetsTool(ctx context.Context, d *db.DB, uid string, args map[string]
 				itemRows.Scan(&itemID, &catID, &amt, &catName)
 				var spent float64
 				if catID.Valid {
-					// Caps inherit the budget's pocket lens (mirrors
-					// api.categorySpent — duplicated for the import cycle).
-					if len(pocketIDs) > 0 {
-						d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-							WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND pocket_id = ANY($3)
-							AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $4 AND $5`,
-							uid, catID.Int64, pocketIDs, ws, we).Scan(&spent)
-					} else {
-						d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-							WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
-							uid, catID.Int64, ws, we).Scan(&spent)
-					}
+					// Caps inherit the budget's slate lens.
+					q, qa := aiBudgetLens(uid, ws, we, slateIDs, catID.Int64)
+					d.QueryRowContext(ctx, q, qa...).Scan(&spent)
 				}
 				item := map[string]any{
 					"id": itemID, "category_name": catName, "amount": amt, "spent": spent,
@@ -2814,27 +2778,45 @@ func listBudgetsTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		}
 
 		var totalSpent float64
-		if len(pocketIDs) > 0 {
-			d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-				WHERE user_id = $1 AND type = 'expense' AND pocket_id = ANY($2) AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
-				uid, pocketIDs, ws, we).Scan(&totalSpent)
-		} else {
-			d.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-				WHERE user_id = $1 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
-				uid, ws, we).Scan(&totalSpent)
-		}
+		q, qa := aiBudgetLens(uid, ws, we, slateIDs, 0)
+		d.QueryRowContext(ctx, q, qa...).Scan(&totalSpent)
 
 		row := map[string]any{
-			"id": id, "name": name, "period": period,
+			"id": id, "name": name,
 			"window_start": ws, "window_end": we,
 			"total_amount": totalAmount, "spent": totalSpent,
 			"items": items,
 		}
-		if len(pocketNames) > 0 {
-			row["pocket_ids"] = pocketIDs
-			row["pocket_names"] = pocketNames
+		if len(slateNames) > 0 {
+			row["slate_ids"] = slateIDs
+			row["slate_names"] = slateNames
 		}
 		out = append(out, row)
 	}
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
+}
+
+// aiBudgetLens mirrors api.budgetLens (duplicated to avoid an import cycle
+// between internal/ai and internal/api). slateIDs empty = Plain only; an
+// empty window = no date bound; catID > 0 restricts to that category.
+func aiBudgetLens(uid, from, to string, slateIDs []int64, catID int64) (string, []any) {
+	q := `SELECT COALESCE(SUM(t.amount),0) FROM fin_transactions t
+		JOIN fin_slates s ON s.id = t.slate_id
+		WHERE t.user_id = $1 AND t.type = 'expense'`
+	args := []any{uid}
+	if len(slateIDs) > 0 {
+		args = append(args, slateIDs)
+		q += fmt.Sprintf(" AND t.slate_id = ANY($%d)", len(args))
+	} else {
+		q += " AND s.is_plain"
+	}
+	if catID > 0 {
+		args = append(args, catID)
+		q += fmt.Sprintf(" AND t.category_id = $%d", len(args))
+	}
+	if from != "" && to != "" {
+		args = append(args, from, to)
+		q += fmt.Sprintf(" AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $%d AND $%d", len(args)-1, len(args))
+	}
+	return q, args
 }

@@ -29,7 +29,7 @@ func requireOwnedFinanceRef(ctx context.Context, q dbtx, table, userID string, i
 		return errFinanceReferenceNotFound
 	}
 	allowed := map[string]bool{
-		"fin_accounts": true, "fin_categories": true, "fin_pockets": true,
+		"fin_accounts": true, "fin_categories": true, "fin_slates": true,
 		"fin_budgets": true, "fin_transactions": true,
 	}
 	if !allowed[table] {
@@ -40,23 +40,6 @@ func requireOwnedFinanceRef(ctx context.Context, q dbtx, table, userID string, i
 		return fmt.Errorf("check %s ownership: %w", table, err)
 	}
 	if !owned {
-		return errFinanceReferenceNotFound
-	}
-	return nil
-}
-
-// requirePersonalPocket is the pocket variant of requireOwnedFinanceRef:
-// personal-ledger machinery (txn pocket refs, budget filters, active pocket)
-// must never point at a shared pocket.
-func requirePersonalPocket(ctx context.Context, q dbtx, userID string, id int64) error {
-	if id == 0 {
-		return errFinanceReferenceNotFound
-	}
-	var ok bool
-	if err := q.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_pockets WHERE id=$1 AND user_id=$2 AND kind='personal')`, id, userID).Scan(&ok); err != nil {
-		return fmt.Errorf("check personal pocket: %w", err)
-	}
-	if !ok {
 		return errFinanceReferenceNotFound
 	}
 	return nil
@@ -81,8 +64,8 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("PUT /api/finance/transactions/{id}", updateTransaction(deps))
 	mux.HandleFunc("DELETE /api/finance/transactions/{id}", deleteTransaction(deps))
 
-	// Pockets (spend contexts)
-	registerPocketRoutes(mux, deps)
+	// Slates (normal life vs outliers)
+	registerSlateRoutes(mux, deps)
 
 	// Budgets
 	mux.HandleFunc("GET /api/finance/budgets", listBudgets(deps))
@@ -430,6 +413,7 @@ func listCategories(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
 		ensureDefaultCategories(deps, uid)
+		ensureSlates(deps, uid)
 		kind := queryParam(r, "kind")
 		args := []any{uid}
 		q := "SELECT id, name, kind, color, icon FROM fin_categories WHERE user_id = $1"
@@ -596,31 +580,9 @@ type txnResp struct {
 	TxnAt         string  `json:"txn_at"` // RFC3339 in IST (carries +05:30)
 	TransferPair  *int64  `json:"transfer_pair"`
 	LinkedAccount *int64  `json:"linked_account"`
-	PocketID      *int64  `json:"pocket_id"`         // NULL = General
-	PocketName    *string `json:"pocket_name"`       // joined for display
-	SharedExpense *int64  `json:"shared_expense_id"` // echo of a shared-pocket expense
-	SettlementID  *int64  `json:"settlement_id"`     // echo of a shared-pocket settlement
+	SlateID       int64   `json:"slate_id"`   // never zero; Plain when unfiled
+	SlateName     string  `json:"slate_name"` // joined for display
 	CreatedAt     string  `json:"created_at"`
-}
-
-// resolvePocketID applies the tri-state pocket contract for txn creation:
-// field absent/null → the user's active pocket (old clients get the default
-// for free); 0 → explicit General (stored NULL); N → that pocket, validated
-// as owned + personal + not archived. Returns (stored value, error message).
-func resolvePocketID(d *db.DB, uid string, requested *int64) (*int64, string) {
-	if requested == nil {
-		return activePocketID(d, uid), ""
-	}
-	if *requested == 0 {
-		return nil, ""
-	}
-	var ok bool
-	d.QueryRow(`SELECT NOT archived FROM fin_pockets WHERE id = $1 AND user_id = $2 AND kind = 'personal'`,
-		*requested, uid).Scan(&ok)
-	if !ok {
-		return nil, "pocket not found"
-	}
-	return requested, ""
 }
 
 // istDateExpr is the SQL that projects a txn_at TIMESTAMPTZ down to its IST
@@ -697,15 +659,12 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			args = append(args, "%"+v+"%")
 			ph++
 		}
-		// pocket_id=N filters to that pocket; pocket_id=0 = General (NULL).
-		if v := queryParam(r, "pocket_id"); v != "" {
-			if v == "0" {
-				clauses = append(clauses, "t.pocket_id IS NULL")
-			} else {
-				clauses = append(clauses, "t.pocket_id = $"+itoa(ph))
-				args = append(args, v)
-				ph++
-			}
+		// slate_id=N filters to that slate. No sentinel: Plain is a real row,
+		// so filtering to normal life is the same query as any other slate.
+		if v := queryParam(r, "slate_id"); v != "" {
+			clauses = append(clauses, "t.slate_id = $"+itoa(ph))
+			args = append(args, v)
+			ph++
 		}
 
 		limit := 200
@@ -716,12 +675,12 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		}
 
 		q := `SELECT t.id, t.account_id, a.name, t.category_id, c.name, c.color, t.type, t.amount,
-			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.pocket_id, p.name,
-			  t.shared_expense_id, t.settlement_id, t.created_at::text
+			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.slate_id, s.name,
+			  t.created_at::text
 			  FROM fin_transactions t
 			  JOIN fin_accounts a ON a.id = t.account_id
 			  LEFT JOIN fin_categories c ON c.id = t.category_id
-			  LEFT JOIN fin_pockets p ON p.id = t.pocket_id
+			  JOIN fin_slates s ON s.id = t.slate_id
 			  WHERE ` + strings.Join(clauses, " AND ") +
 			` ORDER BY t.txn_at DESC, t.id DESC LIMIT ` + itoa(limit)
 
@@ -737,8 +696,8 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			var t txnResp
 			var at time.Time
 			rows.Scan(&t.ID, &t.AccountID, &t.AccountName, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
-				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount, &t.PocketID, &t.PocketName,
-				&t.SharedExpense, &t.SettlementID, &t.CreatedAt)
+				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount,
+				&t.SlateID, &t.SlateName, &t.CreatedAt)
 			t.TxnAt = at.In(loc).Format(time.RFC3339)
 			out = append(out, t)
 		}
@@ -762,7 +721,7 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			Note          string  `json:"note"`
 			TxnAt         string  `json:"txn_at"` // RFC3339 (IST)
 			LinkedAccount *int64  `json:"linked_account"`
-			PocketID      *int64  `json:"pocket_id"` // absent → active pocket; 0 → General; N → pocket
+			SlateID       *int64  `json:"slate_id"` // absent/0 → Plain; N → that slate
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -781,11 +740,11 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			{"fin_categories", b.CategoryID},
 			{"fin_accounts", b.LinkedAccount},
 		}
-		if b.PocketID != nil && *b.PocketID != 0 {
+		if b.SlateID != nil && *b.SlateID != 0 {
 			refs = append(refs, struct {
 				table string
 				id    *int64
-			}{"fin_pockets", b.PocketID})
+			}{"fin_slates", b.SlateID})
 		}
 		for _, ref := range refs {
 			if ref.id == nil {
@@ -803,9 +762,9 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		if b.Type == "" {
 			b.Type = "expense"
 		}
-		pocketID, perrMsg := resolvePocketID(d, uid, b.PocketID)
-		if perrMsg != "" {
-			errJSON(w, 400, perrMsg)
+		slateID, serrMsg := resolveSlateID(d, uid, b.SlateID)
+		if serrMsg != "" {
+			errJSON(w, 400, serrMsg)
 			return
 		}
 		txnAt := resolveTxnAt(b.TxnAt, userNow(d, uid))
@@ -822,14 +781,14 @@ func createTransaction(deps Deps) http.HandlerFunc {
 				return
 			}
 			var outID, inID int64
-			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_at, linked_account) VALUES ($1,$2,'transfer_out',$3,$4,$5,$6,$7) RETURNING id`,
-				uid, b.AccountID, b.Amount, b.Description, b.Note, txnAt, *b.LinkedAccount).Scan(&outID); err != nil {
+			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_at, linked_account, slate_id) VALUES ($1,$2,'transfer_out',$3,$4,$5,$6,$7,$8) RETURNING id`,
+				uid, b.AccountID, b.Amount, b.Description, b.Note, txnAt, *b.LinkedAccount, slateID).Scan(&outID); err != nil {
 				tx.Rollback()
 				internalError(w, r, "insert transfer debit", err)
 				return
 			}
-			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_at, linked_account, transfer_pair) VALUES ($1,$2,'transfer_in',$3,$4,$5,$6,$7,$8) RETURNING id`,
-				uid, *b.LinkedAccount, b.Amount, b.Description, b.Note, txnAt, b.AccountID, outID).Scan(&inID); err != nil {
+			if err := tx.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_at, linked_account, transfer_pair, slate_id) VALUES ($1,$2,'transfer_in',$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+				uid, *b.LinkedAccount, b.Amount, b.Description, b.Note, txnAt, b.AccountID, outID, slateID).Scan(&inID); err != nil {
 				tx.Rollback()
 				internalError(w, r, "insert transfer credit", err)
 				return
@@ -850,8 +809,8 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		}
 
 		var id int64
-		err := d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, note, txn_at, pocket_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-			uid, b.AccountID, b.CategoryID, b.Type, b.Amount, b.Description, b.Note, txnAt, pocketID,
+		err := d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, note, txn_at, slate_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+			uid, b.AccountID, b.CategoryID, b.Type, b.Amount, b.Description, b.Note, txnAt, slateID,
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -881,8 +840,8 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			Amount      *float64 `json:"amount"`
 			Description *string  `json:"description"`
 			Note        *string  `json:"note"`
-			TxnAt       *string  `json:"txn_at"`    // RFC3339 (IST)
-			PocketID    *int64   `json:"pocket_id"` // 0 → General; N → pocket; absent → untouched
+			TxnAt       *string  `json:"txn_at"`   // RFC3339 (IST)
+			SlateID     *int64   `json:"slate_id"` // 0 → Plain; N → that slate; absent → untouched
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -918,29 +877,15 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 				}
 			}
 		}
-		if b.PocketID != nil && *b.PocketID != 0 {
-			if err := requirePersonalPocket(ctx, tx, uid, *b.PocketID); err != nil {
+		if b.SlateID != nil && *b.SlateID != 0 {
+			if err := requireOwnedFinanceRef(ctx, tx, "fin_slates", uid, *b.SlateID); err != nil {
 				if errors.Is(err, errFinanceReferenceNotFound) {
 					errJSON(w, 404, "not found")
 				} else {
-					internalError(w, r, "validate transaction pocket", err)
+					internalError(w, r, "validate transaction slate", err)
 				}
 				return
 			}
-		}
-
-		// Echo rows mirror a shared-pocket expense/settlement: their money
-		// fields are managed by the pocket, only account/category/note are
-		// the user's to edit here.
-		var echoLinked bool
-		if err := tx.QueryRowContext(ctx, `SELECT shared_expense_id IS NOT NULL OR settlement_id IS NOT NULL
-			FROM fin_transactions WHERE id = $1`, id).Scan(&echoLinked); err != nil {
-			internalError(w, r, "check echo link", err)
-			return
-		}
-		if echoLinked && (b.Amount != nil || b.Description != nil || b.TxnAt != nil || b.PocketID != nil) {
-			errJSON(w, 400, "amount, description and date are managed by the shared pocket")
-			return
 		}
 
 		var mainSets, pairSets []string
@@ -949,12 +894,16 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			*args = append(*args, value)
 			*sets = append(*sets, fmt.Sprintf("%s=$%d", column, len(*args)))
 		}
-		if b.PocketID != nil {
-			var value any
-			if *b.PocketID != 0 {
-				value = *b.PocketID
+		// 0 means Plain, not NULL — slate_id has no null state. Both legs of a
+		// transfer move together so a transfer can't straddle two slates.
+		if b.SlateID != nil {
+			target, serrMsg := resolveSlateID(d, uid, b.SlateID)
+			if serrMsg != "" {
+				errJSON(w, 400, serrMsg)
+				return
 			}
-			add(&mainSets, &mainArgs, "pocket_id", value)
+			add(&mainSets, &mainArgs, "slate_id", target)
+			add(&pairSets, &pairArgs, "slate_id", target)
 		}
 		if b.AccountID != nil {
 			add(&mainSets, &mainArgs, "account_id", *b.AccountID)
@@ -1025,14 +974,6 @@ func deleteTransaction(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid id")
 			return
 		}
-		// Echo rows die with their shared expense/settlement, not here.
-		var echoLinked bool
-		d.QueryRow(`SELECT shared_expense_id IS NOT NULL OR settlement_id IS NOT NULL
-			FROM fin_transactions WHERE id = $1 AND user_id = $2`, id, uid).Scan(&echoLinked)
-		if echoLinked {
-			errJSON(w, 400, "this entry is managed by a shared pocket — delete it there")
-			return
-		}
 		// delete pair if any
 		var pair *int64
 		d.QueryRow("SELECT transfer_pair FROM fin_transactions WHERE id = $1 AND user_id = $2", id, uid).Scan(&pair)
@@ -1054,72 +995,60 @@ type budgetItemResp struct {
 	Spent      float64 `json:"spent"`
 }
 type budgetResp struct {
-	ID          int64            `json:"id"`
-	Name        string           `json:"name"`
-	Period      string           `json:"period"`
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	// Window is optional: a slate-scoped budget is defined by its slate, not
+	// by dates. Empty means no date bound at all.
 	StartDate   string           `json:"start_date"`
 	EndDate     string           `json:"end_date"`
-	WindowStart string           `json:"window_start"`
-	WindowEnd   string           `json:"window_end"`
 	TotalAmount float64          `json:"total_amount"`
 	Spent       float64          `json:"spent"`
-	PocketIDs   []int64          `json:"pocket_ids"`
+	SlateIDs    []int64          `json:"slate_ids"`
 	Items       []budgetItemResp `json:"items"`
 }
 
-// budgetWindow resolves the date window spend is computed over. Monthly
-// budgets auto-roll: they ignore their stored dates and use the requested
-// IST month (monthParam "YYYY-MM", default = the current month). Custom
-// budgets use their stored range.
-func budgetWindow(period, startDate, endDate, monthParam string, now time.Time) (string, string) {
-	if period != "monthly" {
-		return startDate, endDate
+// budgetLens is the single definition of what a budget counts, so a category
+// cap can never read through a different lens than its parent budget.
+//
+//   - slateIDs empty  → Plain only. This is the default and the whole point:
+//     an ordinary budget must not see outliers. (Under pockets an empty
+//     filter meant "everything", which is why a trip corrupted the baseline.)
+//   - empty from/to   → no date bound.
+//   - catID > 0       → restrict to that category cap.
+func budgetLens(uid, from, to string, slateIDs []int64, catID int64) (string, []any) {
+	q := `SELECT COALESCE(SUM(t.amount),0) FROM fin_transactions t
+		JOIN fin_slates s ON s.id = t.slate_id
+		WHERE t.user_id = $1 AND t.type = 'expense'`
+	args := []any{uid}
+	if len(slateIDs) > 0 {
+		args = append(args, slateIDs)
+		q += fmt.Sprintf(" AND t.slate_id = ANY($%d)", len(args))
+	} else {
+		q += " AND s.is_plain"
 	}
-	first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-	if monthParam != "" {
-		if m, err := time.Parse("2006-01", monthParam); err == nil {
-			first = m
-		}
+	if catID > 0 {
+		args = append(args, catID)
+		q += fmt.Sprintf(" AND t.category_id = $%d", len(args))
 	}
-	last := first.AddDate(0, 1, -1)
-	return first.Format("2006-01-02"), last.Format("2006-01-02")
+	if from != "" && to != "" {
+		args = append(args, from, to)
+		q += fmt.Sprintf(" AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $%d AND $%d",
+			len(args)-1, len(args))
+	}
+	return q, args
 }
 
-// budgetSpent computes the overall spend in a window, optionally restricted
-// to a pocket set. General (NULL pocket) txns never match a pocket filter.
-func budgetSpent(d *db.DB, uid, from, to string, pocketIDs []int64) float64 {
+func budgetSpent(d *db.DB, uid, from, to string, slateIDs []int64) float64 {
 	var spent float64
-	if len(pocketIDs) > 0 {
-		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND type = 'expense' AND pocket_id = ANY($2)
-			AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
-			uid, pocketIDs, from, to).Scan(&spent)
-	} else {
-		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND type = 'expense'
-			AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
-			uid, from, to).Scan(&spent)
-	}
+	q, args := budgetLens(uid, from, to, slateIDs, 0)
+	d.QueryRow(q, args...).Scan(&spent)
 	return spent
 }
 
-// categorySpent computes a category cap's spend. A cap is a slice of its
-// budget, so it reads through the SAME pocket lens as the overall spent —
-// a trip budget's "Food" cap must not absorb General food spends that merely
-// share the date range. Mirrored in ai.listBudgetsTool and exportBudgetsCSV.
-func categorySpent(d *db.DB, uid string, catID int64, from, to string, pocketIDs []int64) float64 {
+func categorySpent(d *db.DB, uid string, catID int64, from, to string, slateIDs []int64) float64 {
 	var spent float64
-	if len(pocketIDs) > 0 {
-		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND type = 'expense' AND category_id = $2 AND pocket_id = ANY($3)
-			AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $4 AND $5`,
-			uid, catID, pocketIDs, from, to).Scan(&spent)
-	} else {
-		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND type = 'expense' AND category_id = $2
-			AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $3 AND $4`,
-			uid, catID, from, to).Scan(&spent)
-	}
+	q, args := budgetLens(uid, from, to, slateIDs, catID)
+	d.QueryRow(q, args...).Scan(&spent)
 	return spent
 }
 
@@ -1127,10 +1056,8 @@ func listBudgets(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
-		month := queryParam(r, "month") // YYYY-MM; monthly budgets only
-		now := userNow(d, uid)
-		rows, err := d.Query(`SELECT id, name, period, start_date::text, end_date::text, total_amount
-			FROM fin_budgets WHERE user_id = $1 ORDER BY start_date DESC`, uid)
+		rows, err := d.Query(`SELECT id, name, COALESCE(start_date::text,''), COALESCE(end_date::text,''), total_amount
+			FROM fin_budgets WHERE user_id = $1 ORDER BY start_date DESC NULLS LAST, id DESC`, uid)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
@@ -1140,27 +1067,26 @@ func listBudgets(deps Deps) http.HandlerFunc {
 		var out []budgetResp
 		for rows.Next() {
 			var b budgetResp
-			rows.Scan(&b.ID, &b.Name, &b.Period, &b.StartDate, &b.EndDate, &b.TotalAmount)
-			b.WindowStart, b.WindowEnd = budgetWindow(b.Period, b.StartDate, b.EndDate, month, now)
-			// pocket filter
-			b.PocketIDs = []int64{}
-			prows, _ := d.Query(`SELECT pocket_id FROM fin_budget_pockets WHERE budget_id = $1`, b.ID)
-			if prows != nil {
-				for prows.Next() {
-					var pid int64
-					prows.Scan(&pid)
-					b.PocketIDs = append(b.PocketIDs, pid)
+			rows.Scan(&b.ID, &b.Name, &b.StartDate, &b.EndDate, &b.TotalAmount)
+			// Slate lens. No rows = Plain only.
+			b.SlateIDs = []int64{}
+			srows, _ := d.Query(`SELECT slate_id FROM fin_budget_slates WHERE budget_id = $1`, b.ID)
+			if srows != nil {
+				for srows.Next() {
+					var sid int64
+					srows.Scan(&sid)
+					b.SlateIDs = append(b.SlateIDs, sid)
 				}
-				prows.Close()
+				srows.Close()
 			}
-			// items (category caps — inherit the budget's pocket filter)
+			// Items (category caps — inherit the budget's slate lens).
 			itemRows, _ := d.Query(`SELECT id, category_id, amount FROM fin_budget_items WHERE budget_id = $1`, b.ID)
 			if itemRows != nil {
 				for itemRows.Next() {
 					var it budgetItemResp
 					itemRows.Scan(&it.ID, &it.CategoryID, &it.Amount)
 					if it.CategoryID != nil {
-						it.Spent = categorySpent(d, uid, *it.CategoryID, b.WindowStart, b.WindowEnd, b.PocketIDs)
+						it.Spent = categorySpent(d, uid, *it.CategoryID, b.StartDate, b.EndDate, b.SlateIDs)
 					}
 					b.Items = append(b.Items, it)
 				}
@@ -1169,7 +1095,7 @@ func listBudgets(deps Deps) http.HandlerFunc {
 			if b.Items == nil {
 				b.Items = []budgetItemResp{}
 			}
-			b.Spent = budgetSpent(d, uid, b.WindowStart, b.WindowEnd, b.PocketIDs)
+			b.Spent = budgetSpent(d, uid, b.StartDate, b.EndDate, b.SlateIDs)
 			out = append(out, b)
 		}
 		if out == nil {
@@ -1185,11 +1111,10 @@ func createBudget(deps Deps) http.HandlerFunc {
 		uid := userID(r.Context())
 		var b struct {
 			Name        string  `json:"name"`
-			Period      string  `json:"period"`
 			StartDate   string  `json:"start_date"`
 			EndDate     string  `json:"end_date"`
 			TotalAmount float64 `json:"total_amount"`
-			PocketIDs   []int64 `json:"pocket_ids"`
+			SlateIDs    []int64 `json:"slate_ids"`
 			Items       []struct {
 				CategoryID *int64  `json:"category_id"`
 				Amount     float64 `json:"amount"`
@@ -1198,14 +1123,6 @@ func createBudget(deps Deps) http.HandlerFunc {
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
 			return
-		}
-		if b.Period == "" {
-			b.Period = "monthly"
-		}
-		// Monthly budgets auto-roll — the stored dates are display-inert but
-		// kept populated (current month) for legacy readers.
-		if b.Period == "monthly" && (b.StartDate == "" || b.EndDate == "") {
-			b.StartDate, b.EndDate = budgetWindow("monthly", "", "", "", userNow(d, uid))
 		}
 		ctx := r.Context()
 		tx, err := d.BeginTx(ctx, nil)
@@ -1222,15 +1139,15 @@ func createBudget(deps Deps) http.HandlerFunc {
 				}
 			}
 		}
-		for _, pocketID := range b.PocketIDs {
-			if err := requirePersonalPocket(ctx, tx, uid, pocketID); err != nil {
+		for _, slateID := range b.SlateIDs {
+			if err := requireOwnedFinanceRef(ctx, tx, "fin_slates", uid, slateID); err != nil {
 				errJSON(w, 404, "not found")
 				return
 			}
 		}
 		var id int64
-		err = tx.QueryRowContext(ctx, `INSERT INTO fin_budgets (user_id, name, period, start_date, end_date, total_amount) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-			uid, b.Name, b.Period, b.StartDate, b.EndDate, b.TotalAmount,
+		err = tx.QueryRowContext(ctx, `INSERT INTO fin_budgets (user_id, name, start_date, end_date, total_amount) VALUES ($1,$2,NULLIF($3,'')::date,NULLIF($4,'')::date,$5) RETURNING id`,
+			uid, b.Name, b.StartDate, b.EndDate, b.TotalAmount,
 		).Scan(&id)
 		if err != nil {
 			internalError(w, r, "insert budget", err)
@@ -1242,9 +1159,9 @@ func createBudget(deps Deps) http.HandlerFunc {
 				return
 			}
 		}
-		for _, pid := range b.PocketIDs {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO fin_budget_pockets (budget_id, user_id, pocket_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, id, uid, pid); err != nil {
-				internalError(w, r, "insert budget pocket", err)
+		for _, sid := range b.SlateIDs {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO fin_budget_slates (budget_id, user_id, slate_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, id, uid, sid); err != nil {
+				internalError(w, r, "insert budget slate", err)
 				return
 			}
 		}
@@ -1271,7 +1188,7 @@ func updateBudget(deps Deps) http.HandlerFunc {
 			StartDate   *string  `json:"start_date"`
 			EndDate     *string  `json:"end_date"`
 			TotalAmount *float64 `json:"total_amount"`
-			PocketIDs   *[]int64 `json:"pocket_ids"`
+			SlateIDs    *[]int64 `json:"slate_ids"`
 			Items       *[]struct {
 				CategoryID *int64  `json:"category_id"`
 				Amount     float64 `json:"amount"`
@@ -1300,8 +1217,8 @@ func updateBudget(deps Deps) http.HandlerFunc {
 				}
 			}
 		}
-		for _, pocketID := range valueOrEmpty(b.PocketIDs) {
-			if err := requirePersonalPocket(ctx, tx, uid, pocketID); err != nil {
+		for _, slateID := range valueOrEmpty(b.SlateIDs) {
+			if err := requireOwnedFinanceRef(ctx, tx, "fin_slates", uid, slateID); err != nil {
 				errJSON(w, 404, "not found")
 				return
 			}
@@ -1312,9 +1229,8 @@ func updateBudget(deps Deps) http.HandlerFunc {
 			set   bool
 		}{
 			{"UPDATE fin_budgets SET name=$1 WHERE id=$2 AND user_id=$3", valueOrNil(b.Name), b.Name != nil},
-			{"UPDATE fin_budgets SET period=$1 WHERE id=$2 AND user_id=$3", valueOrNil(b.Period), b.Period != nil},
-			{"UPDATE fin_budgets SET start_date=$1 WHERE id=$2 AND user_id=$3", valueOrNil(b.StartDate), b.StartDate != nil},
-			{"UPDATE fin_budgets SET end_date=$1 WHERE id=$2 AND user_id=$3", valueOrNil(b.EndDate), b.EndDate != nil},
+			{"UPDATE fin_budgets SET start_date=NULLIF($1,'')::date WHERE id=$2 AND user_id=$3", valueOrNil(b.StartDate), b.StartDate != nil},
+			{"UPDATE fin_budgets SET end_date=NULLIF($1,'')::date WHERE id=$2 AND user_id=$3", valueOrNil(b.EndDate), b.EndDate != nil},
 			{"UPDATE fin_budgets SET total_amount=$1 WHERE id=$2 AND user_id=$3", valueOrNil(b.TotalAmount), b.TotalAmount != nil},
 		} {
 			if update.set {
@@ -1336,14 +1252,14 @@ func updateBudget(deps Deps) http.HandlerFunc {
 				}
 			}
 		}
-		if b.PocketIDs != nil {
-			if _, err := tx.ExecContext(ctx, "DELETE FROM fin_budget_pockets WHERE budget_id=$1 AND user_id=$2", id, uid); err != nil {
-				internalError(w, r, "replace budget pockets", err)
+		if b.SlateIDs != nil {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM fin_budget_slates WHERE budget_id=$1 AND user_id=$2", id, uid); err != nil {
+				internalError(w, r, "replace budget slates", err)
 				return
 			}
-			for _, pid := range *b.PocketIDs {
-				if _, err := tx.ExecContext(ctx, "INSERT INTO fin_budget_pockets (budget_id,user_id,pocket_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", id, uid, pid); err != nil {
-					internalError(w, r, "replace budget pocket", err)
+			for _, sid := range *b.SlateIDs {
+				if _, err := tx.ExecContext(ctx, "INSERT INTO fin_budget_slates (budget_id,user_id,slate_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", id, uid, sid); err != nil {
+					internalError(w, r, "replace budget slate", err)
 					return
 				}
 			}
@@ -2484,31 +2400,32 @@ func exportBudgetsCSV(deps Deps) http.HandlerFunc {
 		writeCSVHeader(w, "sajni_budgets.csv")
 		cw := csv.NewWriter(w)
 		defer cw.Flush()
-		now := userNow(d, uid)
-		cw.Write([]string{"budget", "period", "window_start", "window_end", "pockets_filter", "category", "allocated", "spent"})
-		rows, _ := d.Query(`SELECT b.id, b.name, b.period, b.start_date::text, b.end_date::text, b.total_amount
-			FROM fin_budgets WHERE user_id = $1 ORDER BY b.start_date ASC`, uid)
+		cw.Write([]string{"budget", "window_start", "window_end", "slates", "category", "allocated", "spent"})
+		rows, _ := d.Query(`SELECT b.id, b.name, COALESCE(b.start_date::text,''), COALESCE(b.end_date::text,''), b.total_amount
+			FROM fin_budgets b WHERE b.user_id = $1 ORDER BY b.start_date ASC NULLS LAST, b.id ASC`, uid)
 		if rows != nil {
 			for rows.Next() {
 				var bid int64
-				var name, period, sd, ed string
+				var name, ws, we string
 				var total float64
-				rows.Scan(&bid, &name, &period, &sd, &ed, &total)
-				ws, we := budgetWindow(period, sd, ed, "", now)
-				// pocket filter (names for the CSV, ids for the spent query)
-				var pocketIDs []int64
-				var pocketNames []string
-				prows, _ := d.Query(`SELECT p.id, p.name FROM fin_budget_pockets bp
-					JOIN fin_pockets p ON p.id = bp.pocket_id WHERE bp.budget_id = $1`, bid)
-				if prows != nil {
-					for prows.Next() {
-						var pid int64
-						var pname string
-						prows.Scan(&pid, &pname)
-						pocketIDs = append(pocketIDs, pid)
-						pocketNames = append(pocketNames, pname)
+				rows.Scan(&bid, &name, &ws, &we, &total)
+				// Slate lens: names for the CSV, ids for the spend query.
+				var slateIDs []int64
+				var slateNames []string
+				srows, _ := d.Query(`SELECT s.id, s.name FROM fin_budget_slates bs
+					JOIN fin_slates s ON s.id = bs.slate_id WHERE bs.budget_id = $1`, bid)
+				if srows != nil {
+					for srows.Next() {
+						var sid int64
+						var sname string
+						srows.Scan(&sid, &sname)
+						slateIDs = append(slateIDs, sid)
+						slateNames = append(slateNames, sname)
 					}
-					prows.Close()
+					srows.Close()
+				}
+				if len(slateNames) == 0 {
+					slateNames = []string{"Plain"}
 				}
 				irows, _ := d.Query(`SELECT COALESCE(c.name,''), bi.category_id, bi.amount
 					FROM fin_budget_items bi LEFT JOIN fin_categories c ON c.id = bi.category_id
@@ -2520,22 +2437,21 @@ func exportBudgetsCSV(deps Deps) http.HandlerFunc {
 						var alloc, spent float64
 						irows.Scan(&cat, &catID, &alloc)
 						if catID.Valid {
-							// caps inherit the budget's pocket lens
-							spent = categorySpent(d, uid, catID.Int64, ws, we, pocketIDs)
+							// caps inherit the budget's slate lens
+							spent = categorySpent(d, uid, catID.Int64, ws, we, slateIDs)
 						}
 						cw.Write([]string{
-							name, period, ws, we, strings.Join(pocketNames, ";"), cat,
+							name, ws, we, strings.Join(slateNames, ";"), cat,
 							strconv.FormatFloat(alloc, 'f', 2, 64),
 							strconv.FormatFloat(spent, 'f', 2, 64),
 						})
 					}
 					irows.Close()
 				}
-				// overall row: the budget's filtered total spend
 				cw.Write([]string{
-					name, period, ws, we, strings.Join(pocketNames, ";"), "TOTAL",
+					name, ws, we, strings.Join(slateNames, ";"), "TOTAL",
 					strconv.FormatFloat(total, 'f', 2, 64),
-					strconv.FormatFloat(budgetSpent(d, uid, ws, we, pocketIDs), 'f', 2, 64),
+					strconv.FormatFloat(budgetSpent(d, uid, ws, we, slateIDs), 'f', 2, 64),
 				})
 			}
 			rows.Close()

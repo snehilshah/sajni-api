@@ -446,9 +446,12 @@ func (d *DB) migrate() error {
 		id          BIGSERIAL   PRIMARY KEY,
 		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name        TEXT        NOT NULL DEFAULT '',
-		period      TEXT        NOT NULL DEFAULT 'monthly',
-		start_date  DATE        NOT NULL,
-		end_date    DATE        NOT NULL,
+		-- Discrete: a budget never resets, so July and August are separate
+		-- rows and editing one cannot rewrite the other's history. The window
+		-- is nullable — a slate-scoped budget is defined by its slate, not by
+		-- dates. See SLATES.md.
+		start_date  DATE,
+		end_date    DATE,
 		total_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
 		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
@@ -601,145 +604,90 @@ func (d *DB) migrate() error {
 		PRIMARY KEY (payment_id, txn_id)
 	);
 
-	-- ─── Pockets: curated spend contexts ──────────────────────────────
-	-- Exactly one pocket per transaction; NULL pocket_id = implicit
-	-- "General". is_active marks the user's active pocket: direct txn
-	-- creation paths (manual form, share capture, AI create_transaction)
-	-- default into it; system/cron txns (biller pay, auto-renew,
-	-- investment auto-debit) always write NULL.
-	CREATE TABLE IF NOT EXISTS fin_pockets (
+	-- ─── Slates: is this normal life, or not? ─────────────────────────
+	-- Every transaction carries exactly one slate. Plain is the system
+	-- slate: seeded per user, undeletable, and the default for everything
+	-- including cron-posted txns (biller pay, auto-renew, investment
+	-- auto-debit) — those no longer need a special case, they just don't
+	-- set a slate. Every other slate is an outlier the user named.
+	-- Budgets ignore slates they do not explicitly name; that exclusion is
+	-- what keeps the baseline clean. See SLATES.md.
+	CREATE TABLE IF NOT EXISTS fin_slates (
 		id         BIGSERIAL   PRIMARY KEY,
 		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name       TEXT        NOT NULL DEFAULT '',
 		color      TEXT        NOT NULL DEFAULT '#2D5A4F',
-		kind       TEXT        NOT NULL DEFAULT 'personal',
-		is_active  BOOLEAN     NOT NULL DEFAULT FALSE,
+		is_plain   BOOLEAN     NOT NULL DEFAULT FALSE,
 		archived   BOOLEAN     NOT NULL DEFAULT FALSE,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
-	CREATE INDEX IF NOT EXISTS idx_fin_pockets_user ON fin_pockets(user_id);
-	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_pockets_active
-		ON fin_pockets(user_id) WHERE is_active = TRUE;
+	CREATE INDEX IF NOT EXISTS idx_fin_slates_user ON fin_slates(user_id);
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_slates_plain
+		ON fin_slates(user_id) WHERE is_plain;
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_slates_user_id ON fin_slates(user_id, id);
 
-	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS
-		pocket_id BIGINT REFERENCES fin_pockets(id) ON DELETE SET NULL;
-	CREATE INDEX IF NOT EXISTS idx_fin_transactions_pocket
-		ON fin_transactions(user_id, pocket_id) WHERE pocket_id IS NOT NULL;
+	-- Plain for every existing user, then One-offs (an ordinary slate that
+	-- merely ships pre-made — nothing in the code treats it specially). The
+	-- NOT EXISTS guard means a user who deleted it does not get it back.
+	INSERT INTO fin_slates (user_id, name, color, is_plain)
+		SELECT id, 'Plain', '#6B7280', TRUE FROM users
+		ON CONFLICT (user_id) WHERE is_plain DO NOTHING;
+	INSERT INTO fin_slates (user_id, name, color)
+		SELECT u.id, 'One-offs', '#A14B4F' FROM users u
+		WHERE NOT EXISTS (SELECT 1 FROM fin_slates s WHERE s.user_id = u.id AND NOT s.is_plain);
 
-	-- Optional pocket filter on a budget: overall spent counts only txns
-	-- in these pockets. No rows = count everything in the window.
-	CREATE TABLE IF NOT EXISTS fin_budget_pockets (
+	-- Nullable → backfill to Plain → NOT NULL. RESTRICT, not SET NULL:
+	-- there is no null state to fall back to, so deleting a slate that
+	-- still holds transactions must be refused at the DB and reassigned
+	-- explicitly by the API.
+	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS slate_id BIGINT;
+	UPDATE fin_transactions t SET slate_id = s.id
+		FROM fin_slates s
+		WHERE s.user_id = t.user_id AND s.is_plain AND t.slate_id IS NULL;
+	ALTER TABLE fin_transactions ALTER COLUMN slate_id SET NOT NULL;
+	CREATE INDEX IF NOT EXISTS idx_fin_transactions_slate
+		ON fin_transactions(user_id, slate_id);
+
+	-- System paths (biller autopay, investment auto-debit, statement import,
+	-- takeout restore) omit slate_id entirely. This fills it with the user's
+	-- Plain slate, so "ambient money is normal life" is enforced in one place
+	-- instead of being repeated — and forgotten — at every call site.
+	CREATE OR REPLACE FUNCTION fin_txn_default_slate() RETURNS trigger AS $fn$
+	BEGIN
+		IF NEW.slate_id IS NULL THEN
+			SELECT id INTO NEW.slate_id FROM fin_slates
+				WHERE user_id = NEW.user_id AND is_plain;
+		END IF;
+		RETURN NEW;
+	END $fn$ LANGUAGE plpgsql;
+	DROP TRIGGER IF EXISTS trg_fin_txn_default_slate ON fin_transactions;
+	CREATE TRIGGER trg_fin_txn_default_slate BEFORE INSERT ON fin_transactions
+		FOR EACH ROW EXECUTE FUNCTION fin_txn_default_slate();
+
+	-- Which slates a budget counts. No rows = Plain only.
+	CREATE TABLE IF NOT EXISTS fin_budget_slates (
 		budget_id BIGINT NOT NULL REFERENCES fin_budgets(id) ON DELETE CASCADE,
 		user_id   UUID   NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		pocket_id BIGINT NOT NULL REFERENCES fin_pockets(id) ON DELETE CASCADE,
-		PRIMARY KEY (budget_id, pocket_id)
+		slate_id  BIGINT NOT NULL REFERENCES fin_slates(id) ON DELETE CASCADE,
+		PRIMARY KEY (budget_id, slate_id)
 	);
 
-	-- ─── Shared pockets: spliit-style expense splitting ───────────────
-	-- kind='shared' pockets carry participants and split expenses. These
-	-- tables are intentionally cross-tenant (members belong to different
-	-- users), so they are NOT in the tenant RAISE guard below; owner
-	-- consistency is enforced by composite FKs onto fin_pockets(user_id,id).
-	-- user_id NULL on a member = text-only person or invite not yet
-	-- accepted; acceptance fills it in.
-	CREATE TABLE IF NOT EXISTS fin_pocket_members (
-		id           BIGSERIAL   PRIMARY KEY,
-		owner_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		pocket_id    BIGINT      NOT NULL,
-		user_id      UUID        REFERENCES users(id) ON DELETE SET NULL,
-		display_name TEXT        NOT NULL DEFAULT '',
-		role         TEXT        NOT NULL DEFAULT 'member',
-		left_at      TIMESTAMPTZ,
-		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_fin_pocket_members_pocket ON fin_pocket_members(pocket_id);
-	CREATE INDEX IF NOT EXISTS idx_fin_pocket_members_user ON fin_pocket_members(user_id) WHERE user_id IS NOT NULL;
-	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_pocket_members_active_user
-		ON fin_pocket_members(pocket_id, user_id) WHERE user_id IS NOT NULL AND left_at IS NULL;
-
-	CREATE TABLE IF NOT EXISTS fin_pocket_invites (
-		id          BIGSERIAL   PRIMARY KEY,
-		owner_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		pocket_id   BIGINT      NOT NULL,
-		member_id   BIGINT      NOT NULL REFERENCES fin_pocket_members(id) ON DELETE CASCADE,
-		email       CITEXT      NOT NULL,
-		token_hash  BYTEA       NOT NULL UNIQUE,
-		status      TEXT        NOT NULL DEFAULT 'pending',
-		expires_at  TIMESTAMPTZ NOT NULL,
-		accepted_at TIMESTAMPTZ,
-		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_fin_pocket_invites_email ON fin_pocket_invites(email) WHERE status = 'pending';
-	CREATE INDEX IF NOT EXISTS idx_fin_pocket_invites_pocket ON fin_pocket_invites(pocket_id);
-
-	-- Shares are always materialized (equal splits included): the
-	-- remainder-paise rule is applied once at write time so balance math
-	-- never re-derives splits.
-	CREATE TABLE IF NOT EXISTS fin_shared_expenses (
-		id          BIGSERIAL   PRIMARY KEY,
-		owner_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		pocket_id   BIGINT      NOT NULL,
-		-- CASCADE so pocket deletion (members cascade off fin_pockets) can
-		-- proceed; a referenced member is never hard-deleted on its own —
-		-- the API soft-leaves (left_at) instead.
-		paid_by     BIGINT      NOT NULL REFERENCES fin_pocket_members(id) ON DELETE CASCADE,
-		amount      NUMERIC(14,2) NOT NULL DEFAULT 0,
-		description TEXT        NOT NULL DEFAULT '',
-		note        TEXT        NOT NULL DEFAULT '',
-		split       TEXT        NOT NULL DEFAULT 'equal',
-		spent_at    TIMESTAMPTZ NOT NULL,
-		created_by  UUID        REFERENCES users(id) ON DELETE SET NULL,
-		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_fin_shared_expenses_pocket ON fin_shared_expenses(pocket_id, spent_at DESC);
-
-	CREATE TABLE IF NOT EXISTS fin_expense_shares (
-		expense_id BIGINT NOT NULL REFERENCES fin_shared_expenses(id) ON DELETE CASCADE,
-		member_id  BIGINT NOT NULL REFERENCES fin_pocket_members(id) ON DELETE CASCADE,
-		amount     NUMERIC(14,2) NOT NULL DEFAULT 0,
-		PRIMARY KEY (expense_id, member_id)
-	);
-	CREATE INDEX IF NOT EXISTS idx_fin_expense_shares_member ON fin_expense_shares(member_id);
-
-	CREATE TABLE IF NOT EXISTS fin_pocket_settlements (
-		id          BIGSERIAL   PRIMARY KEY,
-		owner_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		pocket_id   BIGINT      NOT NULL,
-		from_member BIGINT      NOT NULL REFERENCES fin_pocket_members(id) ON DELETE CASCADE,
-		to_member   BIGINT      NOT NULL REFERENCES fin_pocket_members(id) ON DELETE CASCADE,
-		amount      NUMERIC(14,2) NOT NULL DEFAULT 0,
-		settled_at  TIMESTAMPTZ NOT NULL,
-		created_by  UUID        REFERENCES users(id) ON DELETE SET NULL,
-		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_fin_pocket_settlements_pocket ON fin_pocket_settlements(pocket_id);
-
-	-- actor_name is a display-name snapshot: survives member removal and
-	-- never exposes emails or user ids to other members.
-	CREATE TABLE IF NOT EXISTS fin_pocket_activity (
-		id         BIGSERIAL   PRIMARY KEY,
-		owner_id   UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		pocket_id  BIGINT      NOT NULL,
-		actor_name TEXT        NOT NULL DEFAULT '',
-		kind       TEXT        NOT NULL,
-		detail     JSONB       NOT NULL DEFAULT '{}',
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_fin_pocket_activity_pocket ON fin_pocket_activity(pocket_id, id DESC);
-
-	-- Echo linkage: a shared expense/settlement may mirror into a member's
-	-- personal ledger as a normal fin_transactions row. Echo rows always
-	-- have pocket_id NULL (the link column is the pocket relation — a
-	-- member's txn can never reference another user's fin_pockets row).
-	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS
-		shared_expense_id BIGINT REFERENCES fin_shared_expenses(id) ON DELETE CASCADE;
-	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS
-		settlement_id BIGINT REFERENCES fin_pocket_settlements(id) ON DELETE CASCADE;
-	CREATE INDEX IF NOT EXISTS idx_fin_txn_shared_expense
-		ON fin_transactions(shared_expense_id) WHERE shared_expense_id IS NOT NULL;
-	CREATE INDEX IF NOT EXISTS idx_fin_txn_settlement
-		ON fin_transactions(settlement_id) WHERE settlement_id IS NOT NULL;
+	-- ─── Pockets: dropped outright ────────────────────────────────────
+	-- Not migrated into slates: personal and shared alike are dropped, and
+	-- every transaction lands in Plain. Amounts, dates, accounts and
+	-- categories are untouched — only the pocket relation dies. Children
+	-- first so the FKs unwind cleanly.
+	ALTER TABLE fin_transactions DROP COLUMN IF EXISTS pocket_id;
+	ALTER TABLE fin_transactions DROP COLUMN IF EXISTS shared_expense_id;
+	ALTER TABLE fin_transactions DROP COLUMN IF EXISTS settlement_id;
+	DROP TABLE IF EXISTS fin_budget_pockets;
+	DROP TABLE IF EXISTS fin_expense_shares;
+	DROP TABLE IF EXISTS fin_shared_expenses;
+	DROP TABLE IF EXISTS fin_pocket_settlements;
+	DROP TABLE IF EXISTS fin_pocket_activity;
+	DROP TABLE IF EXISTS fin_pocket_invites;
+	DROP TABLE IF EXISTS fin_pocket_members;
+	DROP TABLE IF EXISTS fin_pockets;
 
 	-- One row per auto-debited investment cycle; UNIQUE key is the
 	-- idempotency gate (mirrors fin_biller_payments).
@@ -761,12 +709,8 @@ func (d *DB) migrate() error {
 	ALTER TABLE fin_budget_items ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE CASCADE;
 	UPDATE fin_budget_items i SET user_id=b.user_id FROM fin_budgets b WHERE i.budget_id=b.id AND i.user_id IS NULL;
 	ALTER TABLE fin_budget_items ALTER COLUMN user_id SET NOT NULL;
-	ALTER TABLE fin_budget_pockets ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE CASCADE;
-	UPDATE fin_budget_pockets p SET user_id=b.user_id FROM fin_budgets b WHERE p.budget_id=b.id AND p.user_id IS NULL;
-	ALTER TABLE fin_budget_pockets ALTER COLUMN user_id SET NOT NULL;
 	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_accounts_user_id ON fin_accounts(user_id,id);
 	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_categories_user_id ON fin_categories(user_id,id);
-	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_pockets_user_id ON fin_pockets(user_id,id);
 	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_budgets_user_id ON fin_budgets(user_id,id);
 	DO $$
 	DECLARE bad_count BIGINT;
@@ -777,12 +721,12 @@ func (d *DB) migrate() error {
 		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_transactions.linked_account count=%', bad_count; END IF;
 		SELECT COUNT(*) INTO bad_count FROM fin_transactions t JOIN fin_categories c ON c.id=t.category_id WHERE t.category_id IS NOT NULL AND t.user_id<>c.user_id;
 		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_transactions.category_id count=%', bad_count; END IF;
-		SELECT COUNT(*) INTO bad_count FROM fin_transactions t JOIN fin_pockets p ON p.id=t.pocket_id WHERE t.pocket_id IS NOT NULL AND t.user_id<>p.user_id;
-		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_transactions.pocket_id count=%', bad_count; END IF;
+		SELECT COUNT(*) INTO bad_count FROM fin_transactions t JOIN fin_slates s ON s.id=t.slate_id WHERE t.user_id<>s.user_id;
+		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_transactions.slate_id count=%', bad_count; END IF;
+		SELECT COUNT(*) INTO bad_count FROM fin_budget_slates b JOIN fin_slates s ON s.id=b.slate_id WHERE b.user_id<>s.user_id;
+		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_budget_slates.slate_id count=%', bad_count; END IF;
 		SELECT COUNT(*) INTO bad_count FROM fin_budget_items i JOIN fin_categories c ON c.id=i.category_id WHERE i.category_id IS NOT NULL AND i.user_id<>c.user_id;
 		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_budget_items.category_id count=%', bad_count; END IF;
-		SELECT COUNT(*) INTO bad_count FROM fin_budget_pockets b JOIN fin_pockets p ON p.id=b.pocket_id WHERE b.user_id<>p.user_id;
-		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_budget_pockets.pocket_id count=%', bad_count; END IF;
 		SELECT COUNT(*) INTO bad_count FROM fin_investments i JOIN fin_accounts a ON a.id=i.account_id WHERE i.account_id IS NOT NULL AND i.user_id<>a.user_id;
 		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_investments.account_id count=%', bad_count; END IF;
 		SELECT COUNT(*) INTO bad_count FROM fin_billers b JOIN fin_accounts a ON a.id=b.account_id WHERE b.account_id IS NOT NULL AND b.user_id<>a.user_id;
@@ -794,24 +738,25 @@ func (d *DB) migrate() error {
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_account_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE CASCADE; END IF;
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_linked_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_linked_user FOREIGN KEY(user_id,linked_account) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (linked_account); END IF;
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_category_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id); END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_pocket_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_pocket_user FOREIGN KEY(user_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE SET NULL (pocket_id); END IF;
+		-- RESTRICT: slate_id has no null state, so a slate holding transactions
+		-- must be reassigned to Plain by the API before it can be deleted.
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_slate_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_slate_user FOREIGN KEY(user_id,slate_id) REFERENCES fin_slates(user_id,id) ON DELETE RESTRICT; END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_slate_budget_user') THEN ALTER TABLE fin_budget_slates ADD CONSTRAINT fk_fin_budget_slate_budget_user FOREIGN KEY(user_id,budget_id) REFERENCES fin_budgets(user_id,id) ON DELETE CASCADE; END IF;
+		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_slate_user') THEN ALTER TABLE fin_budget_slates ADD CONSTRAINT fk_fin_budget_slate_user FOREIGN KEY(user_id,slate_id) REFERENCES fin_slates(user_id,id) ON DELETE CASCADE; END IF;
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_item_budget_user') THEN ALTER TABLE fin_budget_items ADD CONSTRAINT fk_fin_budget_item_budget_user FOREIGN KEY(user_id,budget_id) REFERENCES fin_budgets(user_id,id) ON DELETE CASCADE; END IF;
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_item_category_user') THEN ALTER TABLE fin_budget_items ADD CONSTRAINT fk_fin_budget_item_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id); END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_pocket_budget_user') THEN ALTER TABLE fin_budget_pockets ADD CONSTRAINT fk_fin_budget_pocket_budget_user FOREIGN KEY(user_id,budget_id) REFERENCES fin_budgets(user_id,id) ON DELETE CASCADE; END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_pocket_user') THEN ALTER TABLE fin_budget_pockets ADD CONSTRAINT fk_fin_budget_pocket_user FOREIGN KEY(user_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE CASCADE; END IF;
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_investment_account_user') THEN ALTER TABLE fin_investments ADD CONSTRAINT fk_fin_investment_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (account_id); END IF;
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_biller_account_user') THEN ALTER TABLE fin_billers ADD CONSTRAINT fk_fin_biller_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (account_id); END IF;
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_biller_category_user') THEN ALTER TABLE fin_billers ADD CONSTRAINT fk_fin_biller_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id); END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_pocket_member_pocket_owner') THEN ALTER TABLE fin_pocket_members ADD CONSTRAINT fk_fin_pocket_member_pocket_owner FOREIGN KEY(owner_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE CASCADE; END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_pocket_invite_pocket_owner') THEN ALTER TABLE fin_pocket_invites ADD CONSTRAINT fk_fin_pocket_invite_pocket_owner FOREIGN KEY(owner_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE CASCADE; END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_shared_expense_pocket_owner') THEN ALTER TABLE fin_shared_expenses ADD CONSTRAINT fk_fin_shared_expense_pocket_owner FOREIGN KEY(owner_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE CASCADE; END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_pocket_settlement_pocket_owner') THEN ALTER TABLE fin_pocket_settlements ADD CONSTRAINT fk_fin_pocket_settlement_pocket_owner FOREIGN KEY(owner_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE CASCADE; END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_pocket_activity_pocket_owner') THEN ALTER TABLE fin_pocket_activity ADD CONSTRAINT fk_fin_pocket_activity_pocket_owner FOREIGN KEY(owner_id,pocket_id) REFERENCES fin_pockets(user_id,id) ON DELETE CASCADE; END IF;
 	END $$;
 
+	-- Budgets lost their rolling period: every budget is discrete now, and a
+	-- slate-scoped one needs no window at all.
+	ALTER TABLE fin_budgets DROP COLUMN IF EXISTS period;
+	ALTER TABLE fin_budgets ALTER COLUMN start_date DROP NOT NULL;
+	ALTER TABLE fin_budgets ALTER COLUMN end_date DROP NOT NULL;
+
 	-- ─── Finance migrations for pre-existing DBs (idempotent) ─────────
-	-- Pocket kind (fresh DBs get it via CREATE TABLE).
-	ALTER TABLE fin_pockets ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'personal';
 
 	-- Biller kind backfill (fresh DBs get kind via CREATE TABLE).
 	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT '';

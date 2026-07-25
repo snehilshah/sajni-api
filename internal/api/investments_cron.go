@@ -54,8 +54,8 @@ func advanceDebitDate(d time.Time, freq string, anchorDay int) time.Time {
 
 // ProcessInvestmentDebits catches up every past-due auto-debit cycle. Each
 // cycle: contribution row first (ON CONFLICT = already posted, skip), then
-// the expense txn, then the investment totals. System txns take no pocket
-// (pocket_id stays NULL — ambient money is General by definition).
+// the expense txn, then the investment totals. System txns set no slate, so
+// they land in Plain — no special case needed any more.
 func ProcessInvestmentDebits(ctx context.Context, deps Deps) (posted int, err error) {
 	d := deps.DB
 	// All Sajni users are IST; compare due dates against the shared zone.

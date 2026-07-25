@@ -73,3 +73,16 @@ func TestErrJSONHidesInternalDetails(t *testing.T) {
 		t.Fatalf("body = %q", got)
 	}
 }
+
+// Go's ServeMux panics at registration time when two patterns conflict, so a
+// bad route is a boot failure rather than a build or test failure. Nothing
+// else in the suite builds the mux, which meant a conflicting pattern could
+// ship green. Registering every finance route is enough to catch it.
+func TestFinanceRoutesRegisterWithoutConflict(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("route registration panicked: %v", r)
+		}
+	}()
+	registerFinanceRoutes(http.NewServeMux(), Deps{})
+}

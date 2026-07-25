@@ -507,7 +507,7 @@ func postBillerTxn(ctx context.Context, deps Deps, uid string, billerID, account
 	if categoryID.Valid {
 		catArg = categoryID.Int64
 	}
-	// System-posted txn: no pocket (biller money is ambient — General).
+	// System-posted txn: no slate, so it lands in Plain.
 	var txnID int64
 	if err := tx.QueryRowContext(ctx,
 		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_at)

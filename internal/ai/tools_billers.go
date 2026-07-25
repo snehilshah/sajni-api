@@ -199,7 +199,7 @@ func payBillerTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 			}
 			return nil, nil, err
 		}
-		// Biller pay is a system path — no pocket (General).
+		// Biller pay is a system path — no slate, so it lands in Plain.
 		if err := tx.QueryRowContext(ctx,
 			`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_at)
 			 VALUES ($1,$2,$3,'expense',$4,$5,($6::timestamp AT TIME ZONE 'Asia/Kolkata')) RETURNING id`,

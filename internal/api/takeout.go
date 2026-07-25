@@ -810,6 +810,7 @@ func importFinAccounts(ctx context.Context, deps Deps, uid string, body []byte) 
 func importFinCategories(ctx context.Context, deps Deps, uid string, body []byte) (int, map[int64]int64) {
 	idMap := map[int64]int64{}
 	ensureDefaultCategories(deps, uid)
+	ensureSlates(deps, uid)
 	rows, err := parseCSV(body)
 	if err != nil {
 		return 0, idMap
