@@ -51,7 +51,7 @@ func listJournal(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
-		rows, err := d.Query("SELECT id, date::text, mood, created_at, updated_at FROM journal_entries WHERE user_id = $1 ORDER BY date DESC", uid)
+		rows, err := d.Query("SELECT id, date::text, created_at, updated_at FROM journal_entries WHERE user_id = $1 ORDER BY date DESC", uid)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
@@ -61,7 +61,6 @@ func listJournal(deps Deps) http.HandlerFunc {
 		type Entry struct {
 			ID        int64    `json:"id"`
 			Date      string   `json:"date"`
-			Mood      *string  `json:"mood"`
 			Tags      []string `json:"tags"`
 			CreatedAt string   `json:"created_at"`
 			UpdatedAt string   `json:"updated_at"`
@@ -69,7 +68,7 @@ func listJournal(deps Deps) http.HandlerFunc {
 		var entries []Entry
 		for rows.Next() {
 			var e Entry
-			if err := rows.Scan(&e.ID, &e.Date, &e.Mood, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			if err := rows.Scan(&e.ID, &e.Date, &e.CreatedAt, &e.UpdatedAt); err != nil {
 				errJSON(w, 500, err.Error())
 				return
 			}
@@ -103,7 +102,6 @@ func getJournalEntry(deps Deps) http.HandlerFunc {
 		type Entry struct {
 			ID            int64          `json:"id"`
 			Date          string         `json:"date"`
-			Mood          *string        `json:"mood"`
 			Content       string         `json:"content"`
 			LocationLabel string         `json:"location_label"`
 			LocationLat   *float64       `json:"location_lat"`
@@ -115,13 +113,13 @@ func getJournalEntry(deps Deps) http.HandlerFunc {
 		}
 
 		var e Entry
-		err := d.QueryRow(`SELECT id, date::text, mood, COALESCE(location_label,''),
+		err := d.QueryRow(`SELECT id, date::text, COALESCE(location_label,''),
 			location_lat, location_lon, created_at, updated_at
 			FROM journal_entries WHERE user_id = $1 AND date = $2`, uid, date).
-			Scan(&e.ID, &e.Date, &e.Mood, &e.LocationLabel, &e.LocationLat, &e.LocationLon, &e.CreatedAt, &e.UpdatedAt)
+			Scan(&e.ID, &e.Date, &e.LocationLabel, &e.LocationLat, &e.LocationLon, &e.CreatedAt, &e.UpdatedAt)
 		if err != nil {
 			writeJSON(w, 200, map[string]any{
-				"id": 0, "date": date, "mood": nil, "content": "",
+				"id": 0, "date": date, "content": "",
 				"location_label": "", "location_lat": nil, "location_lon": nil,
 				"tags": []string{}, "backlinks": []BacklinkInfo{}, "created_at": "", "updated_at": "",
 			})
@@ -258,7 +256,6 @@ func upsertJournalEntry(deps Deps) http.HandlerFunc {
 
 		var body struct {
 			Content       string   `json:"content"`
-			Mood          *string  `json:"mood"`
 			LocationLabel *string  `json:"location_label"`
 			LocationLat   *float64 `json:"location_lat"`
 			LocationLon   *float64 `json:"location_lon"`
@@ -297,19 +294,19 @@ func upsertJournalEntry(deps Deps) http.HandlerFunc {
 		err := d.QueryRow("SELECT id FROM journal_entries WHERE user_id = $1 AND date = $2", uid, date).Scan(&id)
 		if err != nil {
 			err := d.QueryRow(
-				`INSERT INTO journal_entries (user_id, date, blob_key, mood, location_label, location_lat, location_lon)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-				uid, date, key, body.Mood, locLabel, body.LocationLat, body.LocationLon,
+				`INSERT INTO journal_entries (user_id, date, blob_key, location_label, location_lat, location_lon)
+				 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+				uid, date, key, locLabel, body.LocationLat, body.LocationLon,
 			).Scan(&id)
 			if err != nil {
 				errJSON(w, 500, err.Error())
 				return
 			}
 		} else {
-			d.Exec(`UPDATE journal_entries SET mood = $1, blob_key = $2,
-				location_label = $3, location_lat = $4, location_lon = $5,
-				updated_at = NOW() WHERE id = $6 AND user_id = $7`,
-				body.Mood, key, locLabel, body.LocationLat, body.LocationLon, id, uid)
+			d.Exec(`UPDATE journal_entries SET blob_key = $1,
+				location_label = $2, location_lat = $3, location_lon = $4,
+				updated_at = NOW() WHERE id = $5 AND user_id = $6`,
+				key, locLabel, body.LocationLat, body.LocationLon, id, uid)
 		}
 
 		syncTags(d, uid, "journal", id, body.Content)
@@ -532,7 +529,7 @@ func listWeeklyEntries(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
-		rows, err := d.Query(`SELECT id, iso_year, iso_week, mood, created_at, updated_at
+		rows, err := d.Query(`SELECT id, iso_year, iso_week, created_at, updated_at
 			FROM journal_weekly WHERE user_id = $1
 			ORDER BY iso_year DESC, iso_week DESC`, uid)
 		if err != nil {
@@ -542,17 +539,16 @@ func listWeeklyEntries(deps Deps) http.HandlerFunc {
 		defer rows.Close()
 
 		type Entry struct {
-			ID        int64   `json:"id"`
-			IsoYear   int     `json:"iso_year"`
-			IsoWeek   int     `json:"iso_week"`
-			Mood      *string `json:"mood"`
-			CreatedAt string  `json:"created_at"`
-			UpdatedAt string  `json:"updated_at"`
+			ID        int64  `json:"id"`
+			IsoYear   int    `json:"iso_year"`
+			IsoWeek   int    `json:"iso_week"`
+			CreatedAt string `json:"created_at"`
+			UpdatedAt string `json:"updated_at"`
 		}
 		out := []Entry{}
 		for rows.Next() {
 			var e Entry
-			if err := rows.Scan(&e.ID, &e.IsoYear, &e.IsoWeek, &e.Mood, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			if err := rows.Scan(&e.ID, &e.IsoYear, &e.IsoWeek, &e.CreatedAt, &e.UpdatedAt); err != nil {
 				errJSON(w, 500, err.Error())
 				return
 			}
@@ -573,25 +569,24 @@ func getWeeklyEntry(deps Deps) http.HandlerFunc {
 		}
 
 		type Entry struct {
-			ID        int64   `json:"id"`
-			IsoYear   int     `json:"iso_year"`
-			IsoWeek   int     `json:"iso_week"`
-			Mood      *string `json:"mood"`
-			Content   string  `json:"content"`
-			CreatedAt string  `json:"created_at"`
-			UpdatedAt string  `json:"updated_at"`
+			ID        int64  `json:"id"`
+			IsoYear   int    `json:"iso_year"`
+			IsoWeek   int    `json:"iso_week"`
+			Content   string `json:"content"`
+			CreatedAt string `json:"created_at"`
+			UpdatedAt string `json:"updated_at"`
 		}
 
 		var e Entry
-		err = d.QueryRow(`SELECT id, iso_year, iso_week, mood, created_at, updated_at
+		err = d.QueryRow(`SELECT id, iso_year, iso_week, created_at, updated_at
 			FROM journal_weekly WHERE user_id = $1 AND iso_year = $2 AND iso_week = $3`,
 			uid, year, week).
-			Scan(&e.ID, &e.IsoYear, &e.IsoWeek, &e.Mood, &e.CreatedAt, &e.UpdatedAt)
+			Scan(&e.ID, &e.IsoYear, &e.IsoWeek, &e.CreatedAt, &e.UpdatedAt)
 		if err != nil {
 			// Empty stub mirrors getJournalEntry behaviour.
 			writeJSON(w, 200, map[string]any{
 				"id": 0, "iso_year": year, "iso_week": week,
-				"mood": nil, "content": "", "created_at": "", "updated_at": "",
+				"content": "", "created_at": "", "updated_at": "",
 			})
 			return
 		}
@@ -613,8 +608,7 @@ func upsertWeeklyEntry(deps Deps) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			Content string  `json:"content"`
-			Mood    *string `json:"mood"`
+			Content string `json:"content"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -632,17 +626,17 @@ func upsertWeeklyEntry(deps Deps) http.HandlerFunc {
 			WHERE user_id = $1 AND iso_year = $2 AND iso_week = $3`, uid, year, week).Scan(&id)
 		if err != nil {
 			err := d.QueryRow(
-				`INSERT INTO journal_weekly (user_id, iso_year, iso_week, blob_key, mood)
-				 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-				uid, year, week, key, body.Mood,
+				`INSERT INTO journal_weekly (user_id, iso_year, iso_week, blob_key)
+				 VALUES ($1, $2, $3, $4) RETURNING id`,
+				uid, year, week, key,
 			).Scan(&id)
 			if err != nil {
 				errJSON(w, 500, err.Error())
 				return
 			}
 		} else {
-			d.Exec(`UPDATE journal_weekly SET mood = $1, blob_key = $2, updated_at = NOW()
-				WHERE id = $3 AND user_id = $4`, body.Mood, key, id, uid)
+			d.Exec(`UPDATE journal_weekly SET blob_key = $1, updated_at = NOW()
+				WHERE id = $2 AND user_id = $3`, key, id, uid)
 		}
 		writeJSON(w, 200, map[string]int64{"id": id})
 	}
@@ -690,12 +684,11 @@ func weeklySummary(deps Deps) http.HandlerFunc {
 
 		// --- Per-day stats. Pre-seed the 7 rows so empty days still appear. ---
 		type DayStat struct {
-			Date        string  `json:"date"`
-			TasksDone   int     `json:"tasks_done"`
-			TasksDue    int     `json:"tasks_due"`
-			TasksMissed int     `json:"tasks_missed"`
-			Mood        *string `json:"mood"`
-			HasEntry    bool    `json:"has_entry"`
+			Date        string `json:"date"`
+			TasksDone   int    `json:"tasks_done"`
+			TasksDue    int    `json:"tasks_due"`
+			TasksMissed int    `json:"tasks_missed"`
+			HasEntry    bool   `json:"has_entry"`
 		}
 		days := make([]DayStat, 7)
 		index := map[string]int{}
@@ -756,16 +749,14 @@ func weeklySummary(deps Deps) http.HandlerFunc {
 			rows.Close()
 		}
 
-		// Daily journal entries (mood + has_entry).
-		if rows, err := d.Query(`SELECT date::text, mood FROM journal_entries
+		// Daily journal entries (has_entry).
+		if rows, err := d.Query(`SELECT date::text FROM journal_entries
 			WHERE user_id = $1 AND date BETWEEN $2 AND $3`, uid, startStr, endStr); err == nil {
 			for rows.Next() {
 				var dateStr string
-				var mood *string
-				rows.Scan(&dateStr, &mood)
+				rows.Scan(&dateStr)
 				if i, ok := index[dateStr]; ok {
 					days[i].HasEntry = true
-					days[i].Mood = mood
 				}
 			}
 			rows.Close()
@@ -887,7 +878,7 @@ func listMonthlyEntries(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
-		rows, err := d.Query(`SELECT id, cal_year, cal_month, mood, created_at, updated_at
+		rows, err := d.Query(`SELECT id, cal_year, cal_month, created_at, updated_at
 			FROM journal_monthly WHERE user_id = $1
 			ORDER BY cal_year DESC, cal_month DESC`, uid)
 		if err != nil {
@@ -897,17 +888,16 @@ func listMonthlyEntries(deps Deps) http.HandlerFunc {
 		defer rows.Close()
 
 		type Entry struct {
-			ID        int64   `json:"id"`
-			Year      int     `json:"year"`
-			Month     int     `json:"month"`
-			Mood      *string `json:"mood"`
-			CreatedAt string  `json:"created_at"`
-			UpdatedAt string  `json:"updated_at"`
+			ID        int64  `json:"id"`
+			Year      int    `json:"year"`
+			Month     int    `json:"month"`
+			CreatedAt string `json:"created_at"`
+			UpdatedAt string `json:"updated_at"`
 		}
 		out := []Entry{}
 		for rows.Next() {
 			var e Entry
-			if err := rows.Scan(&e.ID, &e.Year, &e.Month, &e.Mood, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			if err := rows.Scan(&e.ID, &e.Year, &e.Month, &e.CreatedAt, &e.UpdatedAt); err != nil {
 				errJSON(w, 500, err.Error())
 				return
 			}
@@ -928,25 +918,24 @@ func getMonthlyEntry(deps Deps) http.HandlerFunc {
 		}
 
 		type Entry struct {
-			ID        int64   `json:"id"`
-			Year      int     `json:"year"`
-			Month     int     `json:"month"`
-			Mood      *string `json:"mood"`
-			Content   string  `json:"content"`
-			CreatedAt string  `json:"created_at"`
-			UpdatedAt string  `json:"updated_at"`
+			ID        int64  `json:"id"`
+			Year      int    `json:"year"`
+			Month     int    `json:"month"`
+			Content   string `json:"content"`
+			CreatedAt string `json:"created_at"`
+			UpdatedAt string `json:"updated_at"`
 		}
 
 		var e Entry
-		err = d.QueryRow(`SELECT id, cal_year, cal_month, mood, created_at, updated_at
+		err = d.QueryRow(`SELECT id, cal_year, cal_month, created_at, updated_at
 			FROM journal_monthly WHERE user_id = $1 AND cal_year = $2 AND cal_month = $3`,
 			uid, year, month).
-			Scan(&e.ID, &e.Year, &e.Month, &e.Mood, &e.CreatedAt, &e.UpdatedAt)
+			Scan(&e.ID, &e.Year, &e.Month, &e.CreatedAt, &e.UpdatedAt)
 		if err != nil {
 			// Empty stub mirrors getWeeklyEntry behaviour.
 			writeJSON(w, 200, map[string]any{
 				"id": 0, "year": year, "month": month,
-				"mood": nil, "content": "", "created_at": "", "updated_at": "",
+				"content": "", "created_at": "", "updated_at": "",
 			})
 			return
 		}
@@ -968,8 +957,7 @@ func upsertMonthlyEntry(deps Deps) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			Content string  `json:"content"`
-			Mood    *string `json:"mood"`
+			Content string `json:"content"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -987,17 +975,17 @@ func upsertMonthlyEntry(deps Deps) http.HandlerFunc {
 			WHERE user_id = $1 AND cal_year = $2 AND cal_month = $3`, uid, year, month).Scan(&id)
 		if err != nil {
 			err := d.QueryRow(
-				`INSERT INTO journal_monthly (user_id, cal_year, cal_month, blob_key, mood)
-				 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-				uid, year, month, key, body.Mood,
+				`INSERT INTO journal_monthly (user_id, cal_year, cal_month, blob_key)
+				 VALUES ($1, $2, $3, $4) RETURNING id`,
+				uid, year, month, key,
 			).Scan(&id)
 			if err != nil {
 				errJSON(w, 500, err.Error())
 				return
 			}
 		} else {
-			d.Exec(`UPDATE journal_monthly SET mood = $1, blob_key = $2, updated_at = NOW()
-				WHERE id = $3 AND user_id = $4`, body.Mood, key, id, uid)
+			d.Exec(`UPDATE journal_monthly SET blob_key = $1, updated_at = NOW()
+				WHERE id = $2 AND user_id = $3`, key, id, uid)
 		}
 		writeJSON(w, 200, map[string]int64{"id": id})
 	}

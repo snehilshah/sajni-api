@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -221,24 +220,6 @@ func RunInsightsForUser(ctx context.Context, deps Deps, uid string, window strin
 	cutoff := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
 	var out []detected
 
-	if s, err := dailyMoodTaskSeries(ctx, d, uid, cutoff); err == nil && len(s) >= 5 {
-		r := pearson(s)
-		if !math.IsNaN(r) && math.Abs(r) >= 0.35 {
-			dir := "lower"
-			if r > 0 {
-				dir = "higher"
-			}
-			out = append(out, detected{
-				kind:  "mood_vs_tasks",
-				title: "Mood ↔ task completion",
-				body: fmt.Sprintf("Across the last %dd, your mood tends to be %s on days when you complete more tasks (r=%.2f).",
-					days, dir, r),
-				score:    math.Abs(r),
-				evidence: map[string]any{"r": r, "samples": len(s), "window_days": days},
-			})
-		}
-	}
-
 	out = append(out, detectHabitStreaks(ctx, d, uid, cutoff, days)...)
 	out = append(out, detectSpendingSpikes(ctx, d, uid, cutoff, days)...)
 	out = append(out, detectJournalCadence(ctx, d, uid, cutoff, days)...)
@@ -434,19 +415,15 @@ func timeTravelHandler(deps Deps) http.HandlerFunc {
 		}
 
 		if all || allow["journal"] {
-			rows, _ := d.Query(`SELECT id, date::text, COALESCE(location_label,''), COALESCE(mood,'')
-				FROM journal_entries WHERE user_id=$1 AND (location_label ILIKE $2 OR mood ILIKE $2)`+date("date")+
+			rows, _ := d.Query(`SELECT id, date::text, COALESCE(location_label,'')
+				FROM journal_entries WHERE user_id=$1 AND location_label ILIKE $2`+date("date")+
 				` ORDER BY date DESC LIMIT 20`, append([]any{uid, like}, dargs...)...)
 			if rows != nil {
 				for rows.Next() {
 					var id int64
-					var date, loc, mood string
-					rows.Scan(&id, &date, &loc, &mood)
-					excerpt := loc
-					if excerpt == "" {
-						excerpt = "mood: " + mood
-					}
-					hits = append(hits, Hit{Type: "journal", ID: id, Date: date, Title: date, Excerpt: excerpt})
+					var date, loc string
+					rows.Scan(&id, &date, &loc)
+					hits = append(hits, Hit{Type: "journal", ID: id, Date: date, Title: date, Excerpt: loc})
 				}
 				rows.Close()
 			}
@@ -534,78 +511,6 @@ func trunc(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "…"
-}
-
-// dailyMoodTaskSeries returns [moodScore, completionRate] per day where
-// a journal entry with a non-empty mood exists. Mood string maps to a
-// 1..5 numeric scale so we can compute Pearson r against the daily task
-// completion rate.
-func dailyMoodTaskSeries(ctx context.Context, d *db.DB, uid string, cutoff string) ([][2]float64, error) {
-	moodMap := map[string]float64{
-		"great": 5, "happy": 5, "excited": 5, "energized": 5,
-		"good": 4, "focused": 4, "calm": 4,
-		"okay": 3, "neutral": 3, "meh": 3,
-		"tired": 2, "stressed": 2, "anxious": 2, "sad": 2,
-		"awful": 1, "angry": 1, "exhausted": 1,
-	}
-	rows, err := d.QueryContext(ctx, `
-		WITH days AS (
-			SELECT date::date AS d, COALESCE(mood,'') AS mood
-			FROM journal_entries WHERE user_id=$1 AND date >= $2 AND mood IS NOT NULL AND mood <> ''
-		),
-		t AS (
-			SELECT due_date::date AS d,
-			       COUNT(*) AS total,
-			       COUNT(*) FILTER (WHERE status='done') AS done
-			FROM tasks WHERE user_id=$1 AND due_date >= $2
-			GROUP BY due_date)
-		SELECT d.d, d.mood, COALESCE(t.done,0), COALESCE(t.total,0)
-		FROM days d LEFT JOIN t ON t.d = d.d
-		WHERE COALESCE(t.total,0) > 0
-		ORDER BY d.d`, uid, cutoff)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out [][2]float64
-	for rows.Next() {
-		var date time.Time
-		var mood string
-		var done, total int
-		rows.Scan(&date, &mood, &done, &total)
-		mscore, ok := moodMap[strings.ToLower(mood)]
-		if !ok {
-			continue
-		}
-		out = append(out, [2]float64{mscore, float64(done) / float64(total)})
-	}
-	return out, nil
-}
-
-// pearson returns the Pearson correlation coefficient of {x, y} pairs.
-// NaN on degenerate input (zero variance, < 2 points).
-func pearson(pts [][2]float64) float64 {
-	n := float64(len(pts))
-	if n < 2 {
-		return math.NaN()
-	}
-	var sx, sy float64
-	for _, p := range pts {
-		sx += p[0]
-		sy += p[1]
-	}
-	mx, my := sx/n, sy/n
-	var num, dx2, dy2 float64
-	for _, p := range pts {
-		dx, dy := p[0]-mx, p[1]-my
-		num += dx * dy
-		dx2 += dx * dx
-		dy2 += dy * dy
-	}
-	if dx2 == 0 || dy2 == 0 {
-		return math.NaN()
-	}
-	return num / math.Sqrt(dx2*dy2)
 }
 
 // tryNarrateInsights asks Gemini to rewrite each finding into one warm

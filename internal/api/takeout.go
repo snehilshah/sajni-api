@@ -260,7 +260,7 @@ func exportMedia(ctx context.Context, zw *zip.Writer, deps Deps, uid string) err
 
 func exportJournal(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx,
-		`SELECT date, blob_key, COALESCE(mood,'') FROM journal_entries WHERE user_id = $1 ORDER BY date`, uid)
+		`SELECT date, blob_key FROM journal_entries WHERE user_id = $1 ORDER BY date`, uid)
 	if err != nil {
 		return err
 	}
@@ -268,12 +268,11 @@ func exportJournal(ctx context.Context, zw *zip.Writer, deps Deps, uid string) e
 	type row struct {
 		date time.Time
 		key  string
-		mood string
 	}
 	var entries []row
 	for rows.Next() {
 		var e row
-		if err := rows.Scan(&e.date, &e.key, &e.mood); err == nil {
+		if err := rows.Scan(&e.date, &e.key); err == nil {
 			entries = append(entries, e)
 		}
 	}
@@ -285,7 +284,7 @@ func exportJournal(ctx context.Context, zw *zip.Writer, deps Deps, uid string) e
 				body = string(data)
 			}
 		}
-		fm := fmt.Sprintf("---\ndate: %s\nmood: %s\n---\n\n", e.date.Format("2006-01-02"), e.mood)
+		fm := fmt.Sprintf("---\ndate: %s\n---\n\n", e.date.Format("2006-01-02"))
 		writeZipText(zw, "journal/"+e.date.Format("2006-01-02")+".md", fm+body)
 	}
 	return nil
@@ -931,29 +930,21 @@ func importJournal(ctx context.Context, deps Deps, uid string, name string, body
 		return false
 	}
 	s := string(body)
-	mood := ""
+	// Archives exported before mood was removed carry a `mood:` line in the
+	// front matter. Strip the block and drop it on the floor rather than
+	// rejecting the file — an old takeout must still import.
 	if m := noteFrontRe.FindStringSubmatch(s); m != nil {
-		for _, line := range strings.Split(m[1], "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "mood:") {
-				mood = strings.TrimSpace(strings.TrimPrefix(line, "mood:"))
-			}
-		}
 		s = strings.TrimPrefix(s, m[0])
 	}
 	key := storage.UserKey(uid, "journal", base+".md")
 	if err := deps.Storage.Put(ctx, key, []byte(s), "text/markdown"); err != nil {
 		return false
 	}
-	var moodArg any = nil
-	if mood != "" {
-		moodArg = mood
-	}
 	_, err := deps.DB.ExecContext(ctx, `
-		INSERT INTO journal_entries(user_id, date, blob_key, mood)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (user_id, date) DO UPDATE SET blob_key = EXCLUDED.blob_key, mood = EXCLUDED.mood, updated_at = NOW()`,
-		uid, base, key, moodArg)
+		INSERT INTO journal_entries(user_id, date, blob_key)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (user_id, date) DO UPDATE SET blob_key = EXCLUDED.blob_key, updated_at = NOW()`,
+		uid, base, key)
 	return err == nil
 }
 

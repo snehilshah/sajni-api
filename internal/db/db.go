@@ -279,7 +279,6 @@ func (d *DB) migrate() error {
 		user_id        UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		date           DATE        NOT NULL,
 		blob_key       TEXT        NOT NULL DEFAULT '',
-		mood           TEXT,
 		location_label TEXT        NOT NULL DEFAULT '',
 		location_lat   NUMERIC(9,6),
 		location_lon   NUMERIC(9,6),
@@ -298,7 +297,6 @@ func (d *DB) migrate() error {
 		iso_year   INTEGER     NOT NULL,
 		iso_week   INTEGER     NOT NULL,
 		blob_key   TEXT        NOT NULL DEFAULT '',
-		mood       TEXT,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		UNIQUE(user_id, iso_year, iso_week)
@@ -315,7 +313,6 @@ func (d *DB) migrate() error {
 		cal_year   INTEGER     NOT NULL,
 		cal_month  INTEGER     NOT NULL,
 		blob_key   TEXT        NOT NULL DEFAULT '',
-		mood       TEXT,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		UNIQUE(user_id, cal_year, cal_month)
@@ -978,6 +975,20 @@ func (d *DB) migrate() error {
 	CREATE UNIQUE INDEX IF NOT EXISTS uq_fin_categories_user_kind_name
 	ON fin_categories (user_id, kind,
 		(CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END));
+
+	-- ─── Mood removal (idempotent) ────────────────────────────────────
+	-- Mood is gone from the journal at every level. Dropping the columns
+	-- rather than blanking them: a nullable column nothing reads is a
+	-- standing invitation to half-revive the feature. Lives at the tail of
+	-- the schema because the whole string runs as one ordered batch, and
+	-- the DELETE below needs the insights table to exist first.
+	ALTER TABLE journal_entries DROP COLUMN IF EXISTS mood;
+	ALTER TABLE journal_weekly  DROP COLUMN IF EXISTS mood;
+	ALTER TABLE journal_monthly DROP COLUMN IF EXISTS mood;
+	-- The mood_vs_tasks detector is gone with it, so these rows can never
+	-- regenerate and nothing left in the app can explain them. Scoped to
+	-- that one kind — every other insight is untouched.
+	DELETE FROM insights WHERE kind = 'mood_vs_tasks';
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err

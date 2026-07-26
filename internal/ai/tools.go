@@ -231,7 +231,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_journal_entries",
-			Description: "List recent journal entry metadata (date, mood). Use get_journal_entry to read content.",
+			Description: "List recent journal entry dates. Use get_journal_entry to read content.",
 			Schema: obj(map[string]*genai.Schema{
 				"date_from": str("Lower bound ISO date."),
 				"date_to":   str("Upper bound ISO date."),
@@ -687,7 +687,6 @@ func (s *Service) buildTools() []Tool {
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"date":           str("ISO date. Defaults to today."),
-				"mood":           str("e.g. 'happy', 'focused', 'tired'."),
 				"content":        str("The entry body in markdown."),
 				"location_label": str("Optional short place label like 'Cinepolis, Vashi'."),
 			}, "content"),
@@ -885,7 +884,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_insights",
-			Description: "List the user's generated cross-module insights (mood vs task completion, spending spikes, habit streak correlations, etc). Optionally filter by window.",
+			Description: "List the user's generated cross-module insights (spending spikes, habit streak correlations, journal cadence, etc). Optionally filter by window.",
 			Schema: obj(map[string]*genai.Schema{
 				"window": str("Optional: 1w | 2w | 1m | 6m | 1y."),
 				"limit":  intg("Default 10."),
@@ -1226,7 +1225,7 @@ func listJournalTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		vals = append(vals, dt)
 	}
 	limit := argInt(args, "limit", 20)
-	q := `SELECT id, date::text, COALESCE(mood,'') FROM journal_entries WHERE ` +
+	q := `SELECT id, date::text FROM journal_entries WHERE ` +
 		strings.Join(clauses, " AND ") +
 		fmt.Sprintf(` ORDER BY date DESC LIMIT %d`, limit)
 	rows, err := d.QueryContext(ctx, q, vals...)
@@ -1237,9 +1236,9 @@ func listJournalTool(ctx context.Context, d *db.DB, uid string, args map[string]
 	out := []map[string]any{}
 	for rows.Next() {
 		var id int64
-		var date, mood string
-		rows.Scan(&id, &date, &mood)
-		out = append(out, map[string]any{"id": id, "date": date, "mood": mood})
+		var date string
+		rows.Scan(&id, &date)
+		out = append(out, map[string]any{"id": id, "date": date})
 	}
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }
@@ -1249,9 +1248,9 @@ func getJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid st
 		return nil, nil, fmt.Errorf("missing date")
 	}
 	var id int64
-	var blobKey, mood string
-	err := d.QueryRowContext(ctx, `SELECT id, blob_key, COALESCE(mood,'') FROM journal_entries WHERE user_id=$1 AND date=$2`, uid, date).
-		Scan(&id, &blobKey, &mood)
+	var blobKey string
+	err := d.QueryRowContext(ctx, `SELECT id, blob_key FROM journal_entries WHERE user_id=$1 AND date=$2`, uid, date).
+		Scan(&id, &blobKey)
 	if err == sql.ErrNoRows {
 		return nil, nil, fmt.Errorf("no entry for %s", date)
 	}
@@ -1265,7 +1264,7 @@ func getJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid st
 			content = string(data)
 		}
 	}
-	return map[string]any{"id": id, "date": date, "mood": mood, "content": content}, nil, nil
+	return map[string]any{"id": id, "date": date, "content": content}, nil, nil
 }
 
 func listMemosTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
@@ -2245,7 +2244,6 @@ func createJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid
 	if date == "" {
 		date = time.Now().Format("2006-01-02")
 	}
-	mood := argStr(args, "mood")
 	locLabel := argStr(args, "location_label")
 	blobKey := fmt.Sprintf("user_%s/journal/%s.md", uid, date)
 	if err := store.Put(ctx, blobKey, []byte(content), "text/markdown"); err != nil {
@@ -2253,10 +2251,10 @@ func createJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid
 	}
 	var id int64
 	err := d.QueryRowContext(ctx, `
-		INSERT INTO journal_entries (user_id, date, blob_key, mood, location_label) VALUES ($1,$2,$3,$4,$5)
-		ON CONFLICT (user_id, date) DO UPDATE SET blob_key=EXCLUDED.blob_key, mood=EXCLUDED.mood,
+		INSERT INTO journal_entries (user_id, date, blob_key, location_label) VALUES ($1,$2,$3,$4)
+		ON CONFLICT (user_id, date) DO UPDATE SET blob_key=EXCLUDED.blob_key,
 		  location_label=EXCLUDED.location_label, updated_at=NOW()
-		RETURNING id`, uid, date, blobKey, nullableStr(mood), locLabel).Scan(&id)
+		RETURNING id`, uid, date, blobKey, locLabel).Scan(&id)
 	if err != nil {
 		return nil, nil, err
 	}

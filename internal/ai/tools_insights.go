@@ -89,21 +89,17 @@ func timeTravelTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	}
 
 	if allowAll || typesAllowed["journal"] {
-		query := `SELECT id, date::text, COALESCE(location_label,''), COALESCE(mood,'') FROM journal_entries
-			WHERE user_id=$1 AND (location_label ILIKE $2 OR mood ILIKE $2)` + expand("date") +
+		query := `SELECT id, date::text, COALESCE(location_label,'') FROM journal_entries
+			WHERE user_id=$1 AND location_label ILIKE $2` + expand("date") +
 			` ORDER BY date DESC LIMIT 20`
 		args := append([]any{uid, like}, dateArgs...)
 		rows, err := d.QueryContext(ctx, query, args...)
 		if err == nil {
 			for rows.Next() {
 				var id int64
-				var date, loc, mood string
-				rows.Scan(&id, &date, &loc, &mood)
-				excerpt := loc
-				if excerpt == "" {
-					excerpt = "mood: " + mood
-				}
-				hits = append(hits, Hit{Type: "journal", ID: id, Date: date, Title: date, Excerpt: excerpt})
+				var date, loc string
+				rows.Scan(&id, &date, &loc)
+				hits = append(hits, Hit{Type: "journal", ID: id, Date: date, Title: date, Excerpt: loc})
 			}
 			rows.Close()
 		}

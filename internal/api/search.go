@@ -100,20 +100,20 @@ func search(deps Deps) http.HandlerFunc {
 				})
 		}
 
-		// Journal entries (search by date string + mood)
+		// Journal entries (search by date string)
 		if want("journal") {
 			results = appendQuery(results, d, "journal",
-				`SELECT id, date::text, COALESCE(mood, '') FROM journal_entries
-				 WHERE user_id = $1 AND ($2 = '' OR date::text ILIKE $3 OR mood ILIKE $3)
+				`SELECT id, date::text FROM journal_entries
+				 WHERE user_id = $1 AND ($2 = '' OR date::text ILIKE $3)
 				 ORDER BY date DESC LIMIT 30`,
 				uid, q, like,
 				func(rs *sql.Rows) (SearchHit, bool) {
 					var id int64
-					var date, mood string
-					if err := rs.Scan(&id, &date, &mood); err != nil {
+					var date string
+					if err := rs.Scan(&id, &date); err != nil {
 						return SearchHit{}, false
 					}
-					return SearchHit{Type: "journal", ID: id, Title: date, Subtitle: mood, Route: "/journal?date=" + date}, true
+					return SearchHit{Type: "journal", ID: id, Title: date, Route: "/journal?date=" + date}, true
 				})
 		}
 
