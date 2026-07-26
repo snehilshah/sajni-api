@@ -29,9 +29,8 @@ const reminderGrace = 30 * time.Minute
 const reminderClaimLease = 5 * time.Minute
 
 // defaultTZ is the fallback zone when a user's timezone is unset/unparseable.
-// Every Sajni user is IST (see the users.timezone backfill in db.migrate), so
-// UTC was the wrong fallback — it shifted reminder/month-boundary clock times
-// by 5.5h for any NULL row. Asia/Kolkata is the canonical name for IST.
+// Asia/Kolkata preserves the product's historical clock for older accounts;
+// users with a captured IANA timezone always use their own zone.
 const defaultTZ = "Asia/Kolkata"
 
 // defaultLoc is defaultTZ resolved once at startup (tzdata is embedded in the
@@ -42,6 +41,25 @@ var defaultLoc = func() *time.Location {
 	}
 	return time.UTC
 }()
+
+// timezoneLocation resolves a stored IANA timezone, falling back to the
+// product default for older users whose timezone has not been captured.
+func timezoneLocation(tzName string) *time.Location {
+	if tzName != "" {
+		if loc, err := time.LoadLocation(tzName); err == nil {
+			return loc
+		}
+	}
+	return defaultLoc
+}
+
+// scheduledNotificationWindow is the quarter-hour window beginning at 10:00
+// in a user's local timezone. Cloud Scheduler calls the shared sweep every 15
+// minutes, so zones with :30 or :45 UTC offsets still receive a true 10 AM
+// delivery rather than being rounded to the nearest hour.
+func scheduledNotificationWindow(localNow time.Time) bool {
+	return localNow.Hour() == 10 && localNow.Minute() < 15
+}
 
 // RegisterReminderCronHandler mounts the internal reminder webhooks. Header
 // X-Reminder-Cron must match REMINDER_CRON_SECRET; handlers 401 without it.
@@ -608,12 +626,7 @@ func deleteTaskReminder(deps Deps) http.HandlerFunc {
 // human phrase like "today at 5:00 PM" / "tomorrow at 9:00 AM" /
 // "on Mon, Jun 2 at 5:00 PM". Falls back to defaultLoc (IST) when tz is unknown/bad.
 func formatReminderWhen(at time.Time, tzName string) string {
-	loc := defaultLoc
-	if tzName != "" {
-		if l, err := time.LoadLocation(tzName); err == nil {
-			loc = l
-		}
-	}
+	loc := timezoneLocation(tzName)
 	lt := at.In(loc)
 	now := time.Now().In(loc)
 	clock := lt.Format("3:04 PM")
@@ -637,12 +650,7 @@ func sameDay(a, b time.Time) bool {
 func userLocation(d *db.DB, uid string) *time.Location {
 	var tz string
 	d.QueryRow(`SELECT COALESCE(timezone,'') FROM users WHERE id = $1`, uid).Scan(&tz)
-	if tz != "" {
-		if l, err := time.LoadLocation(tz); err == nil {
-			return l
-		}
-	}
-	return defaultLoc
+	return timezoneLocation(tz)
 }
 
 // userNow is time.Now() in the user's timezone. Use it instead of bare

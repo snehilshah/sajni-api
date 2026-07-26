@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -14,10 +15,10 @@ import (
 )
 
 // Weekly & monthly task digests. Week/month tasks carry no scheduled_at, so
-// the scheduled-time single-task reminder never fires for them. Instead a once-a-day
-// Cloud Scheduler sweep (10:00 IST) hits /internal/reminders/digest; on a
-// Friday it emails each user their still-pending week tasks, and on the last
-// calendar day of the month their still-pending month tasks.
+// the scheduled-time single-task reminder never fires for them. The shared
+// scheduled sweep runs every 15 minutes; each user is selected only during
+// the 10:00 quarter-hour in their own timezone. Friday and month-end are also
+// evaluated on that local calendar.
 //
 // Cycle model (Friday→Friday, month-end→month-end): a task is eligible when it
 // has not been digested since the current day's local midnight boundary, so a
@@ -50,30 +51,48 @@ func digestCronHandler(deps Deps) http.HandlerFunc {
 }
 
 // ProcessDigestCron sends the weekly digest on Fridays and the monthly digest
-// on the last calendar day of the month, both evaluated in defaultLoc (every
-// Sajni user is IST). Safe to call any day: it no-ops when neither applies, so
-// a daily scheduler tick is all that's needed.
+// on the last calendar day of the month at 10:00 in each user's timezone.
+// Safe to call every 15 minutes: outside a user's local delivery window it
+// performs no work.
 func ProcessDigestCron(ctx context.Context, deps Deps) (weekly, monthly int, err error) {
+	return processDigestCronAt(ctx, deps, time.Now())
+}
+
+func processDigestCronAt(ctx context.Context, deps Deps, now time.Time) (weekly, monthly int, err error) {
 	if deps.Auth == nil && deps.Push == nil {
 		return 0, 0, nil // no delivery channel configured
 	}
-	now := time.Now().In(defaultLoc)
-	// Day boundary (local midnight): digested_at before this == eligible again.
-	boundary := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, defaultLoc)
 
-	if now.Weekday() == time.Friday {
-		weekly, err = processWeeklyDigests(ctx, deps, now, boundary)
-		if err != nil {
-			return 0, 0, err
+	owners, err := listDigestOwners(ctx, deps)
+	if err != nil {
+		return 0, 0, err
+	}
+	var jobErrors []error
+	for _, owner := range owners {
+		localNow := now.In(timezoneLocation(owner.timezone))
+		if !scheduledNotificationWindow(localNow) {
+			continue
+		}
+		// Day boundary as an instant: digested_at before this is eligible for
+		// the current local cycle, regardless of the database server timezone.
+		boundary := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, localNow.Location())
+
+		if localNow.Weekday() == time.Friday {
+			n, weeklyErr := processWeeklyDigest(ctx, deps, owner, localNow, boundary)
+			weekly += n
+			if weeklyErr != nil {
+				jobErrors = append(jobErrors, weeklyErr)
+			}
+		}
+		if isLastDayOfMonth(localNow) {
+			n, monthlyErr := processMonthlyDigest(ctx, deps, owner, localNow, boundary)
+			monthly += n
+			if monthlyErr != nil {
+				jobErrors = append(jobErrors, monthlyErr)
+			}
 		}
 	}
-	if isLastDayOfMonth(now) {
-		monthly, err = processMonthlyDigests(ctx, deps, now, boundary)
-		if err != nil {
-			return weekly, 0, err
-		}
-	}
-	return weekly, monthly, nil
+	return weekly, monthly, errors.Join(jobErrors...)
 }
 
 // isLastDayOfMonth reports whether t is the final calendar day of its month.
@@ -89,95 +108,104 @@ type digestRow struct {
 type userDigest struct {
 	uid, email, name string
 	channel          string
+	timezone         string
 	tasks            []digestRow
+}
+
+func listDigestOwners(ctx context.Context, deps Deps) ([]*userDigest, error) {
+	rows, err := deps.DB.QueryContext(ctx, `
+		SELECT id, email, COALESCE(name,''), COALESCE(notify_channel,'both'), COALESCE(timezone,'')
+		  FROM users
+		 WHERE deleted_at IS NULL
+		 ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("query digest users: %w", err)
+	}
+	defer rows.Close()
+
+	var owners []*userDigest
+	for rows.Next() {
+		owner := &userDigest{}
+		if err := rows.Scan(&owner.uid, &owner.email, &owner.name, &owner.channel, &owner.timezone); err != nil {
+			return nil, fmt.Errorf("scan digest user: %w", err)
+		}
+		owners = append(owners, owner)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return owners, nil
 }
 
 // processWeeklyDigests emails each user their pending week tasks (week_of <=
 // this Monday) and stamps digested_at. periodLabel reads e.g. "Jun 16–22".
-func processWeeklyDigests(ctx context.Context, deps Deps, now, boundary time.Time) (int, error) {
+func processWeeklyDigest(ctx context.Context, deps Deps, owner *userDigest, now, boundary time.Time) (int, error) {
 	monday := mondayOf(now)
 	mondayKey := monday.Format("2006-01-02")
 	rows, err := deps.DB.QueryContext(ctx, `
-		SELECT t.id, t.title, u.id, u.email, COALESCE(u.name,''), COALESCE(u.notify_channel,'both')
+		SELECT t.id, t.title
 		  FROM tasks t
-		  JOIN users u ON u.id = t.user_id
-		 WHERE t.week_of IS NOT NULL
-		   AND t.week_of <= $1
+		 WHERE t.user_id = $1
+		   AND t.week_of IS NOT NULL
+		   AND t.week_of <= $2
 		   AND t.status NOT IN ('done','scratched')
-		   AND (t.digested_at IS NULL OR t.digested_at < $2)
-		   AND u.deleted_at IS NULL
-		 ORDER BY u.id, t.week_of, t.id`,
-		mondayKey, boundary)
+		   AND (t.digested_at IS NULL OR t.digested_at < $3)
+		 ORDER BY t.week_of, t.id`,
+		owner.uid, mondayKey, boundary)
 	if err != nil {
 		return 0, fmt.Errorf("query weekly digests: %w", err)
 	}
 	defer rows.Close()
-	users, err := scanDigestRows(rows)
-	if err != nil {
-		return 0, fmt.Errorf("scan weekly digests: %w", err)
+	owner.tasks = nil
+	for rows.Next() {
+		var task digestRow
+		if err := rows.Scan(&task.id, &task.title); err != nil {
+			return 0, fmt.Errorf("scan weekly digest: %w", err)
+		}
+		owner.tasks = append(owner.tasks, task)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
 	}
 
 	periodLabel := monday.Format("Jan 2") + "–" + monday.AddDate(0, 0, 6).Format("Jan 2")
-	sent := deliverDigests(ctx, deps, users, "week", periodLabel)
+	sent := deliverDigests(ctx, deps, []*userDigest{owner}, "week", periodLabel)
 	return sent, nil
 }
 
 // processMonthlyDigests emails each user their pending month tasks (month_of <=
 // this month's 1st) and stamps digested_at. periodLabel reads e.g. "June 2026".
-func processMonthlyDigests(ctx context.Context, deps Deps, now, boundary time.Time) (int, error) {
-	first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, defaultLoc)
+func processMonthlyDigest(ctx context.Context, deps Deps, owner *userDigest, now, boundary time.Time) (int, error) {
+	first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 	firstKey := first.Format("2006-01-02")
 	rows, err := deps.DB.QueryContext(ctx, `
-		SELECT t.id, t.title, u.id, u.email, COALESCE(u.name,''), COALESCE(u.notify_channel,'both')
+		SELECT t.id, t.title
 		  FROM tasks t
-		  JOIN users u ON u.id = t.user_id
-		 WHERE t.month_of IS NOT NULL
-		   AND t.month_of <= $1
+		 WHERE t.user_id = $1
+		   AND t.month_of IS NOT NULL
+		   AND t.month_of <= $2
 		   AND t.status NOT IN ('done','scratched')
-		   AND (t.digested_at IS NULL OR t.digested_at < $2)
-		   AND u.deleted_at IS NULL
-		 ORDER BY u.id, t.month_of, t.id`,
-		firstKey, boundary)
+		   AND (t.digested_at IS NULL OR t.digested_at < $3)
+		 ORDER BY t.month_of, t.id`,
+		owner.uid, firstKey, boundary)
 	if err != nil {
 		return 0, fmt.Errorf("query monthly digests: %w", err)
 	}
 	defer rows.Close()
-	users, err := scanDigestRows(rows)
-	if err != nil {
-		return 0, fmt.Errorf("scan monthly digests: %w", err)
-	}
-
-	sent := deliverDigests(ctx, deps, users, "month", first.Format("January 2006"))
-	return sent, nil
-}
-
-// scanDigestRows folds the (task × user) join into one userDigest per user,
-// preserving row order so the email lists tasks oldest-period first.
-func scanDigestRows(rows interface {
-	Next() bool
-	Scan(...any) error
-	Err() error
-}) ([]*userDigest, error) {
-	var out []*userDigest
-	byUID := map[string]*userDigest{}
+	owner.tasks = nil
 	for rows.Next() {
-		var id int64
-		var title, uid, email, name, channel string
-		if err := rows.Scan(&id, &title, &uid, &email, &name, &channel); err != nil {
-			return nil, err
+		var task digestRow
+		if err := rows.Scan(&task.id, &task.title); err != nil {
+			return 0, fmt.Errorf("scan monthly digest: %w", err)
 		}
-		u := byUID[uid]
-		if u == nil {
-			u = &userDigest{uid: uid, email: email, name: name, channel: channel}
-			byUID[uid] = u
-			out = append(out, u)
-		}
-		u.tasks = append(u.tasks, digestRow{id: id, title: title})
+		owner.tasks = append(owner.tasks, task)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return 0, err
 	}
-	return out, nil
+
+	sent := deliverDigests(ctx, deps, []*userDigest{owner}, "month", first.Format("January 2006"))
+	return sent, nil
 }
 
 // deliverDigests sends one email + one summary push per user, then stamps every

@@ -57,6 +57,7 @@ gcloud services enable \
   secretmanager.googleapis.com \
   iamcredentials.googleapis.com \
   cloudtasks.googleapis.com \
+  cloudscheduler.googleapis.com \
   storage.googleapis.com
 
 # Container registry. Add a cleanup policy to cap storage.
@@ -257,28 +258,34 @@ After a month of clean reminder logs, you can delete the daily reminder
 sweep too. Until then it catches missed Cloud Tasks deliveries with the
 same idempotency gates.
 
-## Weekly / monthly task digests
+## Scheduled notifications
 
-Week and month tasks have no `scheduled_at`, so the scheduled-time reminder
-never fires for them. A once-daily sweep at **10:00 IST** posts to
-`/internal/reminders/digest` (same `REMINDER_CRON_SECRET` header). The
-endpoint self-gates: it emails the pending **week** tasks only on Fridays
-and the pending **month** tasks only on the last calendar day of the month,
-so a single daily job covers both. Create it once:
+Date-driven notifications share one idempotent sweep:
+
+- movie release email at **10:00 in the owner's timezone**, one day before;
+- weekly task digest at local 10:00 on Friday;
+- monthly task digest at local 10:00 on the last day of the month;
+- biller and investment processing against each owner's local calendar.
+
+Cloud Scheduler calls `/internal/notifications/run` every 15 minutes. The
+quarter-hour cadence is required for IANA zones with `:30` or `:45` UTC
+offsets. Exact task reminders still use Cloud Tasks.
+
+Update the existing `sajni-digest` job once when deploying this change:
 
 ```sh
-gcloud scheduler jobs create http sajni-digest \
+gcloud scheduler jobs update http sajni-digest \
   --location="$REGION" \
-  --schedule="0 10 * * *" \
-  --time-zone="Asia/Kolkata" \
-  --uri="$API_BASE_URL/internal/reminders/digest" \
+  --schedule="*/15 * * * *" \
+  --time-zone="UTC" \
+  --uri="$API_BASE_URL/internal/notifications/run" \
   --http-method=POST \
-  --headers="X-Reminder-Cron=$(gcloud secrets versions access latest --secret=REMINDER_CRON_SECRET)"
+  --update-headers="X-Reminder-Cron=$(gcloud secrets versions access latest --secret=REMINDER_CRON_SECRET)"
 ```
 
-Idempotent via `tasks.digested_at`: a still-pending task is re-nudged each
-cycle, and a task added after a fire is caught on the next one. Safe to run
-any day — it no-ops when neither a Friday nor a month-end applies.
+Idempotency comes from the existing task/biller/investment stamps and the
+per-media `release_reminded_for` date. Safe retries do not duplicate mail,
+payments, or alerts.
 
 ---
 

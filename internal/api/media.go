@@ -219,6 +219,10 @@ func listMedia(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
+		if _, err := graduateReleasedMedia(r.Context(), d, uid, userNow(d, uid)); err != nil {
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 
 		args := []any{uid}
 		clauses := []string{"user_id = $1"}

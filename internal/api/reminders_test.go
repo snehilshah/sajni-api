@@ -11,8 +11,8 @@ import (
 	_ "time/tzdata"
 )
 
-// defaultLoc must resolve to IST (+05:30), not UTC — every Sajni user is IST,
-// so an unset timezone falling back to UTC would shift reminder clock times.
+// defaultLoc must resolve to IST (+05:30), not UTC, so older accounts without
+// a captured timezone retain the product's historical clock.
 func TestDefaultLocIsIST(t *testing.T) {
 	at := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	if _, offset := at.In(defaultLoc).Zone(); offset != 5*3600+30*60 {
@@ -50,5 +50,57 @@ func TestSameDay(t *testing.T) {
 	}
 	if sameDay(b, c) {
 		t.Error("sameDay(b,c) = true, want false (different days)")
+	}
+}
+
+func TestScheduledNotificationWindowUsesUserClock(t *testing.T) {
+	tests := []struct {
+		name string
+		at   time.Time
+		tz   string
+		want bool
+	}{
+		{
+			name: "ten in Kolkata",
+			at:   time.Date(2026, 7, 27, 4, 30, 0, 0, time.UTC),
+			tz:   "Asia/Kolkata",
+			want: true,
+		},
+		{
+			name: "ten in New York during daylight time",
+			at:   time.Date(2026, 7, 27, 14, 0, 0, 0, time.UTC),
+			tz:   "America/New_York",
+			want: true,
+		},
+		{
+			name: "ten in Kathmandu quarter-hour zone",
+			at:   time.Date(2026, 7, 27, 4, 15, 0, 0, time.UTC),
+			tz:   "Asia/Kathmandu",
+			want: true,
+		},
+		{
+			name: "outside first quarter hour",
+			at:   time.Date(2026, 7, 27, 4, 45, 0, 0, time.UTC),
+			tz:   "Asia/Kolkata",
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			localNow := tt.at.In(timezoneLocation(tt.tz))
+			if got := scheduledNotificationWindow(localNow); got != tt.want {
+				t.Fatalf("scheduledNotificationWindow(%v in %s) = %v, want %v", tt.at, tt.tz, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMediaReleaseReminderDateUsesLocalCalendar(t *testing.T) {
+	at := time.Date(2026, 7, 27, 18, 45, 0, 0, time.UTC)
+	if got := mediaReleaseReminderDate(at.In(timezoneLocation("Asia/Kolkata"))); got != "2026-07-29" {
+		t.Fatalf("Kolkata reminder target = %s, want 2026-07-29", got)
+	}
+	if got := mediaReleaseReminderDate(at.In(timezoneLocation("America/New_York"))); got != "2026-07-28" {
+		t.Fatalf("New York reminder target = %s, want 2026-07-28", got)
 	}
 }

@@ -186,6 +186,32 @@ func (s *Service) SendTaskReminder(ctx context.Context, to, name, taskTitle, whe
 	return s.SendEmail(ctx, to, subject, buf.String())
 }
 
+// SendMediaReleaseReminder sends the owner of one saved movie a one-day
+// release notice. Recipient selection and idempotency stay in the API layer;
+// this method owns only the email presentation and delivery.
+func (s *Service) SendMediaReleaseReminder(ctx context.Context, to, name, movieTitle, releaseDate, route string) error {
+	tpl, err := template.ParseFS(emailTemplatesFS, "email_templates/media_release.html")
+	if err != nil {
+		return err
+	}
+	displayName := strings.TrimSpace(name)
+	if displayName == "" {
+		displayName = strings.SplitN(to, "@", 2)[0]
+	}
+	appURL := strings.TrimRight(s.AppURL, "/")
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, map[string]any{
+		"Name":        displayName,
+		"MovieTitle":  movieTitle,
+		"ReleaseDate": releaseDate,
+		"AppURL":      appURL,
+		"CTAURL":      appURL + route,
+	}); err != nil {
+		return err
+	}
+	return s.SendEmail(ctx, to, movieTitle+" releases tomorrow", buf.String())
+}
+
 // SendTaskDigest renders + ships the weekly / monthly pending-task digest: one
 // email listing every still-pending week (or month) task. kind is "week" |
 // "month"; periodLabel is the human range (e.g. "Jun 16–22" / "June 2026")

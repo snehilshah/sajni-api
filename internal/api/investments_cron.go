@@ -58,14 +58,16 @@ func advanceDebitDate(d time.Time, freq string, anchorDay int) time.Time {
 // they land in Plain — no special case needed any more.
 func ProcessInvestmentDebits(ctx context.Context, deps Deps) (posted int, err error) {
 	d := deps.DB
-	// All Sajni users are IST; compare due dates against the shared zone.
-	today := time.Now().In(defaultLoc).Format("2006-01-02")
-	todayT, _ := time.Parse("2006-01-02", today)
+	runAt := time.Now()
 
-	rows, err := d.QueryContext(ctx, `SELECT id, user_id, name, account_id, monthly_amount, frequency, next_debit_date::text,
-		COALESCE(anchor_day, EXTRACT(DAY FROM next_debit_date)::INTEGER)
-		FROM fin_investments
-		WHERE auto_debit = TRUE AND account_id IS NOT NULL AND next_debit_date IS NOT NULL AND monthly_amount > 0`)
+	rows, err := d.QueryContext(ctx, `SELECT i.id, i.user_id, i.name, i.account_id, i.monthly_amount, i.frequency, i.next_debit_date::text,
+		COALESCE(i.anchor_day, EXTRACT(DAY FROM i.next_debit_date)::INTEGER),
+		COALESCE(u.timezone,'')
+		FROM fin_investments i
+		JOIN users u ON u.id = i.user_id
+		WHERE i.auto_debit = TRUE AND i.account_id IS NOT NULL
+		  AND i.next_debit_date IS NOT NULL AND i.monthly_amount > 0
+		  AND u.deleted_at IS NULL`)
 	if err != nil {
 		return 0, err
 	}
@@ -80,11 +82,12 @@ func ProcessInvestmentDebits(ctx context.Context, deps Deps) (posted int, err er
 		freq      string
 		debitDate string
 		anchorDay int
+		timezone  string
 	}
 	var invs []inv
 	for rows.Next() {
 		var i inv
-		if err := rows.Scan(&i.id, &i.userID, &i.name, &i.accountID, &i.amount, &i.freq, &i.debitDate, &i.anchorDay); err != nil {
+		if err := rows.Scan(&i.id, &i.userID, &i.name, &i.accountID, &i.amount, &i.freq, &i.debitDate, &i.anchorDay, &i.timezone); err != nil {
 			return 0, fmt.Errorf("scan investment debit: %w", err)
 		}
 		invs = append(invs, i)
@@ -95,6 +98,8 @@ func ProcessInvestmentDebits(ctx context.Context, deps Deps) (posted int, err er
 
 	var jobErrors []error
 	for _, i := range invs {
+		today := runAt.In(timezoneLocation(i.timezone)).Format("2006-01-02")
+		todayT, _ := time.Parse("2006-01-02", today)
 		due, perr := time.Parse("2006-01-02", i.debitDate)
 		if perr != nil {
 			jobErrors = append(jobErrors, fmt.Errorf("investment %d has invalid next_debit_date: %w", i.id, perr))
@@ -133,6 +138,7 @@ func ProcessInvestmentDebits(ctx context.Context, deps Deps) (posted int, err er
 func postInvestmentDebit(ctx context.Context, deps Deps, uid string, invID, accountID int64,
 	name string, amount float64, dueDate string,
 ) (bool, error) {
+	tzName := userLocation(deps.DB, uid).String()
 	tx, err := deps.DB.Begin()
 	if err != nil {
 		return false, err
@@ -156,8 +162,8 @@ func postInvestmentDebit(ctx context.Context, deps Deps, uid string, invID, acco
 	var txnID int64
 	if err := tx.QueryRowContext(ctx,
 		`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_at)
-		 VALUES ($1,$2,'expense',$3,$4,($5::timestamp AT TIME ZONE 'Asia/Kolkata')) RETURNING id`,
-		uid, accountID, amount, name+" (auto)", dueDate).Scan(&txnID); err != nil {
+		 VALUES ($1,$2,'expense',$3,$4,($5::timestamp AT TIME ZONE $6)) RETURNING id`,
+		uid, accountID, amount, name+" (auto)", dueDate, tzName).Scan(&txnID); err != nil {
 		return false, err
 	}
 	if _, err := tx.ExecContext(ctx,

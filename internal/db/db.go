@@ -236,11 +236,20 @@ func (d *DB) migrate() error {
 		season_episodes  JSONB       NOT NULL DEFAULT '[]'::jsonb,
 		collection_id    TEXT        NOT NULL DEFAULT '',
 		collection_name  TEXT        NOT NULL DEFAULT '',
+		-- Release reminders are tracked per saved row, so only the user who
+		-- added a movie can be notified. Storing the release date we reminded
+		-- for naturally re-arms the reminder if that date later changes.
+		release_reminded_for DATE,
+		release_reminder_claimed_until TIMESTAMPTZ,
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
+	ALTER TABLE media ADD COLUMN IF NOT EXISTS release_reminded_for DATE;
+	ALTER TABLE media ADD COLUMN IF NOT EXISTS release_reminder_claimed_until TIMESTAMPTZ;
 	CREATE INDEX IF NOT EXISTS idx_media_user ON media(user_id);
 	CREATE INDEX IF NOT EXISTS idx_media_collection ON media(user_id, collection_id) WHERE collection_id <> '';
+	CREATE INDEX IF NOT EXISTS idx_media_upcoming_release ON media(user_id, release_date)
+		WHERE type = 'movie' AND status = 'upcoming' AND release_date IS NOT NULL;
 
 	CREATE TABLE IF NOT EXISTS media_events (
 		id         BIGSERIAL   PRIMARY KEY,

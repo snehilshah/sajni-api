@@ -136,6 +136,11 @@ func main() {
 		if posted, err := api.ProcessInvestmentDebits(context.Background(), deps); err == nil && posted > 0 {
 			log.Info().Int("debits", posted).Msg("investment auto-debits posted at boot")
 		}
+		if reminded, graduated, err := api.ProcessMediaReleaseCron(context.Background(), deps); err != nil {
+			log.Warn().Err(err).Msg("media release processing failed at boot")
+		} else if reminded+graduated > 0 {
+			log.Info().Int("reminded", reminded).Int("graduated", graduated).Msg("media releases processed at boot")
+		}
 
 		hourly := time.NewTicker(time.Hour)
 		daily := time.NewTicker(24 * time.Hour)
@@ -158,6 +163,11 @@ func main() {
 					log.Warn().Err(err).Msg("investment debit cron failed")
 				} else if posted > 0 {
 					log.Info().Int("debits", posted).Msg("investment auto-debits posted")
+				}
+				if reminded, graduated, err := api.ProcessMediaReleaseCron(context.Background(), deps); err != nil {
+					log.Warn().Err(err).Msg("media release processing failed")
+				} else if reminded+graduated > 0 {
+					log.Info().Int("reminded", reminded).Int("graduated", graduated).Msg("media releases processed")
 				}
 			case <-daily.C:
 				if n, err := api.RunDailyInsightCron(context.Background(), deps); err != nil {

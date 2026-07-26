@@ -159,7 +159,7 @@ func nullableStr(s string) any {
 }
 
 // userTZLoc resolves the user's captured IANA timezone, falling back to
-// Asia/Kolkata (every Sajni user is IST). Cloud Run runs UTC, so deriving a
+// Asia/Kolkata for older accounts without one. Cloud Run runs UTC, so deriving a
 // "today" or a due-date from a bare time.Now() shifts the day by 5.5h and
 // mis-resolves "today"/"tomorrow" for anyone awake past midnight IST. Mirrors
 // the api package's userLocation (kept local to avoid an import cycle).
@@ -170,6 +170,9 @@ func userTZLoc(ctx context.Context, d *db.DB, uid string) *time.Location {
 		tz = "Asia/Kolkata"
 	}
 	if l, err := time.LoadLocation(tz); err == nil {
+		return l
+	}
+	if l, err := time.LoadLocation("Asia/Kolkata"); err == nil {
 		return l
 	}
 	return time.UTC
@@ -2480,7 +2483,7 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	if releaseDate != "" {
 		releaseDateArg = releaseDate
 		if !statusSpecified || status == "pending" {
-			nowStr := time.Now().Format("2006-01-02")
+			nowStr := userTZNow(ctx, d, uid).Format("2006-01-02")
 			cleanDate := strings.TrimSpace(releaseDate)
 			if len(cleanDate) >= 10 {
 				cleanDate = cleanDate[:10]

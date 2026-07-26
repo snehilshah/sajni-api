@@ -109,6 +109,7 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	RegisterInsightCronHandler(root, deps)
 	RegisterReminderCronHandler(root, deps)
 	RegisterDigestCronHandler(root, deps)
+	RegisterScheduledNotificationHandler(root, deps)
 
 	if frontendDir != "" {
 		fs := http.FileServer(http.Dir(frontendDir))

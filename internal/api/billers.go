@@ -480,6 +480,7 @@ func payBiller(deps Deps) http.HandlerFunc {
 func postBillerTxn(ctx context.Context, deps Deps, uid string, billerID, accountID int64,
 	categoryID sql.NullInt64, name string, amount float64, paidDate, dueDate string, auto bool,
 ) (int64, bool, error) {
+	tzName := userLocation(deps.DB, uid).String()
 	tx, err := deps.DB.Begin()
 	if err != nil {
 		return 0, false, err
@@ -511,8 +512,8 @@ func postBillerTxn(ctx context.Context, deps Deps, uid string, billerID, account
 	var txnID int64
 	if err := tx.QueryRowContext(ctx,
 		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_at)
-		 VALUES ($1,$2,$3,'expense',$4,$5,($6::timestamp AT TIME ZONE 'Asia/Kolkata')) RETURNING id`,
-		uid, accountID, catArg, amount, desc, paidDate).Scan(&txnID); err != nil {
+		 VALUES ($1,$2,$3,'expense',$4,$5,($6::timestamp AT TIME ZONE $7)) RETURNING id`,
+		uid, accountID, catArg, amount, desc, paidDate, tzName).Scan(&txnID); err != nil {
 		return 0, false, err
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -716,14 +717,15 @@ func markBillerAlertSeen(deps Deps) http.HandlerFunc {
 // on (biller_id, due_date).
 func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcomingNoticed int, err error) {
 	d := deps.DB
-	// Cron spans all users; every Sajni user is IST, so use the shared default
-	// zone rather than the server's UTC clock for the due-date comparison.
-	today := time.Now().In(defaultLoc).Format("2006-01-02")
+	runAt := time.Now()
 
-	rows, err := d.QueryContext(ctx, `SELECT id, user_id, name, amount, frequency, next_due_date::text,
-		COALESCE(anchor_day, EXTRACT(DAY FROM next_due_date)::INTEGER),
-		account_id, category_id, auto_renew, remind_task, alert_days
-		FROM fin_billers WHERE archived = FALSE`)
+	rows, err := d.QueryContext(ctx, `SELECT b.id, b.user_id, b.name, b.amount, b.frequency, b.next_due_date::text,
+		COALESCE(b.anchor_day, EXTRACT(DAY FROM b.next_due_date)::INTEGER),
+		b.account_id, b.category_id, b.auto_renew, b.remind_task, b.alert_days,
+		COALESCE(u.timezone,'')
+		FROM fin_billers b
+		JOIN users u ON u.id = b.user_id
+		WHERE b.archived = FALSE AND u.deleted_at IS NULL`)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -739,12 +741,13 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 		remindTask            bool
 		alertDays             int
 		anchorDay             int
+		timezone              string
 	}
 	var bills []bill
 	for rows.Next() {
 		var b bill
 		if err := rows.Scan(&b.id, &b.userID, &b.name, &b.amount, &b.freq, &b.dueDate, &b.anchorDay,
-			&b.accountID, &b.categoryID, &b.autoRenew, &b.remindTask, &b.alertDays); err != nil {
+			&b.accountID, &b.categoryID, &b.autoRenew, &b.remindTask, &b.alertDays, &b.timezone); err != nil {
 			return 0, 0, fmt.Errorf("scan biller cron row: %w", err)
 		}
 		bills = append(bills, b)
@@ -753,9 +756,10 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 		return 0, 0, fmt.Errorf("iterate biller cron rows: %w", err)
 	}
 
-	todayT, _ := time.Parse("2006-01-02", today)
 	var jobErrors []error
 	for _, b := range bills {
+		today := runAt.In(timezoneLocation(b.timezone)).Format("2006-01-02")
+		todayT, _ := time.Parse("2006-01-02", today)
 		due, perr := time.Parse("2006-01-02", b.dueDate)
 		if perr != nil {
 			jobErrors = append(jobErrors, fmt.Errorf("biller %d has invalid next_due_date: %w", b.id, perr))
