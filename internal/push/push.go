@@ -56,11 +56,56 @@ func New(ctx context.Context) (*Sender, error) {
 
 // Notification is one user-facing push. Route is the in-app path the tap
 // should open ("/tasks", "/finance"), carried as FCM data so the client can
-// deep-link.
+// deep-link. Type names the kind of nudge (see the Type* constants) and is
+// what clients switch on to pick a notification channel — routes are for
+// navigation and are too fine-grained to classify by ("/finance/investments"
+// and "/finance" are the same channel, different screens).
 type Notification struct {
+	Type  string
 	Title string
 	Body  string
 	Route string
+}
+
+// Push types. Stable wire values: the android client maps each to a
+// notification channel, so renaming one silently re-buckets live devices
+// (an unknown type falls back to the default channel, never dropped).
+const (
+	TypeTaskReminder   = "task_reminder"
+	TypeTaskDigest     = "task_digest"
+	TypeBillDue        = "bill_due"
+	TypeInvestmentAuto = "investment_auto"
+	TypeMediaRelease   = "media_release"
+)
+
+// channelID names the android notification channel this push belongs in.
+//
+// It has to be decided server-side: a notification-message that arrives while
+// the app is backgrounded is rendered by the system directly and never reaches
+// the client's onMessageReceived, so it falls back to the manifest's
+// default_notification_channel_id. Since most pushes arrive backgrounded, the
+// client-side mapping alone would leave nearly everything on the HIGH-urgency
+// reminders channel. These ids must match SajniNotifications.CHANNEL_* in
+// sajni-android.
+func (n Notification) channelID() string {
+	switch n.Type {
+	case TypeTaskDigest:
+		return "digest"
+	case TypeBillDue:
+		return "bills"
+	case TypeInvestmentAuto:
+		return "finance"
+	case TypeMediaRelease:
+		return "media"
+	default:
+		return "reminders"
+	}
+}
+
+// interrupts reports whether this push is worth a heads-up display: true only
+// when there is still something the user can act on in time.
+func (n Notification) interrupts() bool {
+	return n.Type == TypeTaskReminder || n.Type == TypeBillDue || n.Type == ""
 }
 
 // SendToUser delivers n to every device the user has registered and returns
@@ -108,6 +153,10 @@ func isGoneToken(err error) bool {
 
 // send posts one message to the FCM v1 endpoint.
 func (s *Sender) send(ctx context.Context, token string, n Notification) error {
+	priority := "normal"
+	if n.interrupts() {
+		priority = "high"
+	}
 	payload := map[string]any{
 		"message": map[string]any{
 			"token": token,
@@ -117,9 +166,13 @@ func (s *Sender) send(ctx context.Context, token string, n Notification) error {
 			},
 			"data": map[string]string{
 				"route": n.Route,
+				"type":  n.Type,
 			},
 			"android": map[string]any{
-				"priority": "high",
+				"priority": priority,
+				"notification": map[string]string{
+					"channel_id": n.channelID(),
+				},
 			},
 		},
 	}

@@ -9,12 +9,16 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"sajni/internal/db"
+	"sajni/internal/push"
 )
 
 const mediaReleaseClaimLease = 5 * time.Minute
 
 type releaseUser struct {
 	id, email, name, timezone string
+	// channel is users.notify_channel (email | push | both); it decides
+	// whether the email copy goes out once push has landed.
+	channel string
 }
 
 type claimedRelease struct {
@@ -23,10 +27,11 @@ type claimedRelease struct {
 	releaseDate string
 }
 
-// ProcessMediaReleaseCron sends one email at 10:00 in each owner's timezone
-// on the day before release, then promotes released movies into the pending
-// queue. Both actions are scoped by media.user_id: owning a saved row is the
-// only way to become a recipient.
+// ProcessMediaReleaseCron nudges at 10:00 in each owner's timezone on the day
+// before release, then promotes released movies into the pending queue. Both
+// actions are scoped by media.user_id: owning a saved row is the only way to
+// become a recipient. Delivery is push + email like every other nudge, so a
+// push-only user still hears about a film landing tomorrow.
 func ProcessMediaReleaseCron(ctx context.Context, deps Deps) (reminded, graduated int, err error) {
 	return processMediaReleaseCronAt(ctx, deps, time.Now())
 }
@@ -46,10 +51,12 @@ func processMediaReleaseCronAt(ctx context.Context, deps Deps, now time.Time) (r
 			jobErrors = append(jobErrors, fmt.Errorf("graduate media for user %s: %w", user.id, moveErr))
 		}
 
-		if deps.Auth == nil || !scheduledNotificationWindow(localNow) {
+		// Push alone is a complete channel now, so the sweep runs whenever
+		// either sender exists — gating on Auth would mute push-only users.
+		if (deps.Auth == nil && deps.Push == nil) || !scheduledNotificationWindow(localNow) {
 			continue
 		}
-		sent, sendErr := sendDueMediaReleaseEmails(ctx, deps, user, localNow)
+		sent, sendErr := sendDueMediaReleaseReminders(ctx, deps, user, localNow)
 		reminded += sent
 		if sendErr != nil {
 			jobErrors = append(jobErrors, fmt.Errorf("release reminders for user %s: %w", user.id, sendErr))
@@ -60,7 +67,7 @@ func processMediaReleaseCronAt(ctx context.Context, deps Deps, now time.Time) (r
 
 func listReleaseUsers(ctx context.Context, d *db.DB) ([]releaseUser, error) {
 	rows, err := d.QueryContext(ctx, `
-		SELECT id, email, COALESCE(name,''), COALESCE(timezone,'')
+		SELECT id, email, COALESCE(name,''), COALESCE(timezone,''), COALESCE(notify_channel,'both')
 		  FROM users
 		 WHERE deleted_at IS NULL
 		 ORDER BY id`)
@@ -72,7 +79,7 @@ func listReleaseUsers(ctx context.Context, d *db.DB) ([]releaseUser, error) {
 	var users []releaseUser
 	for rows.Next() {
 		var user releaseUser
-		if err := rows.Scan(&user.id, &user.email, &user.name, &user.timezone); err != nil {
+		if err := rows.Scan(&user.id, &user.email, &user.name, &user.timezone, &user.channel); err != nil {
 			return nil, fmt.Errorf("scan release user: %w", err)
 		}
 		users = append(users, user)
@@ -114,7 +121,7 @@ func graduateReleasedMedia(ctx context.Context, d *db.DB, uid string, localNow t
 	return moved, nil
 }
 
-func sendDueMediaReleaseEmails(ctx context.Context, deps Deps, user releaseUser, localNow time.Time) (int, error) {
+func sendDueMediaReleaseReminders(ctx context.Context, deps Deps, user releaseUser, localNow time.Time) (int, error) {
 	tomorrow := mediaReleaseReminderDate(localNow)
 	rows, err := deps.DB.QueryContext(ctx, `
 		WITH due AS (
@@ -162,19 +169,41 @@ func sendDueMediaReleaseEmails(ctx context.Context, deps Deps, user releaseUser,
 		if releaseDate, err := time.Parse("2006-01-02", movie.releaseDate); err == nil {
 			releaseLabel = releaseDate.Format("Monday, January 2, 2006")
 		}
-		if err := deps.Auth.SendMediaReleaseReminder(
-			ctx,
-			user.email,
-			name,
-			movie.title,
-			releaseLabel,
-			"/media?tab=movies",
-		); err != nil {
+		pushed := notifyPush(ctx, deps, user.id, push.Notification{
+			Type:  push.TypeMediaRelease,
+			Title: "Out tomorrow",
+			Body:  movie.title + " releases " + releaseLabel,
+			Route: "/media?tab=movies",
+		})
+
+		// Email is skipped only for a push-only user whose push landed —
+		// same rule as every other nudge (see channelWantsEmail).
+		emailed := false
+		var emailErr error
+		if deps.Auth != nil && channelWantsEmail(user.channel, pushed) {
+			emailErr = deps.Auth.SendMediaReleaseReminder(
+				ctx,
+				user.email,
+				name,
+				movie.title,
+				releaseLabel,
+				"/media?tab=movies",
+			)
+			emailed = emailErr == nil
+			if emailErr != nil {
+				log.Warn().Err(emailErr).Int64("media", movie.id).Str("user", user.id).Msg("movie release email failed")
+			}
+		}
+
+		// Nothing landed on any channel — release the claim so the next tick
+		// retries rather than stamping a reminder that never arrived.
+		if !pushed && !emailed {
 			_, _ = deps.DB.ExecContext(ctx,
 				`UPDATE media SET release_reminder_claimed_until = NULL WHERE id = $1 AND user_id = $2`,
 				movie.id, user.id)
-			log.Warn().Err(err).Int64("media", movie.id).Str("user", user.id).Msg("movie release email failed")
-			jobErrors = append(jobErrors, fmt.Errorf("send media %d: %w", movie.id, err))
+			if emailErr != nil {
+				jobErrors = append(jobErrors, fmt.Errorf("send media %d: %w", movie.id, emailErr))
+			}
 			continue
 		}
 

@@ -229,6 +229,7 @@ func deliverDigests(ctx context.Context, deps Deps, users []*userDigest, kind, p
 		}
 
 		pushed := notifyPush(ctx, deps, u.uid, push.Notification{
+			Type:  push.TypeTaskDigest,
 			Title: digestPushTitle(kind, len(titles)),
 			Body:  periodLabel,
 			Route: "/tasks",

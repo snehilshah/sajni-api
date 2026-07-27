@@ -183,6 +183,7 @@ func postInvestmentDebit(ctx context.Context, deps Deps, uid string, invID, acco
 // push via notifyPush, email unless a push-only user's push landed.
 func notifyInvestmentDebit(ctx context.Context, deps Deps, uid, name string, amount float64, nextDate string) {
 	pushed := notifyPush(ctx, deps, uid, push.Notification{
+		Type:  push.TypeInvestmentAuto,
 		Title: "Invested in " + name,
 		Body:  fmt.Sprintf("₹%.2f auto-debited — next on %s", amount, nextDate),
 		Route: "/finance/investments",

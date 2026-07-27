@@ -155,6 +155,7 @@ func (e errInvalidReminderKind) Error() string {
 // next tick doesn't re-nudge a user who already got one.
 func deliverTaskReminder(ctx context.Context, deps Deps, uid, email, name, channel, title, whenLabel string, notifyEmails []string) error {
 	pushed := notifyPush(ctx, deps, uid, push.Notification{
+		Type:  push.TypeTaskReminder,
 		Title: "Task reminder",
 		Body:  title + " — " + whenLabel,
 		Route: "/tasks",

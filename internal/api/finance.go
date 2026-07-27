@@ -2791,7 +2791,7 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 			// Best-effort: empty fields → sheet opens for manual entry.
 			writeJSON(w, 200, map[string]any{
 				"amount": 0, "type": "expense", "description": "", "note": "",
-				"txn_at": now.Format(time.RFC3339), "account_hint": "", "account_id": nil, "category_id": nil, "category_name": "",
+				"txn_at": now.Format(time.RFC3339), "account_hint": "", "account_id": nil, "category_id": nil, "category_name": "", "ref_id": "",
 			})
 			return
 		}
@@ -2863,6 +2863,10 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 			"account_id":    acctID,
 			"category_id":   catID,
 			"category_name": catName,
+			// Duplicate key for the android capture pipeline. The client
+			// regexes the raw message first and only falls back to this when
+			// its own patterns miss an unusual format.
+			"ref_id": parsed.RefID,
 		})
 	}
 }

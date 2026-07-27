@@ -856,6 +856,7 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 						when = fmt.Sprintf("in %d days", gap)
 					}
 					notifyPush(ctx, deps, b.userID, push.Notification{
+						Type:  push.TypeBillDue,
 						Title: "Bill due " + when,
 						Body:  fmt.Sprintf("%s — ₹%.2f due %s", b.name, b.amount, due.Format("Jan 2")),
 						Route: "/finance",
