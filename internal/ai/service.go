@@ -35,11 +35,9 @@ func functionCallKey(fc *genai.FunctionCall) string {
 }
 
 const (
-	// gemini-3.1-flash-lite is the active cost-tier; the 3.x family
-	// fixed the silent-stop-after-tool behaviour that made earlier -lite
-	// models unusable for the agent loop. Override with GEMINI_MODEL
-	// if you want to A/B against gemini-3.1-flash.
-	defaultModel = "gemini-3.1-flash-lite"
+	// gemini-3.5-flash is the active default model; override with GEMINI_MODEL
+	// if you want to A/B against another model.
+	defaultModel = "gemini-3.5-flash"
 	// Tool budget. A typical palette answer needs: get_current_context →
 	// list_* → maybe cross-check → final text. Chat is bumped to 10 so a
 	// "I watched X, recommend another" style request has room for

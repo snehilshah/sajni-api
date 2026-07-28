@@ -17,7 +17,7 @@ import (
 // Heavy chat turns (≈ 1–3k tok each) are gated by the token cap before
 // the message cap, which is the desired behaviour.
 // Caps are bumped 4× from their original (60 / 100k) values. The
-// switch to gemini-3.1-flash-lite makes each token meaningfully
+// switch to gemini-3.5-flash makes each token meaningfully
 // cheaper, so the budget can absorb the new ceiling without changing
 // monthly spend.
 const (
