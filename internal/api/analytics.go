@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"time"
 
-	"sajni/internal/db"
+	"sajni/internal/habitperiod"
 )
 
 func registerAnalyticsRoutes(mux *http.ServeMux, deps Deps) {
@@ -60,20 +60,24 @@ func getAnalytics(deps Deps) http.HandlerFunc {
 
 		// Habit streaks
 		type HabitStreak struct {
-			Name    string `json:"name"`
-			Current int    `json:"current"`
-			Longest int    `json:"longest"`
+			Name      string `json:"name"`
+			Frequency string `json:"frequency"`
+			Unit      string `json:"unit"`
+			Current   int    `json:"current"`
+			Longest   int    `json:"longest"`
 		}
 		var streaks []HabitStreak
-		hrows, _ := d.Query("SELECT id, name FROM habits WHERE user_id = $1", uid)
+		hrows, _ := d.Query("SELECT id, name, frequency FROM habits WHERE user_id = $1", uid)
 		if hrows != nil {
 			for hrows.Next() {
 				var id int64
-				var name string
-				hrows.Scan(&id, &name)
-				current := calcStreak(d, uid, id)
-				longest := calcLongestStreak(d, uid, id)
-				streaks = append(streaks, HabitStreak{Name: name, Current: current, Longest: longest})
+				var name, frequency string
+				hrows.Scan(&id, &name, &frequency)
+				current, longest := habitperiod.Streaks(habitLogDates(d, uid, id), frequency, userNow(d, uid))
+				streaks = append(streaks, HabitStreak{
+					Name: name, Frequency: frequency, Unit: habitperiod.Unit(frequency),
+					Current: current, Longest: longest,
+				})
 			}
 			hrows.Close()
 		}
@@ -148,45 +152,4 @@ func getAnalytics(deps Deps) http.HandlerFunc {
 
 		writeJSON(w, 200, result)
 	}
-}
-
-func calcLongestStreak(d *db.DB, uid string, habitID int64) int {
-	rows, err := d.Query("SELECT logged_date::text FROM habit_logs WHERE user_id = $1 AND habit_id = $2 ORDER BY logged_date ASC", uid, habitID)
-	if err != nil {
-		return 0
-	}
-	defer rows.Close()
-
-	longest := 0
-	current := 0
-	var prev string
-	for rows.Next() {
-		var dateStr string
-		rows.Scan(&dateStr)
-		if prev == "" {
-			current = 1
-		} else {
-			diff := daysDiff(prev, dateStr)
-			if diff == 1 {
-				current++
-			} else {
-				current = 1
-			}
-		}
-		if current > longest {
-			longest = current
-		}
-		prev = dateStr
-	}
-	return longest
-}
-
-func daysDiff(a, b string) int {
-	const layout = "2006-01-02"
-	ta, e1 := time.Parse(layout, a)
-	tb, e2 := time.Parse(layout, b)
-	if e1 != nil || e2 != nil {
-		return -1
-	}
-	return int(tb.Sub(ta).Hours() / 24)
 }

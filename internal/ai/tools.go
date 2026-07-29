@@ -17,6 +17,7 @@ import (
 	"google.golang.org/genai"
 
 	"sajni/internal/db"
+	"sajni/internal/habitperiod"
 	mediastatus "sajni/internal/media"
 	sharednote "sajni/internal/note"
 	"sajni/internal/reminderqueue"
@@ -639,7 +640,7 @@ func (s *Service) buildTools() []Tool {
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"name":      str("Required."),
-				"frequency": str("'daily' | 'weekly'. Default 'daily'."),
+				"frequency": str("'daily' | 'weekly' | 'fortnightly' | 'monthly'. Default 'daily'."),
 				"color":     str("Hex like '#2D5A4F'."),
 			}, "name"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
@@ -648,27 +649,14 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "log_habit",
-			Description: "Log that a habit was completed on a given day.",
+			Description: "Log that a habit was completed in the cadence period containing a given date.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"habit_id": intg("Habit id."),
 				"date":     str("ISO date. Defaults to today."),
 			}, "habit_id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
-				hid := argInt(args, "habit_id", 0)
-				if hid == 0 {
-					return nil, nil, fmt.Errorf("missing habit_id")
-				}
-				date := argStr(args, "date")
-				if date == "" {
-					date = time.Now().Format("2006-01-02")
-				}
-				_, err := d.Exec(`INSERT INTO habit_logs (user_id, habit_id, logged_date) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, uid, hid, date)
-				if err != nil {
-					return nil, nil, err
-				}
-				return map[string]any{"habit_id": hid, "date": date},
-					map[string]any{"kind": "habit_logged", "habit_id": hid, "date": date}, nil
+				return logHabitPeriodTool(ctx, d, uid, args)
 			},
 		},
 		{
@@ -1004,17 +992,16 @@ func getCurrentContextTool(ctx context.Context, d *db.DB, uid string) (any, map[
 		"timestamp": now.Format(time.RFC3339),
 	}
 	// "open" excludes scratched (abandoned) as well as done.
-	var openTasks, dueToday, missed, habitsTotal, habitsDone, memos7d int
+	var openTasks, dueToday, missed, memos7d int
 	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status NOT IN ('done','scratched')`, uid).Scan(&openTasks)
 	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status NOT IN ('done','scratched') AND due_date=$2`, uid, today).Scan(&dueToday)
 	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status NOT IN ('done','scratched') AND due_date < $2`, uid, today).Scan(&missed)
-	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM habits WHERE user_id=$1`, uid).Scan(&habitsTotal)
-	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM habit_logs WHERE user_id=$1 AND logged_date=$2`, uid, today).Scan(&habitsDone)
+	habitsTotal, habitsDone := currentHabitPeriodProgress(ctx, d, uid, now)
 	d.QueryRowContext(ctx, `SELECT COUNT(*) FROM memos WHERE user_id=$1 AND created_at > NOW() - INTERVAL '7 days'`, uid).Scan(&memos7d)
 	out["open_tasks"] = openTasks
 	out["tasks_due_today"] = dueToday
 	out["tasks_missed"] = missed
-	out["habits"] = map[string]any{"total": habitsTotal, "done_today": habitsDone}
+	out["habits"] = map[string]any{"total": habitsTotal, "done_current_period": habitsDone}
 	out["recent_memos_7d"] = memos7d
 	return out, nil, nil
 }
@@ -1192,7 +1179,8 @@ func createTaskListTool(ctx context.Context, d *db.DB, uid string, args map[stri
 }
 
 func listHabitsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
-	today := time.Now().Format("2006-01-02")
+	now := userTZNow(ctx, d, uid)
+	today := now.Format("2006-01-02")
 	rows, err := d.QueryContext(ctx, `
 		SELECT h.id, h.name, h.frequency,
 		  (SELECT COUNT(*) FROM habit_logs l WHERE l.habit_id=h.id AND l.user_id=$1) AS total_logs,
@@ -1208,9 +1196,18 @@ func listHabitsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]
 		var name, freq string
 		var done bool
 		rows.Scan(&id, &name, &freq, &total, &done)
+		period := habitperiod.ForDate(now, freq)
+		var doneCurrent bool
+		d.QueryRowContext(ctx, `SELECT EXISTS(
+			SELECT 1 FROM habit_logs
+			WHERE user_id=$1 AND habit_id=$2 AND logged_date BETWEEN $3 AND $4
+		)`, uid, id, period.Start, period.End).Scan(&doneCurrent)
 		out = append(out, map[string]any{
 			"id": id, "name": name, "frequency": freq,
 			"total_logs": total, "done_today": done,
+			"done_current_period": doneCurrent,
+			"period_start":        period.Start.Format("2006-01-02"),
+			"period_end":          period.End.Format("2006-01-02"),
 		})
 	}
 	return map[string]any{"items": out, "count": len(out), "today": today}, nil, nil
@@ -2201,6 +2198,9 @@ func createHabitTool(ctx context.Context, d *db.DB, uid string, args map[string]
 	if freq == "" {
 		freq = "daily"
 	}
+	if !habitperiod.ValidFrequency(freq) {
+		return nil, nil, fmt.Errorf("frequency must be daily, weekly, fortnightly, or monthly")
+	}
 	color := argStr(args, "color")
 	if color == "" {
 		color = "#2D5A4F"
@@ -2213,6 +2213,78 @@ func createHabitTool(ctx context.Context, d *db.DB, uid string, args map[string]
 	}
 	return map[string]any{"id": id, "name": name},
 		map[string]any{"kind": "habit_created", "id": id, "title": name, "route": "/habits"}, nil
+}
+
+func logHabitPeriodTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	hid := argInt(args, "habit_id", 0)
+	if hid == 0 {
+		return nil, nil, fmt.Errorf("missing habit_id")
+	}
+	dateValue := argStr(args, "date")
+	if dateValue == "" {
+		dateValue = userTZNow(ctx, d, uid).Format("2006-01-02")
+	}
+	date, err := habitperiod.ParseDate(dateValue)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var frequency string
+	if err := d.QueryRowContext(ctx, `SELECT frequency FROM habits WHERE id=$1 AND user_id=$2`, hid, uid).Scan(&frequency); err != nil {
+		return nil, nil, fmt.Errorf("habit not found")
+	}
+	period := habitperiod.ForDate(date, frequency)
+	current := habitperiod.ForDate(userTZNow(ctx, d, uid), frequency)
+	if period.Start.After(current.Start) {
+		return nil, nil, fmt.Errorf("cannot log a future habit period")
+	}
+	if _, err := d.ExecContext(ctx, `
+		INSERT INTO habit_logs (user_id, habit_id, logged_date)
+		SELECT $1, $2, $3
+		WHERE NOT EXISTS (
+			SELECT 1 FROM habit_logs
+			WHERE user_id=$1 AND habit_id=$2 AND logged_date BETWEEN $3 AND $4
+		)
+		ON CONFLICT DO NOTHING`,
+		uid, hid, period.Start, period.End,
+	); err != nil {
+		return nil, nil, err
+	}
+	result := map[string]any{
+		"habit_id":     hid,
+		"period_start": period.Start.Format("2006-01-02"),
+		"period_end":   period.End.Format("2006-01-02"),
+	}
+	return result, map[string]any{
+		"kind": "habit_logged", "habit_id": hid,
+		"date": period.Start.Format("2006-01-02"),
+	}, nil
+}
+
+func currentHabitPeriodProgress(ctx context.Context, d *db.DB, uid string, now time.Time) (total, done int) {
+	rows, err := d.QueryContext(ctx, `SELECT id, frequency FROM habits WHERE user_id=$1`, uid)
+	if err != nil {
+		return 0, 0
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var frequency string
+		if rows.Scan(&id, &frequency) != nil {
+			continue
+		}
+		total++
+		period := habitperiod.ForDate(now, frequency)
+		var completed bool
+		d.QueryRowContext(ctx, `SELECT EXISTS(
+			SELECT 1 FROM habit_logs
+			WHERE user_id=$1 AND habit_id=$2 AND logged_date BETWEEN $3 AND $4
+		)`, uid, id, period.Start, period.End).Scan(&completed)
+		if completed {
+			done++
+		}
+	}
+	return total, done
 }
 
 func createMemoTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {

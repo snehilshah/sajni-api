@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"sajni/internal/db"
+	"sajni/internal/habitperiod"
 	"sajni/internal/storage"
 )
 
@@ -762,25 +763,38 @@ func weeklySummary(deps Deps) http.HandlerFunc {
 			rows.Close()
 		}
 
-		// --- Habits with per-day logged dates in range. ---
+		// --- Habits with raw daily logs plus cadence status for this week. ---
 		type HabitWeek struct {
-			ID         int64    `json:"id"`
-			Name       string   `json:"name"`
-			Color      string   `json:"color"`
-			LoggedDays []string `json:"logged_days"`
+			ID           int64    `json:"id"`
+			Name         string   `json:"name"`
+			Frequency    string   `json:"frequency"`
+			Color        string   `json:"color"`
+			LoggedDays   []string `json:"logged_days"`
+			PeriodStart  string   `json:"period_start"`
+			PeriodEnd    string   `json:"period_end"`
+			PeriodLogged bool     `json:"period_logged"`
 		}
 		habits := []HabitWeek{}
 		habitIndex := map[int64]int{}
-		if rows, err := d.Query(`SELECT id, name, color FROM habits
+		if rows, err := d.Query(`SELECT id, name, frequency, color FROM habits
 			WHERE user_id = $1 ORDER BY created_at ASC`, uid); err == nil {
 			for rows.Next() {
 				var h HabitWeek
-				rows.Scan(&h.ID, &h.Name, &h.Color)
+				rows.Scan(&h.ID, &h.Name, &h.Frequency, &h.Color)
 				h.LoggedDays = []string{}
 				habitIndex[h.ID] = len(habits)
 				habits = append(habits, h)
 			}
 			rows.Close()
+		}
+		for i := range habits {
+			period := habitperiod.ForDate(start, habits[i].Frequency)
+			habits[i].PeriodStart = period.Start.Format("2006-01-02")
+			habits[i].PeriodEnd = period.End.Format("2006-01-02")
+			d.QueryRow(`SELECT EXISTS(
+				SELECT 1 FROM habit_logs
+				WHERE user_id = $1 AND habit_id = $2 AND logged_date BETWEEN $3 AND $4
+			)`, uid, habits[i].ID, period.Start, period.End).Scan(&habits[i].PeriodLogged)
 		}
 		if rows, err := d.Query(`SELECT habit_id, logged_date::text FROM habit_logs
 			WHERE user_id = $1 AND logged_date BETWEEN $2 AND $3`, uid, startStr, endStr); err == nil {

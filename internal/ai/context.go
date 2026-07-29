@@ -74,9 +74,7 @@ func (s *Service) buildSystemInstruction(ctx context.Context, uid string) string
 	if monthGoals > 0 {
 		parts = append(parts, fmt.Sprintf("- Month goals: %d open this month", monthGoals))
 	}
-	var habitsTotal, habitsDone int
-	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM habits WHERE user_id=$1`, uid).Scan(&habitsTotal)
-	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM habit_logs WHERE user_id=$1 AND logged_date=$2`, uid, now.Format("2006-01-02")).Scan(&habitsDone)
-	parts = append(parts, fmt.Sprintf("- Habits today: %d/%d done", habitsDone, habitsTotal))
+	habitsTotal, habitsDone := currentHabitPeriodProgress(ctx, s.db, uid, now)
+	parts = append(parts, fmt.Sprintf("- Current habit periods: %d/%d done", habitsDone, habitsTotal))
 	return fmt.Sprintf(systemPromptTemplate, strings.Join(parts, "\n"))
 }

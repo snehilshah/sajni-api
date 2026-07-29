@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"sajni/internal/db"
+	"sajni/internal/habitperiod"
 )
 
 // Insights = cross-module correlation engine. Cheap SQL aggregations
@@ -258,32 +259,60 @@ func RunInsightsForUser(ctx context.Context, deps Deps, uid string, window strin
 }
 
 func detectHabitStreaks(ctx context.Context, d *db.DB, uid string, cutoff string, days int) []detected {
-	rows, err := d.QueryContext(ctx, `SELECT h.name,
-		COUNT(*) FILTER (WHERE l.logged_date >= $2) AS done
-		FROM habits h LEFT JOIN habit_logs l
-		  ON l.habit_id = h.id AND l.user_id = h.user_id
-		WHERE h.user_id = $1
-		GROUP BY h.name ORDER BY done DESC LIMIT 3`,
-		uid, cutoff)
+	rows, err := d.QueryContext(ctx, `
+		SELECT id, name, frequency FROM habits
+		WHERE user_id = $1 ORDER BY created_at ASC`, uid)
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
-	var out []detected
+	type habitInfo struct {
+		id        int64
+		name      string
+		frequency string
+	}
+	var habits []habitInfo
 	for rows.Next() {
-		var name string
-		var done int
-		rows.Scan(&name, &done)
-		rate := float64(done) / float64(days)
+		var h habitInfo
+		if rows.Scan(&h.id, &h.name, &h.frequency) == nil {
+			habits = append(habits, h)
+		}
+	}
+	rows.Close()
+
+	from, err := habitperiod.ParseDate(cutoff)
+	if err != nil {
+		return nil
+	}
+	to := userNow(d, uid)
+	var out []detected
+	for _, habit := range habits {
+		available := habitperiod.CountOverlapping(from, to, habit.frequency)
+		if available == 0 {
+			continue
+		}
+		done := 0
+		for key := range habitperiod.CompletedPeriods(habitLogDates(d, uid, habit.id), habit.frequency) {
+			start, parseErr := habitperiod.ParseDate(key)
+			if parseErr == nil && !start.Before(habitperiod.ForDate(from, habit.frequency).Start) && !start.After(to) {
+				done++
+			}
+		}
+		rate := float64(done) / float64(available)
 		if rate >= 0.6 {
 			out = append(out, detected{
-				kind:  "habit_strong_" + name,
-				title: "Strong habit: " + name,
-				body: fmt.Sprintf("You logged %s on %d of the last %d days (%d%%). Keep the streak.",
-					name, done, days, int(rate*100)),
-				score:    rate,
-				evidence: map[string]any{"habit": name, "done": done, "window_days": days},
+				kind:  "habit_strong_" + habit.name,
+				title: "Strong habit: " + habit.name,
+				body: fmt.Sprintf("You completed %s in %d of %d %s periods (%d%%). Keep the rhythm.",
+					habit.name, done, available, habitperiod.Unit(habit.frequency), int(rate*100)),
+				score: rate,
+				evidence: map[string]any{
+					"habit": habit.name, "frequency": habit.frequency,
+					"done": done, "available_periods": available, "window_days": days,
+				},
 			})
+			if len(out) == 3 {
+				break
+			}
 		}
 	}
 	return out
