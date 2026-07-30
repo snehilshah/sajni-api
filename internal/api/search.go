@@ -134,6 +134,43 @@ func search(deps Deps) http.HandlerFunc {
 				})
 		}
 
+		// Events and their occurrence notes.
+		if want("event") {
+			results = appendQuery(results, d, "event",
+				`SELECT e.id, e.name, e.archived,
+				        COALESCE((
+							SELECT ee.note FROM event_entries ee
+							WHERE ee.user_id=e.user_id AND ee.event_id=e.id
+							  AND ee.note ILIKE $3
+							ORDER BY ee.occurred_at DESC LIMIT 1
+						), '')
+				 FROM events e
+				 WHERE e.user_id = $1
+				   AND ($2 = '' OR e.name ILIKE $3 OR e.description ILIKE $3 OR EXISTS(
+						SELECT 1 FROM event_entries ee
+						WHERE ee.user_id=e.user_id AND ee.event_id=e.id AND ee.note ILIKE $3
+				   ))
+				 ORDER BY e.updated_at DESC LIMIT 30`,
+				uid, q, like,
+				func(rs *sql.Rows) (SearchHit, bool) {
+					var id int64
+					var name, note string
+					var archived bool
+					if err := rs.Scan(&id, &name, &archived, &note); err != nil {
+						return SearchHit{}, false
+					}
+					subtitle := "Event"
+					if archived {
+						subtitle = "Archived event"
+					}
+					return SearchHit{
+						Type: "event", ID: id, Title: name,
+						Snippet: truncate(note, 120), Subtitle: subtitle,
+						Route: "/habits?tab=events&id=" + itoa64(id),
+					}, true
+				})
+		}
+
 		// Media
 		if want("media") {
 			results = appendQuery(results, d, "media",

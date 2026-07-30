@@ -215,6 +215,50 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_habit_logs_user ON habit_logs(user_id);
 
+	CREATE TABLE IF NOT EXISTS events (
+		id          BIGSERIAL   PRIMARY KEY,
+		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		name        TEXT        NOT NULL,
+		description TEXT        NOT NULL DEFAULT '',
+		color       TEXT        NOT NULL DEFAULT '#2D5A4F',
+		icon        TEXT        NOT NULL DEFAULT 'calendar',
+		archived    BOOLEAN     NOT NULL DEFAULT FALSE,
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_events_user_archived ON events(user_id, archived, updated_at DESC);
+
+	CREATE TABLE IF NOT EXISTS event_variables (
+		id         BIGSERIAL PRIMARY KEY,
+		user_id    UUID      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		event_id   BIGINT    NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+		name       TEXT      NOT NULL,
+		unit       TEXT      NOT NULL DEFAULT '',
+		sort_order INTEGER   NOT NULL DEFAULT 0,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_event_variables_event ON event_variables(user_id, event_id, sort_order);
+
+	CREATE TABLE IF NOT EXISTS event_entries (
+		id          BIGSERIAL   PRIMARY KEY,
+		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		event_id    BIGINT      NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+		occurred_at TIMESTAMPTZ NOT NULL,
+		note        TEXT        NOT NULL DEFAULT '',
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_event_entries_timeline ON event_entries(user_id, event_id, occurred_at DESC, id DESC);
+	CREATE INDEX IF NOT EXISTS idx_event_entries_day ON event_entries(user_id, occurred_at);
+
+	CREATE TABLE IF NOT EXISTS event_entry_values (
+		entry_id   BIGINT           NOT NULL REFERENCES event_entries(id) ON DELETE CASCADE,
+		variable_id BIGINT          NOT NULL REFERENCES event_variables(id) ON DELETE CASCADE,
+		value      DOUBLE PRECISION NOT NULL,
+		PRIMARY KEY(entry_id, variable_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_event_entry_values_variable ON event_entry_values(variable_id, entry_id);
+
 	CREATE TABLE IF NOT EXISTS media (
 		id               BIGSERIAL   PRIMARY KEY,
 		user_id          UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,

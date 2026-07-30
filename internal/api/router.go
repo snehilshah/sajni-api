@@ -54,6 +54,7 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	registerTaskRoutes(apiMux, deps)
 	registerTaskListRoutes(apiMux, deps)
 	registerHabitRoutes(apiMux, deps)
+	registerEventRoutes(apiMux, deps)
 	registerMediaRoutes(apiMux, deps)
 	registerJournalRoutes(apiMux, deps)
 	registerNoteRoutes(apiMux, deps)

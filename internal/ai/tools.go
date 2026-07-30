@@ -234,6 +234,27 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "list_events",
+			Description: "List tracked life events with their last occurrence, entry count, and numeric variables.",
+			Schema: obj(map[string]*genai.Schema{
+				"archived": boolean("List archived events instead of active events."),
+			}),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return listEventsTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "list_event_entries",
+			Description: "List recent occurrences for one tracked event, newest first.",
+			Schema: obj(map[string]*genai.Schema{
+				"event_id": intg("Required event id."),
+				"limit":    intg("Maximum entries, default 20 and maximum 100."),
+			}, "event_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return listEventEntriesTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "list_journal_entries",
 			Description: "List recent journal entry dates. Use get_journal_entry to read content.",
 			Schema: obj(map[string]*genai.Schema{
@@ -405,7 +426,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "search",
-			Description: "Free-text search across memos, tasks, notes, journals, habits, media, and transactions. Use for 'find anything about X' style questions.",
+			Description: "Free-text search across memos, tasks, notes, journals, habits, events, media, and transactions. Use for 'find anything about X' style questions.",
 			Schema: obj(map[string]*genai.Schema{
 				"q":     str("Search query."),
 				"types": arrayOf(str(""), "Optional whitelist of types: memo, task, note, journal, habit, media, transaction."),
@@ -657,6 +678,133 @@ func (s *Service) buildTools() []Tool {
 			}, "habit_id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return logHabitPeriodTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "create_event",
+			Description: "Create a tracked life event such as Haircut, Beard trim, Leave, or Car service.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"name":        str("Required event name."),
+				"description": str("Optional definition of what counts as this event."),
+				"color":       str("Hex colour like '#2D5A4F'."),
+				"icon":        str("Icon key such as calendar, scissors, briefcase, car, heart, or star."),
+			}, "name"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return createEventTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "update_event",
+			Description: "Rename, describe, recolour, re-icon, archive, or restore a tracked event.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"event_id":    intg("Required event id."),
+				"name":        str("New event name."),
+				"description": str("New event description."),
+				"color":       str("New hex colour."),
+				"icon":        str("New icon key."),
+				"archived":    boolean("True to archive, false to restore."),
+			}, "event_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return updateEventTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "delete_event",
+			Description: "Permanently delete a tracked event and all its entries and variable values.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"event_id": intg("Required event id."),
+			}, "event_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return deleteEventTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "add_event_variable",
+			Description: "Add a numeric variable to a tracked event, such as Cost with unit ₹ or Length with unit mm.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"event_id": intg("Required event id."),
+				"name":     str("Required variable name."),
+				"unit":     str("Optional unit such as ₹, mm, km, kg, or days."),
+			}, "event_id", "name"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return addEventVariableTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "update_event_variable",
+			Description: "Rename a numeric event variable or change its unit.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"event_id":    intg("Required event id."),
+				"variable_id": intg("Required variable id."),
+				"name":        str("New variable name."),
+				"unit":        str("New unit."),
+			}, "event_id", "variable_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return updateEventVariableTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "delete_event_variable",
+			Description: "Permanently delete an event variable and every historical value recorded for it.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"event_id":    intg("Required event id."),
+				"variable_id": intg("Required variable id."),
+			}, "event_id", "variable_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return deleteEventVariableTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "log_event",
+			Description: "Record one timestamped occurrence for a tracked event.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"event_id":    intg("Required event id."),
+				"occurred_at": str("RFC3339 timestamp with offset. Defaults to now."),
+				"note":        str("Optional occurrence note."),
+				"values": arrayOf(obj(map[string]*genai.Schema{
+					"variable_id": intg("Variable id."),
+					"value":       num("Numeric value."),
+				}, "variable_id", "value"), "Optional numeric values."),
+			}, "event_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return logEventTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "update_event_entry",
+			Description: "Update the timestamp, note, or numeric values of an event occurrence.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"event_id":    intg("Required event id."),
+				"entry_id":    intg("Required occurrence id."),
+				"occurred_at": str("New RFC3339 timestamp with offset."),
+				"note":        str("New note."),
+				"values": arrayOf(obj(map[string]*genai.Schema{
+					"variable_id": intg("Variable id."),
+					"value":       num("Numeric value."),
+				}, "variable_id", "value"), "Replacement numeric values."),
+			}, "event_id", "entry_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return updateEventEntryTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "delete_event_entry",
+			Description: "Permanently delete one event occurrence.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"event_id": intg("Required event id."),
+				"entry_id": intg("Required occurrence id."),
+			}, "event_id", "entry_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return deleteEventEntryTool(ctx, d, uid, args)
 			},
 		},
 		{
@@ -1574,6 +1722,21 @@ func runSearchTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	if want("habit") {
 		add("habit", `SELECT id, name, frequency FROM habits WHERE user_id=$1 AND ($2='' OR name ILIKE $3) LIMIT 10`)
 	}
+	if want("event") {
+		add("event", `
+			SELECT e.id, e.name,
+			       COALESCE((
+					SELECT ee.note FROM event_entries ee
+					WHERE ee.user_id=e.user_id AND ee.event_id=e.id AND ee.note ILIKE $3
+					ORDER BY ee.occurred_at DESC LIMIT 1
+				), 'Event')
+			FROM events e
+			WHERE e.user_id=$1 AND ($2='' OR e.name ILIKE $3 OR e.description ILIKE $3 OR EXISTS(
+				SELECT 1 FROM event_entries ee
+				WHERE ee.user_id=e.user_id AND ee.event_id=e.id AND ee.note ILIKE $3
+			))
+			ORDER BY e.updated_at DESC LIMIT 10`)
+	}
 	if want("media") {
 		add("media", `SELECT id, title, type FROM media WHERE user_id=$1 AND ($2='' OR title ILIKE $3 OR genre ILIKE $3) ORDER BY updated_at DESC LIMIT 10`)
 	}
@@ -2259,6 +2422,567 @@ func logHabitPeriodTool(ctx context.Context, d *db.DB, uid string, args map[stri
 		"kind": "habit_logged", "habit_id": hid,
 		"date": period.Start.Format("2006-01-02"),
 	}, nil
+}
+
+type eventToolVariable struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	Unit string `json:"unit"`
+}
+
+type eventToolValueInput struct {
+	VariableID int64
+	Value      float64
+}
+
+func listEventsTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	archived := argBool(args, "archived", false)
+	rows, err := d.QueryContext(ctx, `
+		SELECT e.id, e.name, e.description, e.color, e.icon, e.archived,
+		       (SELECT MAX(occurred_at) FROM event_entries ee
+		        WHERE ee.user_id=e.user_id AND ee.event_id=e.id),
+		       (SELECT COUNT(*) FROM event_entries ee
+		        WHERE ee.user_id=e.user_id AND ee.event_id=e.id)
+		FROM events e WHERE e.user_id=$1 AND e.archived=$2
+		ORDER BY e.updated_at DESC`, uid, archived)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list events: %w", err)
+	}
+	defer rows.Close()
+
+	type eventResult struct {
+		ID             int64               `json:"id"`
+		Name           string              `json:"name"`
+		Description    string              `json:"description"`
+		Color          string              `json:"color"`
+		Icon           string              `json:"icon"`
+		Archived       bool                `json:"archived"`
+		LastOccurredAt *time.Time          `json:"last_occurred_at"`
+		TotalEntries   int                 `json:"total_entries"`
+		Variables      []eventToolVariable `json:"variables"`
+	}
+	events := []eventResult{}
+	for rows.Next() {
+		var event eventResult
+		var last sql.NullTime
+		if err := rows.Scan(
+			&event.ID, &event.Name, &event.Description, &event.Color, &event.Icon,
+			&event.Archived, &last, &event.TotalEntries,
+		); err != nil {
+			return nil, nil, fmt.Errorf("scan event: %w", err)
+		}
+		if last.Valid {
+			event.LastOccurredAt = &last.Time
+		}
+		event.Variables = []eventToolVariable{}
+		varRows, err := d.QueryContext(ctx, `
+			SELECT id, name, unit FROM event_variables
+			WHERE user_id=$1 AND event_id=$2
+			ORDER BY sort_order, id`, uid, event.ID)
+		if err == nil {
+			for varRows.Next() {
+				var variable eventToolVariable
+				if varRows.Scan(&variable.ID, &variable.Name, &variable.Unit) == nil {
+					event.Variables = append(event.Variables, variable)
+				}
+			}
+			varRows.Close()
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate events: %w", err)
+	}
+	return events, nil, nil
+}
+
+func listEventEntriesTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	eventID := argInt(args, "event_id", 0)
+	if eventID == 0 {
+		return nil, nil, fmt.Errorf("missing event_id")
+	}
+	limit := argInt(args, "limit", 20)
+	if limit < 1 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	var owned bool
+	if err := d.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM events WHERE id=$1 AND user_id=$2)`, eventID, uid).Scan(&owned); err != nil {
+		return nil, nil, fmt.Errorf("check event: %w", err)
+	}
+	if !owned {
+		return nil, nil, fmt.Errorf("event not found")
+	}
+
+	rows, err := d.QueryContext(ctx, `
+		SELECT id, occurred_at, note FROM event_entries
+		WHERE user_id=$1 AND event_id=$2
+		ORDER BY occurred_at DESC, id DESC LIMIT $3`, uid, eventID, limit)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list event entries: %w", err)
+	}
+	defer rows.Close()
+
+	type valueResult struct {
+		VariableID int64   `json:"variable_id"`
+		Name       string  `json:"name"`
+		Unit       string  `json:"unit"`
+		Value      float64 `json:"value"`
+	}
+	type entryResult struct {
+		ID         int64         `json:"id"`
+		OccurredAt time.Time     `json:"occurred_at"`
+		Note       string        `json:"note"`
+		Values     []valueResult `json:"values"`
+	}
+	entries := []entryResult{}
+	for rows.Next() {
+		var entry entryResult
+		if err := rows.Scan(&entry.ID, &entry.OccurredAt, &entry.Note); err != nil {
+			return nil, nil, fmt.Errorf("scan event entry: %w", err)
+		}
+		entry.Values = []valueResult{}
+		valueRows, err := d.QueryContext(ctx, `
+			SELECT v.id, v.name, v.unit, ev.value
+			FROM event_entry_values ev
+			JOIN event_variables v ON v.id=ev.variable_id
+			WHERE ev.entry_id=$1 AND v.user_id=$2
+			ORDER BY v.sort_order, v.id`, entry.ID, uid)
+		if err == nil {
+			for valueRows.Next() {
+				var value valueResult
+				if valueRows.Scan(&value.VariableID, &value.Name, &value.Unit, &value.Value) == nil {
+					entry.Values = append(entry.Values, value)
+				}
+			}
+			valueRows.Close()
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil, nil
+}
+
+func createEventTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	name := strings.TrimSpace(argStr(args, "name"))
+	if name == "" {
+		return nil, nil, fmt.Errorf("missing name")
+	}
+	description := strings.TrimSpace(argStr(args, "description"))
+	color := strings.TrimSpace(argStr(args, "color"))
+	if color == "" {
+		color = "#2D5A4F"
+	}
+	icon := strings.TrimSpace(argStr(args, "icon"))
+	if icon == "" {
+		icon = "calendar"
+	}
+	var id int64
+	err := d.QueryRowContext(ctx, `
+		INSERT INTO events(user_id, name, description, color, icon)
+		VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+		uid, name, description, color, icon,
+	).Scan(&id)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create event: %w", err)
+	}
+	result := map[string]any{"id": id, "name": name}
+	meta := map[string]any{
+		"kind": "event_created", "id": id, "title": name,
+		"route": fmt.Sprintf("/habits?tab=events&id=%d", id),
+	}
+	return result, meta, nil
+}
+
+func updateEventTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	eventID := argInt(args, "event_id", 0)
+	if eventID == 0 {
+		return nil, nil, fmt.Errorf("missing event_id")
+	}
+	sets := []string{}
+	values := []any{}
+	add := func(column string, value any) {
+		values = append(values, value)
+		sets = append(sets, fmt.Sprintf("%s=$%d", column, len(values)))
+	}
+	if _, ok := args["name"]; ok {
+		name := strings.TrimSpace(argStr(args, "name"))
+		if name == "" {
+			return nil, nil, fmt.Errorf("name cannot be empty")
+		}
+		add("name", name)
+	}
+	if _, ok := args["description"]; ok {
+		add("description", strings.TrimSpace(argStr(args, "description")))
+	}
+	if _, ok := args["color"]; ok {
+		add("color", strings.TrimSpace(argStr(args, "color")))
+	}
+	if _, ok := args["icon"]; ok {
+		add("icon", strings.TrimSpace(argStr(args, "icon")))
+	}
+	if _, ok := args["archived"]; ok {
+		add("archived", argBool(args, "archived", false))
+	}
+	if len(sets) == 0 {
+		return nil, nil, fmt.Errorf("nothing to update")
+	}
+	values = append(values, eventID, uid)
+	query := fmt.Sprintf(`
+		UPDATE events SET %s, updated_at=NOW()
+		WHERE id=$%d AND user_id=$%d`,
+		strings.Join(sets, ", "), len(values)-1, len(values),
+	)
+	result, err := d.ExecContext(ctx, query, values...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("update event: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return nil, nil, fmt.Errorf("event not found")
+	}
+	data := map[string]any{"id": eventID, "updated": true}
+	meta := map[string]any{
+		"kind": "event_updated", "id": eventID,
+		"route": fmt.Sprintf("/habits?tab=events&id=%d", eventID),
+	}
+	return data, meta, nil
+}
+
+func deleteEventTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	eventID := argInt(args, "event_id", 0)
+	if eventID == 0 {
+		return nil, nil, fmt.Errorf("missing event_id")
+	}
+	result, err := d.ExecContext(ctx, `DELETE FROM events WHERE id=$1 AND user_id=$2`, eventID, uid)
+	if err != nil {
+		return nil, nil, fmt.Errorf("delete event: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return nil, nil, fmt.Errorf("event not found")
+	}
+	data := map[string]any{"id": eventID, "deleted": true}
+	meta := map[string]any{"kind": "event_deleted", "id": eventID, "route": "/habits?tab=events"}
+	return data, meta, nil
+}
+
+func addEventVariableTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	eventID := argInt(args, "event_id", 0)
+	name := strings.TrimSpace(argStr(args, "name"))
+	if eventID == 0 || name == "" {
+		return nil, nil, fmt.Errorf("missing event_id or name")
+	}
+	var count int
+	if err := d.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM event_variables v
+		JOIN events e ON e.id=v.event_id
+		WHERE v.user_id=$1 AND v.event_id=$2 AND e.user_id=$1`,
+		uid, eventID,
+	).Scan(&count); err != nil {
+		return nil, nil, fmt.Errorf("count event variables: %w", err)
+	}
+	if count >= 6 {
+		return nil, nil, fmt.Errorf("an event can have at most 6 variables")
+	}
+	var variableID int64
+	err := d.QueryRowContext(ctx, `
+		INSERT INTO event_variables(user_id, event_id, name, unit, sort_order)
+		SELECT $1,$2,$3,$4,$5 FROM events WHERE id=$2 AND user_id=$1
+		RETURNING id`,
+		uid, eventID, name, strings.TrimSpace(argStr(args, "unit")), count,
+	).Scan(&variableID)
+	if err == sql.ErrNoRows {
+		return nil, nil, fmt.Errorf("event not found")
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("add event variable: %w", err)
+	}
+	data := map[string]any{"id": variableID, "event_id": eventID, "name": name}
+	meta := map[string]any{
+		"kind": "event_updated", "id": eventID,
+		"route": fmt.Sprintf("/habits?tab=events&id=%d", eventID),
+	}
+	return data, meta, nil
+}
+
+func updateEventVariableTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	eventID := argInt(args, "event_id", 0)
+	variableID := argInt(args, "variable_id", 0)
+	if eventID == 0 || variableID == 0 {
+		return nil, nil, fmt.Errorf("missing event_id or variable_id")
+	}
+	sets := []string{}
+	values := []any{}
+	if _, ok := args["name"]; ok {
+		name := strings.TrimSpace(argStr(args, "name"))
+		if name == "" {
+			return nil, nil, fmt.Errorf("name cannot be empty")
+		}
+		values = append(values, name)
+		sets = append(sets, fmt.Sprintf("name=$%d", len(values)))
+	}
+	if _, ok := args["unit"]; ok {
+		values = append(values, strings.TrimSpace(argStr(args, "unit")))
+		sets = append(sets, fmt.Sprintf("unit=$%d", len(values)))
+	}
+	if len(sets) == 0 {
+		return nil, nil, fmt.Errorf("nothing to update")
+	}
+	values = append(values, variableID, eventID, uid)
+	query := fmt.Sprintf(`
+		UPDATE event_variables SET %s
+		WHERE id=$%d AND event_id=$%d AND user_id=$%d`,
+		strings.Join(sets, ", "), len(values)-2, len(values)-1, len(values),
+	)
+	result, err := d.ExecContext(ctx, query, values...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("update event variable: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return nil, nil, fmt.Errorf("event variable not found")
+	}
+	data := map[string]any{"id": variableID, "event_id": eventID, "updated": true}
+	meta := map[string]any{
+		"kind": "event_updated", "id": eventID,
+		"route": fmt.Sprintf("/habits?tab=events&id=%d", eventID),
+	}
+	return data, meta, nil
+}
+
+func deleteEventVariableTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	eventID := argInt(args, "event_id", 0)
+	variableID := argInt(args, "variable_id", 0)
+	if eventID == 0 || variableID == 0 {
+		return nil, nil, fmt.Errorf("missing event_id or variable_id")
+	}
+	result, err := d.ExecContext(ctx, `
+		DELETE FROM event_variables
+		WHERE id=$1 AND event_id=$2 AND user_id=$3`,
+		variableID, eventID, uid,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("delete event variable: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return nil, nil, fmt.Errorf("event variable not found")
+	}
+	data := map[string]any{"id": variableID, "event_id": eventID, "deleted": true}
+	meta := map[string]any{
+		"kind": "event_updated", "id": eventID,
+		"route": fmt.Sprintf("/habits?tab=events&id=%d", eventID),
+	}
+	return data, meta, nil
+}
+
+func logEventTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	eventID := argInt(args, "event_id", 0)
+	if eventID == 0 {
+		return nil, nil, fmt.Errorf("missing event_id")
+	}
+	occurredAt := userTZNow(ctx, d, uid)
+	if raw := strings.TrimSpace(argStr(args, "occurred_at")); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid occurred_at: %w", err)
+		}
+		occurredAt = parsed
+	}
+	values, _, err := eventToolValues(args)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin event log: %w", err)
+	}
+	defer tx.Rollback()
+	var entryID int64
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO event_entries(user_id, event_id, occurred_at, note)
+		SELECT $1,$2,$3,$4 FROM events WHERE id=$2 AND user_id=$1
+		RETURNING id`,
+		uid, eventID, occurredAt, strings.TrimSpace(argStr(args, "note")),
+	).Scan(&entryID)
+	if err == sql.ErrNoRows {
+		return nil, nil, fmt.Errorf("event not found")
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("log event: %w", err)
+	}
+	if err := insertAIEventValues(ctx, tx, uid, eventID, entryID, values); err != nil {
+		return nil, nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE events SET updated_at=NOW() WHERE id=$1 AND user_id=$2`, eventID, uid); err != nil {
+		return nil, nil, fmt.Errorf("touch event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, fmt.Errorf("commit event log: %w", err)
+	}
+	data := map[string]any{"id": entryID, "event_id": eventID, "occurred_at": occurredAt}
+	meta := map[string]any{
+		"kind": "event_logged", "id": eventID, "entry_id": entryID,
+		"route": fmt.Sprintf("/habits?tab=events&id=%d", eventID),
+	}
+	return data, meta, nil
+}
+
+func updateEventEntryTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	eventID := argInt(args, "event_id", 0)
+	entryID := argInt(args, "entry_id", 0)
+	if eventID == 0 || entryID == 0 {
+		return nil, nil, fmt.Errorf("missing event_id or entry_id")
+	}
+	values, valuesPresent, err := eventToolValues(args)
+	if err != nil {
+		return nil, nil, err
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin event entry update: %w", err)
+	}
+	defer tx.Rollback()
+
+	var owned bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM event_entries WHERE id=$1 AND event_id=$2 AND user_id=$3
+		)`, entryID, eventID, uid).Scan(&owned); err != nil {
+		return nil, nil, fmt.Errorf("check event entry: %w", err)
+	}
+	if !owned {
+		return nil, nil, fmt.Errorf("event entry not found")
+	}
+	if raw, ok := args["occurred_at"]; ok && raw != nil {
+		occurredAt, err := time.Parse(time.RFC3339, strings.TrimSpace(argStr(args, "occurred_at")))
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid occurred_at: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE event_entries SET occurred_at=$1, updated_at=NOW()
+			WHERE id=$2 AND event_id=$3 AND user_id=$4`,
+			occurredAt, entryID, eventID, uid,
+		); err != nil {
+			return nil, nil, fmt.Errorf("update event entry time: %w", err)
+		}
+	}
+	if _, ok := args["note"]; ok {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE event_entries SET note=$1, updated_at=NOW()
+			WHERE id=$2 AND event_id=$3 AND user_id=$4`,
+			strings.TrimSpace(argStr(args, "note")), entryID, eventID, uid,
+		); err != nil {
+			return nil, nil, fmt.Errorf("update event entry note: %w", err)
+		}
+	}
+	if valuesPresent {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM event_entry_values WHERE entry_id=$1`, entryID); err != nil {
+			return nil, nil, fmt.Errorf("clear event values: %w", err)
+		}
+		if err := insertAIEventValues(ctx, tx, uid, eventID, entryID, values); err != nil {
+			return nil, nil, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE events SET updated_at=NOW() WHERE id=$1 AND user_id=$2`, eventID, uid); err != nil {
+		return nil, nil, fmt.Errorf("touch event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, fmt.Errorf("commit event entry update: %w", err)
+	}
+	data := map[string]any{"id": entryID, "event_id": eventID, "updated": true}
+	meta := map[string]any{
+		"kind": "event_logged", "id": eventID, "entry_id": entryID,
+		"route": fmt.Sprintf("/habits?tab=events&id=%d", eventID),
+	}
+	return data, meta, nil
+}
+
+func deleteEventEntryTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	eventID := argInt(args, "event_id", 0)
+	entryID := argInt(args, "entry_id", 0)
+	if eventID == 0 || entryID == 0 {
+		return nil, nil, fmt.Errorf("missing event_id or entry_id")
+	}
+	result, err := d.ExecContext(ctx, `
+		DELETE FROM event_entries WHERE id=$1 AND event_id=$2 AND user_id=$3`,
+		entryID, eventID, uid,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("delete event entry: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return nil, nil, fmt.Errorf("event entry not found")
+	}
+	_, _ = d.ExecContext(ctx, `UPDATE events SET updated_at=NOW() WHERE id=$1 AND user_id=$2`, eventID, uid)
+	data := map[string]any{"id": entryID, "event_id": eventID, "deleted": true}
+	meta := map[string]any{
+		"kind": "event_logged", "id": eventID,
+		"route": fmt.Sprintf("/habits?tab=events&id=%d", eventID),
+	}
+	return data, meta, nil
+}
+
+func eventToolValues(args map[string]any) ([]eventToolValueInput, bool, error) {
+	raw, present := args["values"]
+	if !present || raw == nil {
+		return nil, false, nil
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, true, fmt.Errorf("values must be an array")
+	}
+	values := make([]eventToolValueInput, 0, len(items))
+	seen := map[int64]bool{}
+	for _, item := range items {
+		valueMap, ok := item.(map[string]any)
+		if !ok {
+			return nil, true, fmt.Errorf("each value must be an object")
+		}
+		variableID := argInt(valueMap, "variable_id", 0)
+		if variableID == 0 {
+			return nil, true, fmt.Errorf("variable_id is required")
+		}
+		if seen[variableID] {
+			return nil, true, fmt.Errorf("variable %d appears more than once", variableID)
+		}
+		seen[variableID] = true
+		values = append(values, eventToolValueInput{
+			VariableID: variableID,
+			Value:      argFloat(valueMap, "value"),
+		})
+	}
+	return values, true, nil
+}
+
+func insertAIEventValues(
+	ctx context.Context,
+	tx *sql.Tx,
+	uid string,
+	eventID int64,
+	entryID int64,
+	values []eventToolValueInput,
+) error {
+	for _, value := range values {
+		result, err := tx.ExecContext(ctx, `
+			INSERT INTO event_entry_values(entry_id, variable_id, value)
+			SELECT $1, v.id, $2 FROM event_variables v
+			WHERE v.id=$3 AND v.event_id=$4 AND v.user_id=$5`,
+			entryID, value.Value, value.VariableID, eventID, uid,
+		)
+		if err != nil {
+			return fmt.Errorf("insert variable %d: %w", value.VariableID, err)
+		}
+		affected, _ := result.RowsAffected()
+		if affected != 1 {
+			return fmt.Errorf("variable %d does not belong to this event", value.VariableID)
+		}
+	}
+	return nil
 }
 
 func currentHabitPeriodProgress(ctx context.Context, d *db.DB, uid string, now time.Time) (total, done int) {

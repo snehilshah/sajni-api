@@ -49,6 +49,10 @@ func takeoutExport(deps Deps) http.HandlerFunc {
 			exportTaskLists,
 			exportHabits,
 			exportHabitLogs,
+			exportEvents,
+			exportEventVariables,
+			exportEventEntries,
+			exportEventValues,
 			exportMedia,
 			exportJournal,
 			exportNotes,
@@ -88,6 +92,10 @@ Layout:
   task_lists.csv          — your custom task lists
   habits.csv              — habits and their colours
   habit_logs.csv          — every day you ticked a habit
+  events.csv              — tracked life events
+  event_variables.csv     — numeric fields configured for events
+  event_entries.csv       — timestamped event occurrences
+  event_values.csv        — numeric values recorded on occurrences
   media.csv               — your movies/shows/books/games library
   notes/<title>.md        — one file per long-form note
   journal/<date>.md       — one file per journal day
@@ -220,6 +228,108 @@ func exportHabitLogs(ctx context.Context, zw *zip.Writer, deps Deps, uid string)
 			}
 		}
 	})
+}
+
+func exportEvents(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
+	rows, err := deps.DB.QueryContext(ctx, `
+		SELECT id, name, description, color, icon, archived, created_at, updated_at
+		FROM events WHERE user_id=$1 ORDER BY created_at`, uid)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return writeCSV(zw, "events.csv",
+		[]string{"id", "name", "description", "color", "icon", "archived", "created_at", "updated_at"},
+		func(emit func([]string)) {
+			for rows.Next() {
+				var id int64
+				var name, description, color, icon string
+				var archived bool
+				var created, updated time.Time
+				if err := rows.Scan(&id, &name, &description, &color, &icon, &archived, &created, &updated); err == nil {
+					emit([]string{
+						strconv.FormatInt(id, 10), name, description, color, icon,
+						strconv.FormatBool(archived), created.Format(time.RFC3339), updated.Format(time.RFC3339),
+					})
+				}
+			}
+		})
+}
+
+func exportEventVariables(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
+	rows, err := deps.DB.QueryContext(ctx, `
+		SELECT id, event_id, name, unit, sort_order
+		FROM event_variables WHERE user_id=$1 ORDER BY event_id, sort_order, id`, uid)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return writeCSV(zw, "event_variables.csv",
+		[]string{"id", "event_id", "name", "unit", "sort_order"},
+		func(emit func([]string)) {
+			for rows.Next() {
+				var id, eventID int64
+				var name, unit string
+				var sortOrder int
+				if err := rows.Scan(&id, &eventID, &name, &unit, &sortOrder); err == nil {
+					emit([]string{
+						strconv.FormatInt(id, 10), strconv.FormatInt(eventID, 10),
+						name, unit, strconv.Itoa(sortOrder),
+					})
+				}
+			}
+		})
+}
+
+func exportEventEntries(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
+	rows, err := deps.DB.QueryContext(ctx, `
+		SELECT id, event_id, occurred_at, note
+		FROM event_entries WHERE user_id=$1 ORDER BY event_id, occurred_at, id`, uid)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return writeCSV(zw, "event_entries.csv",
+		[]string{"id", "event_id", "occurred_at", "note"},
+		func(emit func([]string)) {
+			for rows.Next() {
+				var id, eventID int64
+				var occurredAt time.Time
+				var note string
+				if err := rows.Scan(&id, &eventID, &occurredAt, &note); err == nil {
+					emit([]string{
+						strconv.FormatInt(id, 10), strconv.FormatInt(eventID, 10),
+						occurredAt.Format(time.RFC3339), note,
+					})
+				}
+			}
+		})
+}
+
+func exportEventValues(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
+	rows, err := deps.DB.QueryContext(ctx, `
+		SELECT ev.entry_id, ev.variable_id, ev.value
+		FROM event_entry_values ev
+		JOIN event_entries ee ON ee.id=ev.entry_id
+		WHERE ee.user_id=$1 ORDER BY ev.entry_id, ev.variable_id`, uid)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return writeCSV(zw, "event_values.csv",
+		[]string{"entry_id", "variable_id", "value"},
+		func(emit func([]string)) {
+			for rows.Next() {
+				var entryID, variableID int64
+				var value float64
+				if err := rows.Scan(&entryID, &variableID, &value); err == nil {
+					emit([]string{
+						strconv.FormatInt(entryID, 10), strconv.FormatInt(variableID, 10),
+						strconv.FormatFloat(value, 'f', -1, 64),
+					})
+				}
+			}
+		})
 }
 
 func exportMedia(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
@@ -580,6 +690,25 @@ func takeoutImport(deps Deps) http.HandlerFunc {
 				counts["habit_logs"] = importHabitLogs(ctx, deps, uid, body2, idMap)
 			}
 		}
+		if body, ok := entries["events.csv"]; ok {
+			n, eventMap := importEvents(ctx, deps, uid, body)
+			counts["events"] = n
+			variableMap := map[int64]int64{}
+			if body2, ok := entries["event_variables.csv"]; ok {
+				var vn int
+				vn, variableMap = importEventVariables(ctx, deps, uid, body2, eventMap)
+				counts["event_variables"] = vn
+			}
+			entryMap := map[int64]int64{}
+			if body3, ok := entries["event_entries.csv"]; ok {
+				var en int
+				en, entryMap = importEventEntries(ctx, deps, uid, body3, eventMap)
+				counts["event_entries"] = en
+			}
+			if body4, ok := entries["event_values.csv"]; ok {
+				counts["event_values"] = importEventValues(ctx, deps, body4, entryMap, variableMap)
+			}
+		}
 		if body, ok := entries["media.csv"]; ok {
 			counts["media"] = importMedia(ctx, deps, uid, body)
 		}
@@ -712,6 +841,148 @@ func importHabitLogs(ctx context.Context, deps Deps, uid string, body []byte, id
 		_, err := deps.DB.ExecContext(ctx, `
 			INSERT INTO habit_logs(user_id, habit_id, logged_date) VALUES ($1,$2,$3)
 			ON CONFLICT (user_id, habit_id, logged_date) DO NOTHING`, uid, newID, r[1])
+		if err == nil {
+			n++
+		}
+	}
+	return n
+}
+
+func importEvents(ctx context.Context, deps Deps, uid string, body []byte) (int, map[int64]int64) {
+	idMap := map[int64]int64{}
+	rows, err := parseCSV(body)
+	if err != nil {
+		return 0, idMap
+	}
+	n := 0
+	for _, row := range rows {
+		if len(row) < 6 || strings.TrimSpace(row[1]) == "" {
+			continue
+		}
+		oldID, _ := strconv.ParseInt(row[0], 10, 64)
+		archived := strings.EqualFold(row[5], "true")
+		var newID int64
+		err := deps.DB.QueryRowContext(ctx, `
+			INSERT INTO events(user_id, name, description, color, icon, archived)
+			VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+			uid, row[1], row[2], row[3], row[4], archived,
+		).Scan(&newID)
+		if err == nil {
+			idMap[oldID] = newID
+			n++
+		}
+	}
+	return n, idMap
+}
+
+func importEventVariables(
+	ctx context.Context,
+	deps Deps,
+	uid string,
+	body []byte,
+	eventMap map[int64]int64,
+) (int, map[int64]int64) {
+	idMap := map[int64]int64{}
+	rows, err := parseCSV(body)
+	if err != nil {
+		return 0, idMap
+	}
+	n := 0
+	for _, row := range rows {
+		if len(row) < 5 || strings.TrimSpace(row[2]) == "" {
+			continue
+		}
+		oldID, _ := strconv.ParseInt(row[0], 10, 64)
+		oldEventID, _ := strconv.ParseInt(row[1], 10, 64)
+		eventID, ok := eventMap[oldEventID]
+		if !ok {
+			continue
+		}
+		sortOrder, _ := strconv.Atoi(row[4])
+		var newID int64
+		err := deps.DB.QueryRowContext(ctx, `
+			INSERT INTO event_variables(user_id, event_id, name, unit, sort_order)
+			VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+			uid, eventID, row[2], row[3], sortOrder,
+		).Scan(&newID)
+		if err == nil {
+			idMap[oldID] = newID
+			n++
+		}
+	}
+	return n, idMap
+}
+
+func importEventEntries(
+	ctx context.Context,
+	deps Deps,
+	uid string,
+	body []byte,
+	eventMap map[int64]int64,
+) (int, map[int64]int64) {
+	idMap := map[int64]int64{}
+	rows, err := parseCSV(body)
+	if err != nil {
+		return 0, idMap
+	}
+	n := 0
+	for _, row := range rows {
+		if len(row) < 4 {
+			continue
+		}
+		oldID, _ := strconv.ParseInt(row[0], 10, 64)
+		oldEventID, _ := strconv.ParseInt(row[1], 10, 64)
+		eventID, ok := eventMap[oldEventID]
+		if !ok {
+			continue
+		}
+		occurredAt, err := time.Parse(time.RFC3339, row[2])
+		if err != nil {
+			continue
+		}
+		var newID int64
+		err = deps.DB.QueryRowContext(ctx, `
+			INSERT INTO event_entries(user_id, event_id, occurred_at, note)
+			VALUES ($1,$2,$3,$4) RETURNING id`,
+			uid, eventID, occurredAt, row[3],
+		).Scan(&newID)
+		if err == nil {
+			idMap[oldID] = newID
+			n++
+		}
+	}
+	return n, idMap
+}
+
+func importEventValues(
+	ctx context.Context,
+	deps Deps,
+	body []byte,
+	entryMap map[int64]int64,
+	variableMap map[int64]int64,
+) int {
+	rows, err := parseCSV(body)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, row := range rows {
+		if len(row) < 3 {
+			continue
+		}
+		oldEntryID, _ := strconv.ParseInt(row[0], 10, 64)
+		oldVariableID, _ := strconv.ParseInt(row[1], 10, 64)
+		entryID, entryOK := entryMap[oldEntryID]
+		variableID, variableOK := variableMap[oldVariableID]
+		value, valueErr := strconv.ParseFloat(row[2], 64)
+		if !entryOK || !variableOK || valueErr != nil {
+			continue
+		}
+		_, err := deps.DB.ExecContext(ctx, `
+			INSERT INTO event_entry_values(entry_id, variable_id, value)
+			VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+			entryID, variableID, value,
+		)
 		if err == nil {
 			n++
 		}
