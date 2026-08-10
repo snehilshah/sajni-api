@@ -9,17 +9,15 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"path/filepath"
-	"strings"
-	"time"
-
-	"github.com/rs/zerolog/log"
-
 	"sajni/internal/ai"
 	"sajni/internal/auth"
 	"sajni/internal/db"
 	"sajni/internal/push"
 	"sajni/internal/storage"
+	"strings"
+	"time"
+
+	"github.com/rs/zerolog/log"
 )
 
 // Deps bundles the runtime dependencies API handlers need.
@@ -37,7 +35,7 @@ type Deps struct {
 // Router builds the top-level HTTP handler. Auth routes are mounted
 // outside of the protected zone; everything else requires a valid
 // access token via auth.Middleware.
-func Router(deps Deps, frontendDir string) http.Handler {
+func Router(deps Deps) http.Handler {
 	if deps.AILimiter == nil {
 		deps.AILimiter = newAILimiter()
 	}
@@ -111,22 +109,6 @@ func Router(deps Deps, frontendDir string) http.Handler {
 	RegisterReminderCronHandler(root, deps)
 	RegisterDigestCronHandler(root, deps)
 	RegisterScheduledNotificationHandler(root, deps)
-
-	if frontendDir != "" {
-		fs := http.FileServer(http.Dir(frontendDir))
-		root.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			if strings.HasPrefix(r.URL.Path, "/api/") {
-				http.NotFound(w, r)
-				return
-			}
-			path := filepath.Join(frontendDir, r.URL.Path)
-			if info, err := os.Stat(path); err == nil && !info.IsDir() {
-				fs.ServeHTTP(w, r)
-				return
-			}
-			http.ServeFile(w, r, filepath.Join(frontendDir, "index.html"))
-		})
-	}
 
 	return withCORS(withLogging(root))
 }

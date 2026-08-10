@@ -9,13 +9,10 @@ import (
 	"os"
 	"strings"
 	"time"
+
 	// Embed the IANA tz database so time.LoadLocation works on the
 	// distroless Cloud Run image (no system zoneinfo). Needed to render
 	// reminder emails in the user's local clock time.
-	_ "time/tzdata"
-
-	"github.com/rs/zerolog/log"
-
 	"sajni/internal/ai"
 	"sajni/internal/api"
 	"sajni/internal/auth"
@@ -23,6 +20,9 @@ import (
 	"sajni/internal/logger"
 	"sajni/internal/push"
 	"sajni/internal/storage"
+	_ "time/tzdata"
+
+	"github.com/rs/zerolog/log"
 )
 
 // loadDotEnv reads KEY=VALUE lines from path and sets them as env vars
@@ -57,7 +57,6 @@ func main() {
 	logger.Init()
 
 	port := flag.Int("port", 8080, "HTTP server port")
-	frontendDir := flag.String("frontend", "", "Path to built frontend directory (optional)")
 	flag.Parse()
 
 	dsn := os.Getenv("DATABASE_URL")
@@ -116,7 +115,7 @@ func main() {
 		AI:      aiSvc,
 		Push:    pushSvc,
 	}
-	handler := api.Router(deps, *frontendDir)
+	handler := api.Router(deps)
 
 	// Background ticks. All work below is idempotent so missed ticks during
 	// deploys are harmless; the next tick catches up.

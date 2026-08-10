@@ -20,5 +20,5 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata
 COPY --from=build /out/sajni /usr/local/bin/sajni
 EXPOSE 8080
-# No --frontend flag — backend serves only /api/* + health probes now.
+
 ENTRYPOINT ["sajni"]
