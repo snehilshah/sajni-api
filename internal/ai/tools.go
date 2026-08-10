@@ -1004,7 +1004,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_themes",
-			Description: "List the user's saved color themes (built-ins, AI-generated, and manual). Useful before activating a theme by name.",
+			Description: "List the user's saved AI-generated or custom color themes. Built-in presets are selected directly in Settings and are not part of this list. Useful before activating a saved theme by name.",
 			Schema:      obj(map[string]*genai.Schema{}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listThemesTool(ctx, d, uid)

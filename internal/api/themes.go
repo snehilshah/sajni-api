@@ -1,7 +1,9 @@
 package api
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -21,6 +23,7 @@ func registerThemeRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /api/themes/generate", generateThemeHandler(deps))
 	mux.HandleFunc("PUT /api/themes/{id}", updateThemeHandler(deps))
 	mux.HandleFunc("DELETE /api/themes/{id}", deleteThemeHandler(deps))
+	mux.HandleFunc("POST /api/themes/deactivate", deactivateThemeHandler(deps))
 	mux.HandleFunc("POST /api/themes/{id}/activate", activateThemeHandler(deps))
 }
 
@@ -57,8 +60,12 @@ func getActiveTheme(deps Deps) http.HandlerFunc {
 		err := d.QueryRow(`SELECT id, name, source, seeds, prompt, mode_pref, is_active, created_at::text
 			FROM user_themes WHERE user_id = $1 AND is_active = TRUE LIMIT 1`, uid).
 			Scan(&t.ID, &t.Name, &t.Source, &seedsRaw, &t.Prompt, &t.ModePref, &t.IsActive, &t.CreatedAt)
-		if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			writeJSON(w, 200, nil)
+			return
+		}
+		if err != nil {
+			errJSON(w, 500, err.Error())
 			return
 		}
 		json.Unmarshal(seedsRaw, &t.Seeds)
@@ -88,9 +95,12 @@ func createThemeHandler(deps Deps) http.HandlerFunc {
 		if body.Source == "" {
 			body.Source = "manual"
 		}
-		if body.ModePref == "" {
-			body.ModePref = "auto"
+		modePref, err := theme.NormalizeModePref(body.ModePref)
+		if err != nil {
+			errJSON(w, 400, err.Error())
+			return
 		}
+		body.ModePref = modePref
 		if body.Name == "" {
 			body.Name = "Untitled theme"
 		}
@@ -133,7 +143,12 @@ func updateThemeHandler(deps Deps) http.HandlerFunc {
 			d.Exec(`UPDATE user_themes SET seeds = $1 WHERE id = $2 AND user_id = $3`, seedsRaw, id, uid)
 		}
 		if body.ModePref != nil {
-			d.Exec(`UPDATE user_themes SET mode_pref = $1 WHERE id = $2 AND user_id = $3`, *body.ModePref, id, uid)
+			modePref, err := theme.NormalizeModePref(*body.ModePref)
+			if err != nil {
+				errJSON(w, 400, err.Error())
+				return
+			}
+			d.Exec(`UPDATE user_themes SET mode_pref = $1 WHERE id = $2 AND user_id = $3`, modePref, id, uid)
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
@@ -161,7 +176,21 @@ func activateThemeHandler(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid id")
 			return
 		}
+		// Keep the old /themes/0/activate behavior for existing clients while
+		// new clients use the explicit /themes/deactivate endpoint.
+		if id == 0 {
+			if err := theme.Deactivate(r.Context(), deps.DB, uid); err != nil {
+				errJSON(w, 500, err.Error())
+				return
+			}
+			writeJSON(w, 200, map[string]string{"status": "ok"})
+			return
+		}
 		if err := theme.Activate(r.Context(), deps.DB, uid, id); err != nil {
+			if errors.Is(err, theme.ErrNotFound) {
+				errJSON(w, 404, err.Error())
+				return
+			}
 			errJSON(w, 500, err.Error())
 			return
 		}
@@ -171,6 +200,16 @@ func activateThemeHandler(deps Deps) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, 200, t)
+	}
+}
+
+func deactivateThemeHandler(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := theme.Deactivate(r.Context(), deps.DB, userID(r.Context())); err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
 }
 
@@ -194,6 +233,12 @@ func generateThemeHandler(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "missing prompt")
 			return
 		}
+		modePref, err := theme.NormalizeModePref(body.ModePref)
+		if err != nil {
+			errJSON(w, 400, err.Error())
+			return
+		}
+		body.ModePref = modePref
 		t, err := theme.Generate(r.Context(), deps.AI, deps.DB, uid, body.Prompt, body.ModePref, body.Activate)
 		if err != nil {
 			errJSON(w, 500, err.Error())

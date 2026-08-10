@@ -59,6 +59,19 @@ type QuickGen interface {
 }
 
 var hexRe = regexp.MustCompile(`^#[0-9A-Fa-f]{6}$`)
+var ErrNotFound = errors.New("theme not found")
+
+func NormalizeModePref(value string) (string, error) {
+	if value == "" {
+		return "auto", nil
+	}
+	switch value {
+	case "auto", "light", "dark":
+		return value, nil
+	default:
+		return "", errors.New("invalid mode_pref (expect auto, light, or dark)")
+	}
+}
 
 func ValidateSeeds(s *Seeds) error {
 	for _, v := range []struct {
@@ -126,7 +139,7 @@ func sanitizePrompt(p string) string {
 
 // Generate calls Gemini, parses the response, validates the hex codes,
 // and inserts a row into user_themes. If activate is true the new row
-// becomes the user's active theme atomically.
+// then becomes the user's active theme.
 func Generate(
 	ctx context.Context, ai QuickGen, d *db.DB,
 	uid string, prompt, modePref string, activate bool,
@@ -137,8 +150,9 @@ func Generate(
 	if strings.TrimSpace(prompt) == "" {
 		return nil, errors.New("missing prompt")
 	}
-	if modePref == "" {
-		modePref = "auto"
+	modePref, err := NormalizeModePref(modePref)
+	if err != nil {
+		return nil, err
 	}
 	raw, err := ai.QuickGenerate(ctx, SystemPrompt, "<prompt>"+sanitizePrompt(prompt)+"</prompt>")
 	if err != nil {
@@ -170,15 +184,19 @@ func Generate(
 	}, nil
 }
 
-// Insert writes a row to user_themes; if activate is true it also flips
-// is_active in a single transaction.
+// Insert writes a row to user_themes; if activate is true it follows with
+// the transactional active-theme swap.
 func Insert(
 	ctx context.Context, d *db.DB, uid string,
 	name, source, prompt, modePref string, seeds Seeds, activate bool,
 ) (int64, error) {
+	modePref, err := NormalizeModePref(modePref)
+	if err != nil {
+		return 0, err
+	}
 	seedsRaw, _ := json.Marshal(seeds)
 	var id int64
-	err := d.QueryRowContext(ctx, `INSERT INTO user_themes
+	err = d.QueryRowContext(ctx, `INSERT INTO user_themes
 		(user_id, name, source, seeds, prompt, mode_pref) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
 		uid, name, source, seedsRaw, prompt, modePref).Scan(&id)
 	if err != nil {
@@ -201,6 +219,15 @@ func Activate(ctx context.Context, d *db.DB, uid string, id int64) error {
 		return err
 	}
 	defer tx.Rollback()
+	var exists bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM user_themes WHERE id = $1 AND user_id = $2)`, id, uid,
+	).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNotFound
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE user_themes SET is_active = FALSE WHERE user_id = $1 AND is_active = TRUE`, uid); err != nil {
 		return err
 	}
@@ -208,6 +235,11 @@ func Activate(ctx context.Context, d *db.DB, uid string, id int64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+func Deactivate(ctx context.Context, d *db.DB, uid string) error {
+	_, err := d.ExecContext(ctx, `UPDATE user_themes SET is_active = FALSE WHERE user_id = $1 AND is_active = TRUE`, uid)
+	return err
 }
 
 // Load fetches a single theme by id (scoped by uid). Useful for tools
