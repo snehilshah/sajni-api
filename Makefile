@@ -4,10 +4,11 @@
 LOG_LEVEL ?= debug
 export
 
-.PHONY: help dev build run fmt lint check test docker-build docker-run clean sync-vars
+.PHONY: help setup dev build run fmt lint check test docker-build docker-run clean sync-vars
 
 help:
 	@echo "sajni-api targets:"
+	@echo "  setup         prepare the local .env once (safe to rerun)"
 	@echo "  dev           run the server with go run"
 	@echo "  build         compile a static binary -> ./sajni"
 	@echo "  run           build and run the binary"
@@ -17,10 +18,21 @@ help:
 	@echo "  test          go test ./..."
 	@echo "  docker-build  build the Cloud Run image (sajni-api:dev)"
 	@echo "  docker-run    docker-build then run with .env"
-	@echo "  sync-vars     push secrets.txt -> GitHub Actions variables (requires gh)"
+	@echo "  sync-vars     push github-variables.env -> GitHub Actions variables"
 
 # --- dev ---
-dev:
+setup:
+	@if [ ! -f .env ]; then cp .env.example .env; echo "Created .env from .env.example"; fi
+	@if ! grep -q '^APP_ENV=' .env; then printf '\nAPP_ENV=local\n' >> .env; fi
+	@if grep -Eq '^JWT_SECRET=(|change-me-to-a-long-random-string)$$' .env; then \
+		secret="$$(openssl rand -hex 32)"; \
+		sed -i "s|^JWT_SECRET=.*|JWT_SECRET=$$secret|" .env; \
+		echo "Generated local JWT_SECRET"; \
+	fi
+	@chmod 600 .env
+	@echo "Local environment ready"
+
+dev: setup
 	go run ./cmd
 
 # --- build (no Docker) ---
@@ -56,17 +68,17 @@ test:
 docker-build:
 	docker build -t sajni-api:dev .
 
-docker-run: docker-build
+docker-run: setup docker-build
 	docker run --rm -p 8080:8080 --env-file .env sajni-api:dev
 
 # --- GitHub Actions variable sync ---
-# Reads secrets.txt (KEY=VALUE) and syncs each line to GitHub Actions
+# Reads github-variables.env (KEY=VALUE) and syncs each line to GitHub Actions
 # variables via `gh`. Requires: gh auth login + repo write access.
 # Use for non-sensitive config (vars.*). Sensitive secrets live in GCP
 # Secret Manager and are never stored here.
 sync-vars:
-	@echo "Syncing GitHub Actions variables from secrets.txt..."
-	@grep -v '^[[:space:]]*#' secrets.txt | grep '=' | while IFS= read -r line; do \
+	@echo "Syncing GitHub Actions variables from github-variables.env..."
+	@grep -v '^[[:space:]]*#' github-variables.env | grep '=' | while IFS= read -r line; do \
 		key=$${line%%=*}; val=$${line#*=}; \
 		gh variable set "$$key" --body "$$val" && echo "  set $$key"; \
 	done

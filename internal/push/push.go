@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -23,6 +22,7 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 
+	"sajni/internal/config"
 	"sajni/internal/db"
 )
 
@@ -35,12 +35,11 @@ type Sender struct {
 	client    *http.Client
 }
 
-// New returns a ready Sender, or (nil, nil) when FIREBASE_PROJECT_ID is unset
-// (push disabled). An ADC failure is a real error: the env var says push
-// should work, so a missing credential must surface at boot.
-func New(ctx context.Context) (*Sender, error) {
-	projectID := os.Getenv("FIREBASE_PROJECT_ID")
-	if projectID == "" {
+// New returns a ready Sender, or (nil, nil) when Firebase is not configured.
+// An ADC failure is a real error: configuration says push should work, so a
+// missing credential must surface at boot.
+func New(ctx context.Context, cfg config.Push) (*Sender, error) {
+	if cfg.FirebaseProjectID == "" {
 		return nil, nil
 	}
 	ts, err := google.DefaultTokenSource(ctx, fcmScope)
@@ -48,7 +47,7 @@ func New(ctx context.Context) (*Sender, error) {
 		return nil, fmt.Errorf("push: application default credentials: %w", err)
 	}
 	return &Sender{
-		projectID: projectID,
+		projectID: cfg.FirebaseProjectID,
 		tokens:    oauth2.ReuseTokenSource(nil, ts),
 		client:    &http.Client{Timeout: 10 * time.Second},
 	}, nil

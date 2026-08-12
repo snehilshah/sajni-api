@@ -736,7 +736,7 @@ func createTask(deps Deps) http.HandlerFunc {
 
 		logTaskEvent(d, uid, id, "created", "", body.Title)
 		if body.Remind {
-			enqueueTaskReminderFromDB(r.Context(), d, uid, id)
+			enqueueTaskReminderFromDB(r.Context(), d, deps.ReminderQueue, uid, id)
 		}
 
 		writeJSON(w, 201, map[string]int64{"id": id})
@@ -1011,7 +1011,7 @@ func updateTask(deps Deps) http.HandlerFunc {
 			return
 		}
 		if reminderTimingChanged {
-			enqueueTaskReminderFromDB(r.Context(), d, uid, id)
+			enqueueTaskReminderFromDB(r.Context(), d, deps.ReminderQueue, uid, id)
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}

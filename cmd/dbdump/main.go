@@ -27,7 +27,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -37,39 +36,14 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"sajni/internal/config"
 )
 
-// loadDotEnv mirrors cmd/main.go: KEY=VALUE lines, no override of real env.
-func loadDotEnv(path string) {
-	f, err := os.Open(path)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		eq := strings.IndexByte(line, '=')
-		if eq <= 0 {
-			continue
-		}
-		key := strings.TrimSpace(line[:eq])
-		val := strings.Trim(strings.TrimSpace(line[eq+1:]), `"'`)
-		if _, set := os.LookupEnv(key); !set {
-			os.Setenv(key, val)
-		}
-	}
-}
-
 func main() {
-	loadDotEnv(".env")
-
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		fmt.Fprintln(os.Stderr, "DATABASE_URL is required (set it or put it in .env)")
+	databaseConfig, err := config.LoadDatabase(".env")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "configuration: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -85,7 +59,7 @@ func main() {
 	}
 
 	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, dsn)
+	conn, err := pgx.Connect(ctx, databaseConfig.URL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "connect: %v\n", err)
 		os.Exit(1)
@@ -138,7 +112,7 @@ func main() {
 		fmt.Printf("-> %-28s %8d rows\n", t, n)
 	}
 
-	writeManifest(outDir, stamp, dsn, tables, counts, grandRows)
+	writeManifest(outDir, stamp, databaseConfig.URL, tables, counts, grandRows)
 	fmt.Printf("\nDone. %d tables, %d rows -> %s\n", len(tables), grandRows, outDir)
 }
 

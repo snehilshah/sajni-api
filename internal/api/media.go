@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,9 +68,9 @@ func tmdbErrorJSON(w http.ResponseWriter, err error) {
 
 func registerMediaRoutes(mux *http.ServeMux, deps Deps) {
 	// More-specific routes register before /{id}.
-	mux.HandleFunc("GET /api/media/search", searchMedia())
-	mux.HandleFunc("GET /api/media/details", mediaDetails())
-	mux.HandleFunc("GET /api/media/collection", collectionDetails())
+	mux.HandleFunc("GET /api/media/search", searchMedia(deps.Media.TMDBAPIKey))
+	mux.HandleFunc("GET /api/media/details", mediaDetails(deps.Media.TMDBAPIKey))
+	mux.HandleFunc("GET /api/media/collection", collectionDetails(deps.Media.TMDBAPIKey))
 	mux.HandleFunc("GET /api/media/{id}/events", listMediaEvents(deps))
 	mux.HandleFunc("GET /api/media", listMedia(deps))
 	mux.HandleFunc("POST /api/media", createMedia(deps))
@@ -785,7 +784,7 @@ func releaseState(releaseDate string) string {
 
 // searchMedia proxies searches to TMDB or Open Library.
 // Doesn't need user scoping since results are public metadata.
-func searchMedia() http.HandlerFunc {
+func searchMedia(tmdbAPIKey string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		query := queryParam(r, "q")
 		mediaType := queryParam(r, "type")
@@ -799,7 +798,7 @@ func searchMedia() http.HandlerFunc {
 			results := searchOpenLibrary(query)
 			writeJSON(w, 200, results)
 		default:
-			results := searchTMDB(query, mediaType)
+			results := searchTMDB(query, mediaType, tmdbAPIKey)
 			writeJSON(w, 200, results)
 		}
 	}
@@ -812,8 +811,7 @@ func searchMedia() http.HandlerFunc {
 // movies, which read as the tab still filtering). Kind is carried in each
 // external_id (tmdb:movie:… / tmdb:tv:…); the frontend derives its badge +
 // form type from that, so no response field changes.
-func searchTMDB(query, mediaType string) []SearchResult {
-	apiKey := os.Getenv("TMDB_API_KEY")
+func searchTMDB(query, mediaType, apiKey string) []SearchResult {
 	if apiKey == "" {
 		return []SearchResult{}
 	}
@@ -1034,7 +1032,7 @@ type CollectionPart struct {
 // mediaDetails fetches a single TMDB title's full record so we can fill
 // per-season episode counts (for shows) or collection info (for movies)
 // without making the user enter them by hand.
-func mediaDetails() http.HandlerFunc {
+func mediaDetails(apiKey string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ext := queryParam(r, "external_id")
 		if ext == "" {
@@ -1046,7 +1044,6 @@ func mediaDetails() http.HandlerFunc {
 			errJSON(w, 400, "external_id must be tmdb:{movie|tv}:{id}")
 			return
 		}
-		apiKey := os.Getenv("TMDB_API_KEY")
 		if apiKey == "" {
 			errJSON(w, 503, "tmdb not configured")
 			return
@@ -1203,7 +1200,7 @@ func fillMovieDetails(out *MediaDetails, id, apiKey string) error {
 // collectionDetails proxies TMDB /collection/{id} so the frontend can
 // list every part of a movie series the user is in. Only returns the
 // list — matching against the user's library happens client-side.
-func collectionDetails() http.HandlerFunc {
+func collectionDetails(apiKey string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cid := queryParam(r, "id")
 		if cid == "" {
@@ -1212,7 +1209,6 @@ func collectionDetails() http.HandlerFunc {
 		}
 		// Accept either "tmdb:collection:1234" or bare "1234".
 		raw := strings.TrimPrefix(cid, "tmdb:collection:")
-		apiKey := os.Getenv("TMDB_API_KEY")
 		if apiKey == "" {
 			errJSON(w, 503, "tmdb not configured")
 			return

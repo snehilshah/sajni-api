@@ -3,7 +3,6 @@ package db
 import (
 	"database/sql"
 	"fmt"
-	"os"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/rs/zerolog/log"
@@ -22,7 +21,7 @@ type DB struct {
 // migrations. Used once when switching the schema (e.g. the auth
 // rework that flipped users.id to UUID). Flip the flag back off after
 // the next successful boot.
-func New(dsn string) (*DB, error) {
+func New(dsn string, dropAndReseed bool) (*DB, error) {
 	if dsn == "" {
 		return nil, fmt.Errorf("empty DATABASE_URL")
 	}
@@ -37,7 +36,7 @@ func New(dsn string) (*DB, error) {
 
 	d := &DB{DB: conn}
 
-	if os.Getenv("DROP_AND_RESEED") == "1" {
+	if dropAndReseed {
 		log.Warn().Msg("DROP_AND_RESEED=1 — wiping public schema before migrate")
 		if _, err := d.Exec(`DROP SCHEMA public CASCADE; CREATE SCHEMA public;`); err != nil {
 			return nil, fmt.Errorf("drop schema: %w", err)

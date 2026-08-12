@@ -10,8 +10,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
+
+	"sajni/internal/config"
 )
 
 // ErrNotFound is returned by Get/Delete when the key does not exist.
@@ -24,26 +25,21 @@ type Storage interface {
 	Delete(ctx context.Context, key string) error
 }
 
-// New returns a Storage implementation chosen by the STORAGE_BACKEND env var.
+// New returns the configured Storage implementation.
 //
 //	local (default) — filesystem-backed, root from STORAGE_LOCAL_DIR (default ./data/blobs)
 //	gcs             — Google Cloud Storage, bucket from GCS_BUCKET
-func New(ctx context.Context) (Storage, error) {
-	switch backend := strings.ToLower(os.Getenv("STORAGE_BACKEND")); backend {
-	case "", "local":
-		root := os.Getenv("STORAGE_LOCAL_DIR")
-		if root == "" {
-			root = "./data/blobs"
-		}
-		return NewLocal(root)
+func New(ctx context.Context, cfg config.Storage) (Storage, error) {
+	switch cfg.Backend {
+	case "local":
+		return NewLocal(cfg.LocalDir)
 	case "gcs":
-		bucket := os.Getenv("GCS_BUCKET")
-		if bucket == "" {
+		if cfg.GCSBucket == "" {
 			return nil, fmt.Errorf("STORAGE_BACKEND=gcs requires GCS_BUCKET")
 		}
-		return NewGCS(ctx, bucket)
+		return NewGCS(ctx, cfg.GCSBucket)
 	default:
-		return nil, fmt.Errorf("unknown STORAGE_BACKEND %q", backend)
+		return nil, fmt.Errorf("unknown STORAGE_BACKEND %q", cfg.Backend)
 	}
 }
 

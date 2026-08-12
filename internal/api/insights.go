@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -154,7 +153,7 @@ func unpinInsight(deps Deps) http.HandlerFunc {
 }
 
 func insightCronHandler(deps Deps) http.HandlerFunc {
-	expected := os.Getenv("INSIGHT_CRON_SECRET")
+	expected := deps.Reminders.InsightCronSecret
 	return func(w http.ResponseWriter, r *http.Request) {
 		if expected == "" || r.Header.Get("X-Insight-Cron") != expected {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)

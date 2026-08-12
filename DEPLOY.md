@@ -113,8 +113,7 @@ echo -n "postgres://USER:PASS@HOST:5432/sajni?sslmode=require" \
 openssl rand -hex 32 \
   | gcloud secrets create sajni-jwt-secret --data-file=-
 
-# Optional integrations. Create the secret even if empty — the
-# deploy workflow references all of these unconditionally.
+# Runtime integrations referenced by the deploy workflow.
 echo -n "your-tmdb-key"   | gcloud secrets create sajni-tmdb-key   --data-file=-
 echo -n "your-gemini-key" | gcloud secrets create sajni-gemini-key --data-file=-
 
@@ -127,7 +126,8 @@ echo -n "GITHUB_CLIENT_ID"      | gcloud secrets create GITHUB_OAUTH_CLIENT_ID  
 echo -n "GITHUB_CLIENT_SECRET"  | gcloud secrets create GITHUB_OAUTH_CLIENT_SECRET --data-file=-
 echo -n "re_xxxxx_resendkey"    | gcloud secrets create RESEND_API_KEY             --data-file=-
 
-# Plain runtime config promoted into Secret Manager for consistency.
+# Runtime values currently stored in Secret Manager. They are not all
+# sensitive, but keeping the existing names avoids a coordinated migration.
 echo -n "https://www.ohmysajni.com"    | gcloud secrets create APP_URL        --data-file=-
 echo -n "https://www.ohmysajni.com"    | gcloud secrets create CORS_ORIGIN    --data-file=-
 echo -n "https://sajni-api-REGION-HASH.a.run.app" | gcloud secrets create API_BASE_URL --data-file=-
@@ -213,13 +213,16 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
 
 ### GitHub configuration
 
-In **Settings → Secrets and variables → Actions** of `ohmysajni/sajni-api`,
+In **Settings → Secrets and variables → Actions** of `snehilshah/sajni-api`,
 add these as **Variables** (not Secrets — they're identifiers, not credentials):
 
 GitHub repo Variables hold the values the *workflow itself* needs to
 deploy — they're never seen by the running container, and they aren't
 sensitive (project ids, region names, the WIF provider path). Runtime
 config lives in Secret Manager (above).
+
+The same non-sensitive values are tracked in `github-variables.env`; run
+`make sync-vars` after changing that file.
 
 | Variable              | Value                                                                                            |
 | --------------------- | ------------------------------------------------------------------------------------------------ |
@@ -228,6 +231,7 @@ config lives in Secret Manager (above).
 | `GCP_SERVICE_ACCOUNT` | `sajni-deployer@ohmysajni.iam.gserviceaccount.com`                                               |
 | `GCP_WIF_PROVIDER`    | the line you `echo`d at the end of the IAM block                                                 |
 | `GCS_BUCKET`          | e.g. `ohmysajni-sajni-blobs`                                                                     |
+| `CLOUD_TASKS_QUEUE`   | `sajni-reminders`                                                                                 |
 
 ---
 
@@ -326,13 +330,15 @@ gcloud run services update-traffic sajni-api --region asia-south1 \
 ## Local dev
 
 ```sh
-make dev        # go run ./cmd against your local Postgres
+make setup      # first run: prepare .env and generate the local JWT secret
+make dev        # later runs: validate config and start the API
 make check      # what CI runs (gofmt-check + vet + build + test)
 make docker-run # build the Cloud Run image and run with .env
 ```
 
-`.env.example` shows the variables; copy to `.env` and fill in
-`DATABASE_URL`, `JWT_SECRET`, optional `TMDB_API_KEY` / `GEMINI_API_KEY`.
+`make setup` is safe to rerun: it does not overwrite existing values and fixes
+`.env` permissions to `600`. Optional integrations such as TMDB, Gemini,
+Google Places, Cloud Tasks, and Firebase may stay blank in local development.
 
 ---
 

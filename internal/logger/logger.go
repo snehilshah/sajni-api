@@ -4,17 +4,19 @@ import (
 	"os"
 	"time"
 
+	"sajni/internal/config"
+
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
 // Init configures the global zerolog logger.
 //
-// Cloud Run (K_SERVICE set): JSON to stdout with Cloud Logging severity mapping.
+// Production: JSON to stdout with Cloud Logging severity mapping.
 // Local: pretty console output.
-// Level: info by default; override with LOG_LEVEL=debug|warn|error.
-func Init() {
-	if os.Getenv("K_SERVICE") != "" {
+// Level is validated by config.Load before initialization.
+func Init(environment config.Environment, levelName string) error {
+	if environment == config.Production {
 		// Cloud Logging parses "severity" field for log levels.
 		zerolog.LevelFieldName = "severity"
 		zerolog.LevelDebugValue = "DEBUG"
@@ -32,9 +34,10 @@ func Init() {
 		}).With().Timestamp().Logger()
 	}
 
-	level := zerolog.InfoLevel
-	if l, err := zerolog.ParseLevel(os.Getenv("LOG_LEVEL")); err == nil {
-		level = l
+	level, err := zerolog.ParseLevel(levelName)
+	if err != nil {
+		return err
 	}
 	zerolog.SetGlobalLevel(level)
+	return nil
 }

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -327,7 +326,7 @@ func upsertJournalEntry(deps Deps) http.HandlerFunc {
 var placesHTTP = &http.Client{Timeout: 6 * time.Second}
 
 func placesAutocomplete(deps Deps) http.HandlerFunc {
-	key := os.Getenv("GOOGLE_PLACES_KEY")
+	key := deps.Media.GooglePlacesAPIKey
 	return func(w http.ResponseWriter, r *http.Request) {
 		if key == "" {
 			errJSON(w, 503, "places not configured")
@@ -409,7 +408,7 @@ func placesAutocomplete(deps Deps) http.HandlerFunc {
 }
 
 func placesDetails(deps Deps) http.HandlerFunc {
-	key := os.Getenv("GOOGLE_PLACES_KEY")
+	key := deps.Media.GooglePlacesAPIKey
 	return func(w http.ResponseWriter, r *http.Request) {
 		if key == "" {
 			errJSON(w, 503, "places not configured")

@@ -8,11 +8,12 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"os"
 	"sajni/internal/ai"
 	"sajni/internal/auth"
+	"sajni/internal/config"
 	"sajni/internal/db"
 	"sajni/internal/push"
+	"sajni/internal/reminderqueue"
 	"sajni/internal/storage"
 	"strings"
 	"time"
@@ -22,11 +23,16 @@ import (
 
 // Deps bundles the runtime dependencies API handlers need.
 type Deps struct {
-	DB      *db.DB
-	Auth    *auth.Service
-	Storage storage.Storage
-	AI      *ai.Service  // nil when GEMINI_API_KEY is unset
-	Push    *push.Sender // nil when FIREBASE_PROJECT_ID is unset
+	Environment   config.Environment
+	HTTP          config.HTTP
+	Media         config.Media
+	Reminders     config.Reminders
+	ReminderQueue reminderqueue.Queue
+	DB            *db.DB
+	Auth          *auth.Service
+	Storage       storage.Storage
+	AI            *ai.Service  // nil when GEMINI_API_KEY is unset
+	Push          *push.Sender // nil when FIREBASE_PROJECT_ID is unset
 	// AILimiter is shared across all AI endpoints (chat, palette,
 	// categorize, …) so a single per-user budget governs total spend.
 	AILimiter *aiLimiter
@@ -110,7 +116,7 @@ func Router(deps Deps) http.Handler {
 	RegisterDigestCronHandler(root, deps)
 	RegisterScheduledNotificationHandler(root, deps)
 
-	return withCORS(withLogging(root))
+	return withCORS(withLogging(root), deps.HTTP)
 }
 
 // withLogging logs all requests at debug, errors (5xx) at error, slow (>2s) at warn.
@@ -161,16 +167,14 @@ func (sw *statusWriter) Flush() {
 
 // withCORS reflects the configured allowed origin and enables credentials
 // so the refresh-token cookie can travel across origins.
-func withCORS(h http.Handler) http.Handler {
-	allowed := os.Getenv("CORS_ORIGIN")
-	allowLocal := os.Getenv("ALLOW_LOCAL_CORS") == "1"
+func withCORS(h http.Handler, cfg config.HTTP) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if allowed != "" && origin == allowed {
+		if cfg.CORSOrigin != "" && origin == cfg.CORSOrigin {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
-		} else if allowLocal && corsLocalPrivateOrigin(origin) {
+		} else if cfg.AllowLocalCORS && corsLocalPrivateOrigin(origin) {
 			// Explicit local-only mode for Vite or a phone on the development LAN.
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")

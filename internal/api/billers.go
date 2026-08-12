@@ -887,5 +887,5 @@ func spawnBillerTask(ctx context.Context, deps Deps, uid, name string, due time.
 		log.Warn().Err(err).Str("biller", name).Msg("biller reminder task insert failed")
 		return
 	}
-	enqueueTaskReminderFromDB(ctx, d, uid, id)
+	enqueueTaskReminderFromDB(ctx, d, deps.ReminderQueue, uid, id)
 }

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -14,6 +13,8 @@ import (
 	"github.com/rs/zerolog/log"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"sajni/internal/config"
 )
 
 const (
@@ -26,7 +27,7 @@ type fireBody struct {
 	ID   int64  `json:"id"`
 }
 
-type config struct {
+type Queue struct {
 	project string
 	region  string
 	queue   string
@@ -34,26 +35,26 @@ type config struct {
 	secret  string
 }
 
-func loadConfig() config {
-	project := firstEnv("CLOUD_TASKS_PROJECT", "GOOGLE_CLOUD_PROJECT", "GCP_PROJECT_ID")
-	return config{
-		project: project,
-		region:  defaultEnv("CLOUD_TASKS_LOCATION", "asia-south1"),
-		queue:   os.Getenv("CLOUD_TASKS_QUEUE"),
-		baseURL: strings.TrimRight(os.Getenv("API_BASE_URL"), "/"),
-		secret:  os.Getenv("REMINDER_CRON_SECRET"),
+func New(cfg config.Reminders, apiBaseURL string) Queue {
+	queue := Queue{
+		project: cfg.CloudTasksProject,
+		region:  cfg.CloudTasksLocation,
+		queue:   cfg.CloudTasksQueue,
+		baseURL: strings.TrimRight(apiBaseURL, "/"),
+		secret:  cfg.CronSecret,
 	}
+	return queue
 }
 
-func (c config) enabled() bool {
+func (c Queue) enabled() bool {
 	return c.project != "" && c.region != "" && c.queue != "" && c.baseURL != "" && c.secret != ""
 }
 
-func (c config) parent() string {
+func (c Queue) parent() string {
 	return fmt.Sprintf("projects/%s/locations/%s/queues/%s", c.project, c.region, c.queue)
 }
 
-func (c config) fireURL() string {
+func (c Queue) fireURL() string {
 	u, err := url.JoinPath(c.baseURL, "/internal/reminders/fire")
 	if err != nil {
 		return c.baseURL + "/internal/reminders/fire"
@@ -64,14 +65,13 @@ func (c config) fireURL() string {
 // Enqueue schedules one reminder fire. It is intentionally append-only:
 // edits enqueue a new Cloud Task, and stale older tasks no-op after the fire
 // endpoint re-checks Postgres.
-func Enqueue(ctx context.Context, kind string, id int64, at time.Time) error {
+func (c Queue) Enqueue(ctx context.Context, kind string, id int64, at time.Time) error {
 	if kind != KindTask && kind != KindMulti {
 		return fmt.Errorf("unknown reminder kind %q", kind)
 	}
 	if id <= 0 || at.IsZero() {
 		return nil
 	}
-	c := loadConfig()
 	if !c.enabled() {
 		log.Debug().Str("kind", kind).Int64("id", id).Msg("reminder cloud task enqueue skipped; config incomplete")
 		return nil
@@ -107,26 +107,10 @@ func Enqueue(ctx context.Context, kind string, id int64, at time.Time) error {
 	return err
 }
 
-func EnqueueTask(ctx context.Context, id int64, scheduledAt time.Time) error {
-	return Enqueue(ctx, KindTask, id, scheduledAt)
+func (c Queue) EnqueueTask(ctx context.Context, id int64, scheduledAt time.Time) error {
+	return c.Enqueue(ctx, KindTask, id, scheduledAt)
 }
 
-func EnqueueMulti(ctx context.Context, id int64, remindAt time.Time) error {
-	return Enqueue(ctx, KindMulti, id, remindAt)
-}
-
-func firstEnv(keys ...string) string {
-	for _, k := range keys {
-		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-func defaultEnv(key, fallback string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		return v
-	}
-	return fallback
+func (c Queue) EnqueueMulti(ctx context.Context, id int64, remindAt time.Time) error {
+	return c.Enqueue(ctx, KindMulti, id, remindAt)
 }

@@ -16,7 +16,7 @@ func TestEmailCodeConcurrentConsumption(t *testing.T) {
 	if dsn == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
 	}
-	database, err := db.New(dsn)
+	database, err := db.New(dsn, false)
 	if err != nil {
 		t.Fatal(err)
 	}

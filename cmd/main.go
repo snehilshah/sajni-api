@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	// Embed the IANA tz database so time.LoadLocation works on the
@@ -16,104 +14,91 @@ import (
 	"sajni/internal/ai"
 	"sajni/internal/api"
 	"sajni/internal/auth"
+	"sajni/internal/config"
 	"sajni/internal/db"
 	"sajni/internal/logger"
 	"sajni/internal/push"
+	"sajni/internal/reminderqueue"
 	"sajni/internal/storage"
 	_ "time/tzdata"
 
 	"github.com/rs/zerolog/log"
 )
 
-// loadDotEnv reads KEY=VALUE lines from path and sets them as env vars
-// (only if not already present). Missing file is not an error.
-func loadDotEnv(path string) {
-	f, err := os.Open(path)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		eq := strings.IndexByte(line, '=')
-		if eq <= 0 {
-			continue
-		}
-		key := strings.TrimSpace(line[:eq])
-		val := strings.Trim(strings.TrimSpace(line[eq+1:]), `"'`)
-		if _, set := os.LookupEnv(key); !set {
-			os.Setenv(key, val)
-		}
-	}
-}
-
 func main() {
-	loadDotEnv(".env")
-	logger.Init()
+	ctx := context.Background()
 
 	port := flag.Int("port", 8080, "HTTP server port")
 	flag.Parse()
 
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		log.Fatal().Msg("DATABASE_URL is required")
+	cfg, err := config.Load(".env")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "configuration: %v\n", err)
+		os.Exit(1)
+	}
+	if err := logger.Init(cfg.Environment, cfg.Logging.Level); err != nil {
+		fmt.Fprintf(os.Stderr, "configure logger: %v\n", err)
+		os.Exit(1)
 	}
 
-	database, err := db.New(dsn)
+	database, err := db.New(cfg.Database.URL, cfg.Database.DropAndReseed)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize database")
 	}
 	defer database.Close()
 
-	ctx := context.Background()
-	store, err := storage.New(ctx)
+	store, err := storage.New(ctx, cfg.Storage)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize storage")
 	}
 
-	authSvc, err := auth.NewService(database)
+	authSvc, err := auth.NewService(database, cfg.Auth)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize auth")
 	}
 
-	aiSvc, err := ai.NewService(ctx, database, store)
+	reminderQueue := reminderqueue.New(cfg.Reminders, cfg.Auth.APIBaseURL)
+	aiSvc, err := ai.NewService(ctx, database, store, cfg.AI, cfg.Media, reminderQueue)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize AI service")
 	}
 
-	pushSvc, err := push.New(ctx)
+	pushSvc, err := push.New(ctx, cfg.Push)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize push sender")
 	}
 
 	// Log startup state once — not on each request.
-	backend := os.Getenv("STORAGE_BACKEND")
-	if backend == "" {
-		backend = "local"
-	}
-	evt := log.Info().Int("port", *port).Str("storage", backend)
+	evt := log.Info().
+		Str("environment", string(cfg.Environment)).
+		Int("port", *port).
+		Str("storage", cfg.Storage.Backend)
 	if aiSvc != nil {
 		evt = evt.Str("model", aiSvc.Model())
 	} else {
 		evt = evt.Bool("ai_enabled", false)
 	}
-	if os.Getenv("TMDB_API_KEY") == "" {
-		evt = evt.Bool("tmdb", false)
-	}
-	evt = evt.Bool("push", pushSvc != nil)
+	cloudTasksEnabled := cfg.Reminders.CloudTasksProject != "" &&
+		cfg.Reminders.CloudTasksQueue != "" &&
+		cfg.Reminders.CronSecret != ""
+	evt = evt.
+		Bool("tmdb", cfg.Media.TMDBAPIKey != "").
+		Bool("places", cfg.Media.GooglePlacesAPIKey != "").
+		Bool("cloud_tasks", cloudTasksEnabled).
+		Bool("push", pushSvc != nil)
 	evt.Msg("sajni started")
 
 	deps := api.Deps{
-		DB:      database,
-		Auth:    authSvc,
-		Storage: store,
-		AI:      aiSvc,
-		Push:    pushSvc,
+		Environment:   cfg.Environment,
+		HTTP:          cfg.HTTP,
+		Media:         cfg.Media,
+		Reminders:     cfg.Reminders,
+		ReminderQueue: reminderQueue,
+		DB:            database,
+		Auth:          authSvc,
+		Storage:       store,
+		AI:            aiSvc,
+		Push:          pushSvc,
 	}
 	handler := api.Router(deps)
 

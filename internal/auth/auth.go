@@ -12,13 +12,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 
+	"sajni/internal/config"
 	"sajni/internal/db"
 )
 
@@ -70,50 +70,30 @@ type Service struct {
 	DevAuthName   string
 }
 
-// NewService reads required env, returns an error if anything load-bearing
-// is missing.
-func NewService(database *db.DB) (*Service, error) {
-	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
+// NewService returns an error if load-bearing auth configuration is missing.
+func NewService(database *db.DB, cfg config.Auth) (*Service, error) {
+	if cfg.JWTSecret == "" {
 		return nil, errors.New("JWT_SECRET is required")
 	}
-	appURL := strings.TrimRight(os.Getenv("APP_URL"), "/")
-	if appURL == "" {
-		appURL = "http://localhost:5173"
-	}
-	apiBase := strings.TrimRight(os.Getenv("API_BASE_URL"), "/")
-	if apiBase == "" {
-		apiBase = "http://localhost:8080"
-	}
-	devAuthEmail := strings.ToLower(strings.TrimSpace(os.Getenv("DEV_AUTH_BYPASS_EMAIL")))
-	if devAuthEmail == "" {
-		devAuthEmail = "dev@sajni.local"
-	}
-	devAuthName := strings.TrimSpace(os.Getenv("DEV_AUTH_BYPASS_NAME"))
-	if devAuthName == "" {
-		devAuthName = "Sajni Dev"
-	}
-	resendAPIKey := os.Getenv("RESEND_API_KEY")
-	devLogEmailCodes := os.Getenv("AUTH_DEV_CODE_LOG") == "1"
-	if resendAPIKey == "" && !devLogEmailCodes {
+	if cfg.ResendAPIKey == "" && !cfg.DevLogEmailCodes {
 		return nil, errors.New("RESEND_API_KEY is required unless AUTH_DEV_CODE_LOG=1")
 	}
 	return &Service{
 		DB:                 database,
-		JWTSecret:          []byte(secret),
-		CookieInsecure:     os.Getenv("COOKIE_INSECURE") == "1",
-		AppURL:             appURL,
-		APIBase:            apiBase,
-		GoogleClientID:     os.Getenv("GOOGLE_OAUTH_CLIENT_ID"),
-		GoogleClientSecret: os.Getenv("GOOGLE_OAUTH_CLIENT_SECRET"),
-		GithubClientID:     os.Getenv("GITHUB_OAUTH_CLIENT_ID"),
-		GithubClientSecret: os.Getenv("GITHUB_OAUTH_CLIENT_SECRET"),
-		ResendAPIKey:       resendAPIKey,
-		EmailFrom:          os.Getenv("EMAIL_FROM"),
-		DevLogEmailCodes:   devLogEmailCodes,
-		DevAuthBypass:      os.Getenv("DEV_AUTH_BYPASS") == "1",
-		DevAuthEmail:       devAuthEmail,
-		DevAuthName:        devAuthName,
+		JWTSecret:          []byte(cfg.JWTSecret),
+		CookieInsecure:     cfg.CookieInsecure,
+		AppURL:             cfg.AppURL,
+		APIBase:            cfg.APIBaseURL,
+		GoogleClientID:     cfg.GoogleClientID,
+		GoogleClientSecret: cfg.GoogleClientSecret,
+		GithubClientID:     cfg.GitHubClientID,
+		GithubClientSecret: cfg.GitHubClientSecret,
+		ResendAPIKey:       cfg.ResendAPIKey,
+		EmailFrom:          cfg.EmailFrom,
+		DevLogEmailCodes:   cfg.DevLogEmailCodes,
+		DevAuthBypass:      cfg.DevAuthBypass,
+		DevAuthEmail:       cfg.DevAuthBypassEmail,
+		DevAuthName:        cfg.DevAuthBypassName,
 	}, nil
 }
 

@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 )
@@ -29,12 +28,12 @@ type mediaMeta struct {
 // enrichMediaMeta resolves real metadata for a title by type. Best-effort:
 // returns a zero mediaMeta when the relevant API key is unset or nothing
 // matches, so the add never fails on enrichment.
-func enrichMediaMeta(ctx context.Context, title, mtype string) mediaMeta {
+func enrichMediaMeta(ctx context.Context, title, mtype, tmdbAPIKey string) mediaMeta {
 	switch mtype {
 	case "book":
 		return enrichBook(ctx, title)
 	default: // movie / show
-		return enrichTMDB(ctx, title, mtype)
+		return enrichTMDB(ctx, title, mtype, tmdbAPIKey)
 	}
 }
 
@@ -53,8 +52,7 @@ func httpGetJSON(ctx context.Context, u string, out any) error {
 
 // enrichTMDB searches TMDB, takes the top hit, then pulls its detail record
 // for genre names and (for shows) season/episode counts.
-func enrichTMDB(ctx context.Context, title, mtype string) mediaMeta {
-	apiKey := os.Getenv("TMDB_API_KEY")
+func enrichTMDB(ctx context.Context, title, mtype, apiKey string) mediaMeta {
 	if apiKey == "" || title == "" {
 		return mediaMeta{}
 	}

@@ -9,51 +9,24 @@
 package main
 
 import (
-	"bufio"
+	"fmt"
 	"os"
-	"strings"
 
 	_ "time/tzdata"
 
 	"github.com/rs/zerolog/log"
 
+	"sajni/internal/config"
 	"sajni/internal/db"
-	"sajni/internal/logger"
 )
 
-func loadDotEnv(path string) {
-	f, err := os.Open(path)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		eq := strings.IndexByte(line, '=')
-		if eq <= 0 {
-			continue
-		}
-		key := strings.TrimSpace(line[:eq])
-		val := strings.Trim(strings.TrimSpace(line[eq+1:]), `"'`)
-		if _, set := os.LookupEnv(key); !set {
-			os.Setenv(key, val)
-		}
-	}
-}
-
 func main() {
-	loadDotEnv(".env")
-	logger.Init()
-
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		log.Fatal().Msg("DATABASE_URL is required")
+	databaseConfig, err := config.LoadDatabase(".env")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "configuration: %v\n", err)
+		os.Exit(1)
 	}
-	database, err := db.New(dsn)
+	database, err := db.New(databaseConfig.URL, databaseConfig.DropAndReseed)
 	if err != nil {
 		log.Fatal().Err(err).Msg("migrate failed")
 	}

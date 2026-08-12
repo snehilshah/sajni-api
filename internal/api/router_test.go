@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"sajni/internal/config"
 )
 
 func TestCorsLocalPrivateOrigin(t *testing.T) {
@@ -34,24 +36,22 @@ func TestCORSOriginPolicy(t *testing.T) {
 	tests := []struct {
 		name       string
 		allowed    string
-		allowLocal string
+		allowLocal bool
 		origin     string
 		wantOrigin string
 	}{
 		{name: "configured origin", allowed: "https://www.ohmysajni.com", origin: "https://www.ohmysajni.com", wantOrigin: "https://www.ohmysajni.com"},
 		{name: "unlisted origin", allowed: "https://www.ohmysajni.com", origin: "https://evil.example"},
 		{name: "missing config fails closed", origin: "https://evil.example"},
-		{name: "explicit local development", allowLocal: "1", origin: "http://192.168.1.22:5173", wantOrigin: "http://192.168.1.22:5173"},
-		{name: "local mode rejects public origin", allowLocal: "1", origin: "https://evil.example"},
+		{name: "explicit local development", allowLocal: true, origin: "http://192.168.1.22:5173", wantOrigin: "http://192.168.1.22:5173"},
+		{name: "local mode rejects public origin", allowLocal: true, origin: "https://evil.example"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("CORS_ORIGIN", tt.allowed)
-			t.Setenv("ALLOW_LOCAL_CORS", tt.allowLocal)
 			h := withCORS(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusNoContent)
-			}))
+			}), config.HTTP{CORSOrigin: tt.allowed, AllowLocalCORS: tt.allowLocal})
 			req := httptest.NewRequest(http.MethodGet, "/", nil)
 			req.Header.Set("Origin", tt.origin)
 			res := httptest.NewRecorder()

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"os"
 )
 
 // RegisterScheduledNotificationHandler mounts the one Cloud Scheduler target
@@ -15,7 +14,7 @@ func RegisterScheduledNotificationHandler(mux *http.ServeMux, deps Deps) {
 }
 
 func scheduledNotificationHandler(deps Deps) http.HandlerFunc {
-	expected := os.Getenv("REMINDER_CRON_SECRET")
+	expected := deps.Reminders.CronSecret
 	return func(w http.ResponseWriter, r *http.Request) {
 		if expected == "" || r.Header.Get("X-Reminder-Cron") != expected {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)

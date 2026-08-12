@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/mail"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -189,6 +188,8 @@ func userTZNow(ctx context.Context, d *db.DB, uid string) time.Time {
 func (s *Service) buildTools() []Tool {
 	d := s.db
 	store := s.store
+	tmdbAPIKey := s.tmdbAPIKey
+	queue := s.reminderQueue
 	return []Tool{
 		// ---------------- READ ----------------
 		{
@@ -443,7 +444,7 @@ func (s *Service) buildTools() []Tool {
 				"type": str("'movie' or 'show'. Defaults to movie."),
 			}, "q"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
-				return tmdbSearchTool(ctx, argStr(args, "q"), argStr(args, "type"))
+				return tmdbSearchTool(ctx, argStr(args, "q"), argStr(args, "type"), tmdbAPIKey)
 			},
 		},
 		{
@@ -483,7 +484,7 @@ func (s *Service) buildTools() []Tool {
 				"tags":             arrayOf(str(""), "Optional tag list."),
 			}, "title"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
-				return createTaskTool(ctx, d, uid, args)
+				return createTaskTool(ctx, d, queue, uid, args)
 			},
 		},
 		{
@@ -592,7 +593,7 @@ func (s *Service) buildTools() []Tool {
 				"remind":       boolean("Optional. Email the user at scheduled_at."),
 			}, "id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
-				return rescheduleTaskTool(ctx, d, uid, args)
+				return rescheduleTaskTool(ctx, d, queue, uid, args)
 			},
 		},
 		{
@@ -650,7 +651,7 @@ func (s *Service) buildTools() []Tool {
 				if err := d.QueryRowContext(ctx, `INSERT INTO task_reminders (user_id, task_id, remind_at) VALUES ($1,$2,$3) RETURNING id, remind_at`, uid, tid, at).Scan(&rid, &remindAt); err != nil {
 					return nil, nil, err
 				}
-				enqueueMultiReminder(ctx, rid, remindAt)
+				enqueueMultiReminder(ctx, queue, rid, remindAt)
 				return map[string]any{"id": rid, "task_id": tid, "remind_at": at},
 					map[string]any{"kind": "task_updated", "id": tid, "route": "/tasks"}, nil
 			},
@@ -899,7 +900,7 @@ func (s *Service) buildTools() []Tool {
 				"rating":       intg("Optional 1–5 star rating, only when user expressed one."),
 			}, "title", "type"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
-				return addMediaTool(ctx, d, uid, args)
+				return addMediaTool(ctx, d, uid, args, tmdbAPIKey)
 			},
 		},
 		{
@@ -1768,8 +1769,7 @@ func tmdbReleaseState(releaseDate string) string {
 	return "upcoming"
 }
 
-func tmdbSearchTool(ctx context.Context, query, mediaType string) (any, map[string]any, error) {
-	apiKey := os.Getenv("TMDB_API_KEY")
+func tmdbSearchTool(ctx context.Context, query, mediaType, apiKey string) (any, map[string]any, error) {
 	if apiKey == "" {
 		return nil, nil, fmt.Errorf("TMDB_API_KEY not configured")
 	}
@@ -2003,7 +2003,7 @@ func sanitizeAITaskEmails(in []string) []string {
 	return out
 }
 
-func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, uid string, args map[string]any) (any, map[string]any, error) {
 	title := argStr(args, "title")
 	if title == "" {
 		return nil, nil, fmt.Errorf("missing title")
@@ -2116,7 +2116,7 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 		return nil, nil, err
 	}
 	if remind && scheduledAt.Valid {
-		enqueueTaskReminder(ctx, id, scheduledAt.Time)
+		enqueueTaskReminder(ctx, queue, id, scheduledAt.Time)
 	}
 	contentForTags := title + " " + desc
 	for _, t := range argStrSlice(args, "tags") {
@@ -2133,7 +2133,7 @@ func createTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 // REST updateTask reschedule semantics: moving a past due day forward records
 // a 'rescheduled' lifecycle row (so the Missed banner stops counting it) and
 // an audit event; setting a time re-arms the reminder by clearing reminded_at.
-func rescheduleTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+func rescheduleTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, uid string, args map[string]any) (any, map[string]any, error) {
 	id := argInt(args, "id", 0)
 	if id == 0 {
 		return nil, nil, fmt.Errorf("missing id")
@@ -2191,7 +2191,7 @@ func rescheduleTaskTool(ctx context.Context, d *db.DB, uid string, args map[stri
 		d.ExecContext(ctx, `UPDATE tasks SET remind=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3`, argBool(args, "remind", false), id, uid)
 	}
 	if sched != "" || hasRemind {
-		enqueueTaskReminderFromDB(ctx, d, uid, int64(id))
+		enqueueTaskReminderFromDB(ctx, d, queue, uid, int64(id))
 	}
 
 	return map[string]any{"id": id, "due_date": due, "scheduled_at": sched},
@@ -2227,7 +2227,7 @@ func scratchTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		map[string]any{"kind": "task_updated", "id": id, "route": "/tasks"}, nil
 }
 
-func enqueueTaskReminderFromDB(ctx context.Context, d *db.DB, uid string, id int64) {
+func enqueueTaskReminderFromDB(ctx context.Context, d *db.DB, queue reminderqueue.Queue, uid string, id int64) {
 	var scheduledAt time.Time
 	err := d.QueryRowContext(ctx, `
 		SELECT scheduled_at
@@ -2246,17 +2246,17 @@ func enqueueTaskReminderFromDB(ctx context.Context, d *db.DB, uid string, id int
 		log.Warn().Err(err).Int64("task", id).Msg("AI reminder enqueue lookup failed")
 		return
 	}
-	enqueueTaskReminder(ctx, id, scheduledAt)
+	enqueueTaskReminder(ctx, queue, id, scheduledAt)
 }
 
-func enqueueTaskReminder(ctx context.Context, id int64, scheduledAt time.Time) {
-	if err := reminderqueue.EnqueueTask(ctx, id, scheduledAt); err != nil {
+func enqueueTaskReminder(ctx context.Context, queue reminderqueue.Queue, id int64, scheduledAt time.Time) {
+	if err := queue.EnqueueTask(ctx, id, scheduledAt); err != nil {
 		log.Warn().Err(err).Int64("task", id).Msg("AI reminder cloud task enqueue failed")
 	}
 }
 
-func enqueueMultiReminder(ctx context.Context, id int64, remindAt time.Time) {
-	if err := reminderqueue.EnqueueMulti(ctx, id, remindAt); err != nil {
+func enqueueMultiReminder(ctx context.Context, queue reminderqueue.Queue, id int64, remindAt time.Time) {
+	if err := queue.EnqueueMulti(ctx, id, remindAt); err != nil {
 		log.Warn().Err(err).Int64("reminder", id).Msg("AI task_reminder cloud task enqueue failed")
 	}
 }
@@ -3196,7 +3196,7 @@ func logAIMediaStatusEvent(ctx context.Context, d *db.DB, uid string, mediaID in
 	}
 }
 
-func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any, tmdbAPIKey string) (any, map[string]any, error) {
 	title := argStr(args, "title")
 	mtype := argStr(args, "type")
 	if title == "" || mtype == "" {
@@ -3252,7 +3252,7 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	var seasonsTotal, episodesTotal int
 	var seasonEpisodes []int
 	if extID == "" {
-		meta := enrichMediaMeta(ctx, title, mtype)
+		meta := enrichMediaMeta(ctx, title, mtype, tmdbAPIKey)
 		extID = meta.ExternalID
 		if poster == "" {
 			poster = meta.PosterURL

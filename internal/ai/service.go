@@ -12,14 +12,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
-	"os"
 	"regexp"
 	"strings"
 
 	"github.com/rs/zerolog/log"
 	"google.golang.org/genai"
 
+	"sajni/internal/config"
 	"sajni/internal/db"
+	"sajni/internal/reminderqueue"
 	"sajni/internal/storage"
 )
 
@@ -35,9 +36,6 @@ func functionCallKey(fc *genai.FunctionCall) string {
 }
 
 const (
-	// gemini-3.5-flash is the active default model; override with GEMINI_MODEL
-	// if you want to A/B against another model.
-	defaultModel = "gemini-3.5-flash"
 	// Tool budget. A typical palette answer needs: get_current_context →
 	// list_* → maybe cross-check → final text. Chat is bumped to 10 so a
 	// "I watched X, recommend another" style request has room for
@@ -72,11 +70,13 @@ func newEvent(t string, v any) Event {
 // disabled (no GEMINI_API_KEY). Construct once at startup; reuse per
 // request.
 type Service struct {
-	db     *db.DB
-	store  storage.Storage
-	client modelClient
-	model  string
-	tools  []Tool
+	db            *db.DB
+	store         storage.Storage
+	client        modelClient
+	model         string
+	tools         []Tool
+	tmdbAPIKey    string
+	reminderQueue reminderqueue.Queue
 }
 
 // modelClient is the part of Gemini consumed by Sajni. Keeping this interface
@@ -99,27 +99,24 @@ func (g geminiModels) GenerateContentStream(ctx context.Context, model string, c
 
 // NewService initializes a Gemini client. Returns (nil, nil) if no
 // GEMINI_API_KEY is set — the HTTP layer should treat that as a 503.
-func NewService(ctx context.Context, database *db.DB, store storage.Storage) (*Service, error) {
-	key := os.Getenv("GEMINI_API_KEY")
-	if key == "" {
+func NewService(ctx context.Context, database *db.DB, store storage.Storage, cfg config.AI, media config.Media, queue reminderqueue.Queue) (*Service, error) {
+	if cfg.GeminiAPIKey == "" {
 		return nil, nil
 	}
 	client, err := genai.NewClient(ctx, &genai.ClientConfig{
-		APIKey:  key,
+		APIKey:  cfg.GeminiAPIKey,
 		Backend: genai.BackendGeminiAPI,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("gemini client: %w", err)
 	}
-	model := os.Getenv("GEMINI_MODEL")
-	if model == "" {
-		model = defaultModel
-	}
 	s := &Service{
-		db:     database,
-		store:  store,
-		client: geminiModels{models: client.Models},
-		model:  model,
+		db:            database,
+		store:         store,
+		client:        geminiModels{models: client.Models},
+		model:         cfg.GeminiModel,
+		tmdbAPIKey:    media.TMDBAPIKey,
+		reminderQueue: queue,
 	}
 	s.tools = s.buildTools()
 	return s, nil

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -70,7 +69,7 @@ func RegisterReminderCronHandler(mux *http.ServeMux, deps Deps) {
 }
 
 func reminderCronHandler(deps Deps) http.HandlerFunc {
-	expected := os.Getenv("REMINDER_CRON_SECRET")
+	expected := deps.Reminders.CronSecret
 	return func(w http.ResponseWriter, r *http.Request) {
 		if expected == "" || r.Header.Get("X-Reminder-Cron") != expected {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -86,7 +85,7 @@ func reminderCronHandler(deps Deps) http.HandlerFunc {
 }
 
 func reminderFireHandler(deps Deps) http.HandlerFunc {
-	expected := os.Getenv("REMINDER_CRON_SECRET")
+	expected := deps.Reminders.CronSecret
 	return func(w http.ResponseWriter, r *http.Request) {
 		if expected == "" || r.Header.Get("X-Reminder-Cron") != expected {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -505,7 +504,7 @@ func sendSingleMultiReminder(ctx context.Context, deps Deps, id int64) (bool, er
 	return n == 1, nil
 }
 
-func enqueueTaskReminderFromDB(ctx context.Context, d *db.DB, uid string, id int64) {
+func enqueueTaskReminderFromDB(ctx context.Context, d *db.DB, queue reminderqueue.Queue, uid string, id int64) {
 	var scheduledAt time.Time
 	err := d.QueryRowContext(ctx, `
 		SELECT scheduled_at
@@ -524,13 +523,13 @@ func enqueueTaskReminderFromDB(ctx context.Context, d *db.DB, uid string, id int
 		log.Warn().Err(err).Int64("task", id).Msg("reminder enqueue lookup failed")
 		return
 	}
-	if err := reminderqueue.EnqueueTask(ctx, id, scheduledAt); err != nil {
+	if err := queue.EnqueueTask(ctx, id, scheduledAt); err != nil {
 		log.Warn().Err(err).Int64("task", id).Msg("reminder cloud task enqueue failed")
 	}
 }
 
-func enqueueMultiReminder(ctx context.Context, id int64, remindAt time.Time) {
-	if err := reminderqueue.EnqueueMulti(ctx, id, remindAt); err != nil {
+func enqueueMultiReminder(ctx context.Context, queue reminderqueue.Queue, id int64, remindAt time.Time) {
+	if err := queue.EnqueueMulti(ctx, id, remindAt); err != nil {
 		log.Warn().Err(err).Int64("reminder", id).Msg("task_reminder cloud task enqueue failed")
 	}
 }
@@ -603,7 +602,7 @@ func addTaskReminder(deps Deps) http.HandlerFunc {
 			errJSON(w, 500, err.Error())
 			return
 		}
-		enqueueMultiReminder(r.Context(), rid, remindAt)
+		enqueueMultiReminder(r.Context(), deps.ReminderQueue, rid, remindAt)
 		writeJSON(w, 201, map[string]int64{"id": rid})
 	}
 }
