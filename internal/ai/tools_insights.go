@@ -82,7 +82,6 @@ func timeTravelTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	if to != "" {
 		dateClause += " AND %s <= $" + itoaInt(idx)
 		dateArgs = append(dateArgs, to)
-		idx++
 	}
 	expand := func(col string) string {
 		return strings.ReplaceAll(dateClause, "%s", col)

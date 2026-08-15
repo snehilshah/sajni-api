@@ -430,7 +430,6 @@ func listTasks(deps Deps) http.HandlerFunc {
 		if cd := queryParam(r, "completed_date"); cd != "" {
 			clauses = append(clauses, "t.status = 'done' AND t.updated_at::date = $"+itoa(ph))
 			args = append(args, cd)
-			ph++
 		}
 
 		// My Day is a derived view (not manually drag-ordered), so it leads

@@ -58,7 +58,6 @@ func listBookmarks(deps Deps) http.HandlerFunc {
 		if k := queryParam(r, "kind"); k == "video" || k == "site" {
 			clauses = append(clauses, "kind = $"+itoa(ph))
 			args = append(args, k)
-			ph++
 		}
 		switch queryParam(r, "unread") {
 		case "true":
@@ -75,7 +74,6 @@ func listBookmarks(deps Deps) http.HandlerFunc {
 		if s := queryParam(r, "search"); s != "" {
 			clauses = append(clauses, "(title ILIKE $"+itoa(ph)+" OR url ILIKE $"+itoa(ph)+" OR note ILIKE $"+itoa(ph)+" OR site_name ILIKE $"+itoa(ph)+")")
 			args = append(args, "%"+s+"%")
-			ph++
 		}
 
 		q := "SELECT " + bookmarkCols + " FROM bookmarks WHERE " + strings.Join(clauses, " AND ") + " ORDER BY created_at DESC"

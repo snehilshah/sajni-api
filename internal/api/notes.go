@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/rs/zerolog/log"
+
 	sharednote "sajni/internal/note"
 	"sajni/internal/storage"
 )
@@ -66,7 +68,6 @@ func listNotes(deps Deps) http.HandlerFunc {
 		if folder := queryParam(r, "folder"); folder != "" {
 			clauses = append(clauses, "n.folder = $"+itoa(ph))
 			args = append(args, normalizeFolder(folder))
-			ph++
 		}
 
 		q := base + " WHERE " + strings.Join(clauses, " AND ") + " ORDER BY n.pinned DESC, n.updated_at DESC"
@@ -292,7 +293,7 @@ func deleteNote(deps Deps) http.HandlerFunc {
 		d.QueryRow("SELECT blob_key FROM notes WHERE id = $1 AND user_id = $2", id, uid).Scan(&blobKey)
 		if blobKey != "" {
 			if err := deps.Storage.Delete(r.Context(), blobKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
-				// best-effort
+				log.Ctx(r.Context()).Warn().Err(err).Int64("note_id", id).Msg("delete note blob")
 			}
 		}
 

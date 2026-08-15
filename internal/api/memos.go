@@ -36,7 +36,6 @@ func listMemos(deps Deps) http.HandlerFunc {
 			base = "SELECT m.id, m.content, m.pinned, m.created_at, m.updated_at FROM memos m INNER JOIN tags t ON t.user_id = m.user_id AND t.entity_type = 'memo' AND t.entity_id = m.id"
 			clauses = append(clauses, "t.tag = $"+itoa(ph))
 			args = append(args, tag)
-			ph++
 		}
 
 		q := base + " WHERE " + strings.Join(clauses, " AND ") + " ORDER BY m.pinned DESC, m.created_at DESC"

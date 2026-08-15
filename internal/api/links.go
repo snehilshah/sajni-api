@@ -18,7 +18,6 @@ type sqlRunner interface {
 
 var (
 	backlinkRe = regexp.MustCompile(`\[\[([^\]\n|]+)(?:\|[^\]\n]*)?\]\]`)
-	dateRe     = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 )
 
 // NormalizeRef trims whitespace and lowercases a wiki-link reference for matching.

@@ -76,7 +76,7 @@ func updateSlateTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		return nil, nil, fmt.Errorf("slate not found")
 	}
 	if isPlain {
-		return nil, nil, fmt.Errorf("Plain cannot be renamed or archived")
+		return nil, nil, fmt.Errorf("plain cannot be renamed or archived")
 	}
 
 	if n := strings.TrimSpace(argStr(args, "name")); n != "" {

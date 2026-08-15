@@ -157,9 +157,10 @@ func isDefaultCategoryName(kind, name string) bool {
 		Color string
 		Icon  string
 	}
-	if kind == "income" {
+	switch kind {
+	case "income":
 		defaults = defaultIncomeCategories
-	} else if kind == "expense" {
+	case "expense":
 		defaults = defaultExpenseCategories
 	}
 	for _, category := range defaults {
@@ -664,7 +665,6 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		if v := queryParam(r, "slate_id"); v != "" {
 			clauses = append(clauses, "t.slate_id = $"+itoa(ph))
 			args = append(args, v)
-			ph++
 		}
 
 		limit := 200

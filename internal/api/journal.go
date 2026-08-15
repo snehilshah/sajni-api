@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog/log"
+
 	"sajni/internal/db"
 	"sajni/internal/habitperiod"
 	"sajni/internal/storage"
@@ -484,7 +486,7 @@ func deleteJournalEntry(deps Deps) http.HandlerFunc {
 		}
 
 		if err := deps.Storage.Delete(r.Context(), journalKey(uid, date)); err != nil && !errors.Is(err, storage.ErrNotFound) {
-			// Log-and-continue: DB row should still go.
+			log.Ctx(r.Context()).Warn().Err(err).Str("date", date).Msg("delete journal blob")
 		}
 
 		d.Exec("DELETE FROM tags WHERE user_id = $1 AND entity_type = 'journal' AND entity_id = $2", uid, id)
@@ -658,7 +660,7 @@ func deleteWeeklyEntry(deps Deps) http.HandlerFunc {
 			return
 		}
 		if err := deps.Storage.Delete(r.Context(), weeklyKey(uid, year, week)); err != nil && !errors.Is(err, storage.ErrNotFound) {
-			// log-and-continue
+			log.Ctx(r.Context()).Warn().Err(err).Int("year", year).Int("week", week).Msg("delete weekly journal blob")
 		}
 		d.Exec("DELETE FROM journal_weekly WHERE id = $1 AND user_id = $2", id, uid)
 		writeJSON(w, 200, map[string]string{"status": "ok"})
@@ -1020,7 +1022,7 @@ func deleteMonthlyEntry(deps Deps) http.HandlerFunc {
 			return
 		}
 		if err := deps.Storage.Delete(r.Context(), monthlyKey(uid, year, month)); err != nil && !errors.Is(err, storage.ErrNotFound) {
-			// log-and-continue
+			log.Ctx(r.Context()).Warn().Err(err).Int("year", year).Int("month", month).Msg("delete monthly journal blob")
 		}
 		d.Exec("DELETE FROM journal_monthly WHERE id = $1 AND user_id = $2", id, uid)
 		writeJSON(w, 200, map[string]string{"status": "ok"})

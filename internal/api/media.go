@@ -248,7 +248,6 @@ func listMedia(deps Deps) http.HandlerFunc {
 		if c := queryParam(r, "collection_id"); c != "" {
 			clauses = append(clauses, "collection_id = $"+itoa(ph))
 			args = append(args, c)
-			ph++
 		}
 
 		q := `SELECT m.id, m.title, m.type, m.status, m.rating, m.notes, m.platform, m.poster_url,

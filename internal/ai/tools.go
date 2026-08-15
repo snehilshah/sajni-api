@@ -150,14 +150,6 @@ func argInt64Slice(args map[string]any, k string) []int64 {
 	return nil
 }
 
-// nullableStr returns nil for empty strings so we get NULL in DB instead of "".
-func nullableStr(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
-}
-
 // userTZLoc resolves the user's captured IANA timezone, falling back to
 // Asia/Kolkata for older accounts without one. Cloud Run runs UTC, so deriving a
 // "today" or a due-date from a bare time.Now() shifts the day by 5.5h and
@@ -1815,7 +1807,7 @@ func tmdbSearchTool(ctx context.Context, query, mediaType, apiKey string) (any, 
 			poster = "https://image.tmdb.org/t/p/w300" + poster
 		}
 		overview, _ := item["overview"].(string)
-		var idRaw any = item["id"]
+		idRaw := item["id"]
 		out = append(out, map[string]any{
 			"external_id":   fmt.Sprintf("tmdb:%s:%v", endpoint, idRaw),
 			"title":         title,
@@ -3328,7 +3320,7 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	date := argStr(args, "date")
 
 	// Resolve Category
-	var catID int64 = argInt(args, "category_id", 0)
+	catID := argInt(args, "category_id", 0)
 	catName := strings.TrimSpace(argStr(args, "category_name"))
 
 	if catID == 0 && catName != "" {

@@ -521,8 +521,8 @@ func timeTravelHandler(deps Deps) http.HandlerFunc {
 		}
 		limit := 25
 		if v := queryParam(r, "limit"); v != "" {
-			if n, err := fmt.Sscanf(v, "%d", &limit); err == nil && n > 0 {
-				// no-op
+			if _, err := fmt.Sscanf(v, "%d", &limit); err != nil || limit <= 0 {
+				limit = 25
 			}
 		}
 		if len(hits) > limit {
