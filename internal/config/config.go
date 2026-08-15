@@ -141,7 +141,7 @@ func Load(dotEnvPath string) (Config, error) {
 		},
 		AI: AI{
 			GeminiAPIKey: os.Getenv("GEMINI_API_KEY"),
-			GeminiModel:  strings.TrimSpace(os.Getenv("GEMINI_MODEL")),
+			GeminiModel:  "gemini-3.7-flash",
 		},
 		Media: Media{
 			TMDBAPIKey:         os.Getenv("TMDB_API_KEY"),
@@ -211,9 +211,6 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Auth.DevAuthBypassName == "" {
 		cfg.Auth.DevAuthBypassName = "Sajni Dev"
-	}
-	if cfg.AI.GeminiModel == "" {
-		cfg.AI.GeminiModel = "gemini-3.5-flash"
 	}
 	if cfg.Reminders.CloudTasksLocation == "" {
 		cfg.Reminders.CloudTasksLocation = "asia-south1"
