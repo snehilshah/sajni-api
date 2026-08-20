@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"sajni/internal/auth/providers"
+	"sajni/internal/profile"
 )
 
 // makeOAuthState returns a stateless, tamper-evident OAuth state value.
@@ -100,14 +101,15 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux) {
 
 // userResponse mirrors the shape /me + auth-success bodies use.
 type userResponse struct {
-	ID            string             `json:"id"`
-	Email         string             `json:"email"`
-	Name          string             `json:"name"`
-	Timezone      string             `json:"timezone"`
-	NotifyChannel string             `json:"notify_channel"`
-	OnboardedAt   *string            `json:"onboarded_at"`
-	Identities    []identityResponse `json:"identities"`
-	DeletedAt     *string            `json:"deleted_at,omitempty"`
+	ID             string             `json:"id"`
+	Email          string             `json:"email"`
+	Name           string             `json:"name"`
+	AvatarRevision int64              `json:"avatar_revision"`
+	Timezone       string             `json:"timezone"`
+	NotifyChannel  string             `json:"notify_channel"`
+	OnboardedAt    *string            `json:"onboarded_at"`
+	Identities     []identityResponse `json:"identities"`
+	DeletedAt      *string            `json:"deleted_at,omitempty"`
 }
 
 type identityResponse struct {
@@ -132,19 +134,20 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 // loadUser fills userResponse from a single users row + identities join.
 func (s *Service) loadUser(ctx context.Context, id string) (*userResponse, error) {
 	var (
-		email, name string
-		tz          sql.NullString
-		channel     string
-		onboarded   sql.NullTime
-		deleted     sql.NullTime
+		email, name    string
+		tz             sql.NullString
+		channel        string
+		avatarRevision int64
+		onboarded      sql.NullTime
+		deleted        sql.NullTime
 	)
 	err := s.DB.QueryRowContext(ctx,
-		`SELECT email, name, timezone, COALESCE(notify_channel,'both'), onboarded_at, deleted_at FROM users WHERE id=$1`, id,
-	).Scan(&email, &name, &tz, &channel, &onboarded, &deleted)
+		`SELECT email, name, avatar_revision, timezone, COALESCE(notify_channel,'both'), onboarded_at, deleted_at FROM users WHERE id=$1`, id,
+	).Scan(&email, &name, &avatarRevision, &tz, &channel, &onboarded, &deleted)
 	if err != nil {
 		return nil, err
 	}
-	resp := &userResponse{ID: id, Email: email, Name: name, Timezone: tz.String, NotifyChannel: channel, Identities: []identityResponse{}}
+	resp := &userResponse{ID: id, Email: email, Name: name, AvatarRevision: avatarRevision, Timezone: tz.String, NotifyChannel: channel, Identities: []identityResponse{}}
 	if onboarded.Valid {
 		v := onboarded.Time.UTC().Format(time.RFC3339)
 		resp.OnboardedAt = &v
@@ -559,6 +562,23 @@ func (s *Service) HandleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.DB.ExecContext(r.Context(),
 		`UPDATE users SET name=$2 WHERE id=$1`, id, name,
 	); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	u, err := s.loadUser(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, u)
+}
+
+// HandleRerollAvatar changes the deterministic avatar seed without storing an
+// image. Returning the regular user payload keeps the client auth context as
+// the single owner of live profile state.
+func (s *Service) HandleRerollAvatar(w http.ResponseWriter, r *http.Request) {
+	id := MustUserID(r.Context())
+	if _, err := profile.RerollAvatar(r.Context(), s.DB, id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}

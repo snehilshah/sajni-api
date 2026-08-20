@@ -983,6 +983,15 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "reroll_avatar",
+			Description: "Generate a different profile avatar for the user. The new avatar stays consistent across pages, sessions, and devices until rerolled again.",
+			Mutating:    true,
+			Schema:      obj(map[string]*genai.Schema{}),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return rerollAvatarTool(ctx, d, uid)
+			},
+		},
+		{
 			Name:        "generate_theme",
 			Description: "Generate a new Material 3 color theme from a natural-language prompt (e.g. 'dusty rose calm dark-leaning' or 'forest morning'). Picks primary, secondary, tertiary, and neutral seed colors. Saves the theme to the user's profile; pass activate=true to make it the active one immediately.",
 			Mutating:    true,

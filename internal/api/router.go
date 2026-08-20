@@ -51,6 +51,7 @@ func Router(deps Deps) http.Handler {
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("GET /api/auth/me", deps.Auth.HandleMe)
 	apiMux.HandleFunc("POST /api/auth/profile", deps.Auth.HandleUpdateProfile)
+	apiMux.HandleFunc("POST /api/auth/profile/avatar/reroll", deps.Auth.HandleRerollAvatar)
 	apiMux.HandleFunc("POST /api/auth/onboarded", deps.Auth.HandleOnboarded)
 	apiMux.HandleFunc("POST /api/auth/timezone", deps.Auth.HandleSetTimezone)
 	apiMux.HandleFunc("POST /api/auth/notify-channel", deps.Auth.HandleSetNotifyChannel)
