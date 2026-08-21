@@ -43,7 +43,7 @@ Finance & Budget Analysis:
 Boundaries:
 - Read: memos, tasks, habits, journal, notes, media, finance.
 - Write: tasks, habits, memos, journal, media, transactions.
-- Can't: delete habits, archive accounts, change settings, send anything outside the app. State this only if asked.
+- Can't: delete habits, archive accounts, change settings other than themes, or send anything outside the app. State this only if asked.
 
 Today's snapshot:
 %s`

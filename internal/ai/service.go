@@ -182,6 +182,53 @@ func (s *Service) QuickGenerate(ctx context.Context, system, user string) (strin
 	return strings.TrimSpace(out.String()), nil
 }
 
+// GenerateThemePalette is the structured-output path used only by AI themes.
+// Unlike QuickGenerate, Gemini is constrained to return the exact palette
+// object, so callers do not need markdown-fence or stray-prose cleanup.
+func (s *Service) GenerateThemePalette(ctx context.Context, system, user string) (string, error) {
+	temp := float32(0.4)
+	maxOut := int32(160)
+	thinkBudget := int32(0)
+	hex := &genai.Schema{
+		Type:        genai.TypeString,
+		Pattern:     `^#[0-9A-Fa-f]{6}$`,
+		Description: "A six-digit hexadecimal color with a leading #.",
+	}
+	cfg := &genai.GenerateContentConfig{
+		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: system}}},
+		Temperature:       &temp,
+		MaxOutputTokens:   maxOut,
+		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
+		ResponseMIMEType:  "application/json",
+		ResponseSchema: &genai.Schema{
+			Type: genai.TypeObject,
+			Properties: map[string]*genai.Schema{
+				"name": {
+					Type:        genai.TypeString,
+					Description: "An evocative theme name containing two to four words.",
+				},
+				"primary":   hex,
+				"secondary": hex,
+				"tertiary":  hex,
+				"neutral":   hex,
+			},
+			Required:         []string{"name", "primary", "secondary", "tertiary", "neutral"},
+			PropertyOrdering: []string{"name", "primary", "secondary", "tertiary", "neutral"},
+		},
+	}
+	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
+		{Role: "user", Parts: []*genai.Part{{Text: user}}},
+	}, cfg)
+	if err != nil {
+		return "", err
+	}
+	out := strings.TrimSpace(collectText(resp))
+	if out == "" {
+		return "", fmt.Errorf("Gemini returned an empty theme")
+	}
+	return out, nil
+}
+
 // ChatRequest is the input for one user turn.
 type ChatRequest struct {
 	UserID  string

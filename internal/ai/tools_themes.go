@@ -14,10 +14,8 @@ func generateThemeTool(ctx context.Context, s *Service, uid string, args map[str
 	if prompt == "" {
 		return nil, nil, fmt.Errorf("missing prompt")
 	}
-	modePref := argStr(args, "mode_pref")
-	activate := argBool(args, "activate", false)
 
-	t, err := theme.Generate(ctx, s, s.db, uid, prompt, modePref, activate)
+	t, err := theme.Generate(ctx, s, s.db, uid, prompt)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -27,12 +25,12 @@ func generateThemeTool(ctx context.Context, s *Service, uid string, args map[str
 			"seeds":     t.Seeds,
 			"is_active": t.IsActive,
 		},
-		map[string]any{"kind": "theme_created", "id": t.ID, "title": t.Name, "route": "/settings#themes", "activated": activate}, nil
+		map[string]any{"kind": "theme_created", "id": t.ID, "title": t.Name, "route": "/settings#themes"}, nil
 }
 
 func listThemesTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
-	rows, err := d.QueryContext(ctx, `SELECT id, name, source, seeds, is_active, created_at::text
-		FROM user_themes WHERE user_id = $1 ORDER BY is_active DESC, created_at DESC`, uid)
+	rows, err := d.QueryContext(ctx, `SELECT id, name, seeds, is_active, created_at::text
+		FROM user_themes WHERE user_id = $1 ORDER BY created_at DESC, id DESC`, uid)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -40,16 +38,23 @@ func listThemesTool(ctx context.Context, d *db.DB, uid string) (any, map[string]
 	out := []map[string]any{}
 	for rows.Next() {
 		var id int64
-		var name, source, created string
+		var name, created string
 		var seedsRaw []byte
 		var active bool
-		rows.Scan(&id, &name, &source, &seedsRaw, &active, &created)
+		if err := rows.Scan(&id, &name, &seedsRaw, &active, &created); err != nil {
+			return nil, nil, err
+		}
 		var seeds theme.Seeds
-		json.Unmarshal(seedsRaw, &seeds)
+		if err := json.Unmarshal(seedsRaw, &seeds); err != nil {
+			return nil, nil, err
+		}
 		out = append(out, map[string]any{
-			"id": id, "name": name, "source": source,
-			"seeds": seeds, "is_active": active, "created_at": created,
+			"id": id, "name": name, "seeds": seeds,
+			"is_active": active, "created_at": created,
 		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
 	}
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }

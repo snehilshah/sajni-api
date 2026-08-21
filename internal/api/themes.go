@@ -10,161 +10,104 @@ import (
 	"sajni/internal/theme"
 )
 
-// Themes = user-owned M3 color palettes. Each row stores 2–4 seed hex
-// colors; the frontend derives the full token set via Google's
-// material-color-utilities. The heavy lifting (Gemini prompt, hex
-// validation, atomic activation) lives in internal/theme so both the
-// HTTP handler below and the AI tool can share it.
-
 func registerThemeRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/themes", listThemesHandler(deps))
 	mux.HandleFunc("GET /api/themes/active", getActiveTheme(deps))
-	mux.HandleFunc("POST /api/themes", createThemeHandler(deps))
 	mux.HandleFunc("POST /api/themes/generate", generateThemeHandler(deps))
-	mux.HandleFunc("PUT /api/themes/{id}", updateThemeHandler(deps))
 	mux.HandleFunc("DELETE /api/themes/{id}", deleteThemeHandler(deps))
 	mux.HandleFunc("POST /api/themes/deactivate", deactivateThemeHandler(deps))
 	mux.HandleFunc("POST /api/themes/{id}/activate", activateThemeHandler(deps))
 }
 
 func listThemesHandler(deps Deps) http.HandlerFunc {
-	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
-		rows, err := d.Query(`SELECT id, name, source, seeds, prompt, mode_pref, is_active, created_at::text
+		rows, err := deps.DB.QueryContext(r.Context(), `SELECT id, name, seeds, prompt, is_active, created_at::text
 			FROM user_themes WHERE user_id = $1
-			ORDER BY is_active DESC, created_at DESC`, uid)
+			ORDER BY created_at DESC, id DESC`, uid)
 		if err != nil {
-			errJSON(w, 500, err.Error())
+			internalError(w, r, "list themes", err)
 			return
 		}
 		defer rows.Close()
+
 		out := []theme.Theme{}
 		for rows.Next() {
 			var t theme.Theme
 			var seedsRaw []byte
-			rows.Scan(&t.ID, &t.Name, &t.Source, &seedsRaw, &t.Prompt, &t.ModePref, &t.IsActive, &t.CreatedAt)
-			json.Unmarshal(seedsRaw, &t.Seeds)
+			if err := rows.Scan(&t.ID, &t.Name, &seedsRaw, &t.Prompt, &t.IsActive, &t.CreatedAt); err != nil {
+				internalError(w, r, "scan theme", err)
+				return
+			}
+			if err := json.Unmarshal(seedsRaw, &t.Seeds); err != nil {
+				internalError(w, r, "decode theme seeds", err)
+				return
+			}
+			if err := theme.ValidateSeeds(&t.Seeds); err != nil {
+				internalError(w, r, "validate theme seeds", err)
+				return
+			}
 			out = append(out, t)
 		}
-		writeJSON(w, 200, out)
+		if err := rows.Err(); err != nil {
+			internalError(w, r, "iterate themes", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
 	}
 }
 
 func getActiveTheme(deps Deps) http.HandlerFunc {
-	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
 		var t theme.Theme
 		var seedsRaw []byte
-		err := d.QueryRow(`SELECT id, name, source, seeds, prompt, mode_pref, is_active, created_at::text
+		err := deps.DB.QueryRowContext(r.Context(), `SELECT id, name, seeds, prompt, is_active, created_at::text
 			FROM user_themes WHERE user_id = $1 AND is_active = TRUE LIMIT 1`, uid).
-			Scan(&t.ID, &t.Name, &t.Source, &seedsRaw, &t.Prompt, &t.ModePref, &t.IsActive, &t.CreatedAt)
+			Scan(&t.ID, &t.Name, &seedsRaw, &t.Prompt, &t.IsActive, &t.CreatedAt)
 		if errors.Is(err, sql.ErrNoRows) {
-			writeJSON(w, 200, nil)
+			writeJSON(w, http.StatusOK, nil)
 			return
 		}
 		if err != nil {
-			errJSON(w, 500, err.Error())
+			internalError(w, r, "get active theme", err)
 			return
 		}
-		json.Unmarshal(seedsRaw, &t.Seeds)
-		writeJSON(w, 200, t)
+		if err := json.Unmarshal(seedsRaw, &t.Seeds); err != nil {
+			internalError(w, r, "decode active theme seeds", err)
+			return
+		}
+		if err := theme.ValidateSeeds(&t.Seeds); err != nil {
+			internalError(w, r, "validate active theme seeds", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, t)
 	}
 }
 
-func createThemeHandler(deps Deps) http.HandlerFunc {
+func generateThemeHandler(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		uid := userID(r.Context())
-		var body struct {
-			Name     string      `json:"name"`
-			Seeds    theme.Seeds `json:"seeds"`
-			Source   string      `json:"source"`
-			Prompt   string      `json:"prompt"`
-			ModePref string      `json:"mode_pref"`
-			Activate bool        `json:"activate"`
-		}
-		if err := readJSON(r, &body); err != nil {
-			errJSON(w, 400, "invalid json")
-			return
-		}
-		if err := theme.ValidateSeeds(&body.Seeds); err != nil {
-			errJSON(w, 400, err.Error())
-			return
-		}
-		if body.Source == "" {
-			body.Source = "manual"
-		}
-		modePref, err := theme.NormalizeModePref(body.ModePref)
-		if err != nil {
-			errJSON(w, 400, err.Error())
-			return
-		}
-		body.ModePref = modePref
-		if body.Name == "" {
-			body.Name = "Untitled theme"
-		}
-		id, err := theme.Insert(r.Context(), deps.DB, uid, body.Name, body.Source, body.Prompt, body.ModePref, body.Seeds, body.Activate)
-		if err != nil {
-			errJSON(w, 500, err.Error())
-			return
-		}
-		writeJSON(w, 201, map[string]int64{"id": id})
-	}
-}
-
-func updateThemeHandler(deps Deps) http.HandlerFunc {
-	d := deps.DB
-	return func(w http.ResponseWriter, r *http.Request) {
-		uid := userID(r.Context())
-		id, err := intParam(r, "id")
-		if err != nil {
-			errJSON(w, 400, "invalid id")
+		if deps.AI == nil {
+			errJSON(w, http.StatusServiceUnavailable, "AI not configured")
 			return
 		}
 		var body struct {
-			Name     *string      `json:"name"`
-			Seeds    *theme.Seeds `json:"seeds"`
-			ModePref *string      `json:"mode_pref"`
+			Prompt string `json:"prompt"`
 		}
 		if err := readJSON(r, &body); err != nil {
-			errJSON(w, 400, "invalid json")
+			errJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
-		if body.Name != nil {
-			d.Exec(`UPDATE user_themes SET name = $1 WHERE id = $2 AND user_id = $3`, *body.Name, id, uid)
+		if strings.TrimSpace(body.Prompt) == "" {
+			errJSON(w, http.StatusBadRequest, "missing prompt")
+			return
 		}
-		if body.Seeds != nil {
-			if err := theme.ValidateSeeds(body.Seeds); err != nil {
-				errJSON(w, 400, err.Error())
-				return
-			}
-			seedsRaw, _ := json.Marshal(body.Seeds)
-			d.Exec(`UPDATE user_themes SET seeds = $1 WHERE id = $2 AND user_id = $3`, seedsRaw, id, uid)
-		}
-		if body.ModePref != nil {
-			modePref, err := theme.NormalizeModePref(*body.ModePref)
-			if err != nil {
-				errJSON(w, 400, err.Error())
-				return
-			}
-			d.Exec(`UPDATE user_themes SET mode_pref = $1 WHERE id = $2 AND user_id = $3`, modePref, id, uid)
-		}
-		writeJSON(w, 200, map[string]string{"status": "ok"})
-	}
-}
-
-func deleteThemeHandler(deps Deps) http.HandlerFunc {
-	d := deps.DB
-	return func(w http.ResponseWriter, r *http.Request) {
-		uid := userID(r.Context())
-		id, err := intParam(r, "id")
+		t, err := theme.Generate(r.Context(), deps.AI, deps.DB, userID(r.Context()), body.Prompt)
 		if err != nil {
-			errJSON(w, 400, "invalid id")
+			internalError(w, r, "generate theme", err)
 			return
 		}
-		d.Exec("DELETE FROM user_themes WHERE id = $1 AND user_id = $2", id, uid)
-		writeJSON(w, 200, map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusCreated, t)
 	}
 }
 
@@ -172,78 +115,57 @@ func activateThemeHandler(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
 		id, err := intParam(r, "id")
-		if err != nil {
-			errJSON(w, 400, "invalid id")
-			return
-		}
-		// Keep the old /themes/0/activate behavior for existing clients while
-		// new clients use the explicit /themes/deactivate endpoint.
-		if id == 0 {
-			if err := theme.Deactivate(r.Context(), deps.DB, uid); err != nil {
-				errJSON(w, 500, err.Error())
-				return
-			}
-			writeJSON(w, 200, map[string]string{"status": "ok"})
+		if err != nil || id <= 0 {
+			errJSON(w, http.StatusBadRequest, "invalid id")
 			return
 		}
 		if err := theme.Activate(r.Context(), deps.DB, uid, id); err != nil {
 			if errors.Is(err, theme.ErrNotFound) {
-				errJSON(w, 404, err.Error())
+				errJSON(w, http.StatusNotFound, err.Error())
 				return
 			}
-			errJSON(w, 500, err.Error())
+			internalError(w, r, "activate theme", err)
 			return
 		}
-		t, lerr := theme.Load(r.Context(), deps.DB, uid, id)
-		if lerr != nil {
-			writeJSON(w, 200, map[string]string{"status": "ok"})
+		t, err := theme.Load(r.Context(), deps.DB, uid, id)
+		if err != nil {
+			internalError(w, r, "load activated theme", err)
 			return
 		}
-		writeJSON(w, 200, t)
+		writeJSON(w, http.StatusOK, t)
 	}
 }
 
 func deactivateThemeHandler(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := theme.Deactivate(r.Context(), deps.DB, userID(r.Context())); err != nil {
-			errJSON(w, 500, err.Error())
+			internalError(w, r, "deactivate theme", err)
 			return
 		}
-		writeJSON(w, 200, map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}
 }
 
-func generateThemeHandler(deps Deps) http.HandlerFunc {
+func deleteThemeHandler(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if deps.AI == nil {
-			errJSON(w, 503, "AI not configured")
+		id, err := intParam(r, "id")
+		if err != nil || id <= 0 {
+			errJSON(w, http.StatusBadRequest, "invalid id")
 			return
 		}
-		uid := userID(r.Context())
-		var body struct {
-			Prompt   string `json:"prompt"`
-			Activate bool   `json:"activate"`
-			ModePref string `json:"mode_pref"`
-		}
-		if err := readJSON(r, &body); err != nil {
-			errJSON(w, 400, "invalid json")
-			return
-		}
-		if strings.TrimSpace(body.Prompt) == "" {
-			errJSON(w, 400, "missing prompt")
-			return
-		}
-		modePref, err := theme.NormalizeModePref(body.ModePref)
+		result, err := deps.DB.ExecContext(r.Context(),
+			`DELETE FROM user_themes WHERE id = $1 AND user_id = $2`, id, userID(r.Context()))
 		if err != nil {
-			errJSON(w, 400, err.Error())
+			internalError(w, r, "delete theme", err)
 			return
 		}
-		body.ModePref = modePref
-		t, err := theme.Generate(r.Context(), deps.AI, deps.DB, uid, body.Prompt, body.ModePref, body.Activate)
-		if err != nil {
-			errJSON(w, 500, err.Error())
+		if affected, err := result.RowsAffected(); err != nil {
+			internalError(w, r, "count deleted themes", err)
+			return
+		} else if affected == 0 {
+			errJSON(w, http.StatusNotFound, theme.ErrNotFound.Error())
 			return
 		}
-		writeJSON(w, 201, t)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}
 }

@@ -993,12 +993,10 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "generate_theme",
-			Description: "Generate a new Material 3 color theme from a natural-language prompt (e.g. 'dusty rose calm dark-leaning' or 'forest morning'). Picks primary, secondary, tertiary, and neutral seed colors. Saves the theme to the user's profile; pass activate=true to make it the active one immediately.",
+			Description: "Generate and immediately activate a new Material 3 color theme from a natural-language prompt (e.g. 'dusty rose calm' or 'forest morning'). Picks primary, secondary, tertiary, and neutral seed colors and saves the theme to the user's profile.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"prompt":    str("Required. Free-form description of the mood, vibe, or palette."),
-				"activate":  boolean("If true, switch to this theme right away. Default false."),
-				"mode_pref": str("'auto' | 'light' | 'dark'. Default 'auto'."),
+				"prompt": str("Required. Free-form description of the mood, vibe, or palette."),
 			}, "prompt"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return generateThemeTool(ctx, s, uid, args)
@@ -1006,7 +1004,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_themes",
-			Description: "List the user's saved AI-generated or custom color themes. Built-in presets are selected directly in Settings and are not part of this list. Useful before activating a saved theme by name.",
+			Description: "List the user's saved AI-generated color themes. Built-in presets are selected directly in Settings and are not part of this list. Useful before activating a saved theme by name.",
 			Schema:      obj(map[string]*genai.Schema{}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listThemesTool(ctx, d, uid)
