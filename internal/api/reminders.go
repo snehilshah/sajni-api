@@ -135,6 +135,15 @@ func ProcessReminderFire(ctx context.Context, deps Deps, kind string, id int64) 
 			return 1, nil
 		}
 		return 0, nil
+	case reminderqueue.KindStandalone:
+		sent, err := sendStandaloneReminder(ctx, deps, id)
+		if err != nil {
+			return 0, err
+		}
+		if sent {
+			return 1, nil
+		}
+		return 0, nil
 	default:
 		return 0, errInvalidReminderKind(kind)
 	}
@@ -282,7 +291,11 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 	if err != nil {
 		return sent, err
 	}
-	return sent + multiSent, nil
+	standaloneSent, err := processStandaloneReminderCron(ctx, deps)
+	if err != nil {
+		return sent + multiSent, err
+	}
+	return sent + multiSent + standaloneSent, nil
 }
 
 func sendSingleTaskReminder(ctx context.Context, deps Deps, id int64) (bool, error) {

@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	KindTask  = "task"
-	KindMulti = "multi"
+	KindTask       = "task"
+	KindMulti      = "multi"
+	KindStandalone = "standalone"
 )
 
 type fireBody struct {
@@ -66,7 +67,7 @@ func (c Queue) fireURL() string {
 // edits enqueue a new Cloud Task, and stale older tasks no-op after the fire
 // endpoint re-checks Postgres.
 func (c Queue) Enqueue(ctx context.Context, kind string, id int64, at time.Time) error {
-	if kind != KindTask && kind != KindMulti {
+	if kind != KindTask && kind != KindMulti && kind != KindStandalone {
 		return fmt.Errorf("unknown reminder kind %q", kind)
 	}
 	if id <= 0 || at.IsZero() {
@@ -113,4 +114,8 @@ func (c Queue) EnqueueTask(ctx context.Context, id int64, scheduledAt time.Time)
 
 func (c Queue) EnqueueMulti(ctx context.Context, id int64, remindAt time.Time) error {
 	return c.Enqueue(ctx, KindMulti, id, remindAt)
+}
+
+func (c Queue) EnqueueStandalone(ctx context.Context, id int64, fireAt time.Time) error {
+	return c.Enqueue(ctx, KindStandalone, id, fireAt)
 }

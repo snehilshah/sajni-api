@@ -197,6 +197,43 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_tasks_week_of ON tasks(user_id, week_of) WHERE week_of IS NOT NULL;
 	CREATE INDEX IF NOT EXISTS idx_tasks_month_of ON tasks(user_id, month_of) WHERE month_of IS NOT NULL;
 
+	-- Standalone reminders deliberately do not ride on tasks. A reminder is a
+	-- lightweight message + schedule; occurrence rows carry delivery state so
+	-- snoozing one firing never shifts the recurring series.
+	CREATE TABLE IF NOT EXISTS reminders (
+		id         BIGSERIAL   PRIMARY KEY,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		message    TEXT        NOT NULL,
+		notes      TEXT        NOT NULL DEFAULT '',
+		timezone   TEXT        NOT NULL DEFAULT 'Asia/Kolkata',
+		starts_at  TIMESTAMPTZ NOT NULL,
+		recurrence JSONB       NOT NULL DEFAULT '{}'::jsonb,
+		active     BOOLEAN     NOT NULL DEFAULT TRUE,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_reminders_user ON reminders(user_id, active, updated_at DESC);
+
+	CREATE TABLE IF NOT EXISTS reminder_occurrences (
+		id            BIGSERIAL   PRIMARY KEY,
+		reminder_id   BIGINT      NOT NULL REFERENCES reminders(id) ON DELETE CASCADE,
+		user_id       UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		sequence      INTEGER     NOT NULL DEFAULT 1,
+		scheduled_at  TIMESTAMPTZ NOT NULL,
+		fire_at       TIMESTAMPTZ NOT NULL,
+		status        TEXT        NOT NULL DEFAULT 'pending',
+		delivered_at  TIMESTAMPTZ,
+		skipped_at    TIMESTAMPTZ,
+		claimed_until TIMESTAMPTZ,
+		created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_reminder_occurrences_reminder
+		ON reminder_occurrences(reminder_id, scheduled_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_reminder_occurrences_due
+		ON reminder_occurrences(fire_at) WHERE status = 'pending';
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_reminder_pending_occurrence
+		ON reminder_occurrences(reminder_id) WHERE status = 'pending';
+
 	CREATE TABLE IF NOT EXISTS habits (
 		id         BIGSERIAL   PRIMARY KEY,
 		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,

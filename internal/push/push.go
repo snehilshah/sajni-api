@@ -60,10 +60,12 @@ func New(ctx context.Context, cfg config.Push) (*Sender, error) {
 // navigation and are too fine-grained to classify by ("/finance/investments"
 // and "/finance" are the same channel, different screens).
 type Notification struct {
-	Type  string
-	Title string
-	Body  string
-	Route string
+	Type     string
+	Title    string
+	Body     string
+	Route    string
+	Data     map[string]string
+	DataOnly bool
 }
 
 // Push types. Stable wire values: the android client maps each to a
@@ -71,6 +73,7 @@ type Notification struct {
 // (an unknown type falls back to the default channel, never dropped).
 const (
 	TypeTaskReminder   = "task_reminder"
+	TypeReminder       = "reminder"
 	TypeTaskDigest     = "task_digest"
 	TypeBillDue        = "bill_due"
 	TypeInvestmentAuto = "investment_auto"
@@ -104,7 +107,7 @@ func (n Notification) channelID() string {
 // interrupts reports whether this push is worth a heads-up display: true only
 // when there is still something the user can act on in time.
 func (n Notification) interrupts() bool {
-	return n.Type == TypeTaskReminder || n.Type == TypeBillDue || n.Type == ""
+	return n.Type == TypeTaskReminder || n.Type == TypeReminder || n.Type == TypeBillDue || n.Type == ""
 }
 
 // SendToUser delivers n to every device the user has registered and returns
@@ -156,24 +159,30 @@ func (s *Sender) send(ctx context.Context, token string, n Notification) error {
 	if n.interrupts() {
 		priority = "high"
 	}
-	payload := map[string]any{
-		"message": map[string]any{
-			"token": token,
+	data := map[string]string{
+		"route": n.Route,
+		"type":  n.Type,
+		"title": n.Title,
+		"body":  n.Body,
+	}
+	for key, value := range n.Data {
+		data[key] = value
+	}
+	message := map[string]any{
+		"token": token,
+		"data":  data,
+		"android": map[string]any{
+			"priority": priority,
 			"notification": map[string]string{
-				"title": n.Title,
-				"body":  n.Body,
-			},
-			"data": map[string]string{
-				"route": n.Route,
-				"type":  n.Type,
-			},
-			"android": map[string]any{
-				"priority": priority,
-				"notification": map[string]string{
-					"channel_id": n.channelID(),
-				},
+				"channel_id": n.channelID(),
 			},
 		},
+	}
+	if !n.DataOnly {
+		message["notification"] = map[string]string{"title": n.Title, "body": n.Body}
+	}
+	payload := map[string]any{
+		"message": message,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

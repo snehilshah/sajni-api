@@ -182,7 +182,7 @@ func (s *Service) buildTools() []Tool {
 	store := s.store
 	tmdbAPIKey := s.tmdbAPIKey
 	queue := s.reminderQueue
-	return []Tool{
+	tools := []Tool{
 		// ---------------- READ ----------------
 		{
 			Name:        "get_current_context",
@@ -456,7 +456,7 @@ func (s *Service) buildTools() []Tool {
 		// ---------------- WRITE ----------------
 		{
 			Name:        "create_task",
-			Description: "Create a new task. Resolve relative dates ('tomorrow', 'next monday') against get_current_context first. Use list_task_lists to look up list_id by name; use list_tasks to find a parent_task_id when nesting. For 'remind me to X at <time>' requests, set scheduled_at to the requested reminder time AND remind=true — Sajni emails the user at that time.",
+			Description: "Create a new task. Resolve relative dates ('tomorrow', 'next monday') against get_current_context first. Use list_task_lists to look up list_id by name; use list_tasks to find a parent_task_id when nesting. Explicit 'remind me to X at <time>' wording belongs in create_reminder, not here. Use scheduled_at + remind only when the user explicitly asks for a task that also carries a notification.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"title":            str("Required. Short title."),
@@ -1129,6 +1129,7 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 	}
+	return append(tools, standaloneReminderTools(d, queue)...)
 }
 
 // ----- handler implementations -----
