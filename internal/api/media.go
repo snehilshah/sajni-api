@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -71,6 +72,7 @@ func registerMediaRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/media/search", searchMedia(deps.Media.TMDBAPIKey))
 	mux.HandleFunc("GET /api/media/details", mediaDetails(deps.Media.TMDBAPIKey))
 	mux.HandleFunc("GET /api/media/collection", collectionDetails(deps.Media.TMDBAPIKey))
+	mux.HandleFunc("POST /api/media/refresh", refreshMediaMetadata(deps))
 	mux.HandleFunc("GET /api/media/{id}/events", listMediaEvents(deps))
 	mux.HandleFunc("GET /api/media", listMedia(deps))
 	mux.HandleFunc("POST /api/media", createMedia(deps))
@@ -313,6 +315,13 @@ func decodeIntArray(raw string) []int {
 	return out
 }
 
+func validateUserMediaStatus(requested mediastatus.Status, current string) error {
+	if requested == mediastatus.StatusNewSeason && current != string(mediastatus.StatusNewSeason) {
+		return fmt.Errorf("new_season status is automatic")
+	}
+	return nil
+}
+
 func createMedia(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -352,7 +361,11 @@ func createMedia(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid status")
 			return
 		}
-		body.Status = string(status)
+		if err := validateUserMediaStatus(status, ""); err != nil {
+			errJSON(w, 400, err.Error())
+			return
+		}
+		body.Status = string(mediastatus.ResolveStatus(body.Type, status, body.ReleaseDate, userNow(d, uid)))
 		dup, err := findMediaDuplicate(d, uid, mediaDupCandidate{
 			Title:       body.Title,
 			Type:        body.Type,
@@ -607,6 +620,44 @@ func updateMedia(deps Deps) http.HandlerFunc {
 			Scan(&prevStatus, &prevEpsWatched, &prevSeasWatch, &prevSeasTotal, &prevRating, &prevType, &prevSEraw, &prevEpsTotal,
 				&prevTitle, &prevYear, &prevRelease, &prevExternalID)
 		prevSeasonEps := decodeIntArray(prevSEraw)
+		// Upcoming is derived from release metadata. A client may submit a
+		// normal lifecycle status, but it cannot override a future release or
+		// manufacture Upcoming for an already-released/dateless item.
+		effectiveType := prevType
+		if value, ok := body["type"].(string); ok {
+			effectiveType = value
+		}
+		effectiveRelease := prevRelease
+		if value, ok := body["release_date"]; ok {
+			if value == nil {
+				effectiveRelease = ""
+			} else {
+				effectiveRelease = value.(string)
+			}
+		}
+		requestedStatus := mediastatus.Status(prevStatus)
+		_, statusSet := body["status"]
+		if statusSet {
+			value, ok := body["status"].(string)
+			if !ok {
+				errJSON(w, 400, "invalid status")
+				return
+			}
+			norm, valid := mediastatus.NormalizeStatus(value)
+			if !valid {
+				errJSON(w, 400, "invalid status")
+				return
+			}
+			requestedStatus = norm
+			if err := validateUserMediaStatus(requestedStatus, prevStatus); err != nil {
+				errJSON(w, 400, err.Error())
+				return
+			}
+		}
+		resolvedStatus := mediastatus.ResolveStatus(effectiveType, requestedStatus, effectiveRelease, userNow(d, uid))
+		if statusSet || resolvedStatus != mediastatus.Status(prevStatus) {
+			body["status"] = string(resolvedStatus)
+		}
 		episodesWatched := prevEpsWatched
 		if value, ok := body["episodes_watched"].(int); ok {
 			episodesWatched = value
@@ -1038,7 +1089,7 @@ func mediaDetails(apiKey string) http.HandlerFunc {
 			errJSON(w, 400, "missing external_id")
 			return
 		}
-		kind, id, ok := parseTMDBExternalID(ext)
+		_, _, ok := parseTMDBExternalID(ext)
 		if !ok {
 			errJSON(w, 400, "external_id must be tmdb:{movie|tv}:{id}")
 			return
@@ -1047,37 +1098,54 @@ func mediaDetails(apiKey string) http.HandlerFunc {
 			errJSON(w, 503, "tmdb not configured")
 			return
 		}
-		cacheKey := "details:" + ext
-		if v, ok := cacheGet(cacheKey); ok {
-			writeJSON(w, 200, v.(MediaDetails))
+		out, err := loadMediaDetails(r.Context(), ext, apiKey)
+		if err != nil {
+			tmdbErrorJSON(w, err)
 			return
 		}
-		out := MediaDetails{ExternalID: ext}
-		if kind == "tv" {
-			out.Type = "show"
-			if err := fillShowDetails(&out, id, apiKey); err != nil {
-				tmdbErrorJSON(w, err)
-				return
-			}
-		} else {
-			out.Type = "movie"
-			if err := fillMovieDetails(&out, id, apiKey); err != nil {
-				tmdbErrorJSON(w, err)
-				return
-			}
-		}
-		cacheSet(cacheKey, out, 30*time.Minute)
 		writeJSON(w, 200, out)
 	}
 }
 
-func fillShowDetails(out *MediaDetails, id, apiKey string) error {
+func loadMediaDetails(ctx context.Context, externalID, apiKey string) (MediaDetails, error) {
+	cacheKey := "details:" + externalID
+	if value, ok := cacheGet(cacheKey); ok {
+		return value.(MediaDetails), nil
+	}
+	kind, id, ok := parseTMDBExternalID(externalID)
+	if !ok {
+		return MediaDetails{}, fmt.Errorf("invalid TMDB external id")
+	}
+	out := MediaDetails{ExternalID: externalID}
+	if kind == "tv" {
+		out.Type = "show"
+		if err := fillShowDetails(ctx, &out, id, apiKey); err != nil {
+			return MediaDetails{}, err
+		}
+	} else {
+		out.Type = "movie"
+		if err := fillMovieDetails(ctx, &out, id, apiKey); err != nil {
+			return MediaDetails{}, err
+		}
+	}
+	cacheSet(cacheKey, out, 30*time.Minute)
+	return out, nil
+}
+
+func fillShowDetails(ctx context.Context, out *MediaDetails, id, apiKey string) error {
 	u := fmt.Sprintf("https://api.themoviedb.org/3/tv/%s?api_key=%s", id, apiKey)
-	resp, err := httpClient.Get(u)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("tmdb returned %s", resp.Status)
+	}
 	body, _ := io.ReadAll(resp.Body)
 	var d struct {
 		Name             string `json:"name"`
@@ -1147,13 +1215,20 @@ func fillShowDetails(out *MediaDetails, id, apiKey string) error {
 	return nil
 }
 
-func fillMovieDetails(out *MediaDetails, id, apiKey string) error {
+func fillMovieDetails(ctx context.Context, out *MediaDetails, id, apiKey string) error {
 	u := fmt.Sprintf("https://api.themoviedb.org/3/movie/%s?api_key=%s", id, apiKey)
-	resp, err := httpClient.Get(u)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("tmdb returned %s", resp.Status)
+	}
 	body, _ := io.ReadAll(resp.Body)
 	var d struct {
 		Title       string `json:"title"`

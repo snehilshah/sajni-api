@@ -323,15 +323,22 @@ func (d *DB) migrate() error {
 		-- for naturally re-arms the reminder if that date later changes.
 		release_reminded_for DATE,
 		release_reminder_claimed_until TIMESTAMPTZ,
+		-- Successful TMDB freshness check. Clients may request a refresh on
+		-- every startup; this server-owned stamp keeps it to once per week.
+		metadata_checked_at TIMESTAMPTZ,
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	ALTER TABLE media ADD COLUMN IF NOT EXISTS release_reminded_for DATE;
 	ALTER TABLE media ADD COLUMN IF NOT EXISTS release_reminder_claimed_until TIMESTAMPTZ;
+	ALTER TABLE media ADD COLUMN IF NOT EXISTS metadata_checked_at TIMESTAMPTZ;
 	CREATE INDEX IF NOT EXISTS idx_media_user ON media(user_id);
 	CREATE INDEX IF NOT EXISTS idx_media_collection ON media(user_id, collection_id) WHERE collection_id <> '';
-	CREATE INDEX IF NOT EXISTS idx_media_upcoming_release ON media(user_id, release_date)
-		WHERE type = 'movie' AND status = 'upcoming' AND release_date IS NOT NULL;
+	CREATE INDEX IF NOT EXISTS idx_media_upcoming_release_all ON media(user_id, release_date)
+		WHERE type IN ('movie', 'show') AND status = 'upcoming' AND release_date IS NOT NULL;
+	CREATE INDEX IF NOT EXISTS idx_media_completed_show_refresh ON media(user_id, metadata_checked_at)
+		WHERE type = 'show' AND status = 'complete' AND external_id LIKE 'tmdb:tv:%';
+	DROP INDEX IF EXISTS idx_media_upcoming_release;
 
 	CREATE TABLE IF NOT EXISTS media_events (
 		id         BIGSERIAL   PRIMARY KEY,

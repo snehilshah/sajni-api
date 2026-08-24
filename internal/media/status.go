@@ -1,6 +1,9 @@
 package media
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // Status is the canonical media-library status stored in Postgres and
 // returned to clients. Labels such as "Complete" are frontend concerns.
@@ -11,6 +14,7 @@ const (
 	StatusInProgress Status = "in_progress"
 	StatusWaiting    Status = "waiting"
 	StatusComplete   Status = "complete"
+	StatusNewSeason  Status = "new_season"
 	StatusUpcoming   Status = "upcoming"
 	StatusDropped    Status = "dropped"
 	StatusScratched  Status = "scratched"
@@ -31,6 +35,8 @@ func NormalizeStatus(raw string) (Status, bool) {
 		return StatusWaiting, true
 	case string(StatusComplete), "completed", "done", "finished", "watched", "read":
 		return StatusComplete, true
+	case string(StatusNewSeason), "new season", "new-season":
+		return StatusNewSeason, true
 	case string(StatusUpcoming):
 		return StatusUpcoming, true
 	case string(StatusDropped), "drop":
@@ -42,4 +48,23 @@ func NormalizeStatus(raw string) (Status, bool) {
 	default:
 		return "", false
 	}
+}
+
+// ResolveStatus keeps Upcoming as release metadata, not a user-controlled
+// lifecycle choice. Only an unreleased movie or show may carry that status;
+// once its release day arrives it joins the normal pending queue.
+func ResolveStatus(kind string, requested Status, releaseDate string, today time.Time) Status {
+	releaseDate = strings.TrimSpace(releaseDate)
+	if len(releaseDate) >= len("2006-01-02") {
+		releaseDate = releaseDate[:len("2006-01-02")]
+	}
+	_, dateErr := time.Parse("2006-01-02", releaseDate)
+	isReleasable := kind == "movie" || kind == "show"
+	if isReleasable && dateErr == nil && releaseDate > today.Format("2006-01-02") {
+		return StatusUpcoming
+	}
+	if requested == StatusUpcoming {
+		return StatusPending
+	}
+	return requested
 }

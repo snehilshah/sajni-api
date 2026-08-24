@@ -284,7 +284,7 @@ func (s *Service) buildTools() []Tool {
 			Name:        "list_media",
 			Description: "List the user's media library. Use to avoid recommending things they already have.",
 			Schema: obj(map[string]*genai.Schema{
-				"status": str("Canonical media status: 'pending', 'in_progress', 'complete', 'waiting', 'upcoming', 'dropped', 'scratched', or 'archived'."),
+				"status": str("Canonical media status: 'pending', 'in_progress', 'complete', 'waiting', 'new_season', 'upcoming', 'dropped', 'scratched', or 'archived'. new_season is system-detected and read-only."),
 				"type":   str("'movie', 'show', 'book'."),
 				"limit":  intg("Default 30."),
 			}),
@@ -883,7 +883,7 @@ func (s *Service) buildTools() []Tool {
 			Schema: obj(map[string]*genai.Schema{
 				"title":        str("Required. Exact title."),
 				"type":         str("'movie' | 'show' | 'book'."),
-				"status":       str("'pending' | 'in_progress' | 'complete' | 'waiting' | 'upcoming' | 'dropped' | 'scratched' | 'archived'. Pick based on the user's wording — past tense ⇒ 'complete'. Default 'pending' only when unclear."),
+				"status":       str("'pending' | 'in_progress' | 'complete' | 'waiting' | 'dropped' | 'scratched' | 'archived'. Pick based on the user's wording — past tense ⇒ 'complete'. Default 'pending' only when unclear. Upcoming is derived automatically from a future release_date."),
 				"external_id":  str("Optional TMDB external id from tmdb_search."),
 				"year":         intg("Optional release year."),
 				"release_date": str("Optional release date from tmdb_search, YYYY-MM-DD."),
@@ -3203,12 +3203,15 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		return nil, nil, fmt.Errorf("missing title or type")
 	}
 	rawStatus := argStr(args, "status")
-	statusSpecified := strings.TrimSpace(rawStatus) != ""
 	statusValue, ok := mediastatus.NormalizeStatus(rawStatus)
 	if !ok {
 		return nil, nil, fmt.Errorf("invalid media status: %s", rawStatus)
 	}
+	if statusValue == mediastatus.StatusNewSeason {
+		return nil, nil, fmt.Errorf("new_season status is automatic")
+	}
 	status := string(statusValue)
+	releaseDate := normalizeReleaseDate(argStr(args, "release_date"))
 	year := argInt(args, "year", 0)
 	var yearArg any
 	if year > 0 {
@@ -3224,14 +3227,25 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	// triggers add_media twice for the same title in one round.
 	var existingID int64
 	var existingStatus string
+	var existingReleaseDate string
 	d.QueryRowContext(ctx,
-		`SELECT id, status FROM media WHERE user_id=$1 AND LOWER(title)=LOWER($2) AND type=$3 LIMIT 1`,
-		uid, title, mtype).Scan(&existingID, &existingStatus)
+		`SELECT id, status, COALESCE(release_date::text,'') FROM media WHERE user_id=$1 AND LOWER(title)=LOWER($2) AND type=$3 LIMIT 1`,
+		uid, title, mtype).Scan(&existingID, &existingStatus, &existingReleaseDate)
 	if existingID > 0 {
+		if releaseDate == "" {
+			releaseDate = existingReleaseDate
+		}
+		status = string(mediastatus.ResolveStatus(mtype, statusValue, releaseDate, userTZNow(ctx, d, uid)))
+		var duplicateReleaseDate any
+		if releaseDate != "" {
+			duplicateReleaseDate = releaseDate
+		}
 		_, err := d.ExecContext(ctx,
-			`UPDATE media SET status=$1, rating=COALESCE($2, rating), updated_at=NOW()
-			 WHERE id=$3 AND user_id=$4`,
-			status, ratingArg, existingID, uid)
+			`UPDATE media
+			    SET status=$1, rating=COALESCE($2, rating),
+			        release_date=COALESCE($3::date, release_date), updated_at=NOW()
+			  WHERE id=$4 AND user_id=$5`,
+			status, ratingArg, duplicateReleaseDate, existingID, uid)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -3248,7 +3262,6 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	extID := argStr(args, "external_id")
 	genre := argStr(args, "genre")
 	poster := argStr(args, "poster_url")
-	releaseDate := normalizeReleaseDate(argStr(args, "release_date"))
 	var seasonsTotal, episodesTotal int
 	var seasonEpisodes []int
 	if extID == "" {
@@ -3278,17 +3291,8 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	var releaseDateArg any
 	if releaseDate != "" {
 		releaseDateArg = releaseDate
-		if !statusSpecified || status == "pending" {
-			nowStr := userTZNow(ctx, d, uid).Format("2006-01-02")
-			cleanDate := strings.TrimSpace(releaseDate)
-			if len(cleanDate) >= 10 {
-				cleanDate = cleanDate[:10]
-				if _, err := time.Parse("2006-01-02", cleanDate); err == nil && cleanDate > nowStr {
-					status = string(mediastatus.StatusUpcoming)
-				}
-			}
-		}
 	}
+	status = string(mediastatus.ResolveStatus(mtype, statusValue, releaseDate, userTZNow(ctx, d, uid)))
 
 	var id int64
 	err := d.QueryRowContext(ctx, `

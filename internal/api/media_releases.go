@@ -24,11 +24,12 @@ type releaseUser struct {
 type claimedRelease struct {
 	id          int64
 	title       string
+	kind        string
 	releaseDate string
 }
 
 // ProcessMediaReleaseCron nudges at 10:00 in each owner's timezone on the day
-// before release, then promotes released movies into the pending queue. Both
+// before release, then promotes released movies and shows into the pending queue. Both
 // actions are scoped by media.user_id: owning a saved row is the only way to
 // become a recipient. Delivery is push + email like every other nudge, so a
 // push-only user still hears about a film landing tomorrow.
@@ -88,7 +89,7 @@ func listReleaseUsers(ctx context.Context, d *db.DB) ([]releaseUser, error) {
 }
 
 // graduateReleasedMedia is also called by the library read path, so a movie
-// cannot remain stale merely because a scheduled sweep was delayed. The
+// or show cannot remain stale merely because a scheduled sweep was delayed. The
 // update is atomic: only the worker that actually moves a row records the
 // release event.
 func graduateReleasedMedia(ctx context.Context, d *db.DB, uid string, localNow time.Time) (int, error) {
@@ -101,7 +102,7 @@ func graduateReleasedMedia(ctx context.Context, d *db.DB, uid string, localNow t
 			       updated_at = NOW(),
 			       release_reminder_claimed_until = NULL
 			 WHERE user_id = $1
-			   AND type = 'movie'
+			   AND type IN ('movie', 'show')
 			   AND status = 'upcoming'
 			   AND release_date IS NOT NULL
 			   AND release_date <= $2::date
@@ -128,7 +129,7 @@ func sendDueMediaReleaseReminders(ctx context.Context, deps Deps, user releaseUs
 			SELECT id
 			  FROM media
 			 WHERE user_id = $1
-			   AND type = 'movie'
+			   AND type IN ('movie', 'show')
 			   AND status = 'upcoming'
 			   AND release_date = $2::date
 			   AND release_reminded_for IS DISTINCT FROM release_date
@@ -139,7 +140,7 @@ func sendDueMediaReleaseReminders(ctx context.Context, deps Deps, user releaseUs
 		   SET release_reminder_claimed_until = NOW() + make_interval(secs => $3)
 		  FROM due
 		 WHERE m.id = due.id
-		RETURNING m.id, m.title, m.release_date::text`,
+		RETURNING m.id, m.title, m.type, m.release_date::text`,
 		user.id, tomorrow, int(mediaReleaseClaimLease.Seconds()))
 	if err != nil {
 		return 0, fmt.Errorf("claim release reminders: %w", err)
@@ -148,7 +149,7 @@ func sendDueMediaReleaseReminders(ctx context.Context, deps Deps, user releaseUs
 	var claimed []claimedRelease
 	for rows.Next() {
 		var movie claimedRelease
-		if err := rows.Scan(&movie.id, &movie.title, &movie.releaseDate); err != nil {
+		if err := rows.Scan(&movie.id, &movie.title, &movie.kind, &movie.releaseDate); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("scan claimed release: %w", err)
 		}
@@ -169,11 +170,15 @@ func sendDueMediaReleaseReminders(ctx context.Context, deps Deps, user releaseUs
 		if releaseDate, err := time.Parse("2006-01-02", movie.releaseDate); err == nil {
 			releaseLabel = releaseDate.Format("Monday, January 2, 2006")
 		}
+		route := "/media?tab=movies"
+		if movie.kind == "show" {
+			route = "/media?tab=shows"
+		}
 		pushed := notifyPush(ctx, deps, user.id, push.Notification{
 			Type:  push.TypeMediaRelease,
 			Title: "Out tomorrow",
 			Body:  movie.title + " releases " + releaseLabel,
-			Route: "/media?tab=movies",
+			Route: route,
 		})
 
 		// Email is skipped only for a push-only user whose push landed —
@@ -187,7 +192,7 @@ func sendDueMediaReleaseReminders(ctx context.Context, deps Deps, user releaseUs
 				name,
 				movie.title,
 				releaseLabel,
-				"/media?tab=movies",
+				route,
 			)
 			emailed = emailErr == nil
 			if emailErr != nil {
