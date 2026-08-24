@@ -142,6 +142,9 @@ func friendlyAIError(err error) string {
 		return "Sajni's hit a rate limit. Wait a moment and try again."
 	case strings.Contains(low, "function response turn comes immediately after a function call turn"):
 		return "Conversation went out of sync. Start a new chat to clear it."
+	case strings.Contains(low, "required oneof field 'data'"),
+		strings.Contains(low, "invalid_argument"):
+		return "Conversation history was invalid. Start a new chat to clear it."
 	case strings.Contains(low, "deadline exceeded"),
 		strings.Contains(low, "context canceled"):
 		return "Sajni took too long. Try a shorter prompt."
@@ -322,7 +325,6 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 	for r := 0; r < rounds; r++ {
 		var (
 			turnText  strings.Builder
-			modelPart []*genai.Part
 			calls     []*genai.FunctionCall
 			streamErr error
 		)
@@ -352,7 +354,6 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 					seenCalls[key] = true
 					calls = append(calls, p.FunctionCall)
 				}
-				modelPart = append(modelPart, p)
 			}
 		}
 		if streamErr != nil {
@@ -362,8 +363,15 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 
 		finalText.WriteString(turnText.String())
 
-		if len(modelPart) > 0 {
-			contents = append(contents, &genai.Content{Role: "model", Parts: modelPart})
+		var turnParts []*genai.Part
+		if turnText.Len() > 0 {
+			turnParts = append(turnParts, &genai.Part{Text: turnText.String()})
+		}
+		for _, fc := range calls {
+			turnParts = append(turnParts, &genai.Part{FunctionCall: fc})
+		}
+		if len(turnParts) > 0 {
+			contents = append(contents, &genai.Content{Role: "model", Parts: turnParts})
 		}
 
 		if len(calls) == 0 {
@@ -419,7 +427,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 	synthesisCfg.ToolConfig = &genai.ToolConfig{
 		FunctionCallingConfig: &genai.FunctionCallingConfig{Mode: genai.FunctionCallingConfigModeNone},
 	}
-	var synthesisParts []*genai.Part
+	var synthesisText strings.Builder
 	for resp, err := range s.client.GenerateContentStream(ctx, s.model, contents, &synthesisCfg) {
 		if err != nil {
 			send("error", map[string]string{"message": friendlyAIError(err)})
@@ -432,13 +440,16 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			if part.Text == "" || part.Thought {
 				continue
 			}
+			synthesisText.WriteString(part.Text)
 			finalText.WriteString(part.Text)
-			synthesisParts = append(synthesisParts, part)
 			send("delta", map[string]string{"text": part.Text})
 		}
 	}
-	if len(synthesisParts) > 0 {
-		contents = append(contents, &genai.Content{Role: "model", Parts: synthesisParts})
+	if synthesisText.Len() > 0 {
+		contents = append(contents, &genai.Content{
+			Role:  "model",
+			Parts: []*genai.Part{{Text: synthesisText.String()}},
+		})
 	}
 	if finalText.Len() == 0 {
 		send("error", map[string]string{"message": "I couldn't finish that one in time."})

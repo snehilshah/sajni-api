@@ -55,6 +55,7 @@ func LoadSession(ctx context.Context, d *db.DB, uid string, sid int64) (*Session
 	if s.Messages == nil {
 		s.Messages = []*genai.Content{}
 	}
+	s.Messages = SanitizeHistory(s.Messages)
 	return &s, nil
 }
 
@@ -96,8 +97,8 @@ func SaveSessionMessages(ctx context.Context, d *db.DB, uid string, sid int64, m
 	if len(trimmed) > historyWindow*2 {
 		trimmed = trimmed[len(trimmed)-historyWindow*2:]
 	}
-	// SanitizeHistory drops orphan tool-call / tool-response pairs so the
-	// next chat round never starts with a malformed history.
+	// SanitizeHistory drops orphan tool-call / tool-response pairs and invalid
+	// parts so the next chat round never starts with a malformed history.
 	trimmed = SanitizeHistory(trimmed)
 	raw, err := json.Marshal(trimmed)
 	if err != nil {
@@ -108,7 +109,7 @@ func SaveSessionMessages(ctx context.Context, d *db.DB, uid string, sid int64, m
 		SET messages = $1::jsonb,
 		    title = CASE WHEN title = 'New chat' OR title = '' THEN $2 ELSE title END,
 		    updated_at = NOW()
-		WHERE id = $3 AND user_id = $4`, raw, deriveTitle(messages), sid, uid); err != nil {
+		WHERE id = $3 AND user_id = $4`, raw, deriveTitle(trimmed), sid, uid); err != nil {
 		return err
 	}
 	return nil
@@ -136,63 +137,134 @@ func TrimHistory(history []*genai.Content) []*genai.Content {
 	return SanitizeHistory(out)
 }
 
-// SanitizeHistory walks the conversation and strips orphan tool turns:
+// isPartValid returns true if the part contains valid payload for Gemini
+// content (oneof data must be set). Thought-only or empty parts are invalid.
+func isPartValid(p *genai.Part) bool {
+	if p == nil || p.Thought {
+		return false
+	}
+	if p.Text != "" {
+		return true
+	}
+	return p.FunctionCall != nil ||
+		p.FunctionResponse != nil ||
+		p.InlineData != nil ||
+		p.FileData != nil ||
+		p.ExecutableCode != nil ||
+		p.CodeExecutionResult != nil
+}
+
+func sanitizeParts(parts []*genai.Part) []*genai.Part {
+	if len(parts) == 0 {
+		return nil
+	}
+	var out []*genai.Part
+	for _, p := range parts {
+		if !isPartValid(p) {
+			continue
+		}
+		// If both this and previous part are plain text, merge them.
+		if len(out) > 0 && out[len(out)-1].Text != "" && p.Text != "" &&
+			out[len(out)-1].FunctionCall == nil && p.FunctionCall == nil &&
+			out[len(out)-1].FunctionResponse == nil && p.FunctionResponse == nil {
+			out[len(out)-1].Text += p.Text
+			continue
+		}
+		cp := *p
+		out = append(out, &cp)
+	}
+	return out
+}
+
+func hasFunctionCall(c *genai.Content) bool {
+	if c == nil || c.Role != "model" {
+		return false
+	}
+	for _, p := range c.Parts {
+		if p != nil && p.FunctionCall != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFunctionResponse(c *genai.Content) bool {
+	if c == nil || c.Role != "user" {
+		return false
+	}
+	for _, p := range c.Parts {
+		if p != nil && p.FunctionResponse != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// SanitizeHistory walks the conversation and:
 //
-//  1. A leading user-turn whose parts include any function_response.
-//     This happens after TrimHistory slices in the middle of a
-//     model(function_call) → user(function_response) pair.
-//  2. A trailing model-turn that has any function_call but no matching
-//     user(function_response) immediately after.
-//
-// The remaining turns satisfy Gemini's strict tool-pair contract.
+//  1. Strips nil parts, empty parts, thought parts, and empty content turns.
+//  2. Merges fragmented text parts within the same turn.
+//  3. Enforces Gemini's strict tool-pair contract (drops orphan function responses
+//     and dangling function calls).
 func SanitizeHistory(history []*genai.Content) []*genai.Content {
 	if len(history) == 0 {
 		return history
 	}
-	// (1) skip orphan function-response turns at the head.
-	start := 0
-	for start < len(history) {
-		c := history[start]
-		if c == nil {
-			start++
-			continue
-		}
-		hasFnResp := false
-		for _, p := range c.Parts {
-			if p != nil && p.FunctionResponse != nil {
-				hasFnResp = true
-				break
-			}
-		}
-		if c.Role == "user" && hasFnResp {
-			start++
-			continue
-		}
-		break
-	}
-	out := history[start:]
 
-	// (2) drop trailing dangling function-call turn.
-	for len(out) > 0 {
-		last := out[len(out)-1]
-		if last == nil {
-			out = out[:len(out)-1]
+	var cleaned []*genai.Content
+	for _, c := range history {
+		if c == nil {
 			continue
 		}
-		hasFnCall := false
-		for _, p := range last.Parts {
-			if p != nil && p.FunctionCall != nil {
-				hasFnCall = true
-				break
-			}
-		}
-		if last.Role == "model" && hasFnCall {
-			out = out[:len(out)-1]
+		validParts := sanitizeParts(c.Parts)
+		if len(validParts) == 0 {
 			continue
 		}
-		break
+		cleaned = append(cleaned, &genai.Content{
+			Role:  c.Role,
+			Parts: validParts,
+		})
 	}
-	return out
+
+	if len(cleaned) == 0 {
+		return []*genai.Content{}
+	}
+
+	var validated []*genai.Content
+	for i := 0; i < len(cleaned); i++ {
+		c := cleaned[i]
+		if hasFunctionResponse(c) {
+			if len(validated) == 0 || !hasFunctionCall(validated[len(validated)-1]) {
+				continue
+			}
+			validated = append(validated, c)
+			continue
+		}
+
+		if hasFunctionCall(c) {
+			if i+1 < len(cleaned) && hasFunctionResponse(cleaned[i+1]) {
+				validated = append(validated, c)
+			} else {
+				var nonCallParts []*genai.Part
+				for _, p := range c.Parts {
+					if p.FunctionCall == nil {
+						nonCallParts = append(nonCallParts, p)
+					}
+				}
+				if len(nonCallParts) > 0 {
+					validated = append(validated, &genai.Content{
+						Role:  c.Role,
+						Parts: nonCallParts,
+					})
+				}
+			}
+			continue
+		}
+
+		validated = append(validated, c)
+	}
+
+	return validated
 }
 
 // deriveTitle picks the first 8 words of the first user-text message
@@ -203,7 +275,7 @@ func deriveTitle(messages []*genai.Content) string {
 			continue
 		}
 		for _, p := range c.Parts {
-			if p.Text == "" {
+			if p == nil || p.Text == "" {
 				continue
 			}
 			words := strings.Fields(p.Text)
