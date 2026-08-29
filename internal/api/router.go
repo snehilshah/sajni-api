@@ -92,6 +92,7 @@ func Router(deps Deps) http.Handler {
 	root.Handle("/api/auth/github/callback", authMux)
 	root.Handle("/api/auth/email/start", authMux)
 	root.Handle("/api/auth/email/verify", authMux)
+	root.Handle("/api/auth/mobile/exchange", authMux)
 	root.Handle("/api/auth/refresh", authMux)
 	root.Handle("/api/auth/logout", authMux)
 	root.Handle("/api/", protected)

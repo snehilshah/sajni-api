@@ -35,7 +35,7 @@ import (
 // signed base for the token exchange redirect_uri, so a proxy header
 // mismatch between /start and /callback cannot invalidate the OAuth
 // code. No server-side storage, no cookie.
-func (s *Service) makeOAuthState(base string) (string, error) {
+func (s *Service) makeOAuthState(base, client string) (string, error) {
 	raw := make([]byte, 18)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
@@ -44,6 +44,9 @@ func (s *Service) makeOAuthState(base string) (string, error) {
 	exp := strconv.FormatInt(time.Now().Add(10*time.Minute).Unix(), 10)
 	basePart := base64.RawURLEncoding.EncodeToString([]byte(strings.TrimRight(base, "/")))
 	body := nonce + "." + exp + "." + basePart
+	if client == "android" {
+		body += ".android"
+	}
 	h := hmac.New(sha256.New, s.JWTSecret)
 	h.Write([]byte(body))
 	sig := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
@@ -51,39 +54,45 @@ func (s *Service) makeOAuthState(base string) (string, error) {
 }
 
 // verifyOAuthState checks the signature and expiry of a state value
-// produced by makeOAuthState. Returns the signed redirect base iff the
-// value is authentic and unexpired.
-func (s *Service) verifyOAuthState(state string) (string, error) {
+// produced by makeOAuthState. Returns the signed redirect base and native
+// client marker iff the value is authentic and unexpired.
+func (s *Service) verifyOAuthState(state string) (base, client string, err error) {
 	parts := strings.Split(state, ".")
-	if len(parts) != 3 && len(parts) != 4 {
-		return "", errors.New("bad state format")
+	if len(parts) != 3 && len(parts) != 4 && len(parts) != 5 {
+		return "", "", errors.New("bad state format")
 	}
 	body := strings.Join(parts[:len(parts)-1], ".")
 	h := hmac.New(sha256.New, s.JWTSecret)
 	h.Write([]byte(body))
 	want := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
 	if !hmac.Equal([]byte(want), []byte(parts[len(parts)-1])) {
-		return "", errors.New("state signature mismatch")
+		return "", "", errors.New("state signature mismatch")
 	}
 	exp, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
-		return "", errors.New("bad state expiry")
+		return "", "", errors.New("bad state expiry")
 	}
 	if time.Now().Unix() > exp {
-		return "", errors.New("state expired")
+		return "", "", errors.New("state expired")
 	}
 	if len(parts) == 3 {
-		return "", nil
+		return "", "", nil
 	}
 	baseRaw, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
-		return "", errors.New("bad state base")
+		return "", "", errors.New("bad state base")
 	}
-	base := string(baseRaw)
+	base = string(baseRaw)
 	if !sameOrigin(base, s.AppURL) && !sameOrigin(base, s.APIBase) {
-		return "", errors.New("state base not allowed")
+		return "", "", errors.New("state base not allowed")
 	}
-	return strings.TrimRight(base, "/"), nil
+	if len(parts) == 5 {
+		client = parts[3]
+		if client != "android" {
+			return "", "", errors.New("bad state client")
+		}
+	}
+	return strings.TrimRight(base, "/"), client, nil
 }
 
 // RegisterRoutes attaches all unauthenticated auth endpoints to the
@@ -95,6 +104,7 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/auth/github/callback", s.oauthCallback("github"))
 	mux.HandleFunc("POST /api/auth/email/start", s.handleEmailStart)
 	mux.HandleFunc("POST /api/auth/email/verify", s.handleEmailVerify)
+	mux.HandleFunc("POST /api/auth/mobile/exchange", s.handleMobileExchange)
 	mux.HandleFunc("POST /api/auth/refresh", s.handleRefresh)
 	mux.HandleFunc("POST /api/auth/logout", s.handleLogout)
 }
@@ -302,7 +312,7 @@ func (s *Service) oauthStart(name string) http.HandlerFunc {
 			writeErr(w, http.StatusBadRequest, "unknown provider")
 			return
 		}
-		state, err := s.makeOAuthState(base)
+		state, err := s.makeOAuthState(base, r.URL.Query().Get("client"))
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -311,9 +321,9 @@ func (s *Service) oauthStart(name string) http.HandlerFunc {
 	}
 }
 
-// oauthCallback exchanges the code for an Identity, links/creates the
-// user via resolveOrLinkIdentity, then 302s the browser to APP_URL with
-// the access token in the fragment so it never hits server logs.
+// oauthCallback exchanges the provider code for an Identity, links/creates
+// the user, then returns either a web access token or a short-lived native
+// exchange code in the APP_URL fragment.
 func (s *Service) oauthCallback(name string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		p := s.provider(name, s.oauthBaseForRequest(r))
@@ -322,7 +332,7 @@ func (s *Service) oauthCallback(name string) http.HandlerFunc {
 			return
 		}
 		state := r.URL.Query().Get("state")
-		stateBase, err := s.verifyOAuthState(state)
+		stateBase, client, err := s.verifyOAuthState(state)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "state mismatch: "+err.Error())
 			return
@@ -361,19 +371,27 @@ func (s *Service) oauthCallback(name string) http.HandlerFunc {
 			http.Redirect(w, r, s.AppURL+"/auth/link?"+q.Encode(), http.StatusFound)
 			return
 		}
-		resp, err := s.issueSession(r.Context(), w, userID)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		// Query string carries the "we just linked X" hint so the
-		// frontend can fire a toast. The access token goes in the URL
-		// fragment so it never hits server logs or the Referer header.
 		dest := s.AppURL + "/auth/done"
 		if linkedNew {
 			dest += "?linked=" + url.QueryEscape(name)
 		}
-		dest += "#access=" + url.QueryEscape(resp.AccessToken)
+		if client == "android" {
+			code, err := s.issueOAuthExchangeCode(userID)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			dest += "#code=" + url.QueryEscape(code)
+		} else {
+			resp, err := s.issueSession(r.Context(), w, userID)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			// The access token stays in the fragment so it never reaches
+			// server logs or the Referer header.
+			dest += "#access=" + url.QueryEscape(resp.AccessToken)
+		}
 		http.Redirect(w, r, dest, http.StatusFound)
 	}
 }
@@ -475,6 +493,30 @@ func (s *Service) handleEmailVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 // ─── Refresh / Logout ────────────────────────────────────────────────
+
+type mobileExchangeBody struct {
+	Code string `json:"code"`
+}
+
+func (s *Service) handleMobileExchange(w http.ResponseWriter, r *http.Request) {
+	var body mobileExchangeBody
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	userID, err := s.consumeOAuthExchangeCode(strings.TrimSpace(body.Code))
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	resp, err := s.issueSession(r.Context(), w, userID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, resp)
+}
 
 func (s *Service) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	if s.devAuthBypassAllowed(r) {

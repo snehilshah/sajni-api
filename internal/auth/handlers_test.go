@@ -53,16 +53,39 @@ func TestOAuthStateCarriesAllowedRedirectBase(t *testing.T) {
 		AppURL:    "https://ohmysajni.com",
 		APIBase:   "https://sajni-api-a7bzmoi2qq-el.a.run.app",
 	}
-	state, err := s.makeOAuthState("https://ohmysajni.com")
+	state, err := s.makeOAuthState("https://ohmysajni.com", "")
 	if err != nil {
 		t.Fatalf("makeOAuthState() error = %v", err)
 	}
 
-	got, err := s.verifyOAuthState(state)
+	got, client, err := s.verifyOAuthState(state)
 	if err != nil {
 		t.Fatalf("verifyOAuthState() error = %v", err)
 	}
 	if want := "https://ohmysajni.com"; got != want {
 		t.Fatalf("verifyOAuthState() base = %q, want %q", got, want)
+	}
+	if client != "" {
+		t.Fatalf("verifyOAuthState() client = %q, want empty", client)
+	}
+}
+
+func TestOAuthStateCarriesSignedAndroidClient(t *testing.T) {
+	s := &Service{
+		JWTSecret: []byte("test-secret"),
+		AppURL:    "https://ohmysajni.com",
+		APIBase:   "https://sajni-api-a7bzmoi2qq-el.a.run.app",
+	}
+	state, err := s.makeOAuthState("https://ohmysajni.com", "android")
+	if err != nil {
+		t.Fatalf("makeOAuthState() error = %v", err)
+	}
+
+	base, client, err := s.verifyOAuthState(state)
+	if err != nil {
+		t.Fatalf("verifyOAuthState() error = %v", err)
+	}
+	if base != "https://ohmysajni.com" || client != "android" {
+		t.Fatalf("verifyOAuthState() = (%q, %q), want app origin and android", base, client)
 	}
 }

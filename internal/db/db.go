@@ -125,6 +125,18 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
 
+	-- Native OAuth finishes in a browser whose cookie store is isolated from
+	-- Android's HTTP client. A short-lived, single-use exchange code lets the
+	-- app finish the session inside OkHttp and receive its own refresh cookie.
+	CREATE TABLE IF NOT EXISTS oauth_exchange_codes (
+		id          UUID         PRIMARY KEY,
+		user_id     UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		code_hash   BYTEA        NOT NULL UNIQUE,
+		expires_at  TIMESTAMPTZ  NOT NULL,
+		created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_oauth_exchange_codes_expiry ON oauth_exchange_codes(expires_at);
+
 	-- ─── Content (BIGSERIAL row PK; user_id is UUID) ──────────────────
 	CREATE TABLE IF NOT EXISTS memos (
 		id         BIGSERIAL   PRIMARY KEY,

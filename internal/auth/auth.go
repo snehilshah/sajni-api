@@ -29,9 +29,10 @@ type ContextKey struct{}
 const (
 	// 30 minutes — bumped from 15. Halves refresh churn while still
 	// short enough to expire stolen tokens quickly.
-	accessTokenTTL  = 30 * time.Minute
-	refreshTokenTTL = 7 * 24 * time.Hour
-	refreshCookie   = "sajni_refresh"
+	accessTokenTTL   = 30 * time.Minute
+	refreshTokenTTL  = 7 * 24 * time.Hour
+	oauthExchangeTTL = 5 * time.Minute
+	refreshCookie    = "sajni_refresh"
 )
 
 // Service holds the dependencies the auth handlers need.
@@ -199,6 +200,41 @@ func (s *Service) consumeRefreshToken(raw string) (string, error) {
 	).Scan(&userID)
 	if err != nil {
 		return "", errors.New("invalid refresh token")
+	}
+	return userID, nil
+}
+
+// issueOAuthExchangeCode creates the short-lived, single-use code carried
+// from the browser callback into the native app. Only its SHA-256 hash is
+// stored, matching the refresh-token storage boundary.
+func (s *Service) issueOAuthExchangeCode(userID string) (string, error) {
+	raw, err := randomToken(32)
+	if err != nil {
+		return "", err
+	}
+	_, _ = s.DB.Exec("DELETE FROM oauth_exchange_codes WHERE expires_at <= NOW()")
+	if _, err := s.DB.Exec(
+		"INSERT INTO oauth_exchange_codes (id, user_id, code_hash, expires_at) VALUES ($1, $2, $3, $4)",
+		NewID(), userID, hashToken(raw), time.Now().Add(oauthExchangeTTL),
+	); err != nil {
+		return "", err
+	}
+	return raw, nil
+}
+
+func (s *Service) consumeOAuthExchangeCode(raw string) (string, error) {
+	if raw == "" {
+		return "", errors.New("missing exchange code")
+	}
+	var userID string
+	err := s.DB.QueryRow(
+		`DELETE FROM oauth_exchange_codes
+		 WHERE code_hash = $1 AND expires_at > NOW()
+		 RETURNING user_id`,
+		hashToken(raw),
+	).Scan(&userID)
+	if err != nil {
+		return "", errors.New("invalid exchange code")
 	}
 	return userID, nil
 }
