@@ -163,6 +163,7 @@ func (d *DB) migrate() error {
 		description      TEXT        NOT NULL DEFAULT '',
 		status           TEXT        NOT NULL DEFAULT 'todo',
 		priority         TEXT        NOT NULL DEFAULT 'medium',
+		color            TEXT,
 		due_date         DATE,
 		week_of          DATE,
 		month_of         DATE,
@@ -187,6 +188,7 @@ func (d *DB) migrate() error {
 	-- makes this path safe for both.
 	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS blocked_by_task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL;
 	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reminder_claimed_until TIMESTAMPTZ;
+	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS color TEXT;
 	CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_list ON tasks(list_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
@@ -196,6 +198,7 @@ func (d *DB) migrate() error {
 		WHERE remind = TRUE AND reminded_at IS NULL;
 	CREATE INDEX IF NOT EXISTS idx_tasks_week_of ON tasks(user_id, week_of) WHERE week_of IS NOT NULL;
 	CREATE INDEX IF NOT EXISTS idx_tasks_month_of ON tasks(user_id, month_of) WHERE month_of IS NOT NULL;
+	CREATE INDEX IF NOT EXISTS idx_tasks_user_due_date ON tasks(user_id, due_date) WHERE due_date IS NOT NULL;
 
 	-- Standalone reminders deliberately do not ride on tasks. A reminder is a
 	-- lightweight message + schedule; occurrence rows carry delivery state so

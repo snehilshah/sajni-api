@@ -16,6 +16,16 @@ import (
 // cap + per-address validation is the pragmatic guard.
 const maxNotifyEmails = 3
 
+var taskColors = map[string]struct{}{
+	"#2D5A4F": {}, "#7C9A92": {}, "#C49A6C": {}, "#A14B4F": {},
+	"#4F6FA1": {}, "#8B6FA1": {}, "#7A7A7A": {},
+}
+
+func validTaskColor(color string) bool {
+	_, ok := taskColors[strings.ToUpper(strings.TrimSpace(color))]
+	return ok
+}
+
 // sanitizeNotifyEmails trims, RFC-validates, lowercases and de-dups the custom
 // reminder recipients, capping at maxNotifyEmails. Invalid entries are dropped.
 func sanitizeNotifyEmails(in []string) []string {
@@ -184,6 +194,7 @@ func registerTaskRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/tasks/{id}/reminders", listTaskReminders(deps))
 	mux.HandleFunc("POST /api/tasks/{id}/reminders", addTaskReminder(deps))
 	mux.HandleFunc("DELETE /api/tasks/{id}/reminders/{rid}", deleteTaskReminder(deps))
+	mux.HandleFunc("POST /api/tasks/{id}/reschedule", rescheduleTaskDate(deps))
 
 	mux.HandleFunc("GET /api/tasks", listTasks(deps))
 	mux.HandleFunc("POST /api/tasks", createTask(deps))
@@ -207,7 +218,7 @@ func getTask(deps Deps) http.HandlerFunc {
 		var t taskRow
 		var stepsRaw, emailsRaw []byte
 		err = d.QueryRow(`
-			SELECT t.id, t.title, t.description, t.status, t.priority,
+			SELECT t.id, t.title, t.description, t.status, t.priority, t.color,
 			       t.due_date::text, t.week_of::text, t.month_of::text, t.scheduled_at::text,
 			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
 			       t.list_id, t.parent_task_id, t.blocked_by_task_id,
@@ -226,7 +237,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			) c ON c.parent_task_id = t.id
 			LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
 			WHERE t.user_id = $1 AND t.id = $2`, uid, id).Scan(
-			&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority,
+			&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority, &t.Color,
 			&t.DueDate, &t.WeekOf, &t.MonthOf, &t.ScheduledAt,
 			&t.Remind, &t.RemindedAt, &emailsRaw,
 			&t.ListID, &t.ParentTaskID, &t.BlockedByTaskID,
@@ -266,6 +277,7 @@ type taskRow struct {
 	Description         string   `json:"description"`
 	Status              string   `json:"status"`
 	Priority            string   `json:"priority"`
+	Color               *string  `json:"color"`
 	Tags                []string `json:"tags"`
 	DueDate             *string  `json:"due_date"`
 	WeekOf              *string  `json:"week_of"`
@@ -298,6 +310,7 @@ type subtaskBrief struct {
 	Title               string  `json:"title"`
 	Status              string  `json:"status"`
 	Priority            string  `json:"priority"`
+	Color               *string `json:"color"`
 	DueDate             *string `json:"due_date"`
 	Important           bool    `json:"important"`
 	ParentTaskID        *int64  `json:"parent_task_id"`
@@ -452,7 +465,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 		}
 
 		q := `
-			SELECT t.id, t.title, t.description, t.status, t.priority,
+			SELECT t.id, t.title, t.description, t.status, t.priority, t.color,
 			       t.due_date::text, t.week_of::text, t.month_of::text, t.scheduled_at::text,
 			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
 			       t.list_id, t.parent_task_id, t.blocked_by_task_id,
@@ -485,7 +498,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 			var t taskRow
 			var stepsRaw, emailsRaw []byte
 			if err := rows.Scan(
-				&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority,
+				&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority, &t.Color,
 				&t.DueDate, &t.WeekOf, &t.MonthOf, &t.ScheduledAt,
 				&t.Remind, &t.RemindedAt, &emailsRaw,
 				&t.ListID, &t.ParentTaskID, &t.BlockedByTaskID,
@@ -528,7 +541,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 				ph2 = append(ph2, "$"+itoa(len(cargs)))
 			}
 			crows, cerr := d.Query(`
-				SELECT t.id, t.title, t.status, t.priority, t.due_date::text,
+				SELECT t.id, t.title, t.status, t.priority, t.color, t.due_date::text,
 				       t.important, t.parent_task_id, t.blocked_by_task_id,
 				       blocker.title, blocker.status, COALESCE(t.sort_order, 0)
 				FROM tasks t
@@ -538,7 +551,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 			if cerr == nil {
 				for crows.Next() {
 					var s subtaskBrief
-					if crows.Scan(&s.ID, &s.Title, &s.Status, &s.Priority, &s.DueDate,
+					if crows.Scan(&s.ID, &s.Title, &s.Status, &s.Priority, &s.Color, &s.DueDate,
 						&s.Important, &s.ParentTaskID, &s.BlockedByTaskID,
 						&s.BlockedByTaskTitle, &s.BlockedByTaskStatus, &s.SortOrder) == nil && s.ParentTaskID != nil {
 						if i, ok := idx[*s.ParentTaskID]; ok {
@@ -564,7 +577,7 @@ func listSubtasks(deps Deps) http.HandlerFunc {
 			return
 		}
 		rows, err := d.Query(`
-			SELECT t.id, t.title, t.status, t.priority, t.due_date::text,
+			SELECT t.id, t.title, t.status, t.priority, t.color, t.due_date::text,
 			       t.important, t.blocked_by_task_id, blocker.title, blocker.status,
 			       COALESCE(t.sort_order, 0)
 			FROM tasks t
@@ -581,6 +594,7 @@ func listSubtasks(deps Deps) http.HandlerFunc {
 			Title               string  `json:"title"`
 			Status              string  `json:"status"`
 			Priority            string  `json:"priority"`
+			Color               *string `json:"color"`
 			DueDate             *string `json:"due_date"`
 			Important           bool    `json:"important"`
 			BlockedByTaskID     *int64  `json:"blocked_by_task_id"`
@@ -591,7 +605,7 @@ func listSubtasks(deps Deps) http.HandlerFunc {
 		out := []Sub{}
 		for rows.Next() {
 			var s Sub
-			rows.Scan(&s.ID, &s.Title, &s.Status, &s.Priority, &s.DueDate, &s.Important,
+			rows.Scan(&s.ID, &s.Title, &s.Status, &s.Priority, &s.Color, &s.DueDate, &s.Important,
 				&s.BlockedByTaskID, &s.BlockedByTaskTitle, &s.BlockedByTaskStatus, &s.SortOrder)
 			out = append(out, s)
 		}
@@ -607,6 +621,7 @@ func createTask(deps Deps) http.HandlerFunc {
 			Title           string   `json:"title"`
 			Description     string   `json:"description"`
 			Priority        string   `json:"priority"`
+			Color           *string  `json:"color"`
 			Status          string   `json:"status"`
 			DueDate         *string  `json:"due_date"`
 			WeekOf          *string  `json:"week_of"`
@@ -633,6 +648,14 @@ func createTask(deps Deps) http.HandlerFunc {
 		if !validTaskStatus(body.Status) {
 			errJSON(w, 400, "invalid task status")
 			return
+		}
+		if body.Color != nil {
+			value := strings.ToUpper(strings.TrimSpace(*body.Color))
+			if !validTaskColor(value) {
+				errJSON(w, 400, "invalid task color")
+				return
+			}
+			body.Color = &value
 		}
 		if body.Status == "blocked" {
 			if body.BlockedByTaskID == nil || validateTaskBlocker(d, uid, 0, *body.BlockedByTaskID) != nil {
@@ -717,11 +740,11 @@ func createTask(deps Deps) http.HandlerFunc {
 
 		var id int64
 		err := d.QueryRow(`
-			INSERT INTO tasks (user_id, title, description, priority, status, due_date, week_of, month_of, scheduled_at, remind,
+			INSERT INTO tasks (user_id, title, description, priority, color, status, due_date, week_of, month_of, scheduled_at, remind,
 			                   notify_emails, list_id, parent_task_id, blocked_by_task_id, important, steps, sort_order)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, $16::jsonb, $17)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15, $16, $17::jsonb, $18)
 			RETURNING id`,
-			uid, body.Title, body.Description, body.Priority, body.Status, dueArg, weekArg, monthArg, schedArg, body.Remind,
+			uid, body.Title, body.Description, body.Priority, body.Color, body.Status, dueArg, weekArg, monthArg, schedArg, body.Remind,
 			string(notifyJSON), body.ListID, body.ParentTaskID, body.BlockedByTaskID, body.Important, stepsJSON, nextSort,
 		).Scan(&id)
 		if err != nil {
@@ -759,6 +782,7 @@ func updateTask(deps Deps) http.HandlerFunc {
 			Description     *string   `json:"description"`
 			Status          *string   `json:"status"`
 			Priority        *string   `json:"priority"`
+			Color           *string   `json:"color"`
 			DueDate         *string   `json:"due_date"`
 			WeekOf          *string   `json:"week_of"`
 			MonthOf         *string   `json:"month_of"`
@@ -778,6 +802,7 @@ func updateTask(deps Deps) http.HandlerFunc {
 			ClearDue        bool      `json:"clear_due"`
 			ClearWeek       bool      `json:"clear_week"`
 			ClearMonth      bool      `json:"clear_month"`
+			ClearColor      bool      `json:"clear_color"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -865,6 +890,18 @@ func updateTask(deps Deps) http.HandlerFunc {
 		}
 		if body.Priority != nil {
 			q.Exec("UPDATE tasks SET priority = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Priority, id, uid)
+		}
+		if body.Color != nil || body.ClearColor {
+			var color any
+			if body.Color != nil && !body.ClearColor {
+				value := strings.ToUpper(strings.TrimSpace(*body.Color))
+				if !validTaskColor(value) {
+					errJSON(w, 400, "invalid task color")
+					return
+				}
+				color = value
+			}
+			q.Exec("UPDATE tasks SET color=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", color, id, uid)
 		}
 		if body.DueDate != nil {
 			oldDate := ""

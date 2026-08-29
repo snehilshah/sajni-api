@@ -57,6 +57,7 @@ func Router(deps Deps) http.Handler {
 	apiMux.HandleFunc("POST /api/auth/notify-channel", deps.Auth.HandleSetNotifyChannel)
 	registerMemoRoutes(apiMux, deps)
 	registerTaskRoutes(apiMux, deps)
+	registerPlannerRoutes(apiMux, deps)
 	registerReminderRoutes(apiMux, deps)
 	registerTaskListRoutes(apiMux, deps)
 	registerHabitRoutes(apiMux, deps)

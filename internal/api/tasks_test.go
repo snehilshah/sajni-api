@@ -1,6 +1,42 @@
 package api
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+func TestTaskColorValidation(t *testing.T) {
+	for _, color := range []string{"#2D5A4F", "#7c9a92", " #C49A6C ", "#A14B4F", "#4F6FA1", "#8B6FA1", "#7A7A7A"} {
+		if !validTaskColor(color) {
+			t.Errorf("validTaskColor(%q) = false", color)
+		}
+	}
+	for _, color := range []string{"", "red", "#FFFFFF", "#2D5A4F00"} {
+		if validTaskColor(color) {
+			t.Errorf("validTaskColor(%q) = true", color)
+		}
+	}
+}
+
+func TestPlannerCalendarHelpersAcrossDST(t *testing.T) {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2026, 3, 7, 0, 0, 0, 0, loc)
+	to := time.Date(2026, 3, 9, 0, 0, 0, 0, loc)
+	if got := calendarDays(from, to); got != 2 {
+		t.Fatalf("calendarDays across DST = %d, want 2", got)
+	}
+	original := time.Date(2026, 3, 7, 9, 30, 0, 0, loc)
+	shifted := shiftCalendarDays(original, 2, loc)
+	if shifted.Hour() != 9 || shifted.Minute() != 30 || shifted.Format("2006-01-02") != "2026-03-09" {
+		t.Fatalf("shiftCalendarDays = %s, want 2026-03-09 09:30 local", shifted)
+	}
+	if got := mondayAt(time.Date(2026, 8, 26, 14, 0, 0, 0, loc)).Format("2006-01-02"); got != "2026-08-24" {
+		t.Fatalf("mondayAt = %s, want 2026-08-24", got)
+	}
+}
 
 func TestValidTaskStatus(t *testing.T) {
 	for _, status := range []string{"todo", "in_progress", "blocked", "done", "scratched"} {

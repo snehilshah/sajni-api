@@ -462,6 +462,7 @@ func (s *Service) buildTools() []Tool {
 				"title":            str("Required. Short title."),
 				"description":      str("Optional details."),
 				"priority":         str("'high' | 'medium' | 'low'. Default 'medium'."),
+				"color":            str("Optional task accent: #2D5A4F, #7C9A92, #C49A6C, #A14B4F, #4F6FA1, #8B6FA1, or #7A7A7A."),
 				"due_date":         str("Optional ISO date YYYY-MM-DD."),
 				"week_of":          str("Optional. Makes this a week-scoped task with no specific day — pass the ISO Monday date (YYYY-MM-DD) of the target week. Shows in the 'This Week' list. Mutually exclusive with due_date."),
 				"month_of":         str("Optional. Makes this a month goal with no specific day — pass the ISO 1st-of-month date (YYYY-MM-DD), e.g. 2026-06-01. Shows in the 'This Month' list; the user breaks it into dated child sessions (create them with parent_task_id + due_date). Mutually exclusive with due_date and week_of. Don't invent session dates — create only the goal unless the user gives a schedule."),
@@ -501,6 +502,7 @@ func (s *Service) buildTools() []Tool {
 				"title":          str("Optional. New title."),
 				"description":    str("Optional. New details."),
 				"priority":       str("Optional. 'high' | 'medium' | 'low'."),
+				"color":          str("Optional task accent from the supported muted palette. Pass an empty string to clear it."),
 				"due_date":       str("Optional. New due date, ISO YYYY-MM-DD."),
 				"list_id":        intg("Optional. Move the task into this list."),
 				"parent_task_id": intg("Optional. Re-parent as a subtask of this task id."),
@@ -1231,7 +1233,7 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		vals = append(vals, dt)
 	}
 	limit := argInt(args, "limit", 50)
-	q := `SELECT id,title,COALESCE(description,''),status,priority,
+	q := `SELECT id,title,COALESCE(description,''),status,priority,COALESCE(color,''),
 	             COALESCE(due_date::text,''),COALESCE(scheduled_at::text,''),
 	             COALESCE(duration_minutes,30),
 	             list_id,parent_task_id,blocked_by_task_id,important,
@@ -1246,16 +1248,17 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	out := []map[string]any{}
 	for rows.Next() {
 		var id int64
-		var title, desc, status, priority, due, sched string
+		var title, desc, status, priority, color, due, sched string
 		var dur int
 		var listID, parentID, blockedByID sql.NullInt64
 		var important bool
 		var subCount int
-		rows.Scan(&id, &title, &desc, &status, &priority, &due, &sched, &dur,
+		rows.Scan(&id, &title, &desc, &status, &priority, &color, &due, &sched, &dur,
 			&listID, &parentID, &blockedByID, &important, &subCount)
 		row := map[string]any{
 			"id": id, "title": title, "description": desc,
 			"status": status, "priority": priority,
+			"color":    color,
 			"due_date": due, "scheduled_at": sched, "duration_minutes": dur,
 			"important": important, "subtask_count": subCount,
 		}
@@ -2003,6 +2006,15 @@ func sanitizeAITaskEmails(in []string) []string {
 	return out
 }
 
+func validAITaskColor(value string) bool {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "#2D5A4F", "#7C9A92", "#C49A6C", "#A14B4F", "#4F6FA1", "#8B6FA1", "#7A7A7A":
+		return true
+	default:
+		return false
+	}
+}
+
 func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, uid string, args map[string]any) (any, map[string]any, error) {
 	title := argStr(args, "title")
 	if title == "" {
@@ -2012,6 +2024,13 @@ func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, ui
 	priority := argStr(args, "priority")
 	if priority == "" {
 		priority = "medium"
+	}
+	var colorArg any
+	if color := strings.ToUpper(strings.TrimSpace(argStr(args, "color"))); color != "" {
+		if !validAITaskColor(color) {
+			return nil, nil, fmt.Errorf("unsupported task color")
+		}
+		colorArg = color
 	}
 	dueDate := argStr(args, "due_date")
 	weekOf := argStr(args, "week_of")
@@ -2106,11 +2125,11 @@ func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, ui
 
 	var scheduledAt sql.NullTime
 	err := d.QueryRowContext(ctx, `
-		INSERT INTO tasks (user_id, title, description, priority, status, due_date, week_of, month_of, scheduled_at, remind,
+		INSERT INTO tasks (user_id, title, description, priority, color, status, due_date, week_of, month_of, scheduled_at, remind,
 		                   notify_emails, duration_minutes, list_id, parent_task_id, important, steps)
-		VALUES ($1,$2,$3,$4,'todo',$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15::jsonb)
+		VALUES ($1,$2,$3,$4,$5,'todo',$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16::jsonb)
 		RETURNING id, scheduled_at`,
-		uid, title, desc, priority, dueArg, weekArg, monthArg, schArg, remind, notifyJSON, dur, listArg, parentArg, important, stepsJSON,
+		uid, title, desc, priority, colorArg, dueArg, weekArg, monthArg, schArg, remind, notifyJSON, dur, listArg, parentArg, important, stepsJSON,
 	).Scan(&id, &scheduledAt)
 	if err != nil {
 		return nil, nil, err
@@ -2145,57 +2164,147 @@ func rescheduleTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue
 		return nil, nil, fmt.Errorf("nothing to change: pass due_date and/or scheduled_at")
 	}
 
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
 	var oldDue sql.NullString
+	var oldScheduled sql.NullTime
 	var status string
-	if err := d.QueryRowContext(ctx, `SELECT due_date::text, status FROM tasks WHERE id=$1 AND user_id=$2`, id, uid).
-		Scan(&oldDue, &status); err != nil {
+	var remind bool
+	if err := tx.QueryRowContext(ctx, `SELECT due_date::text, scheduled_at, status, remind FROM tasks WHERE id=$1 AND user_id=$2 FOR UPDATE`, id, uid).
+		Scan(&oldDue, &oldScheduled, &status, &remind); err != nil {
 		return nil, nil, fmt.Errorf("task not found")
 	}
 
 	loc := userTZLoc(ctx, d, uid)
-	today := time.Now().In(loc).Format("2006-01-02")
+	now := time.Now()
+	today := now.In(loc).Format("2006-01-02")
+	if due == "" && sched != "" {
+		if parsed, parseErr := time.Parse(time.RFC3339, sched); parseErr == nil {
+			due = parsed.In(loc).Format("2006-01-02")
+		}
+	}
+	if due != "" && due < today {
+		return nil, nil, fmt.Errorf("schedule_would_be_past")
+	}
+
+	delta := 0
+	if due != "" && oldDue.Valid {
+		from, fromErr := time.ParseInLocation("2006-01-02", oldDue.String, loc)
+		to, toErr := time.ParseInLocation("2006-01-02", due, loc)
+		if fromErr != nil || toErr != nil {
+			return nil, nil, fmt.Errorf("due_date must be YYYY-MM-DD")
+		}
+		delta = aiCalendarDays(from, to)
+	}
+
+	nextScheduled := oldScheduled
+	if sched != "" {
+		parsed, parseErr := time.Parse(time.RFC3339, sched)
+		if parseErr != nil || (due != "" && parsed.In(loc).Format("2006-01-02") != due) {
+			return nil, nil, fmt.Errorf("scheduled_at must be an ISO timestamp on due_date")
+		}
+		nextScheduled = sql.NullTime{Time: parsed, Valid: true}
+	} else if delta != 0 && oldScheduled.Valid {
+		nextScheduled = sql.NullTime{Time: shiftAICalendarDays(oldScheduled.Time, delta, loc), Valid: true}
+	}
+
+	type shiftedReminder struct {
+		id int64
+		at time.Time
+	}
+	shifted := []shiftedReminder{}
+	if delta != 0 {
+		rows, queryErr := tx.QueryContext(ctx, `SELECT id,remind_at FROM task_reminders WHERE task_id=$1 AND user_id=$2 FOR UPDATE`, id, uid)
+		if queryErr != nil {
+			return nil, nil, queryErr
+		}
+		for rows.Next() {
+			var item shiftedReminder
+			var at time.Time
+			if scanErr := rows.Scan(&item.id, &at); scanErr != nil {
+				rows.Close()
+				return nil, nil, scanErr
+			}
+			item.at = shiftAICalendarDays(at, delta, loc)
+			shifted = append(shifted, item)
+		}
+		rows.Close()
+	}
+	if nextScheduled.Valid && !nextScheduled.Time.After(now) {
+		return nil, nil, fmt.Errorf("schedule_would_be_past")
+	}
+	for _, item := range shifted {
+		if !item.at.After(now) {
+			return nil, nil, fmt.Errorf("schedule_would_be_past")
+		}
+	}
 
 	if due != "" {
 		od := ""
 		if oldDue.Valid {
 			od = oldDue.String
 		}
-		// A move off an already-past day (while still open) is a reschedule,
-		// not a miss — promote/insert the lifecycle row and log the event.
 		if od != "" && od != due && status != "done" && status != "scratched" && od < today {
 			var cnt int
-			d.QueryRowContext(ctx, `SELECT COUNT(*) FROM task_due_history WHERE user_id=$1 AND task_id=$2 AND due_date=$3`, uid, id, od).Scan(&cnt)
+			tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM task_due_history WHERE user_id=$1 AND task_id=$2 AND due_date=$3`, uid, id, od).Scan(&cnt)
 			if cnt == 0 {
-				d.ExecContext(ctx, `INSERT INTO task_due_history (user_id, task_id, due_date, outcome) VALUES ($1,$2,$3,'rescheduled')`, uid, id, od)
+				tx.ExecContext(ctx, `INSERT INTO task_due_history (user_id, task_id, due_date, outcome) VALUES ($1,$2,$3,'rescheduled')`, uid, id, od)
 			} else {
-				d.ExecContext(ctx, `UPDATE task_due_history SET outcome='rescheduled' WHERE user_id=$1 AND task_id=$2 AND due_date=$3`, uid, id, od)
+				tx.ExecContext(ctx, `UPDATE task_due_history SET outcome='rescheduled' WHERE user_id=$1 AND task_id=$2 AND due_date=$3`, uid, id, od)
 			}
-			d.ExecContext(ctx, `INSERT INTO task_events (user_id, task_id, kind, from_val, to_val) VALUES ($1,$2,'rescheduled',$3,$4)`, uid, id, od, due)
 		}
-		d.ExecContext(ctx, `UPDATE tasks SET due_date=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, due, id, uid)
-		// Day/week scope are exclusive — rescheduling to a concrete day converts
-		// a week task to a day task, so clear any stale week_of.
-		d.ExecContext(ctx, `UPDATE tasks SET week_of=NULL WHERE id=$1 AND user_id=$2`, id, uid)
+		if od != due {
+			tx.ExecContext(ctx, `INSERT INTO task_events (user_id, task_id, kind, from_val, to_val) VALUES ($1,$2,'rescheduled',$3,$4)`, uid, id, od, due)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET due_date=$1,week_of=NULL,month_of=NULL,scheduled_at=$2,reminded_at=NULL,reminder_claimed_until=NULL,updated_at=NOW() WHERE id=$3 AND user_id=$4`, due, nextScheduled, id, uid); err != nil {
+			return nil, nil, err
+		}
 	}
 
-	if sched != "" {
-		d.ExecContext(ctx, `UPDATE tasks SET scheduled_at=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3`, sched, id, uid)
-		if due == "" {
-			if t, err := time.Parse(time.RFC3339, sched); err == nil {
-				d.ExecContext(ctx, `UPDATE tasks SET due_date=$1 WHERE id=$2 AND user_id=$3`, t.In(loc).Format("2006-01-02"), id, uid)
-			}
+	if sched != "" && due == "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET scheduled_at=$1,reminded_at=NULL,reminder_claimed_until=NULL,updated_at=NOW() WHERE id=$2 AND user_id=$3`, nextScheduled, id, uid); err != nil {
+			return nil, nil, err
 		}
 	}
 
 	if hasRemind {
-		d.ExecContext(ctx, `UPDATE tasks SET remind=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3`, argBool(args, "remind", false), id, uid)
+		remind = argBool(args, "remind", false)
+		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET remind=$1,reminded_at=NULL,reminder_claimed_until=NULL,updated_at=NOW() WHERE id=$2 AND user_id=$3`, remind, id, uid); err != nil {
+			return nil, nil, err
+		}
 	}
-	if sched != "" || hasRemind {
+	for _, item := range shifted {
+		if _, err := tx.ExecContext(ctx, `UPDATE task_reminders SET remind_at=$1,sent_at=NULL,claimed_until=NULL WHERE id=$2 AND user_id=$3`, item.at, item.id, uid); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	if (nextScheduled.Valid && remind) || sched != "" || hasRemind {
 		enqueueTaskReminderFromDB(ctx, d, queue, uid, int64(id))
+	}
+	for _, item := range shifted {
+		enqueueMultiReminder(ctx, queue, item.id, item.at)
 	}
 
 	return map[string]any{"id": id, "due_date": due, "scheduled_at": sched},
 		map[string]any{"kind": "task_updated", "id": id, "route": "/tasks"}, nil
+}
+
+func aiCalendarDays(from, to time.Time) int {
+	a := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, time.UTC)
+	b := time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, time.UTC)
+	return int(b.Sub(a).Hours() / 24)
+}
+
+func shiftAICalendarDays(value time.Time, days int, loc *time.Location) time.Time {
+	local := value.In(loc).AddDate(0, 0, days)
+	return time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), local.Minute(), local.Second(), local.Nanosecond(), loc)
 }
 
 // scratchTaskTool flips a task to (or back from) the 'scratched' status — an
@@ -2305,6 +2414,16 @@ func updateTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 			add("priority", p)
 		}
 	}
+	if _, ok := args["color"]; ok {
+		color := strings.ToUpper(strings.TrimSpace(argStr(args, "color")))
+		if color == "" {
+			add("color", nil)
+		} else if validAITaskColor(color) {
+			add("color", color)
+		} else {
+			return nil, nil, fmt.Errorf("unsupported task color")
+		}
+	}
 	if _, ok := args["due_date"]; ok {
 		if due := strings.TrimSpace(argStr(args, "due_date")); due != "" {
 			add("due_date", due)
@@ -2332,7 +2451,7 @@ func updateTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 	}
 
 	if len(sets) == 0 {
-		return nil, nil, fmt.Errorf("nothing to update: pass at least one of title, description, priority, due_date, list_id, parent_task_id, to_inbox")
+		return nil, nil, fmt.Errorf("nothing to update: pass at least one of title, description, priority, color, due_date, list_id, parent_task_id, to_inbox")
 	}
 
 	vals = append(vals, id, uid)

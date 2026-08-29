@@ -72,3 +72,17 @@ func TestRecurrenceStopsAtCountAndUntil(t *testing.T) {
 		t.Fatal("until-limited recurrence returned an occurrence after the end date")
 	}
 }
+
+func TestYearlyRecurrenceClampsLeapDayAndKeepsClock(t *testing.T) {
+	loc := time.UTC
+	start := time.Date(2024, time.February, 29, 14, 45, 0, 0, loc)
+	rule, err := Normalize(Rule{Frequency: "yearly"}, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, ok := Next(start, start, 1, rule, loc)
+	want := time.Date(2025, time.February, 28, 14, 45, 0, 0, loc)
+	if !ok || next != want {
+		t.Fatalf("next = %v, want %v", next, want)
+	}
+}
