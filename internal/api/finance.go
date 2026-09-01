@@ -1331,6 +1331,11 @@ func listInvestments(deps Deps) http.HandlerFunc {
 			rows.Scan(&i.ID, &i.Name, &i.Type, &i.AccountID, &i.InvestedAmount, &i.CurrentValue, &i.MonthlyAmount,
 				&i.Frequency, &i.StartDate, &i.MaturityDate, &i.ExpectedReturn, &i.Notes, &i.LastUpdated,
 				&i.AutoDebit, &i.NextDebitDate)
+			i.CurrentValue = effectiveInvestmentValue(investmentValuation{
+				ID: i.ID, Name: i.Name, Type: i.Type, InvestedAmount: i.InvestedAmount,
+				CurrentValue: i.CurrentValue, CycleAmount: i.MonthlyAmount, Frequency: i.Frequency,
+				StartDate: i.StartDate, MaturityDate: i.MaturityDate, ExpectedReturn: i.ExpectedReturn,
+			}, userNow(d, uid))
 			out = append(out, i)
 		}
 		if out == nil {
@@ -1340,8 +1345,8 @@ func listInvestments(deps Deps) http.HandlerFunc {
 	}
 }
 
-// validInvestmentType gates the manual instrument set (market trading was
-// removed from the product; sip/mutual_fund live on as manual entries).
+// Keep mutual_fund valid for existing clients and records, but the current UI
+// no longer offers it for new investments.
 func validInvestmentType(t string) bool {
 	switch t {
 	case "sip", "mutual_fund", "fd", "rd", "other":
@@ -1420,6 +1425,11 @@ func createInvestment(deps Deps) http.HandlerFunc {
 		if b.CurrentValue == 0 {
 			b.CurrentValue = b.InvestedAmount
 		}
+		b.CurrentValue = effectiveInvestmentValue(investmentValuation{
+			Type: b.Type, InvestedAmount: b.InvestedAmount, CurrentValue: b.CurrentValue,
+			CycleAmount: b.MonthlyAmount, Frequency: b.Frequency, StartDate: b.StartDate,
+			MaturityDate: b.MaturityDate, ExpectedReturn: b.ExpectedReturn,
+		}, userNow(d, uid))
 		if b.AccountID != nil {
 			if err := requireOwnedFinanceRef(r.Context(), d, "fin_accounts", uid, *b.AccountID); err != nil {
 				errJSON(w, 404, "not found")
@@ -1583,6 +1593,10 @@ func updateInvestment(deps Deps) http.HandlerFunc {
 		args = append(args, id, uid)
 		q := "UPDATE fin_investments SET " + strings.Join(set, ", ") + " WHERE id = $" + itoa(ph) + " AND user_id = $" + itoa(ph+1)
 		if _, err := d.Exec(q, args...); err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		if err := refreshStoredFixedInvestmentValue(d, uid, id, userNow(d, uid)); err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
@@ -2115,10 +2129,32 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			}
 		}
 
-		// Investments add to assets (current_value)
-		var invTotal float64
-		d.QueryRow("SELECT COALESCE(SUM(current_value),0) FROM fin_investments WHERE user_id = $1", uid).Scan(&invTotal)
+		// Fixed deposits are valued to today; market-linked entries keep their
+		// user-reported value.
+		invTotal, investmentAssets, err := loadInvestmentValues(d, uid, userNow(d, uid))
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
 		totalAssets += invTotal
+		// Preserve the existing type-grouped response for older clients while
+		// also exposing each investment separately for asset distribution.
+		type InvBreak struct {
+			Type   string  `json:"type"`
+			Amount float64 `json:"amount"`
+		}
+		invBreakByType := map[string]float64{}
+		invTypeOrder := []string{}
+		for _, investment := range investmentAssets {
+			if _, seen := invBreakByType[investment.Type]; !seen {
+				invTypeOrder = append(invTypeOrder, investment.Type)
+			}
+			invBreakByType[investment.Type] += investment.Amount
+		}
+		invBreak := make([]InvBreak, 0, len(invTypeOrder))
+		for _, investmentType := range invTypeOrder {
+			invBreak = append(invBreak, InvBreak{Type: investmentType, Amount: roundMoney(invBreakByType[investmentType])})
+		}
 
 		// Unpaid CC due adds to liabilities (already counted via account balance)
 
@@ -2227,22 +2263,6 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			upcomingBills = []UpcomingBill{}
 		}
 
-		// Investments distribution
-		type InvBreak struct {
-			Type   string  `json:"type"`
-			Amount float64 `json:"amount"`
-		}
-		var invBreak []InvBreak
-		ibrows, _ := d.Query(`SELECT type, COALESCE(SUM(current_value),0) FROM fin_investments WHERE user_id = $1 GROUP BY type`, uid)
-		if ibrows != nil {
-			for ibrows.Next() {
-				var b InvBreak
-				ibrows.Scan(&b.Type, &b.Amount)
-				invBreak = append(invBreak, b)
-			}
-			ibrows.Close()
-		}
-
 		// Monthly recurring investments outflow
 		var monthlyInvest float64
 		d.QueryRow(`SELECT COALESCE(SUM(monthly_amount),0) FROM fin_investments WHERE user_id = $1 AND frequency = 'monthly'`, uid).Scan(&monthlyInvest)
@@ -2259,10 +2279,6 @@ func financeOverview(deps Deps) http.HandlerFunc {
 		if upcoming == nil {
 			upcoming = []Upcoming{}
 		}
-		if invBreak == nil {
-			invBreak = []InvBreak{}
-		}
-
 		writeJSON(w, 200, map[string]any{
 			"net_worth":              netWorth,
 			"total_assets":           totalAssets,
@@ -2278,6 +2294,7 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			"upcoming_dues":          upcoming,
 			"upcoming_bills":         upcomingBills,
 			"investments_breakdown":  invBreak,
+			"investment_assets":      investmentAssets,
 		})
 	}
 }
@@ -2341,13 +2358,16 @@ func networthSnapshot(deps Deps) http.HandlerFunc {
 			}
 			rows.Close()
 		}
-		var invTotal float64
-		d.QueryRow("SELECT COALESCE(SUM(current_value),0) FROM fin_investments WHERE user_id = $1", uid).Scan(&invTotal)
+		invTotal, _, err := loadInvestmentValues(d, uid, userNow(d, uid))
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
 		assets += invTotal
 
 		netWorth := assets - liabilities
 		today := userNow(d, uid).Format("2006-01-02")
-		_, err := d.Exec(`INSERT INTO fin_networth_snapshots (user_id, snapshot_date, assets, liabilities, net_worth)
+		_, err = d.Exec(`INSERT INTO fin_networth_snapshots (user_id, snapshot_date, assets, liabilities, net_worth)
 			VALUES ($1,$2,$3,$4,$5)
 			ON CONFLICT (user_id, snapshot_date) DO UPDATE SET assets = EXCLUDED.assets, liabilities = EXCLUDED.liabilities, net_worth = EXCLUDED.net_worth`,
 			uid, today, assets, liabilities, netWorth)
