@@ -892,6 +892,7 @@ func (d *DB) migrate() error {
 	-- match zero rows.
 	DELETE FROM fin_investments WHERE type IN ('stock','etf');
 	DELETE FROM fin_accounts WHERE type = 'trading';
+	UPDATE fin_accounts SET type = 'savings' WHERE type = 'checking';
 	DELETE FROM fin_transactions WHERE type IN ('buy','sell');
 	ALTER TABLE fin_investments
 		DROP COLUMN IF EXISTS quantity, DROP COLUMN IF EXISTS avg_buy_price,
