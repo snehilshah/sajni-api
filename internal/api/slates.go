@@ -97,7 +97,7 @@ func listSlates(deps Deps) http.HandlerFunc {
 		to := time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
 
 		q := `SELECT s.id, s.name, s.color, s.is_plain, s.archived,
-			COUNT(t.id),
+			COUNT(t.id) FILTER (WHERE t.type NOT IN ('lend','lend_repayment')),
 			COALESCE(SUM(t.amount) FILTER (WHERE t.type = 'expense'), 0),
 			COALESCE(SUM(t.amount) FILTER (WHERE t.type = 'expense'
 				AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3), 0)
@@ -246,7 +246,8 @@ func moveTransactionsToSlate(deps Deps) http.HandlerFunc {
 		// partner along — otherwise the pair splits across normal life and an
 		// outlier and the ledger stops balancing.
 		res, err := d.Exec(`UPDATE fin_transactions SET slate_id = $1, updated_at = NOW()
-			WHERE user_id = $2 AND (id = ANY($3) OR transfer_pair = ANY($3))`,
+			WHERE user_id = $2 AND type NOT IN ('lend','lend_repayment')
+			  AND (id = ANY($3) OR transfer_pair = ANY($3))`,
 			target, uid, b.TransactionIDs)
 		if err != nil {
 			internalError(w, r, "move transactions to slate", err)

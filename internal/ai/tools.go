@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/mail"
 	"net/url"
@@ -333,6 +334,14 @@ func (s *Service) buildTools() []Tool {
 			}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listTxnsTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "list_lends",
+			Description: "List money the user has lent, including borrower, source account, principal, repaid amount, outstanding principal, optional due date, and status. A lend is a receivable asset, not an expense.",
+			Schema:      obj(map[string]*genai.Schema{}),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return listLendsTool(ctx, d, uid)
 			},
 		},
 		{
@@ -1096,6 +1105,39 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "create_lend",
+			Description: "Record principal lent to someone. This debits the source bank, cash, or card account and creates an equal receivable so net worth does not change. Use this instead of an expense. Interest is separate income when received.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"source_account_id": intg("Required. Account or card from list_finance_accounts."),
+				"borrower":          str("Required. Free-text borrower name."),
+				"amount":            num("Required positive principal amount."),
+				"description":       str("Optional reason or description."),
+				"note":              str("Optional note."),
+				"date":              str("ISO date. Defaults to today."),
+				"due_date":          str("Optional ISO repayment due date."),
+				"remind":            boolean("Opt in to one reminder when the due date arrives. Requires due_date."),
+			}, "source_account_id", "borrower", "amount"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return createLendTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "record_lend_repayment",
+			Description: "Record principal repaid against an existing lend. It credits any destination account, defaults to the original source account, and reduces the receivable by the same amount. Record interest separately as income.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"lend_id":                intg("Required. From list_lends."),
+				"amount":                 num("Required positive principal repayment, no more than outstanding."),
+				"destination_account_id": intg("Optional receiving account. Defaults to the lend source account."),
+				"date":                   str("ISO date. Defaults to today."),
+				"note":                   str("Optional note."),
+			}, "lend_id", "amount"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return recordLendRepaymentTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "update_transaction",
 			Description: "Update an existing finance transaction by id — change its account, category, slate, amount, type, description, or date. To move it to another account pass account_id (balances recompute automatically). To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. To move it between slates pass slate_id (0 = Plain). Use list_finance_transactions to find the id first.",
 			Mutating:    true,
@@ -1610,7 +1652,10 @@ func listMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 func listAccountsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
 	rows, err := d.QueryContext(ctx, `
 		SELECT a.id, a.name, a.type, a.institution, a.currency,
-		       a.opening_balance + COALESCE((SELECT SUM(CASE WHEN t.type='income' THEN t.amount ELSE -t.amount END)
+		       a.opening_balance + COALESCE((SELECT SUM(CASE
+		                                     WHEN t.type IN ('income','transfer_in','lend_repayment') THEN t.amount
+		                                     WHEN t.type IN ('expense','transfer_out','lend') THEN -t.amount
+		                                     ELSE 0 END)
 		                                     FROM fin_transactions t WHERE t.account_id=a.id AND t.user_id=a.user_id),0) AS balance
 		FROM fin_accounts a WHERE a.user_id=$1 AND a.archived=FALSE ORDER BY a.id`, uid)
 	if err != nil {
@@ -3434,6 +3479,198 @@ func addMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		map[string]any{"kind": "media_added", "id": id, "title": title, "route": "/media"}, nil
 }
 
+func financeToolTimestamp(ctx context.Context, d *db.DB, uid, value string) (time.Time, error) {
+	if value == "" {
+		return userTZNow(ctx, d, uid), nil
+	}
+	parsed, err := time.ParseInLocation("2006-01-02", value, userTZLoc(ctx, d, uid))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("date must be YYYY-MM-DD")
+	}
+	return parsed, nil
+}
+
+func financeToolMoney(value float64) float64 {
+	return math.Round(value*100) / 100
+}
+
+func listLendsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
+	rows, err := d.QueryContext(ctx, `
+		SELECT l.id, l.source_account_id, a.name, l.borrower, l.principal,
+		       COALESCE(SUM(r.amount),0), l.description, l.note,
+		       (l.lent_at AT TIME ZONE COALESCE(NULLIF(u.timezone,''),'Asia/Kolkata'))::date::text,
+		       l.due_date::text
+		FROM fin_lends l
+		JOIN fin_accounts a ON a.id=l.source_account_id AND a.user_id=l.user_id
+		JOIN users u ON u.id=l.user_id
+		LEFT JOIN fin_lend_repayments r ON r.lend_id=l.id AND r.user_id=l.user_id
+		WHERE l.user_id=$1
+		GROUP BY l.id, a.name, u.timezone
+		ORDER BY (l.principal-COALESCE(SUM(r.amount),0)>0) DESC, l.lent_at DESC`, uid)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	items := []map[string]any{}
+	for rows.Next() {
+		var id, accountID int64
+		var account, borrower, description, note, lentAt string
+		var principal, repaid float64
+		var dueDate sql.NullString
+		if err := rows.Scan(&id, &accountID, &account, &borrower, &principal, &repaid,
+			&description, &note, &lentAt, &dueDate); err != nil {
+			return nil, nil, err
+		}
+		principal = financeToolMoney(principal)
+		repaid = financeToolMoney(repaid)
+		outstanding := financeToolMoney(math.Max(principal-repaid, 0))
+		status := "open"
+		if outstanding == 0 {
+			status = "settled"
+		}
+		var due any
+		if dueDate.Valid {
+			due = dueDate.String
+		}
+		items = append(items, map[string]any{
+			"id": id, "source_account_id": accountID, "source_account": account,
+			"borrower": borrower, "principal": principal, "repaid": repaid,
+			"outstanding": outstanding, "description": description, "note": note,
+			"lent_at": lentAt, "due_date": due, "status": status,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"items": items, "count": len(items)}, nil, nil
+}
+
+func createLendTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	accountID := argInt(args, "source_account_id", 0)
+	borrower := strings.TrimSpace(argStr(args, "borrower"))
+	amount := financeToolMoney(argFloat(args, "amount"))
+	if accountID == 0 || borrower == "" || amount <= 0 {
+		return nil, nil, fmt.Errorf("source_account_id, borrower, and a positive amount are required")
+	}
+	lentAt, err := financeToolTimestamp(ctx, d, uid, argStr(args, "date"))
+	if err != nil {
+		return nil, nil, err
+	}
+	dueDate := argStr(args, "due_date")
+	var dueArg any
+	if dueDate != "" {
+		if _, err := time.Parse("2006-01-02", dueDate); err != nil {
+			return nil, nil, fmt.Errorf("due_date must be YYYY-MM-DD")
+		}
+		dueArg = dueDate
+	}
+	description := strings.TrimSpace(argStr(args, "description"))
+	if description == "" {
+		description = "Lent to " + borrower
+	}
+	note := strings.TrimSpace(argStr(args, "note"))
+
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	var accountExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM fin_accounts WHERE id=$1 AND user_id=$2 AND NOT archived)`, accountID, uid).Scan(&accountExists); err != nil || !accountExists {
+		return nil, nil, fmt.Errorf("source account not found")
+	}
+	var plainID int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM fin_slates WHERE user_id=$1 AND is_plain`, uid).Scan(&plainID); err != nil {
+		return nil, nil, fmt.Errorf("no Plain slate available")
+	}
+	var transactionID int64
+	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions
+		(user_id,account_id,type,amount,description,note,txn_at,slate_id)
+		VALUES($1,$2,'lend',$3,$4,$5,$6,$7) RETURNING id`, uid, accountID, amount,
+		description, note, lentAt, plainID).Scan(&transactionID); err != nil {
+		return nil, nil, err
+	}
+	var lendID int64
+	remind := argBool(args, "remind", false) && dueArg != nil
+	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_lends
+		(user_id,source_account_id,source_transaction_id,borrower,principal,description,note,lent_at,due_date,remind)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, uid, accountID,
+		transactionID, borrower, amount, description, note, lentAt, dueArg, remind).Scan(&lendID); err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	_ = d.SyncTags(ctx, uid, "transaction", transactionID, description+" "+note)
+	return map[string]any{"id": lendID, "transaction_id": transactionID, "borrower": borrower, "principal": amount, "outstanding": amount},
+		map[string]any{"kind": "lend_created", "id": lendID, "title": borrower, "route": "/finance/lends"}, nil
+}
+
+func recordLendRepaymentTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	lendID := argInt(args, "lend_id", 0)
+	amount := financeToolMoney(argFloat(args, "amount"))
+	if lendID == 0 || amount <= 0 {
+		return nil, nil, fmt.Errorf("lend_id and a positive amount are required")
+	}
+	repaidAt, err := financeToolTimestamp(ctx, d, uid, argStr(args, "date"))
+	if err != nil {
+		return nil, nil, err
+	}
+	note := strings.TrimSpace(argStr(args, "note"))
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	var borrower string
+	var sourceAccountID int64
+	var principal, alreadyRepaid float64
+	if err := tx.QueryRowContext(ctx, `SELECT l.borrower,l.source_account_id,l.principal,
+		COALESCE((SELECT SUM(amount) FROM fin_lend_repayments WHERE lend_id=l.id),0)
+		FROM fin_lends l WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE`, lendID, uid).Scan(
+		&borrower, &sourceAccountID, &principal, &alreadyRepaid); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil, fmt.Errorf("lend not found")
+		}
+		return nil, nil, err
+	}
+	outstanding := financeToolMoney(principal - alreadyRepaid)
+	if amount > outstanding {
+		return nil, nil, fmt.Errorf("repayment exceeds outstanding amount %.2f", outstanding)
+	}
+	destinationID := argInt(args, "destination_account_id", sourceAccountID)
+	var destinationExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM fin_accounts WHERE id=$1 AND user_id=$2 AND NOT archived)`, destinationID, uid).Scan(&destinationExists); err != nil || !destinationExists {
+		return nil, nil, fmt.Errorf("destination account not found")
+	}
+	var plainID int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM fin_slates WHERE user_id=$1 AND is_plain`, uid).Scan(&plainID); err != nil {
+		return nil, nil, fmt.Errorf("no Plain slate available")
+	}
+	var transactionID int64
+	description := "Repayment from " + borrower
+	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions
+		(user_id,account_id,type,amount,description,note,txn_at,slate_id)
+		VALUES($1,$2,'lend_repayment',$3,$4,$5,$6,$7) RETURNING id`, uid, destinationID,
+		amount, description, note, repaidAt, plainID).Scan(&transactionID); err != nil {
+		return nil, nil, err
+	}
+	var repaymentID int64
+	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_lend_repayments
+		(user_id,lend_id,destination_account_id,transaction_id,amount,repaid_at,note)
+		VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`, uid, lendID, destinationID,
+		transactionID, amount, repaidAt, note).Scan(&repaymentID); err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	_ = d.SyncTags(ctx, uid, "transaction", transactionID, description+" "+note)
+	remaining := financeToolMoney(outstanding - amount)
+	return map[string]any{"id": repaymentID, "transaction_id": transactionID, "lend_id": lendID, "amount": amount, "outstanding": remaining},
+		map[string]any{"kind": "lend_repayment_created", "id": lendID, "title": borrower, "route": "/finance/lends"}, nil
+}
+
 func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	acct := argInt(args, "account_id", 0)
 	if acct == 0 {
@@ -3442,6 +3679,9 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	ttype := argStr(args, "type")
 	if ttype == "" {
 		ttype = "expense"
+	}
+	if ttype != "expense" && ttype != "income" {
+		return nil, nil, fmt.Errorf("type must be expense or income; use create_lend for lending")
 	}
 	amount := argFloat(args, "amount")
 	if amount <= 0 {
@@ -3529,9 +3769,13 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		return nil, nil, fmt.Errorf("missing id")
 	}
 	var owned int
-	d.QueryRowContext(ctx, `SELECT 1 FROM fin_transactions WHERE id=$1 AND user_id=$2`, id, uid).Scan(&owned)
+	var storedType string
+	d.QueryRowContext(ctx, `SELECT 1,type FROM fin_transactions WHERE id=$1 AND user_id=$2`, id, uid).Scan(&owned, &storedType)
 	if owned != 1 {
 		return nil, nil, fmt.Errorf("transaction not found")
+	}
+	if storedType == "lend" || storedType == "lend_repayment" {
+		return nil, nil, fmt.Errorf("manage lending entries with list_lends and record_lend_repayment")
 	}
 
 	sets := []string{"updated_at = NOW()"}

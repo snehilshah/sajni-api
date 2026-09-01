@@ -63,6 +63,7 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /api/finance/transactions", createTransaction(deps))
 	mux.HandleFunc("PUT /api/finance/transactions/{id}", updateTransaction(deps))
 	mux.HandleFunc("DELETE /api/finance/transactions/{id}", deleteTransaction(deps))
+	registerLendRoutes(mux, deps)
 
 	// Slates (normal life vs outliers)
 	registerSlateRoutes(mux, deps)
@@ -183,20 +184,22 @@ func categoryNameExists(d *db.DB, uid, kind, name string, excludeID int64) bool 
 }
 
 // computeBalance returns the current signed balance of an account based on
-// opening_balance + income - expense + transfer_in - transfer_out.
+// opening_balance + income - expense + transfer_in - transfer_out - lends + repayments.
 // For credit cards this comes out negative when money is owed.
 func computeBalance(deps Deps, uid string, accountID int64) float64 {
 	d := deps.DB
 	var opening float64
 	d.QueryRow("SELECT opening_balance FROM fin_accounts WHERE id = $1 AND user_id = $2", accountID, uid).Scan(&opening)
 
-	var income, expense, transferIn, transferOut float64
+	var income, expense, transferIn, transferOut, lent, repaid float64
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'income'", uid, accountID).Scan(&income)
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'expense'", uid, accountID).Scan(&expense)
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_in'", uid, accountID).Scan(&transferIn)
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_out'", uid, accountID).Scan(&transferOut)
+	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'lend'", uid, accountID).Scan(&lent)
+	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'lend_repayment'", uid, accountID).Scan(&repaid)
 
-	return opening + income - expense + transferIn - transferOut
+	return opening + income - expense + transferIn - transferOut - lent + repaid
 }
 
 // --- accounts --------------------------------------------------------------
@@ -402,7 +405,23 @@ func deleteAccount(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid id")
 			return
 		}
-		d.Exec("DELETE FROM fin_accounts WHERE id = $1 AND user_id = $2", id, uid)
+		var usedByLend bool
+		if err := d.QueryRow(`SELECT EXISTS(
+			SELECT 1 FROM fin_lends WHERE user_id=$1 AND source_account_id=$2
+			UNION ALL
+			SELECT 1 FROM fin_lend_repayments WHERE user_id=$1 AND destination_account_id=$2
+		)`, uid, id).Scan(&usedByLend); err != nil {
+			internalError(w, r, "check account lends", err)
+			return
+		}
+		if usedByLend {
+			errJSON(w, http.StatusConflict, "this account is used by a lend or repayment; remove the linked lending record first")
+			return
+		}
+		if _, err := d.Exec("DELETE FROM fin_accounts WHERE id = $1 AND user_id = $2", id, uid); err != nil {
+			internalError(w, r, "delete account", err)
+			return
+		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
 }
@@ -762,6 +781,14 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		if b.Type == "" {
 			b.Type = "expense"
 		}
+		if b.Amount <= 0 {
+			errJSON(w, http.StatusBadRequest, "amount must be positive")
+			return
+		}
+		if b.Type != "expense" && b.Type != "income" && b.Type != "transfer" {
+			errJSON(w, http.StatusBadRequest, "type must be expense, income, or transfer; use the lends endpoint for lending")
+			return
+		}
 		slateID, serrMsg := resolveSlateID(d, uid, b.SlateID)
 		if serrMsg != "" {
 			errJSON(w, 400, serrMsg)
@@ -860,6 +887,15 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			} else {
 				internalError(w, r, "find transaction", err)
 			}
+			return
+		}
+		var storedType string
+		if err := tx.QueryRowContext(ctx, `SELECT type FROM fin_transactions WHERE id=$1 AND user_id=$2`, id, uid).Scan(&storedType); err != nil {
+			internalError(w, r, "read transaction type", err)
+			return
+		}
+		if storedType == "lend" || storedType == "lend_repayment" {
+			errJSON(w, http.StatusConflict, "manage lending entries from Lends")
 			return
 		}
 		for _, ref := range []struct {
@@ -972,6 +1008,15 @@ func deleteTransaction(deps Deps) http.HandlerFunc {
 		id, err := intParam(r, "id")
 		if err != nil {
 			errJSON(w, 400, "invalid id")
+			return
+		}
+		var storedType string
+		if err := d.QueryRow("SELECT type FROM fin_transactions WHERE id = $1 AND user_id = $2", id, uid).Scan(&storedType); err != nil {
+			errJSON(w, http.StatusNotFound, "not found")
+			return
+		}
+		if storedType == "lend" || storedType == "lend_repayment" {
+			errJSON(w, http.StatusConflict, "manage lending entries from Lends")
 			return
 		}
 		// delete pair if any
@@ -1852,10 +1897,10 @@ func computeStatementTotals(d *db.DB, uid string, acctID int64, in statementCalc
 	} else {
 		var spend, refund float64
 		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND account_id = $2 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
+			WHERE user_id = $1 AND account_id = $2 AND type IN ('expense','lend') AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
 			uid, acctID, from, in.StatementDate).Scan(&spend)
 		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND account_id = $2 AND type = 'income' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
+			WHERE user_id = $1 AND account_id = $2 AND type IN ('income','lend_repayment') AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
 			uid, acctID, from, in.StatementDate).Scan(&refund)
 		newCharges = spend - refund
 	}
@@ -2155,6 +2200,12 @@ func financeOverview(deps Deps) http.HandlerFunc {
 		for _, investmentType := range invTypeOrder {
 			invBreak = append(invBreak, InvBreak{Type: investmentType, Amount: roundMoney(invBreakByType[investmentType])})
 		}
+		moneyLentTotal, lendAssets, err := loadOutstandingLends(r.Context(), d, uid)
+		if err != nil {
+			internalError(w, r, "load outstanding lends", err)
+			return
+		}
+		totalAssets += moneyLentTotal
 
 		// Unpaid CC due adds to liabilities (already counted via account balance)
 
@@ -2284,6 +2335,7 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			"total_assets":           totalAssets,
 			"total_liabilities":      totalLiabilities,
 			"investments_total":      invTotal,
+			"money_lent_total":       moneyLentTotal,
 			"month_income":           monthIncome,
 			"month_expense":          monthExpense,
 			"month_savings":          monthIncome - monthExpense,
@@ -2295,6 +2347,7 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			"upcoming_bills":         upcomingBills,
 			"investments_breakdown":  invBreak,
 			"investment_assets":      investmentAssets,
+			"lends_breakdown":        lendAssets,
 		})
 	}
 }
@@ -2364,6 +2417,12 @@ func networthSnapshot(deps Deps) http.HandlerFunc {
 			return
 		}
 		assets += invTotal
+		moneyLentTotal, _, err := loadOutstandingLends(r.Context(), d, uid)
+		if err != nil {
+			internalError(w, r, "load outstanding lends", err)
+			return
+		}
+		assets += moneyLentTotal
 
 		netWorth := assets - liabilities
 		today := userNow(d, uid).Format("2006-01-02")

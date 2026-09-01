@@ -63,5 +63,11 @@ func ProcessScheduledNotifications(ctx context.Context, deps Deps) (map[string]i
 		jobErrors = append(jobErrors, err)
 	}
 
+	lends, err := ProcessLendReminders(ctx, deps)
+	result["lend_reminders"] = lends
+	if err != nil {
+		jobErrors = append(jobErrors, err)
+	}
+
 	return result, errors.Join(jobErrors...)
 }

@@ -77,6 +77,7 @@ const (
 	TypeTaskDigest     = "task_digest"
 	TypeBillDue        = "bill_due"
 	TypeInvestmentAuto = "investment_auto"
+	TypeLendDue        = "lend_due"
 	TypeMediaRelease   = "media_release"
 )
 
@@ -95,7 +96,7 @@ func (n Notification) channelID() string {
 		return "digest"
 	case TypeBillDue:
 		return "bills"
-	case TypeInvestmentAuto:
+	case TypeInvestmentAuto, TypeLendDue:
 		return "finance"
 	case TypeMediaRelease:
 		return "media"
@@ -107,7 +108,7 @@ func (n Notification) channelID() string {
 // interrupts reports whether this push is worth a heads-up display: true only
 // when there is still something the user can act on in time.
 func (n Notification) interrupts() bool {
-	return n.Type == TypeTaskReminder || n.Type == TypeReminder || n.Type == TypeBillDue || n.Type == ""
+	return n.Type == TypeTaskReminder || n.Type == TypeReminder || n.Type == TypeBillDue || n.Type == TypeLendDue || n.Type == ""
 }
 
 // SendToUser delivers n to every device the user has registered and returns

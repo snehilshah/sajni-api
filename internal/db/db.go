@@ -552,6 +552,42 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_account ON fin_transactions(account_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_at ON fin_transactions(user_id, txn_at);
 
+	-- A lend is a receivable, not spending. source_transaction_id is the
+	-- account outflow; repayments each own an account inflow. Keeping those
+	-- ledger rows explicit makes bank and card balances reconcile while the
+	-- outstanding principal remains a separate asset in net worth.
+	CREATE TABLE IF NOT EXISTS fin_lends (
+		id                    BIGSERIAL     PRIMARY KEY,
+		user_id               UUID          NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		source_account_id     BIGINT        NOT NULL REFERENCES fin_accounts(id) ON DELETE RESTRICT,
+		source_transaction_id BIGINT        NOT NULL UNIQUE REFERENCES fin_transactions(id) ON DELETE RESTRICT,
+		borrower              TEXT          NOT NULL,
+		principal             NUMERIC(14,2) NOT NULL CHECK (principal > 0),
+		description           TEXT          NOT NULL DEFAULT '',
+		note                  TEXT          NOT NULL DEFAULT '',
+		lent_at               TIMESTAMPTZ   NOT NULL,
+		due_date              DATE,
+		remind                BOOLEAN       NOT NULL DEFAULT FALSE,
+		last_reminded_due_date DATE,
+		created_at            TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+		updated_at            TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_lends_user ON fin_lends(user_id, lent_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_fin_lends_due ON fin_lends(user_id, due_date) WHERE remind AND due_date IS NOT NULL;
+
+	CREATE TABLE IF NOT EXISTS fin_lend_repayments (
+		id                     BIGSERIAL     PRIMARY KEY,
+		user_id                UUID          NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		lend_id                BIGINT        NOT NULL REFERENCES fin_lends(id) ON DELETE CASCADE,
+		destination_account_id BIGINT        NOT NULL REFERENCES fin_accounts(id) ON DELETE RESTRICT,
+		transaction_id         BIGINT        NOT NULL UNIQUE REFERENCES fin_transactions(id) ON DELETE RESTRICT,
+		amount                 NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+		repaid_at              TIMESTAMPTZ   NOT NULL,
+		note                   TEXT          NOT NULL DEFAULT '',
+		created_at             TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_lend_repayments_lend ON fin_lend_repayments(lend_id, repaid_at);
+
 	CREATE TABLE IF NOT EXISTS fin_budgets (
 		id          BIGSERIAL   PRIMARY KEY,
 		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
