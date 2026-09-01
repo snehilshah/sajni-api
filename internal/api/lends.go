@@ -226,11 +226,14 @@ func updateLend(deps Deps) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			Borrower    string `json:"borrower"`
-			Description string `json:"description"`
-			Note        string `json:"note"`
-			DueDate     string `json:"due_date"`
-			Remind      bool   `json:"remind"`
+			SourceAccountID *int64   `json:"source_account_id"`
+			Amount          *float64 `json:"amount"`
+			Borrower        string   `json:"borrower"`
+			Description     string   `json:"description"`
+			Note            string   `json:"note"`
+			LentAt          *string  `json:"lent_at"`
+			DueDate         string   `json:"due_date"`
+			Remind          bool     `json:"remind"`
 		}
 		if err := readJSON(r, &body); err != nil || strings.TrimSpace(body.Borrower) == "" {
 			errJSON(w, http.StatusBadRequest, "borrower required")
@@ -242,6 +245,19 @@ func updateLend(deps Deps) http.HandlerFunc {
 				return
 			}
 		}
+		if body.Amount != nil && *body.Amount <= 0 {
+			errJSON(w, http.StatusBadRequest, "amount must be positive")
+			return
+		}
+		var requestedLentAt *time.Time
+		if body.LentAt != nil {
+			parsed, err := time.Parse(time.RFC3339, *body.LentAt)
+			if err != nil {
+				errJSON(w, http.StatusBadRequest, "invalid lent_at")
+				return
+			}
+			requestedLentAt = &parsed
+		}
 		ctx := r.Context()
 		tx, err := deps.DB.BeginTx(ctx, nil)
 		if err != nil {
@@ -249,13 +265,13 @@ func updateLend(deps Deps) http.HandlerFunc {
 			return
 		}
 		defer tx.Rollback()
-		var txnID int64
-		if err := tx.QueryRowContext(ctx, `UPDATE fin_lends SET borrower=$1, description=$2, note=$3,
-			due_date=NULLIF($4,'')::date, remind=($5 AND $4<>''),
-			last_reminded_due_date=CASE WHEN due_date IS DISTINCT FROM NULLIF($4,'')::date THEN NULL ELSE last_reminded_due_date END,
-			updated_at=NOW() WHERE id=$6 AND user_id=$7 RETURNING source_transaction_id`,
-			strings.TrimSpace(body.Borrower), strings.TrimSpace(body.Description), strings.TrimSpace(body.Note),
-			body.DueDate, body.Remind, id, uid).Scan(&txnID); err != nil {
+		var txnID, sourceAccountID int64
+		var principal, repaid float64
+		var lentAt time.Time
+		if err := tx.QueryRowContext(ctx, `SELECT l.source_transaction_id, l.source_account_id, l.principal, l.lent_at,
+			COALESCE((SELECT SUM(amount) FROM fin_lend_repayments WHERE lend_id=l.id),0)
+			FROM fin_lends l WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE`, id, uid,
+		).Scan(&txnID, &sourceAccountID, &principal, &lentAt, &repaid); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				errJSON(w, http.StatusNotFound, "lend not found")
 			} else {
@@ -263,12 +279,41 @@ func updateLend(deps Deps) http.HandlerFunc {
 			}
 			return
 		}
+		if body.SourceAccountID != nil {
+			if err := requireOwnedFinanceRef(ctx, tx, "fin_accounts", uid, *body.SourceAccountID); err != nil {
+				errJSON(w, http.StatusNotFound, "account not found")
+				return
+			}
+			sourceAccountID = *body.SourceAccountID
+		}
+		if body.Amount != nil {
+			principal = roundMoney(*body.Amount)
+		}
+		if principal < roundMoney(repaid) {
+			errJSON(w, http.StatusBadRequest, fmt.Sprintf("principal cannot be below the %.2f already repaid", roundMoney(repaid)))
+			return
+		}
+		if requestedLentAt != nil {
+			lentAt = *requestedLentAt
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE fin_lends SET source_account_id=$1, borrower=$2,
+			principal=$3, description=$4, note=$5, lent_at=$6,
+			due_date=NULLIF($7,'')::date, remind=($8 AND $7<>''),
+			last_reminded_due_date=CASE WHEN due_date IS DISTINCT FROM NULLIF($7,'')::date THEN NULL ELSE last_reminded_due_date END,
+			updated_at=NOW() WHERE id=$9 AND user_id=$10`, sourceAccountID,
+			strings.TrimSpace(body.Borrower), principal, strings.TrimSpace(body.Description), strings.TrimSpace(body.Note),
+			lentAt, body.DueDate, body.Remind, id, uid); err != nil {
+			internalError(w, r, "update lend", err)
+			return
+		}
 		description := strings.TrimSpace(body.Description)
 		if description == "" {
 			description = "Lent to " + strings.TrimSpace(body.Borrower)
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET description=$1, note=$2, updated_at=NOW()
-			WHERE id=$3 AND user_id=$4`, description, strings.TrimSpace(body.Note), txnID, uid); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET account_id=$1, amount=$2,
+			description=$3, note=$4, txn_at=$5, updated_at=NOW()
+			WHERE id=$6 AND user_id=$7`, sourceAccountID, principal, description,
+			strings.TrimSpace(body.Note), lentAt, txnID, uid); err != nil {
 			internalError(w, r, "update lend transaction", err)
 			return
 		}

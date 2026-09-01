@@ -602,6 +602,7 @@ type txnResp struct {
 	LinkedAccount *int64  `json:"linked_account"`
 	SlateID       int64   `json:"slate_id"`   // never zero; Plain when unfiled
 	SlateName     string  `json:"slate_name"` // joined for display
+	LendID        *int64  `json:"lend_id"`    // source or repayment row's receivable
 	CreatedAt     string  `json:"created_at"`
 }
 
@@ -695,11 +696,13 @@ func listTransactions(deps Deps) http.HandlerFunc {
 
 		q := `SELECT t.id, t.account_id, a.name, t.category_id, c.name, c.color, t.type, t.amount,
 			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.slate_id, s.name,
-			  t.created_at::text
+			  COALESCE(l.id, r.lend_id), t.created_at::text
 			  FROM fin_transactions t
 			  JOIN fin_accounts a ON a.id = t.account_id
 			  LEFT JOIN fin_categories c ON c.id = t.category_id
 			  JOIN fin_slates s ON s.id = t.slate_id
+			  LEFT JOIN fin_lends l ON l.source_transaction_id=t.id AND l.user_id=t.user_id
+			  LEFT JOIN fin_lend_repayments r ON r.transaction_id=t.id AND r.user_id=t.user_id
 			  WHERE ` + strings.Join(clauses, " AND ") +
 			` ORDER BY t.txn_at DESC, t.id DESC LIMIT ` + itoa(limit)
 
@@ -716,7 +719,7 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			var at time.Time
 			rows.Scan(&t.ID, &t.AccountID, &t.AccountName, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
 				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount,
-				&t.SlateID, &t.SlateName, &t.CreatedAt)
+				&t.SlateID, &t.SlateName, &t.LendID, &t.CreatedAt)
 			t.TxnAt = at.In(loc).Format(time.RFC3339)
 			out = append(out, t)
 		}
