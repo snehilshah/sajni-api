@@ -171,6 +171,15 @@ func sanitizeParts(parts []*genai.Part) []*genai.Part {
 			continue
 		}
 		cp := *p
+		if p.FunctionCall != nil {
+			call := *p.FunctionCall
+			cp.FunctionCall = &call
+		}
+		if p.FunctionResponse != nil {
+			response := *p.FunctionResponse
+			cp.FunctionResponse = &response
+		}
+		cp.ThoughtSignature = append([]byte(nil), p.ThoughtSignature...)
 		out = append(out, &cp)
 	}
 	return out
@@ -200,12 +209,90 @@ func hasFunctionResponse(c *genai.Content) bool {
 	return false
 }
 
+// functionPairMatches validates every response against one call. Gemini 3
+// adds call IDs; legacy stored sessions only have names, so repair a missing
+// response ID when the name still identifies the corresponding call.
+func functionPairMatches(callTurn, responseTurn *genai.Content) bool {
+	if !hasFunctionCall(callTurn) || !hasFunctionResponse(responseTurn) {
+		return false
+	}
+	var calls []*genai.FunctionCall
+	var responses []*genai.FunctionResponse
+	for _, p := range callTurn.Parts {
+		if p != nil && p.FunctionCall != nil {
+			calls = append(calls, p.FunctionCall)
+		}
+	}
+	for _, p := range responseTurn.Parts {
+		if p != nil && p.FunctionResponse != nil {
+			responses = append(responses, p.FunctionResponse)
+		}
+	}
+	if len(calls) == 0 || len(calls) != len(responses) {
+		return false
+	}
+	used := make([]bool, len(responses))
+	for _, call := range calls {
+		matched := -1
+		for index, response := range responses {
+			if used[index] || call.Name == "" || response.Name != call.Name {
+				continue
+			}
+			if call.ID != "" && response.ID != "" && response.ID != call.ID {
+				continue
+			}
+			matched = index
+			break
+		}
+		if matched < 0 {
+			return false
+		}
+		used[matched] = true
+		if responses[matched].ID == "" {
+			responses[matched].ID = call.ID
+		}
+	}
+	return true
+}
+
+// alternatingHistorySuffix keeps the newest complete, valid conversation
+// suffix. This is deliberately loss-tolerant: retaining a little less context
+// is better than making every future turn fail on a legacy malformed row.
+func alternatingHistorySuffix(history []*genai.Content) []*genai.Content {
+	end := len(history)
+	for end > 0 && history[end-1].Role != "model" {
+		end--
+	}
+	for start := 0; start < end; start++ {
+		if history[start].Role != "user" || hasFunctionResponse(history[start]) || (end-start)%2 != 0 {
+			continue
+		}
+		valid := true
+		for index := start; index < end; index++ {
+			want := "user"
+			if (index-start)%2 == 1 {
+				want = "model"
+			}
+			if history[index].Role != want {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return history[start:end]
+		}
+	}
+	return []*genai.Content{}
+}
+
 // SanitizeHistory walks the conversation and:
 //
 //  1. Strips nil parts, empty parts, thought parts, and empty content turns.
 //  2. Merges fragmented text parts within the same turn.
-//  3. Enforces Gemini's strict tool-pair contract (drops orphan function responses
-//     and dangling function calls).
+//  3. Enforces Gemini's strict tool-pair contract (drops orphan or mismatched
+//     function responses and dangling function calls).
+//  4. Keeps the newest suffix that starts with user and strictly alternates
+//     user/model roles.
 func SanitizeHistory(history []*genai.Content) []*genai.Content {
 	if len(history) == 0 {
 		return history
@@ -213,7 +300,7 @@ func SanitizeHistory(history []*genai.Content) []*genai.Content {
 
 	var cleaned []*genai.Content
 	for _, c := range history {
-		if c == nil {
+		if c == nil || (c.Role != "user" && c.Role != "model") {
 			continue
 		}
 		validParts := sanitizeParts(c.Parts)
@@ -234,7 +321,7 @@ func SanitizeHistory(history []*genai.Content) []*genai.Content {
 	for i := 0; i < len(cleaned); i++ {
 		c := cleaned[i]
 		if hasFunctionResponse(c) {
-			if len(validated) == 0 || !hasFunctionCall(validated[len(validated)-1]) {
+			if len(validated) == 0 || !functionPairMatches(validated[len(validated)-1], c) {
 				continue
 			}
 			validated = append(validated, c)
@@ -242,7 +329,7 @@ func SanitizeHistory(history []*genai.Content) []*genai.Content {
 		}
 
 		if hasFunctionCall(c) {
-			if i+1 < len(cleaned) && hasFunctionResponse(cleaned[i+1]) {
+			if i+1 < len(cleaned) && functionPairMatches(c, cleaned[i+1]) {
 				validated = append(validated, c)
 			} else {
 				var nonCallParts []*genai.Part
@@ -264,7 +351,7 @@ func SanitizeHistory(history []*genai.Content) []*genai.Content {
 		validated = append(validated, c)
 	}
 
-	return validated
+	return alternatingHistorySuffix(validated)
 }
 
 // deriveTitle picks the first 8 words of the first user-text message

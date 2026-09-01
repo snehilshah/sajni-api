@@ -31,6 +31,9 @@ func functionCallKey(fc *genai.FunctionCall) string {
 	if fc == nil {
 		return ""
 	}
+	if fc.ID != "" {
+		return "id|" + fc.ID
+	}
 	b, _ := json.Marshal(fc.Args)
 	return fc.Name + "|" + string(b)
 }
@@ -143,8 +146,11 @@ func friendlyAIError(err error) string {
 	case strings.Contains(low, "function response turn comes immediately after a function call turn"):
 		return "Conversation went out of sync. Start a new chat to clear it."
 	case strings.Contains(low, "required oneof field 'data'"),
-		strings.Contains(low, "invalid_argument"):
+		strings.Contains(low, "thought_signature"),
+		strings.Contains(low, "conversation history"):
 		return "Conversation history was invalid. Start a new chat to clear it."
+	case strings.Contains(low, "invalid_argument"):
+		return "Sajni couldn't process that request. Try again."
 	case strings.Contains(low, "deadline exceeded"),
 		strings.Contains(low, "context canceled"):
 		return "Sajni took too long. Try a shorter prompt."
@@ -324,15 +330,18 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 
 	for r := 0; r < rounds; r++ {
 		var (
-			turnText  strings.Builder
-			calls     []*genai.FunctionCall
+			turnText strings.Builder
+			calls    []*genai.FunctionCall
+			// Gemini 3 requires the function-call Part's thought signature to
+			// be returned exactly as received on the next tool round.
+			callParts []*genai.Part
 			streamErr error
 		)
 
 		// Dedupe identical FunctionCall parts. Gemini sometimes emits the
 		// same call twice across stream chunks; without this guard we'd
 		// dispatch the tool twice and pollute history with two responses.
-		seenCalls := map[string]bool{}
+		seenCalls := map[string]int{}
 		for resp, err := range s.client.GenerateContentStream(ctx, s.model, contents, cfg) {
 			if err != nil {
 				streamErr = err
@@ -348,15 +357,30 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 				}
 				if p.FunctionCall != nil {
 					key := functionCallKey(p.FunctionCall)
-					if seenCalls[key] {
+					if index, seen := seenCalls[key]; seen {
+						// Some stream variants emit the signature on a later copy
+						// of the same call. Keep it without dispatching twice.
+						if len(callParts[index].ThoughtSignature) == 0 && len(p.ThoughtSignature) > 0 {
+							callParts[index].ThoughtSignature = append([]byte(nil), p.ThoughtSignature...)
+						}
 						continue
 					}
-					seenCalls[key] = true
-					calls = append(calls, p.FunctionCall)
+					seenCalls[key] = len(calls)
+					call := *p.FunctionCall
+					part := *p
+					part.FunctionCall = &call
+					part.ThoughtSignature = append([]byte(nil), p.ThoughtSignature...)
+					calls = append(calls, &call)
+					callParts = append(callParts, &part)
 				}
 			}
 		}
 		if streamErr != nil {
+			log.Warn().Err(streamErr).
+				Str("model", s.model).
+				Str("mode", req.Mode).
+				Int("round", r+1).
+				Msg("gemini chat stream failed")
 			send("error", map[string]string{"message": friendlyAIError(streamErr)})
 			return
 		}
@@ -367,9 +391,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		if turnText.Len() > 0 {
 			turnParts = append(turnParts, &genai.Part{Text: turnText.String()})
 		}
-		for _, fc := range calls {
-			turnParts = append(turnParts, &genai.Part{FunctionCall: fc})
-		}
+		turnParts = append(turnParts, callParts...)
 		if len(turnParts) > 0 {
 			contents = append(contents, &genai.Content{Role: "model", Parts: turnParts})
 		}
@@ -410,6 +432,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			}
 			respParts = append(respParts, &genai.Part{
 				FunctionResponse: &genai.FunctionResponse{
+					ID:       fc.ID,
 					Name:     fc.Name,
 					Response: respObj,
 				},
@@ -430,6 +453,10 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 	var synthesisText strings.Builder
 	for resp, err := range s.client.GenerateContentStream(ctx, s.model, contents, &synthesisCfg) {
 		if err != nil {
+			log.Warn().Err(err).
+				Str("model", s.model).
+				Str("mode", req.Mode).
+				Msg("gemini chat synthesis failed")
 			send("error", map[string]string{"message": friendlyAIError(err)})
 			return
 		}

@@ -118,11 +118,8 @@ func TestSanitizeHistory(t *testing.T) {
 		}
 
 		out := SanitizeHistory(in)
-		if len(out) != 1 {
-			t.Fatalf("expected 1 content, got %d", len(out))
-		}
-		if out[0].Role != "model" || out[0].Parts[0].Text != "You have 1 task." {
-			t.Errorf("unexpected content: %v", out[0])
+		if len(out) != 0 {
+			t.Fatalf("expected invalid model-leading history to be dropped, got %d contents", len(out))
 		}
 	})
 
@@ -141,11 +138,8 @@ func TestSanitizeHistory(t *testing.T) {
 		}
 
 		out := SanitizeHistory(in)
-		if len(out) != 1 {
-			t.Fatalf("expected 1 content, got %d", len(out))
-		}
-		if out[0].Role != "user" || out[0].Parts[0].Text != "check tasks" {
-			t.Errorf("unexpected content: %v", out[0])
+		if len(out) != 0 {
+			t.Fatalf("expected incomplete exchange to be dropped, got %d contents", len(out))
 		}
 	})
 
@@ -169,11 +163,47 @@ func TestSanitizeHistory(t *testing.T) {
 		}
 
 		out := SanitizeHistory(in)
-		if len(out) != 3 {
-			t.Fatalf("expected 3 contents, got %d", len(out))
+		if len(out) != 2 {
+			t.Fatalf("expected latest complete exchange, got %d contents", len(out))
 		}
 		if len(out[1].Parts) != 1 || out[1].Parts[0].Text != "Let me check." {
 			t.Errorf("expected model turn to preserve text and strip dangling function call, got %v", out[1].Parts)
+		}
+	})
+
+	t.Run("keeps newest alternating suffix", func(t *testing.T) {
+		in := []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: "old user"}}},
+			{Role: "user", Parts: []*genai.Part{{Text: "new user"}}},
+			{Role: "model", Parts: []*genai.Part{{Text: "new answer"}}},
+		}
+		out := SanitizeHistory(in)
+		if len(out) != 2 || out[0].Parts[0].Text != "new user" || out[1].Parts[0].Text != "new answer" {
+			t.Fatalf("unexpected alternating suffix: %#v", out)
+		}
+	})
+
+	t.Run("repairs legacy function response id", func(t *testing.T) {
+		in := []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: "check tasks"}}},
+			{Role: "model", Parts: []*genai.Part{{
+				FunctionCall:     &genai.FunctionCall{ID: "call-1", Name: "list_tasks"},
+				ThoughtSignature: []byte("signature"),
+			}}},
+			{Role: "user", Parts: []*genai.Part{{FunctionResponse: &genai.FunctionResponse{
+				Name: "list_tasks", Response: map[string]any{"ok": true},
+			}}}},
+			{Role: "model", Parts: []*genai.Part{{Text: "One task."}}},
+		}
+		out := SanitizeHistory(in)
+		if len(out) != 4 {
+			t.Fatalf("expected complete tool exchange, got %d contents", len(out))
+		}
+		if got := out[2].Parts[0].FunctionResponse.ID; got != "call-1" {
+			t.Fatalf("response id = %q, want call-1", got)
+		}
+		if got := string(out[1].Parts[0].ThoughtSignature); got != "signature" {
+			t.Fatalf("thought signature = %q, want signature", got)
 		}
 	})
 }
