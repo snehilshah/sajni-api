@@ -3622,13 +3622,14 @@ func recordLendRepaymentTool(ctx context.Context, d *db.DB, uid string, args map
 		return nil, nil, err
 	}
 	defer tx.Rollback()
-	var borrower string
+	var borrower, sourceAccountType string
 	var sourceAccountID int64
 	var principal, alreadyRepaid float64
-	if err := tx.QueryRowContext(ctx, `SELECT l.borrower,l.source_account_id,l.principal,
+	if err := tx.QueryRowContext(ctx, `SELECT l.borrower,l.source_account_id,a.type,l.principal,
 		COALESCE((SELECT SUM(amount) FROM fin_lend_repayments WHERE lend_id=l.id),0)
-		FROM fin_lends l WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE`, lendID, uid).Scan(
-		&borrower, &sourceAccountID, &principal, &alreadyRepaid); err != nil {
+		FROM fin_lends l JOIN fin_accounts a ON a.id=l.source_account_id
+		WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE`, lendID, uid).Scan(
+		&borrower, &sourceAccountID, &sourceAccountType, &principal, &alreadyRepaid); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil, fmt.Errorf("lend not found")
 		}
@@ -3639,6 +3640,12 @@ func recordLendRepaymentTool(ctx context.Context, d *db.DB, uid string, args map
 		return nil, nil, fmt.Errorf("repayment exceeds outstanding amount %.2f", outstanding)
 	}
 	destinationID := argInt(args, "destination_account_id", sourceAccountID)
+	if _, supplied := args["destination_account_id"]; !supplied && sourceAccountType == "credit_card" {
+		tx.QueryRowContext(ctx, `SELECT id FROM fin_accounts
+			WHERE user_id=$1 AND NOT archived AND type<>'credit_card'
+			ORDER BY CASE type WHEN 'salary' THEN 0 WHEN 'savings' THEN 1 WHEN 'cash' THEN 2 ELSE 3 END, id
+			LIMIT 1`, uid).Scan(&destinationID)
+	}
 	var destinationExists bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM fin_accounts WHERE id=$1 AND user_id=$2 AND NOT archived)`, destinationID, uid).Scan(&destinationExists); err != nil || !destinationExists {
 		return nil, nil, fmt.Errorf("destination account not found")

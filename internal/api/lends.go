@@ -307,14 +307,15 @@ func createLendRepayment(deps Deps) http.HandlerFunc {
 		}
 		defer tx.Rollback()
 
-		var borrower string
+		var borrower, sourceAccountType string
 		var sourceAccountID, plainID int64
 		var principal, repaid float64
-		if err := tx.QueryRowContext(ctx, `SELECT l.borrower, l.source_account_id, l.principal,
+		if err := tx.QueryRowContext(ctx, `SELECT l.borrower, l.source_account_id, a.type, l.principal,
 			COALESCE((SELECT SUM(amount) FROM fin_lend_repayments WHERE lend_id=l.id),0),
 			(SELECT id FROM fin_slates WHERE user_id=l.user_id AND is_plain)
-			FROM fin_lends l WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE`, lendID, uid,
-		).Scan(&borrower, &sourceAccountID, &principal, &repaid, &plainID); err != nil {
+			FROM fin_lends l JOIN fin_accounts a ON a.id=l.source_account_id
+			WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE`, lendID, uid,
+		).Scan(&borrower, &sourceAccountID, &sourceAccountType, &principal, &repaid, &plainID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				errJSON(w, http.StatusNotFound, "lend not found")
 			} else {
@@ -324,6 +325,15 @@ func createLendRepayment(deps Deps) http.HandlerFunc {
 		}
 		if body.DestinationAccountID == 0 {
 			body.DestinationAccountID = sourceAccountID
+			if sourceAccountType == "credit_card" {
+				// Money lent from a card remains payable on that card. The
+				// borrower's return normally lands in cash, so prefer a real
+				// receiving account instead of silently crediting the card.
+				tx.QueryRowContext(ctx, `SELECT id FROM fin_accounts
+					WHERE user_id=$1 AND NOT archived AND type<>'credit_card'
+					ORDER BY CASE type WHEN 'salary' THEN 0 WHEN 'savings' THEN 1 WHEN 'cash' THEN 2 ELSE 3 END, id
+					LIMIT 1`, uid).Scan(&body.DestinationAccountID)
+			}
 		}
 		if err := requireOwnedFinanceRef(ctx, tx, "fin_accounts", uid, body.DestinationAccountID); err != nil {
 			errJSON(w, http.StatusNotFound, "destination account not found")

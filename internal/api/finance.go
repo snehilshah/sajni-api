@@ -1796,7 +1796,14 @@ func listStatements(deps Deps) http.HandlerFunc {
 		uid := userID(r.Context())
 		args := []any{uid}
 		q := `SELECT s.id, s.account_id, a.name, s.statement_date::text, s.due_date::text,
-			s.amount_due, s.new_charges, s.previous_balance, s.cashback_earned, s.paid, s.paid_at::text
+			s.amount_due, s.new_charges, s.previous_balance, s.cashback_earned, s.paid, s.paid_at::text,
+			COALESCE((SELECT SUM(t.amount) FROM fin_transactions t
+				WHERE t.user_id=s.user_id AND t.account_id=s.account_id AND t.type='lend'
+				  AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date > COALESCE(
+					(SELECT MAX(prev.statement_date) FROM fin_cc_statements prev
+					 WHERE prev.user_id=s.user_id AND prev.account_id=s.account_id AND prev.statement_date<s.statement_date),
+					DATE '1970-01-01')
+				  AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date <= s.statement_date),0)
 			FROM fin_cc_statements s JOIN fin_accounts a ON a.id = s.account_id
 			WHERE s.user_id = $1`
 		if v := queryParam(r, "account_id"); v != "" {
@@ -1822,12 +1829,13 @@ func listStatements(deps Deps) http.HandlerFunc {
 			CashbackEarned  float64 `json:"cashback_earned"`
 			Paid            bool    `json:"paid"`
 			PaidAt          *string `json:"paid_at"`
+			LendCharges     float64 `json:"lend_charges"`
 		}
 		var out []Stmt
 		for rows.Next() {
 			var s Stmt
 			rows.Scan(&s.ID, &s.AccountID, &s.AccountName, &s.StatementDate, &s.DueDate,
-				&s.AmountDue, &s.NewCharges, &s.PreviousBalance, &s.CashbackEarned, &s.Paid, &s.PaidAt)
+				&s.AmountDue, &s.NewCharges, &s.PreviousBalance, &s.CashbackEarned, &s.Paid, &s.PaidAt, &s.LendCharges)
 			out = append(out, s)
 		}
 		if out == nil {
@@ -1879,6 +1887,7 @@ type statementCalcResult struct {
 	PreviousBalance float64 `json:"previous_balance"`
 	CashbackEarned  float64 `json:"cashback_earned"`
 	Payments        float64 `json:"payments"`
+	LendCharges     float64 `json:"lend_charges"`
 }
 
 func computeStatementTotals(d *db.DB, uid string, acctID int64, in statementCalcInput) statementCalcResult {
@@ -1891,18 +1900,25 @@ func computeStatementTotals(d *db.DB, uid string, acctID int64, in statementCalc
 		from = *lastStmt
 	}
 
+	var lendCharges float64
+	d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
+		WHERE user_id=$1 AND account_id=$2 AND type='lend'
+		  AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3
+		  AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
+		uid, acctID, from, in.StatementDate).Scan(&lendCharges)
+
 	var newCharges float64
 	if in.NewCharges != nil {
 		newCharges = *in.NewCharges
 	} else {
-		var spend, refund float64
+		var personalSpend, refund float64
 		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND account_id = $2 AND type IN ('expense','lend') AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
-			uid, acctID, from, in.StatementDate).Scan(&spend)
+			WHERE user_id = $1 AND account_id = $2 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
+			uid, acctID, from, in.StatementDate).Scan(&personalSpend)
 		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
 			WHERE user_id = $1 AND account_id = $2 AND type IN ('income','lend_repayment') AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
 			uid, acctID, from, in.StatementDate).Scan(&refund)
-		newCharges = spend - refund
+		newCharges = personalSpend + lendCharges - refund
 	}
 
 	var prevBalance float64
@@ -1946,7 +1962,7 @@ func computeStatementTotals(d *db.DB, uid string, acctID int64, in statementCalc
 
 	return statementCalcResult{
 		AmountDue: total, NewCharges: newCharges, PreviousBalance: prevBalance,
-		CashbackEarned: cashback, Payments: payments,
+		CashbackEarned: cashback, Payments: payments, LendCharges: lendCharges,
 	}
 }
 
@@ -1982,7 +1998,7 @@ func previewStatement(deps Deps) http.HandlerFunc {
 			"due_date":       deriveDueDate(deps, uid, acctID, b.StatementDate),
 			"amount_due":     calc.AmountDue, "new_charges": calc.NewCharges,
 			"previous_balance": calc.PreviousBalance, "cashback_earned": calc.CashbackEarned,
-			"payments": calc.Payments,
+			"payments": calc.Payments, "lend_charges": calc.LendCharges,
 		})
 	}
 }
@@ -2042,6 +2058,7 @@ func createStatement(deps Deps) http.HandlerFunc {
 		writeJSON(w, 201, map[string]any{
 			"id": id, "amount_due": calc.AmountDue, "new_charges": calc.NewCharges,
 			"previous_balance": calc.PreviousBalance, "cashback_earned": calc.CashbackEarned,
+			"lend_charges": calc.LendCharges,
 		})
 	}
 }
