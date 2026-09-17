@@ -17,7 +17,7 @@ push tag sga/release/v*─►  CI gate → docker build → Artifact Registry
                             ─►  Cloud Run deploy + /readyz smoke test
 ```
 
-The frontend is a separate repo (`ohmysajni/sajni-web`) — it deploys
+The frontend is a separate repo (`snehilshah/sajni-web`) — it deploys
 to Vercel and calls this service through same-origin `/api/*` rewrites
 to the Cloud Run default URL.
 
@@ -47,7 +47,7 @@ alert in Billing for ~₹100/mo so any drift pings you.
 ```sh
 PROJECT_ID=ohmysajni
 REGION=asia-south1
-GH_REPO=ohmysajni/sajni-api
+GH_REPO=snehilshah/sajni-api
 
 gcloud config set project "$PROJECT_ID"
 
@@ -159,7 +159,7 @@ The deploy uses `:latest` so a fresh revision picks up rotations.
 To rotate a key without rebuilding the image:
 
 ```sh
-echo -n "NEW_VALUE" | gcloud secrets versions add sajni-google-oauth-client-id --data-file=-
+echo -n "NEW_VALUE" | gcloud secrets versions add GOOGLE_OAUTH_CLIENT_ID --data-file=-
 # Roll the service so it picks up the new version. No image rebuild.
 gcloud run services update sajni-api --region asia-south1
 ```
