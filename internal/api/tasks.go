@@ -308,6 +308,7 @@ type taskRow struct {
 type subtaskBrief struct {
 	ID                  int64   `json:"id"`
 	Title               string  `json:"title"`
+	Description         string  `json:"description"`
 	Status              string  `json:"status"`
 	Priority            string  `json:"priority"`
 	Color               *string `json:"color"`
@@ -541,7 +542,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 				ph2 = append(ph2, "$"+itoa(len(cargs)))
 			}
 			crows, cerr := d.Query(`
-				SELECT t.id, t.title, t.status, t.priority, t.color, t.due_date::text,
+				SELECT t.id, t.title, COALESCE(t.description, ''), t.status, t.priority, t.color, t.due_date::text,
 				       t.important, t.parent_task_id, t.blocked_by_task_id,
 				       blocker.title, blocker.status, COALESCE(t.sort_order, 0)
 				FROM tasks t
@@ -551,7 +552,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 			if cerr == nil {
 				for crows.Next() {
 					var s subtaskBrief
-					if crows.Scan(&s.ID, &s.Title, &s.Status, &s.Priority, &s.Color, &s.DueDate,
+					if crows.Scan(&s.ID, &s.Title, &s.Description, &s.Status, &s.Priority, &s.Color, &s.DueDate,
 						&s.Important, &s.ParentTaskID, &s.BlockedByTaskID,
 						&s.BlockedByTaskTitle, &s.BlockedByTaskStatus, &s.SortOrder) == nil && s.ParentTaskID != nil {
 						if i, ok := idx[*s.ParentTaskID]; ok {
@@ -577,7 +578,7 @@ func listSubtasks(deps Deps) http.HandlerFunc {
 			return
 		}
 		rows, err := d.Query(`
-			SELECT t.id, t.title, t.status, t.priority, t.color, t.due_date::text,
+			SELECT t.id, t.title, COALESCE(t.description, ''), t.status, t.priority, t.color, t.due_date::text,
 			       t.important, t.blocked_by_task_id, blocker.title, blocker.status,
 			       COALESCE(t.sort_order, 0)
 			FROM tasks t
@@ -592,6 +593,7 @@ func listSubtasks(deps Deps) http.HandlerFunc {
 		type Sub struct {
 			ID                  int64   `json:"id"`
 			Title               string  `json:"title"`
+			Description         string  `json:"description"`
 			Status              string  `json:"status"`
 			Priority            string  `json:"priority"`
 			Color               *string `json:"color"`
@@ -605,7 +607,7 @@ func listSubtasks(deps Deps) http.HandlerFunc {
 		out := []Sub{}
 		for rows.Next() {
 			var s Sub
-			rows.Scan(&s.ID, &s.Title, &s.Status, &s.Priority, &s.Color, &s.DueDate, &s.Important,
+			rows.Scan(&s.ID, &s.Title, &s.Description, &s.Status, &s.Priority, &s.Color, &s.DueDate, &s.Important,
 				&s.BlockedByTaskID, &s.BlockedByTaskTitle, &s.BlockedByTaskStatus, &s.SortOrder)
 			out = append(out, s)
 		}
