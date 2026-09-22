@@ -1053,7 +1053,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "get_thinking_project",
-			Description: "Read one Thinking project with its cards, open/closed states, recent comments, and resolution history. Use when the user references a project by name and you need its current context before answering or acting.",
+			Description: "Read one Thinking project with its cards, open/closed states, recent comments, and answer or resolution history. Use when the user references a project by name and you need its current context before answering or acting.",
 			Schema: obj(map[string]*genai.Schema{
 				"id": intg("Project id."),
 			}, "id"),
@@ -1100,7 +1100,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "update_thought_comment",
-			Description: "Edit one ordinary user comment in a Thinking card thread. Read the project first to get the card and event ids. Resolution and reopen events are immutable.",
+			Description: "Edit one ordinary user comment in a Thinking card thread. Read the project first to get the card and event ids. Answer, resolution, and reopen events are immutable.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"card_id":  intg("Required. Thinking card id."),
@@ -1113,7 +1113,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "delete_thought_comment",
-			Description: "Delete one ordinary user comment from a Thinking card thread. Read the project first to get the card and event ids. Resolution and reopen events are immutable.",
+			Description: "Delete one ordinary user comment from a Thinking card thread. Read the project first to get the card and event ids. Answer, resolution, and reopen events are immutable.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"card_id":  intg("Required. Thinking card id."),
@@ -1125,12 +1125,12 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "set_thought_state",
-			Description: "Complete/reopen a todo or resolve/reopen a contradiction in a Thinking project. Closing a contradiction requires the user's explanation of how it was resolved. A todo completion comment is optional. Do not infer resolution from an AI summary alone.",
+			Description: "Complete/reopen a todo, answer/reopen a question, or resolve/reopen a contradiction in a Thinking project. Answering a question and resolving a contradiction require the user's comment. A todo completion comment is optional. Do not infer an answer or resolution from an AI summary alone.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"card_id": intg("Required. Thinking card id."),
-				"closed":  boolean("Required. true to complete/resolve; false to reopen."),
-				"comment": str("Required when resolving a contradiction; optional otherwise."),
+				"closed":  boolean("Required. true to complete/answer/resolve; false to reopen."),
+				"comment": str("Required when answering a question or resolving a contradiction; optional for todos and reopening."),
 			}, "card_id", "closed"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return setThinkingCardStateTool(ctx, d, uid, args)

@@ -164,7 +164,7 @@ Produce a JSON object:
 
 - gap_questions: 3-6 short open questions, highest-leverage first. These mirror what's in "Suggested next thoughts" but as one-liners suitable for a chip UI.
 
-The cards include their current status and dated user thread events. User comments and closure explanations take precedence over older AI summaries and connections. A closed card remains historical context, not an open action item.
+The cards include their current status and dated user thread events. User comments, answers, and resolution explanations take precedence over older AI summaries and connections. A closed card remains historical context, not an open action item.
 
 Reply with ONLY a single JSON object. The thesis VALUE must be a single markdown string (not nested JSON). No outer markdown fences.`
 

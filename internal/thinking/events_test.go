@@ -17,6 +17,8 @@ func TestStateChangeComments(t *testing.T) {
 	}{
 		{"todo without comment", "todo", true, "", "", nil},
 		{"todo with comment", "todo", true, "  shipped  ", "shipped", nil},
+		{"question needs answer", "question", true, "  ", "", ErrCommentRequired},
+		{"question answered", "question", true, "  documented in the API guide  ", "documented in the API guide", nil},
 		{"contradiction needs explanation", "contradiction", true, "  ", "", ErrCommentRequired},
 		{"contradiction explained", "contradiction", true, "  both refer to different dates  ", "both refer to different dates", nil},
 		{"reopen without comment", "contradiction", false, "", "", nil},

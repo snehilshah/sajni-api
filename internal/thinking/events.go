@@ -12,8 +12,8 @@ import (
 
 var (
 	ErrNotFound        = errors.New("card not found")
-	ErrNotActionable   = errors.New("only todo and contradiction cards can be closed")
-	ErrCommentRequired = errors.New("a contradiction needs a resolution comment")
+	ErrNotActionable   = errors.New("only todo, question, and contradiction cards can be closed")
+	ErrCommentRequired = errors.New("an answer or resolution comment is required")
 	ErrEmptyComment    = errors.New("comment is required")
 	ErrCommentTooLong  = errors.New("comment is too long")
 	ErrCommentNotFound = errors.New("comment not found")
@@ -41,10 +41,10 @@ func validateComment(body string, required bool) (string, error) {
 }
 
 func validateStateChange(kind string, closed bool, comment string) (string, error) {
-	if kind != "todo" && kind != "contradiction" {
+	if kind != "todo" && kind != "question" && kind != "contradiction" {
 		return "", ErrNotActionable
 	}
-	comment, err := validateComment(comment, closed && kind == "contradiction")
+	comment, err := validateComment(comment, closed && (kind == "question" || kind == "contradiction"))
 	if errors.Is(err, ErrEmptyComment) {
 		return "", ErrCommentRequired
 	}
@@ -103,8 +103,8 @@ func UpdateComment(ctx context.Context, d *db.DB, uid string, cardID, eventID in
 	return tx.Commit()
 }
 
-// DeleteComment removes user-authored context. Resolution and reopen events
-// cannot be deleted because they explain the card's state history.
+// DeleteComment removes user-authored context. Answer, resolution, and reopen
+// events cannot be deleted because they explain the card's state history.
 func DeleteComment(ctx context.Context, d *db.DB, uid string, cardID, eventID int64) error {
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
@@ -159,7 +159,7 @@ func SetClosed(ctx context.Context, d *db.DB, uid string, cardID int64, closed b
 		}
 		return err
 	}
-	if kind != "todo" && kind != "contradiction" {
+	if kind != "todo" && kind != "question" && kind != "contradiction" {
 		return ErrNotActionable
 	}
 	if (status == "closed") == closed {
