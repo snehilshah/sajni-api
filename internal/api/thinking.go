@@ -175,6 +175,7 @@ type thinkingCardRow struct {
 	UpdatedAt    string          `json:"updated_at"`
 	Status       string          `json:"status"`
 	ClosedAt     string          `json:"closed_at"`
+	ThreadCount  int             `json:"thread_count"`
 }
 
 func thinkingEventError(w http.ResponseWriter, err error) {
@@ -673,10 +674,17 @@ func reEnrichNeighbors(deps Deps, uid string, projectID, justAddedCardID int64) 
 
 func loadProjectCardRows(d *db.DB, uid string, pid int64) ([]thinkingCardRow, error) {
 	rows, err := d.Query(`
-		SELECT id, project_id, kind, content, ai_enrichment,
-		       COALESCE(enriched_at::text,''), created_at, updated_at, status, COALESCE(closed_at::text,'')
-		FROM thinking_cards WHERE project_id=$1 AND user_id=$2
-		ORDER BY created_at ASC`, pid, uid)
+		SELECT c.id, c.project_id, c.kind, c.content, c.ai_enrichment,
+		       COALESCE(c.enriched_at::text,''), c.created_at, c.updated_at, c.status,
+		       COALESCE(c.closed_at::text,''), COALESCE(activity.thread_count, 0)
+		FROM thinking_cards c
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*)::int AS thread_count
+			FROM thinking_card_events e
+			WHERE e.card_id=c.id AND e.user_id=$2
+		) activity ON TRUE
+		WHERE c.project_id=$1 AND c.user_id=$2
+		ORDER BY c.created_at ASC`, pid, uid)
 	if err != nil {
 		return nil, err
 	}
@@ -685,7 +693,7 @@ func loadProjectCardRows(d *db.DB, uid string, pid int64) ([]thinkingCardRow, er
 	for rows.Next() {
 		var c thinkingCardRow
 		if err := rows.Scan(&c.ID, &c.ProjectID, &c.Kind, &c.Content, &c.AIEnrichment,
-			&c.EnrichedAt, &c.CreatedAt, &c.UpdatedAt, &c.Status, &c.ClosedAt); err != nil {
+			&c.EnrichedAt, &c.CreatedAt, &c.UpdatedAt, &c.Status, &c.ClosedAt, &c.ThreadCount); err != nil {
 			return nil, err
 		}
 		if len(c.AIEnrichment) == 0 {
@@ -693,7 +701,7 @@ func loadProjectCardRows(d *db.DB, uid string, pid int64) ([]thinkingCardRow, er
 		}
 		out = append(out, c)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // loadProjectCardsWithEnrichment loads siblings WITH their prior

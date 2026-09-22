@@ -72,6 +72,9 @@ func AddComment(ctx context.Context, d *db.DB, uid string, cardID int64, body st
 	if _, err := tx.ExecContext(ctx, `INSERT INTO thinking_card_events (card_id,user_id,kind,body) VALUES ($1,$2,'comment',$3)`, cardID, uid, body); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE thinking_cards SET updated_at=NOW() WHERE id=$1 AND user_id=$2`, cardID, uid); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE thinking_projects SET context_updated_at=NOW(),updated_at=NOW() WHERE id=$1 AND user_id=$2`, projectID, uid); err != nil {
 		return err
 	}
@@ -97,6 +100,9 @@ func UpdateComment(ctx context.Context, d *db.DB, uid string, cardID, eventID in
 	if _, err := tx.ExecContext(ctx, `UPDATE thinking_card_events SET body=$1 WHERE id=$2`, body, eventID); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE thinking_cards SET updated_at=NOW() WHERE id=$1 AND user_id=$2`, cardID, uid); err != nil {
+		return err
+	}
 	if err := touchProjectContext(ctx, tx, uid, projectID); err != nil {
 		return err
 	}
@@ -116,6 +122,9 @@ func DeleteComment(ctx context.Context, d *db.DB, uid string, cardID, eventID in
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM thinking_card_events WHERE id=$1`, eventID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE thinking_cards SET updated_at=NOW() WHERE id=$1 AND user_id=$2`, cardID, uid); err != nil {
 		return err
 	}
 	if err := touchProjectContext(ctx, tx, uid, projectID); err != nil {
