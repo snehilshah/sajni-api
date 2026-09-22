@@ -1053,7 +1053,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "get_thinking_project",
-			Description: "Read one Thinking project with all its cards. Use when the user references a project by name and you need its current cards before answering or adding a thought.",
+			Description: "Read one Thinking project with its cards, open/closed states, recent comments, and resolution history. Use when the user references a project by name and you need its current context before answering or acting.",
 			Schema: obj(map[string]*genai.Schema{
 				"id": intg("Project id."),
 			}, "id"),
@@ -1084,6 +1084,31 @@ func (s *Service) buildTools() []Tool {
 			}, "project_id", "content"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return addThoughtTool(ctx, s, uid, args)
+			},
+		},
+		{
+			Name:        "comment_on_thought",
+			Description: "Add a user-supplied comment to a Thinking card's thread. Use for new context, progress, or an explanation the user wants to retain. Read the project first to find the card id. Do not invent the user's comment.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"card_id": intg("Required. Thinking card id."),
+				"comment": str("Required. The user's comment."),
+			}, "card_id", "comment"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return commentThinkingCardTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "set_thought_state",
+			Description: "Complete/reopen a todo or resolve/reopen a contradiction in a Thinking project. Closing a contradiction requires the user's explanation of how it was resolved. A todo completion comment is optional. Do not infer resolution from an AI summary alone.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"card_id": intg("Required. Thinking card id."),
+				"closed":  boolean("Required. true to complete/resolve; false to reopen."),
+				"comment": str("Required when resolving a contradiction; optional otherwise."),
+			}, "card_id", "closed"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return setThinkingCardStateTool(ctx, d, uid, args)
 			},
 		},
 		{

@@ -2,13 +2,16 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 
 	"sajni/internal/ai"
 	"sajni/internal/db"
+	"sajni/internal/thinking"
 )
 
 // Thinking mode: projects hold typed cards (note/entity/question/idea/
@@ -43,6 +46,9 @@ func registerThinkingRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("DELETE /api/thinking/cards/{id}", deleteThinkingCard(deps))
 	mux.HandleFunc("POST /api/thinking/cards/{id}/enrich", enrichThinkingCard(deps))
 	mux.HandleFunc("PUT /api/thinking/cards/{id}/enrichment", saveThinkingCardEnrichment(deps))
+	mux.HandleFunc("GET /api/thinking/cards/{id}/events", getThinkingCardEvents(deps))
+	mux.HandleFunc("POST /api/thinking/cards/{id}/events", addThinkingCardComment(deps))
+	mux.HandleFunc("PUT /api/thinking/cards/{id}/state", setThinkingCardState(deps))
 
 	mux.HandleFunc("POST /api/thinking/classify", classifyThinkingKind(deps))
 }
@@ -114,8 +120,27 @@ func saveThinkingCardEnrichment(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid json")
 			return
 		}
-		_, err = d.Exec(`UPDATE thinking_cards SET ai_enrichment=$1, enriched_at=NOW(), updated_at=NOW() WHERE id=$2 AND user_id=$3`, raw, id, uid)
+		tx, err := d.BeginTx(r.Context(), nil)
 		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		defer tx.Rollback()
+		var pid int64
+		err = tx.QueryRow(`UPDATE thinking_cards SET ai_enrichment=$1, enriched_at=NOW(), updated_at=NOW() WHERE id=$2 AND user_id=$3 RETURNING project_id`, raw, id, uid).Scan(&pid)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				errJSON(w, 404, "card not found")
+				return
+			}
+			errJSON(w, 500, err.Error())
+			return
+		}
+		if _, err := tx.Exec(`UPDATE thinking_projects SET updated_at=NOW(), context_updated_at=NOW() WHERE id=$1 AND user_id=$2`, pid, uid); err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		if err := tx.Commit(); err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
@@ -124,15 +149,17 @@ func saveThinkingCardEnrichment(deps Deps) http.HandlerFunc {
 }
 
 type thinkingProjectRow struct {
-	ID            int64           `json:"id"`
-	Title         string          `json:"title"`
-	Description   string          `json:"description"`
-	Thesis        string          `json:"thesis"`
-	GapQuestions  json.RawMessage `json:"gap_questions"`
-	SynthesizedAt string          `json:"synthesized_at"`
-	CardCount     int             `json:"card_count"`
-	CreatedAt     string          `json:"created_at"`
-	UpdatedAt     string          `json:"updated_at"`
+	ID               int64           `json:"id"`
+	Title            string          `json:"title"`
+	Description      string          `json:"description"`
+	Thesis           string          `json:"thesis"`
+	GapQuestions     json.RawMessage `json:"gap_questions"`
+	SynthesizedAt    string          `json:"synthesized_at"`
+	CardCount        int             `json:"card_count"`
+	CreatedAt        string          `json:"created_at"`
+	UpdatedAt        string          `json:"updated_at"`
+	ContextUpdatedAt string          `json:"context_updated_at"`
+	NeedsSynthesis   bool            `json:"needs_synthesis"`
 }
 
 type thinkingCardRow struct {
@@ -144,6 +171,82 @@ type thinkingCardRow struct {
 	EnrichedAt   string          `json:"enriched_at"`
 	CreatedAt    string          `json:"created_at"`
 	UpdatedAt    string          `json:"updated_at"`
+	Status       string          `json:"status"`
+	ClosedAt     string          `json:"closed_at"`
+}
+
+func thinkingEventError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, thinking.ErrNotFound):
+		errJSON(w, 404, err.Error())
+	case errors.Is(err, thinking.ErrNotActionable):
+		errJSON(w, 409, err.Error())
+	case errors.Is(err, thinking.ErrEmptyComment), errors.Is(err, thinking.ErrCommentRequired), errors.Is(err, thinking.ErrCommentTooLong):
+		errJSON(w, 400, err.Error())
+	default:
+		errJSON(w, 500, err.Error())
+	}
+}
+
+func getThinkingCardEvents(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		events, err := thinking.LoadEvents(r.Context(), deps.DB, userID(r.Context()), id)
+		if err != nil {
+			thinkingEventError(w, err)
+			return
+		}
+		writeJSON(w, 200, events)
+	}
+}
+
+func addThinkingCardComment(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		var body struct {
+			Comment string `json:"comment"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			errJSON(w, 400, "invalid json")
+			return
+		}
+		if err := thinking.AddComment(r.Context(), deps.DB, userID(r.Context()), id, body.Comment); err != nil {
+			thinkingEventError(w, err)
+			return
+		}
+		writeJSON(w, 201, map[string]string{"status": "ok"})
+	}
+}
+
+func setThinkingCardState(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		var body struct {
+			Closed  *bool  `json:"closed"`
+			Comment string `json:"comment"`
+		}
+		if err := readJSON(r, &body); err != nil || body.Closed == nil {
+			errJSON(w, 400, "closed is required")
+			return
+		}
+		if err := thinking.SetClosed(r.Context(), deps.DB, userID(r.Context()), id, *body.Closed, body.Comment); err != nil {
+			thinkingEventError(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "ok"})
+	}
 }
 
 func listThinkingProjects(deps Deps) http.HandlerFunc {
@@ -153,7 +256,8 @@ func listThinkingProjects(deps Deps) http.HandlerFunc {
 		rows, err := d.Query(`
 			SELECT p.id, p.title, p.description, p.thesis, p.gap_questions,
 			       COALESCE(p.synthesized_at::text,''), COALESCE(c.cnt,0)::int,
-			       p.created_at, p.updated_at
+			       p.created_at, p.updated_at, p.context_updated_at::text,
+			       (p.synthesized_at IS NOT NULL AND p.context_updated_at > p.synthesized_at)
 			FROM thinking_projects p
 			LEFT JOIN (SELECT project_id, COUNT(*) cnt FROM thinking_cards GROUP BY project_id) c
 			  ON c.project_id = p.id
@@ -169,7 +273,7 @@ func listThinkingProjects(deps Deps) http.HandlerFunc {
 			var row thinkingProjectRow
 			rows.Scan(&row.ID, &row.Title, &row.Description, &row.Thesis,
 				&row.GapQuestions, &row.SynthesizedAt, &row.CardCount,
-				&row.CreatedAt, &row.UpdatedAt)
+				&row.CreatedAt, &row.UpdatedAt, &row.ContextUpdatedAt, &row.NeedsSynthesis)
 			if len(row.GapQuestions) == 0 {
 				row.GapQuestions = json.RawMessage("[]")
 			}
@@ -219,10 +323,11 @@ func getThinkingProject(deps Deps) http.HandlerFunc {
 		var p thinkingProjectRow
 		err = d.QueryRow(`
 			SELECT id, title, description, thesis, gap_questions,
-			       COALESCE(synthesized_at::text,''), 0, created_at, updated_at
+			       COALESCE(synthesized_at::text,''), 0, created_at, updated_at, context_updated_at::text,
+			       (synthesized_at IS NOT NULL AND context_updated_at > synthesized_at)
 			FROM thinking_projects WHERE id=$1 AND user_id=$2`, id, uid).
 			Scan(&p.ID, &p.Title, &p.Description, &p.Thesis, &p.GapQuestions,
-				&p.SynthesizedAt, &p.CardCount, &p.CreatedAt, &p.UpdatedAt)
+				&p.SynthesizedAt, &p.CardCount, &p.CreatedAt, &p.UpdatedAt, &p.ContextUpdatedAt, &p.NeedsSynthesis)
 		if err != nil {
 			errJSON(w, 404, "not found")
 			return
@@ -258,10 +363,10 @@ func updateThinkingProject(deps Deps) http.HandlerFunc {
 			return
 		}
 		if body.Title != nil {
-			d.Exec(`UPDATE thinking_projects SET title=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, *body.Title, id, uid)
+			d.Exec(`UPDATE thinking_projects SET title=$1, updated_at=NOW(), context_updated_at=NOW() WHERE id=$2 AND user_id=$3`, *body.Title, id, uid)
 		}
 		if body.Description != nil {
-			d.Exec(`UPDATE thinking_projects SET description=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, *body.Description, id, uid)
+			d.Exec(`UPDATE thinking_projects SET description=$1, updated_at=NOW(), context_updated_at=NOW() WHERE id=$2 AND user_id=$3`, *body.Description, id, uid)
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
@@ -313,7 +418,7 @@ func createThinkingCard(deps Deps) http.HandlerFunc {
 			errJSON(w, 500, err.Error())
 			return
 		}
-		d.Exec(`UPDATE thinking_projects SET updated_at=NOW() WHERE id=$1`, pid)
+		d.Exec(`UPDATE thinking_projects SET updated_at=NOW(), context_updated_at=NOW() WHERE id=$1`, pid)
 
 		if deps.AI != nil {
 			// userID stays string (UUID); project + card ids are int64
@@ -347,11 +452,43 @@ func updateThinkingCard(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid json")
 			return
 		}
+		tx, err := d.BeginTx(r.Context(), nil)
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		defer tx.Rollback()
+		var pid int64
+		var oldKind, status string
+		if err := tx.QueryRow(`SELECT project_id,kind,status FROM thinking_cards WHERE id=$1 AND user_id=$2 FOR UPDATE`, id, uid).Scan(&pid, &oldKind, &status); err != nil {
+			errJSON(w, 404, "card not found")
+			return
+		}
+		if body.Kind != nil && status == "closed" && normalizeKind(*body.Kind) != oldKind {
+			errJSON(w, 409, "reopen the card before changing its kind")
+			return
+		}
 		if body.Kind != nil {
-			d.Exec(`UPDATE thinking_cards SET kind=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, normalizeKind(*body.Kind), id, uid)
+			if _, err := tx.Exec(`UPDATE thinking_cards SET kind=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, normalizeKind(*body.Kind), id, uid); err != nil {
+				errJSON(w, 500, err.Error())
+				return
+			}
 		}
 		if body.Content != nil {
-			d.Exec(`UPDATE thinking_cards SET content=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, *body.Content, id, uid)
+			if _, err := tx.Exec(`UPDATE thinking_cards SET content=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, *body.Content, id, uid); err != nil {
+				errJSON(w, 500, err.Error())
+				return
+			}
+		}
+		if body.Kind != nil || body.Content != nil {
+			if _, err := tx.Exec(`UPDATE thinking_projects SET updated_at=NOW(),context_updated_at=NOW() WHERE id=$1 AND user_id=$2`, pid, uid); err != nil {
+				errJSON(w, 500, err.Error())
+				return
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			errJSON(w, 500, err.Error())
+			return
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
@@ -366,7 +503,25 @@ func deleteThinkingCard(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid id")
 			return
 		}
-		d.Exec(`DELETE FROM thinking_cards WHERE id=$1 AND user_id=$2`, id, uid)
+		tx, err := d.BeginTx(r.Context(), nil)
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		defer tx.Rollback()
+		var pid int64
+		if err := tx.QueryRow(`DELETE FROM thinking_cards WHERE id=$1 AND user_id=$2 RETURNING project_id`, id, uid).Scan(&pid); err != nil {
+			errJSON(w, 404, "card not found")
+			return
+		}
+		if _, err := tx.Exec(`UPDATE thinking_projects SET updated_at=NOW(),context_updated_at=NOW() WHERE id=$1 AND user_id=$2`, pid, uid); err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
 }
@@ -417,7 +572,7 @@ func synthesizeThinkingProject(deps Deps) http.HandlerFunc {
 			errJSON(w, 404, "project not found")
 			return
 		}
-		cards, err := loadProjectCardsWithEnrichment(d, uid, id, 0)
+		cards, err := loadProjectCardsWithEnrichment(r.Context(), d, uid, id, 0)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
@@ -470,7 +625,7 @@ func reEnrichNeighbors(deps Deps, uid string, projectID, justAddedCardID int64) 
 func loadProjectCardRows(d *db.DB, uid string, pid int64) ([]thinkingCardRow, error) {
 	rows, err := d.Query(`
 		SELECT id, project_id, kind, content, ai_enrichment,
-		       COALESCE(enriched_at::text,''), created_at, updated_at
+		       COALESCE(enriched_at::text,''), created_at, updated_at, status, COALESCE(closed_at::text,'')
 		FROM thinking_cards WHERE project_id=$1 AND user_id=$2
 		ORDER BY created_at ASC`, pid, uid)
 	if err != nil {
@@ -481,7 +636,7 @@ func loadProjectCardRows(d *db.DB, uid string, pid int64) ([]thinkingCardRow, er
 	for rows.Next() {
 		var c thinkingCardRow
 		if err := rows.Scan(&c.ID, &c.ProjectID, &c.Kind, &c.Content, &c.AIEnrichment,
-			&c.EnrichedAt, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.EnrichedAt, &c.CreatedAt, &c.UpdatedAt, &c.Status, &c.ClosedAt); err != nil {
 			return nil, err
 		}
 		if len(c.AIEnrichment) == 0 {
@@ -496,9 +651,9 @@ func loadProjectCardRows(d *db.DB, uid string, pid int64) ([]thinkingCardRow, er
 // enrichment fields (summary + outbound connections) so the AI can
 // build on the existing graph instead of reinterpreting from raw text
 // every time. Pass excludeID > 0 to drop a specific card (the target).
-func loadProjectCardsWithEnrichment(d *db.DB, uid string, pid, excludeID int64) ([]ai.ThinkingCardWithEnrichment, error) {
-	rows, err := d.Query(`
-		SELECT id, kind, content, ai_enrichment
+func loadProjectCardsWithEnrichment(ctx context.Context, d *db.DB, uid string, pid, excludeID int64) ([]ai.ThinkingCardWithEnrichment, error) {
+	rows, err := d.QueryContext(ctx, `
+		SELECT id, kind, content, ai_enrichment, status
 		FROM thinking_cards
 		WHERE project_id=$1 AND user_id=$2 AND ($3 = 0 OR id <> $3)
 		ORDER BY created_at ASC`, pid, uid, excludeID)
@@ -510,7 +665,7 @@ func loadProjectCardsWithEnrichment(d *db.DB, uid string, pid, excludeID int64) 
 	for rows.Next() {
 		var c ai.ThinkingCardWithEnrichment
 		var enrichRaw []byte
-		if err := rows.Scan(&c.ID, &c.Kind, &c.Content, &enrichRaw); err != nil {
+		if err := rows.Scan(&c.ID, &c.Kind, &c.Content, &enrichRaw, &c.Status); err != nil {
 			return nil, err
 		}
 		if len(enrichRaw) > 0 {
@@ -521,6 +676,19 @@ func loadProjectCardsWithEnrichment(d *db.DB, uid string, pid, excludeID int64) 
 			}
 		}
 		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	events, err := thinking.LoadProjectEvents(ctx, d, uid, pid)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Events = events[out[i].ID]
 	}
 	return out, nil
 }

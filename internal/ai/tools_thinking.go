@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"sajni/internal/db"
+	"sajni/internal/thinking"
 )
 
 func listThinkingProjectsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
@@ -49,7 +50,7 @@ func getThinkingProjectAITool(ctx context.Context, d *db.DB, uid string, args ma
 	}
 	var gapList []string
 	json.Unmarshal(gap, &gapList)
-	rows, err := d.QueryContext(ctx, `SELECT id, kind, content FROM thinking_cards WHERE project_id=$1 AND user_id=$2 ORDER BY created_at ASC`, id, uid)
+	rows, err := d.QueryContext(ctx, `SELECT id, kind, content, status FROM thinking_cards WHERE project_id=$1 AND user_id=$2 ORDER BY created_at ASC`, id, uid)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -57,9 +58,24 @@ func getThinkingProjectAITool(ctx context.Context, d *db.DB, uid string, args ma
 	cards := []map[string]any{}
 	for rows.Next() {
 		var cid int64
-		var kind, content string
-		rows.Scan(&cid, &kind, &content)
-		cards = append(cards, map[string]any{"id": cid, "kind": kind, "content": content})
+		var kind, content, status string
+		if err := rows.Scan(&cid, &kind, &content, &status); err != nil {
+			return nil, nil, err
+		}
+		cards = append(cards, map[string]any{"id": cid, "kind": kind, "content": content, "status": status})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, err
+	}
+	events, err := thinking.LoadProjectEvents(ctx, d, uid, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, card := range cards {
+		card["events"] = events[card["id"].(int64)]
 	}
 	return map[string]any{
 		"id": id, "title": title, "description": desc,
@@ -103,7 +119,7 @@ func addThoughtTool(ctx context.Context, s *Service, uid string, args map[string
 	if err != nil {
 		return nil, nil, err
 	}
-	d.ExecContext(ctx, `UPDATE thinking_projects SET updated_at=NOW() WHERE id=$1`, pid)
+	d.ExecContext(ctx, `UPDATE thinking_projects SET updated_at=NOW(),context_updated_at=NOW() WHERE id=$1`, pid)
 
 	// Async enrichment using sibling context (with prior enrichments).
 	// userID is a UUID string; project + card ids stay int64 (BIGSERIAL).
@@ -115,17 +131,48 @@ func addThoughtTool(ctx context.Context, s *Service, uid string, args map[string
 		map[string]any{"kind": "thinking_card_added", "id": id, "title": fmt.Sprintf("%s thought", kind), "route": fmt.Sprintf("/thinking/%d", pid)}, nil
 }
 
+func commentThinkingCardTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	id := argInt(args, "card_id", 0)
+	if id == 0 {
+		return nil, nil, fmt.Errorf("missing card_id")
+	}
+	if err := thinking.AddComment(ctx, d, uid, id, argStr(args, "comment")); err != nil {
+		return nil, nil, err
+	}
+	var pid int64
+	if err := d.QueryRowContext(ctx, `SELECT project_id FROM thinking_cards WHERE id=$1 AND user_id=$2`, id, uid).Scan(&pid); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"card_id": id, "commented": true}, map[string]any{"kind": "thinking_card_commented", "id": id, "route": fmt.Sprintf("/projects/%d", pid)}, nil
+}
+
+func setThinkingCardStateTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	id := argInt(args, "card_id", 0)
+	if id == 0 {
+		return nil, nil, fmt.Errorf("missing card_id")
+	}
+	closed := argBool(args, "closed", false)
+	if err := thinking.SetClosed(ctx, d, uid, id, closed, argStr(args, "comment")); err != nil {
+		return nil, nil, err
+	}
+	var pid int64
+	if err := d.QueryRowContext(ctx, `SELECT project_id FROM thinking_cards WHERE id=$1 AND user_id=$2`, id, uid).Scan(&pid); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"card_id": id, "status": map[bool]string{true: "closed", false: "open"}[closed]}, map[string]any{"kind": "thinking_card_state_changed", "id": id, "route": fmt.Sprintf("/projects/%d", pid)}, nil
+}
+
 // enrichCardWithContext loads the target card + sibling cards (with
 // their prior enrichments) and runs EnrichThinkingCard against it.
 // Used by both the AI tool path (add_thought) and the HTTP path
 // (api/thinking.go) — shared so we don't drift.
 func (s *Service) EnrichCardWithContext(ctx context.Context, uid string, projectID, cardID int64) error {
 	var target ThinkingCard
-	if err := s.db.QueryRowContext(ctx, `SELECT id, kind, content FROM thinking_cards WHERE id=$1 AND user_id=$2`, cardID, uid).
-		Scan(&target.ID, &target.Kind, &target.Content); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT id, kind, content, status FROM thinking_cards WHERE id=$1 AND user_id=$2`, cardID, uid).
+		Scan(&target.ID, &target.Kind, &target.Content, &target.Status); err != nil {
 		return err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, kind, content, ai_enrichment FROM thinking_cards WHERE project_id=$1 AND user_id=$2 AND id<>$3 ORDER BY created_at ASC`, projectID, uid, cardID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, kind, content, ai_enrichment, status FROM thinking_cards WHERE project_id=$1 AND user_id=$2 AND id<>$3 ORDER BY created_at ASC`, projectID, uid, cardID)
 	if err != nil {
 		return err
 	}
@@ -134,7 +181,9 @@ func (s *Service) EnrichCardWithContext(ctx context.Context, uid string, project
 	for rows.Next() {
 		var c ThinkingCardWithEnrichment
 		var er []byte
-		rows.Scan(&c.ID, &c.Kind, &c.Content, &er)
+		if err := rows.Scan(&c.ID, &c.Kind, &c.Content, &er, &c.Status); err != nil {
+			return err
+		}
 		if len(er) > 0 {
 			var e ThinkingEnrichment
 			if err := json.Unmarshal(er, &e); err == nil {
@@ -143,6 +192,20 @@ func (s *Service) EnrichCardWithContext(ctx context.Context, uid string, project
 			}
 		}
 		siblings = append(siblings, c)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	events, err := thinking.LoadProjectEvents(ctx, s.db, uid, projectID)
+	if err != nil {
+		return err
+	}
+	target.Events = events[target.ID]
+	for i := range siblings {
+		siblings[i].Events = events[siblings[i].ID]
 	}
 	var pTitle, pDesc string
 	s.db.QueryRowContext(ctx, `SELECT title, description FROM thinking_projects WHERE id=$1`, projectID).Scan(&pTitle, &pDesc)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sajni/internal/thinking"
 	"strings"
 
 	"google.golang.org/genai"
@@ -13,9 +14,11 @@ import (
 // "Enriched" version below carries prior AI output too, so the model
 // has graph context instead of just raw text.
 type ThinkingCard struct {
-	ID      int64  `json:"id"`
-	Kind    string `json:"kind"`
-	Content string `json:"content"`
+	ID      int64            `json:"id"`
+	Kind    string           `json:"kind"`
+	Content string           `json:"content"`
+	Status  string           `json:"status"`
+	Events  []thinking.Event `json:"events,omitempty"`
 }
 
 // ThinkingCardWithEnrichment lets us pass siblings' prior enrichments
@@ -27,6 +30,8 @@ type ThinkingCardWithEnrichment struct {
 	Content     string               `json:"content"`
 	Summary     string               `json:"summary,omitempty"`
 	Connections []ThinkingConnection `json:"connections,omitempty"`
+	Status      string               `json:"status"`
+	Events      []thinking.Event     `json:"events,omitempty"`
 }
 
 // ThinkingEnrichment is what the AI returns per card. Stored verbatim
@@ -70,7 +75,7 @@ func (s *Service) EnrichThinkingCard(ctx context.Context, projectTitle, projectD
 
 For the TARGET card below, given the rest of the project (each sibling already carries its own summary + outbound connections from prior enrichments), return a JSON enrichment that:
 
-- summary: ONE sentence (≤24 words) distilling what this card means inside the project's current shape. Don't restate; interpret.
+- summary: ONE sentence (≤24 words) distilling what this card means inside the project's current shape. Don't restate; interpret. Treat user comments and resolution events as newer evidence than prior AI summaries.
 - implications: 1-3 short bullets. What follows if this card holds?
 - questions_raised: 1-3 short open questions this card surfaces that the project hasn't answered yet.
 - connections: 0-6 entries pointing to sibling cards by id with a relation. ` + ThinkingRelationsHelp + `
@@ -148,13 +153,18 @@ Produce a JSON object:
   # Evidence map
   Short bulleted clusters: group cards (by id and quoted phrase) that support each line of the thesis.
 
-  # Tensions
-  Bulleted list of contradictions / unresolved tensions between cards. Cite the conflicting card ids.
+	# Tensions
+	Bulleted list of unresolved contradictions / tensions between cards. Cite the conflicting card ids. Explain resolved contradictions as outcomes, not open tensions.
+
+	# Progress and resolutions
+	Summarize completed todos and resolved contradictions, including how they were resolved when the thread says so. Never invent a resolution.
 
   # Suggested next thoughts
   3-5 prompts the user could capture next to deepen the project. These are seeds for cards, not chat replies.
 
 - gap_questions: 3-6 short open questions, highest-leverage first. These mirror what's in "Suggested next thoughts" but as one-liners suitable for a chip UI.
+
+The cards include their current status and dated user thread events. User comments and closure explanations take precedence over older AI summaries and connections. A closed card remains historical context, not an open action item.
 
 Reply with ONLY a single JSON object. The thesis VALUE must be a single markdown string (not nested JSON). No outer markdown fences.`
 

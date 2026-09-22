@@ -996,10 +996,17 @@ func (d *DB) migrate() error {
 		thesis         TEXT        NOT NULL DEFAULT '',
 		gap_questions  JSONB       NOT NULL DEFAULT '[]'::jsonb,
 		synthesized_at TIMESTAMPTZ,
+		context_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_thinking_projects_user ON thinking_projects(user_id, updated_at DESC);
+	-- TODO(next commit after this migration has run in production): remove this one-time upgrade block.
+	-- Keep context_updated_at in CREATE TABLE for new databases.
+	ALTER TABLE thinking_projects ADD COLUMN IF NOT EXISTS context_updated_at TIMESTAMPTZ;
+	UPDATE thinking_projects SET context_updated_at=COALESCE(synthesized_at, updated_at) WHERE context_updated_at IS NULL;
+	ALTER TABLE thinking_projects ALTER COLUMN context_updated_at SET DEFAULT NOW();
+	ALTER TABLE thinking_projects ALTER COLUMN context_updated_at SET NOT NULL;
 
 	CREATE TABLE IF NOT EXISTS thinking_cards (
 		id            BIGSERIAL   PRIMARY KEY,
@@ -1009,11 +1016,27 @@ func (d *DB) migrate() error {
 		content       TEXT        NOT NULL DEFAULT '',
 		ai_enrichment JSONB       NOT NULL DEFAULT '{}'::jsonb,
 		enriched_at   TIMESTAMPTZ,
+		status        TEXT        NOT NULL DEFAULT 'open',
+		closed_at     TIMESTAMPTZ,
 		created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_thinking_cards_project ON thinking_cards(project_id, created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_thinking_cards_user ON thinking_cards(user_id);
+	-- TODO(next commit after this migration has run in production): remove these one-time ALTERs.
+	-- Keep status and closed_at in CREATE TABLE for new databases.
+	ALTER TABLE thinking_cards ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open';
+	ALTER TABLE thinking_cards ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
+
+	CREATE TABLE IF NOT EXISTS thinking_card_events (
+		id         BIGSERIAL   PRIMARY KEY,
+		card_id    BIGINT      NOT NULL REFERENCES thinking_cards(id) ON DELETE CASCADE,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		kind       TEXT        NOT NULL,
+		body       TEXT        NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_thinking_card_events_card ON thinking_card_events(card_id, id);
 
 	-- ─── Task audit trail ─────────────────────────────────────────────
 	-- One row per tracked mutation, surfaced as a GitHub-style timeline in
