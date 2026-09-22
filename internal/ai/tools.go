@@ -1099,6 +1099,31 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "update_thought_comment",
+			Description: "Edit one ordinary user comment in a Thinking card thread. Read the project first to get the card and event ids. Resolution and reopen events are immutable.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"card_id":  intg("Required. Thinking card id."),
+				"event_id": intg("Required. Comment event id from the card thread."),
+				"comment":  str("Required. Replacement comment text supplied by the user."),
+			}, "card_id", "event_id", "comment"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return updateThinkingCardCommentTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "delete_thought_comment",
+			Description: "Delete one ordinary user comment from a Thinking card thread. Read the project first to get the card and event ids. Resolution and reopen events are immutable.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"card_id":  intg("Required. Thinking card id."),
+				"event_id": intg("Required. Comment event id from the card thread."),
+			}, "card_id", "event_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return deleteThinkingCardCommentTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "set_thought_state",
 			Description: "Complete/reopen a todo or resolve/reopen a contradiction in a Thinking project. Closing a contradiction requires the user's explanation of how it was resolved. A todo completion comment is optional. Do not infer resolution from an AI summary alone.",
 			Mutating:    true,

@@ -146,6 +146,38 @@ func commentThinkingCardTool(ctx context.Context, d *db.DB, uid string, args map
 	return map[string]any{"card_id": id, "commented": true}, map[string]any{"kind": "thinking_card_commented", "id": id, "route": fmt.Sprintf("/projects/%d", pid)}, nil
 }
 
+func updateThinkingCardCommentTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	cardID := argInt(args, "card_id", 0)
+	eventID := argInt(args, "event_id", 0)
+	if cardID == 0 || eventID == 0 {
+		return nil, nil, fmt.Errorf("missing card_id or event_id")
+	}
+	if err := thinking.UpdateComment(ctx, d, uid, cardID, eventID, argStr(args, "comment")); err != nil {
+		return nil, nil, err
+	}
+	var pid int64
+	if err := d.QueryRowContext(ctx, `SELECT project_id FROM thinking_cards WHERE id=$1 AND user_id=$2`, cardID, uid).Scan(&pid); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"card_id": cardID, "event_id": eventID, "updated": true}, map[string]any{"kind": "thinking_card_comment_updated", "id": cardID, "route": fmt.Sprintf("/projects/%d", pid)}, nil
+}
+
+func deleteThinkingCardCommentTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	cardID := argInt(args, "card_id", 0)
+	eventID := argInt(args, "event_id", 0)
+	if cardID == 0 || eventID == 0 {
+		return nil, nil, fmt.Errorf("missing card_id or event_id")
+	}
+	if err := thinking.DeleteComment(ctx, d, uid, cardID, eventID); err != nil {
+		return nil, nil, err
+	}
+	var pid int64
+	if err := d.QueryRowContext(ctx, `SELECT project_id FROM thinking_cards WHERE id=$1 AND user_id=$2`, cardID, uid).Scan(&pid); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"card_id": cardID, "event_id": eventID, "deleted": true}, map[string]any{"kind": "thinking_card_comment_deleted", "id": cardID, "route": fmt.Sprintf("/projects/%d", pid)}, nil
+}
+
 func setThinkingCardStateTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	id := argInt(args, "card_id", 0)
 	if id == 0 {

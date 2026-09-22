@@ -16,6 +16,7 @@ var (
 	ErrCommentRequired = errors.New("a contradiction needs a resolution comment")
 	ErrEmptyComment    = errors.New("comment is required")
 	ErrCommentTooLong  = errors.New("comment is too long")
+	ErrCommentNotFound = errors.New("comment not found")
 )
 
 const MaxCommentLength = 4000
@@ -75,6 +76,71 @@ func AddComment(ctx context.Context, d *db.DB, uid string, cardID int64, body st
 		return err
 	}
 	return tx.Commit()
+}
+
+// UpdateComment edits user-authored context. State-change events remain an
+// immutable audit trail and are deliberately excluded by kind='comment'.
+func UpdateComment(ctx context.Context, d *db.DB, uid string, cardID, eventID int64, body string) error {
+	body, err := validateComment(body, true)
+	if err != nil {
+		return err
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	projectID, err := editableCommentProject(ctx, tx, uid, cardID, eventID)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE thinking_card_events SET body=$1 WHERE id=$2`, body, eventID); err != nil {
+		return err
+	}
+	if err := touchProjectContext(ctx, tx, uid, projectID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeleteComment removes user-authored context. Resolution and reopen events
+// cannot be deleted because they explain the card's state history.
+func DeleteComment(ctx context.Context, d *db.DB, uid string, cardID, eventID int64) error {
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	projectID, err := editableCommentProject(ctx, tx, uid, cardID, eventID)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM thinking_card_events WHERE id=$1`, eventID); err != nil {
+		return err
+	}
+	if err := touchProjectContext(ctx, tx, uid, projectID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func editableCommentProject(ctx context.Context, tx *sql.Tx, uid string, cardID, eventID int64) (int64, error) {
+	var projectID int64
+	err := tx.QueryRowContext(ctx, `
+		SELECT c.project_id
+		FROM thinking_card_events e
+		JOIN thinking_cards c ON c.id=e.card_id
+		WHERE e.id=$1 AND e.card_id=$2 AND e.user_id=$3 AND c.user_id=$3 AND e.kind='comment'
+		FOR UPDATE OF e`, eventID, cardID, uid).Scan(&projectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrCommentNotFound
+	}
+	return projectID, err
+}
+
+func touchProjectContext(ctx context.Context, tx *sql.Tx, uid string, projectID int64) error {
+	_, err := tx.ExecContext(ctx, `UPDATE thinking_projects SET context_updated_at=NOW(),updated_at=NOW() WHERE id=$1 AND user_id=$2`, projectID, uid)
+	return err
 }
 
 // SetClosed changes an actionable card's state and records the explanation

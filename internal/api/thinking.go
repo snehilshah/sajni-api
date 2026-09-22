@@ -48,6 +48,8 @@ func registerThinkingRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("PUT /api/thinking/cards/{id}/enrichment", saveThinkingCardEnrichment(deps))
 	mux.HandleFunc("GET /api/thinking/cards/{id}/events", getThinkingCardEvents(deps))
 	mux.HandleFunc("POST /api/thinking/cards/{id}/events", addThinkingCardComment(deps))
+	mux.HandleFunc("PUT /api/thinking/cards/{id}/events/{eventID}", updateThinkingCardComment(deps))
+	mux.HandleFunc("DELETE /api/thinking/cards/{id}/events/{eventID}", deleteThinkingCardComment(deps))
 	mux.HandleFunc("PUT /api/thinking/cards/{id}/state", setThinkingCardState(deps))
 
 	mux.HandleFunc("POST /api/thinking/classify", classifyThinkingKind(deps))
@@ -177,7 +179,7 @@ type thinkingCardRow struct {
 
 func thinkingEventError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, thinking.ErrNotFound):
+	case errors.Is(err, thinking.ErrNotFound), errors.Is(err, thinking.ErrCommentNotFound):
 		errJSON(w, 404, err.Error())
 	case errors.Is(err, thinking.ErrNotActionable):
 		errJSON(w, 409, err.Error())
@@ -223,6 +225,53 @@ func addThinkingCardComment(deps Deps) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, 201, map[string]string{"status": "ok"})
+	}
+}
+
+func updateThinkingCardComment(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cardID, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid card id")
+			return
+		}
+		eventID, err := intParam(r, "eventID")
+		if err != nil {
+			errJSON(w, 400, "invalid event id")
+			return
+		}
+		var body struct {
+			Comment string `json:"comment"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			errJSON(w, 400, "invalid json")
+			return
+		}
+		if err := thinking.UpdateComment(r.Context(), deps.DB, userID(r.Context()), cardID, eventID, body.Comment); err != nil {
+			thinkingEventError(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "ok"})
+	}
+}
+
+func deleteThinkingCardComment(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cardID, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid card id")
+			return
+		}
+		eventID, err := intParam(r, "eventID")
+		if err != nil {
+			errJSON(w, 400, "invalid event id")
+			return
+		}
+		if err := thinking.DeleteComment(r.Context(), deps.DB, userID(r.Context()), cardID, eventID); err != nil {
+			thinkingEventError(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
 }
 
