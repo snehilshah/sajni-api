@@ -228,8 +228,10 @@ don't want to use Google/GitHub can still sign in.
    - Stores `SHA-256(code)` in `email_codes` with
      `purpose='login'`, `expires_at = now() + 10 minutes`.
    - Renders the M3-themed HTML template (`email_templates/totp.html`)
-     and ships it via Resend's REST API. If `RESEND_API_KEY` is unset
-     (local dev), we print the code to stdout instead.
+     and ships it via Resend's REST API. If `RESEND_API_KEY` is unset,
+     local stdout delivery is available only when `AUTH_DEV_CODE_LOG=1`
+     was explicitly enabled; otherwise auth setup fails rather than
+     silently logging the code.
 4. User opens the email, sees the code, types it (or pastes it) into
    the 6-digit OTP boxes on `/signin`.
 5. Frontend POSTs `{email, code}` to `/api/auth/email/verify`.
@@ -452,7 +454,9 @@ These are worth knowing because they show up as opaque
   `API_BASE_URL`, `CORS_ORIGIN`, `COOKIE_INSECURE` (set to `1` in
   local dev only), `GOOGLE_OAUTH_CLIENT_ID`,
   `GOOGLE_OAUTH_CLIENT_SECRET`, `GITHUB_OAUTH_CLIENT_ID`,
-  `GITHUB_OAUTH_CLIENT_SECRET`, `RESEND_API_KEY`, `EMAIL_FROM`.
+  `GITHUB_OAUTH_CLIENT_SECRET`, `RESEND_API_KEY`, `EMAIL_FROM`, and
+  `AUTH_DEV_CODE_LOG` (local development only; must be explicitly set
+  to `1` to log email codes when Resend is not configured).
   With the Vercel `/api` rewrite, register OAuth callbacks on
   `${APP_URL}/api/auth/{provider}/callback`; `API_BASE_URL` is only the
   direct Cloud Run fallback.
