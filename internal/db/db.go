@@ -1152,6 +1152,10 @@ func (d *DB) migrate() error {
 	-- regenerate and nothing left in the app can explain them. Scoped to
 	-- that one kind — every other insight is untouched.
 	DELETE FROM insights WHERE kind = 'mood_vs_tasks';
+
+	-- Week and day scopes are mutually exclusive. Clear due_date/scheduled_at on any
+	-- task that was scoped to a week so it never renders as a daily task.
+	UPDATE tasks SET due_date = NULL, scheduled_at = NULL WHERE week_of IS NOT NULL AND due_date IS NOT NULL;
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err

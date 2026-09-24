@@ -2149,15 +2149,18 @@ func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, ui
 	}
 	if weekOf != "" {
 		weekArg = weekOf
+		dueArg = nil
 	}
 	if monthOf != "" {
 		monthArg = monthOf
+		dueArg = nil
+		weekArg = nil
 	}
 	notifyJSON := "[]"
 	if b, err := json.Marshal(sanitizeAITaskEmails(argStrSlice(args, "notify_emails"))); err == nil {
 		notifyJSON = string(b)
 	}
-	if scheduled != "" {
+	if scheduled != "" && weekArg == nil && monthArg == nil {
 		schArg = scheduled
 		// Keep due_date aligned to the scheduled day (user's tz) when the model
 		// set a time but no explicit date. Without this the task carries a

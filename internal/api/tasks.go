@@ -704,11 +704,17 @@ func createTask(deps Deps) http.HandlerFunc {
 			monthArg = *body.MonthOf
 		}
 
+		// Day, week, and month scopes are mutually exclusive.
+		// A week task or month goal has no specific day or time.
+		if weekArg != nil || monthArg != nil {
+			dueArg = nil
+		}
+
 		notifyJSON, _ := json.Marshal(sanitizeNotifyEmails(body.NotifyEmails))
 
 		// scheduled_at is the event instant (powers time chips + reminders).
 		var schedArg any
-		if body.ScheduledAt != nil && strings.TrimSpace(*body.ScheduledAt) != "" {
+		if weekArg == nil && monthArg == nil && body.ScheduledAt != nil && strings.TrimSpace(*body.ScheduledAt) != "" {
 			schedArg = *body.ScheduledAt
 			// Keep due_date (the all-day bucket the smart-lists use) in sync
 			// with the scheduled day in the user's local tz when the client
@@ -1012,9 +1018,9 @@ func updateTask(deps Deps) http.HandlerFunc {
 				v = *body.WeekOf
 			}
 			q.Exec("UPDATE tasks SET week_of=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
-			// Week scope is exclusive with month scope.
-			if v != nil && body.MonthOf == nil && !body.ClearMonth {
-				q.Exec("UPDATE tasks SET month_of=NULL WHERE id=$1 AND user_id=$2", id, uid)
+			// Week scope is exclusive with month scope and day scope.
+			if v != nil {
+				q.Exec("UPDATE tasks SET due_date=NULL, month_of=NULL, scheduled_at=NULL WHERE id=$1 AND user_id=$2", id, uid)
 			}
 		}
 		// month_of: set/clear the 1st-of-month anchor of a month goal. Mirrors
