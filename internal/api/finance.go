@@ -3,15 +3,18 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"sajni/internal/ai"
 	"sajni/internal/db"
 )
 
@@ -107,6 +110,8 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /api/finance/categorize", categorizeTransaction(deps))
 	// AI parse of a shared bank/UPI message into transaction fields (PWA share target).
 	mux.HandleFunc("POST /api/finance/parse-message", parseTransactionMessage(deps))
+	// AI parse of a shared transaction screenshot / receipt image.
+	mux.HandleFunc("POST /api/finance/parse-image", parseTransactionImage(deps))
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -836,6 +841,28 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			syncTags(d, uid, "transaction", outID, b.Note)
 			writeJSON(w, 201, map[string]int64{"id": outID, "pair_id": inID})
 			return
+		}
+
+		// Duplicate check: if not forced, check if an identical transaction was recorded in the last 5 minutes.
+		force := r.URL.Query().Get("force") == "true" || r.Header.Get("X-Force") == "true"
+		if !force && b.Type != "transfer" {
+			var dupID int64
+			var existingNote string
+			err := d.QueryRowContext(ctx, `
+				SELECT id, COALESCE(note, '')
+				FROM fin_transactions
+				WHERE user_id = $1 AND account_id = $2 AND type = $3
+				  AND ABS(amount - $4) < 0.001
+				  AND created_at >= NOW() - INTERVAL '5 minutes'
+				  AND ABS(EXTRACT(EPOCH FROM (txn_at - $5))) < 600
+				ORDER BY id DESC LIMIT 1`, uid, b.AccountID, b.Type, b.Amount, txnAt).Scan(&dupID, &existingNote)
+			if err == nil && dupID > 0 {
+				if existingNote == "" && b.Note != "" {
+					d.ExecContext(ctx, `UPDATE fin_transactions SET note = $1 WHERE id = $2`, b.Note, dupID)
+				}
+				writeJSON(w, 200, map[string]any{"id": dupID, "duplicate": true})
+				return
+			}
 		}
 
 		var id int64
@@ -2895,77 +2922,182 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		// Resolve a category for the parsed merchant. Prefer a learned rule
-		// (instant, no AI); fall back to AI inference against the user's
-		// categories. Either way the client gets a pre-filled, editable pick.
-		var catID *int64
-		var catName string
-		if parsed.Amount > 0 && strings.TrimSpace(parsed.Description) != "" {
-			if id, name := lookupMerchantCategory(deps.DB, uid, parsed.Description); id != nil {
-				catID, catName = id, name
-			} else {
-				kind := parsed.Type
-				if kind != "income" {
-					kind = "expense"
-				}
-				type cat struct {
-					id   int64
-					name string
-				}
-				var cats []cat
-				var names []string
-				if crows, qerr := deps.DB.Query(`SELECT id, name FROM fin_categories WHERE user_id=$1 AND kind=$2 ORDER BY name`, uid, kind); qerr == nil {
-					for crows.Next() {
-						var c cat
-						if crows.Scan(&c.id, &c.name) == nil {
-							cats = append(cats, c)
-							names = append(names, c.name)
-						}
+		out := resolveParsedTransaction(ctx, deps, uid, parsed, loc, now)
+		writeJSON(w, 200, out)
+	}
+}
+
+func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed ai.ParsedTxn, loc *time.Location, now time.Time) map[string]any {
+	var catID *int64
+	var catName string
+	if parsed.Amount > 0 && strings.TrimSpace(parsed.Description) != "" {
+		if id, name := lookupMerchantCategory(deps.DB, uid, parsed.Description); id != nil {
+			catID, catName = id, name
+		} else {
+			kind := parsed.Type
+			if kind != "income" {
+				kind = "expense"
+			}
+			type cat struct {
+				id   int64
+				name string
+			}
+			var cats []cat
+			var names []string
+			if crows, qerr := deps.DB.Query(`SELECT id, name FROM fin_categories WHERE user_id=$1 AND kind=$2 ORDER BY name`, uid, kind); qerr == nil {
+				for crows.Next() {
+					var c cat
+					if crows.Scan(&c.id, &c.name) == nil {
+						cats = append(cats, c)
+						names = append(names, c.name)
 					}
-					crows.Close()
 				}
-				picked, ctoks, cerr := deps.AI.CategorizeExpense(ctx, parsed.Description, kind, names)
-				if ctoks <= 0 {
-					ctoks = 30
-				}
-				deps.AILimiter.record(uid, ctoks)
-				if cerr == nil {
-					isOthers := func(s string) bool { return strings.EqualFold(s, "Others") || strings.EqualFold(s, "Other") }
-					for _, c := range cats {
-						if strings.EqualFold(c.name, picked) || (isOthers(picked) && isOthers(c.name)) {
-							id := c.id
-							catID, catName = &id, c.name
-							break
-						}
+				crows.Close()
+			}
+			picked, ctoks, cerr := deps.AI.CategorizeExpense(ctx, parsed.Description, kind, names)
+			if ctoks <= 0 {
+				ctoks = 30
+			}
+			deps.AILimiter.record(uid, ctoks)
+			if cerr == nil {
+				isOthers := func(s string) bool { return strings.EqualFold(s, "Others") || strings.EqualFold(s, "Other") }
+				for _, c := range cats {
+					if strings.EqualFold(c.name, picked) || (isOthers(picked) && isOthers(c.name)) {
+						id := c.id
+						catID, catName = &id, c.name
+						break
 					}
 				}
 			}
 		}
+	}
 
-		// Resolve the matched account server-side (single source of truth for
-		// web + android) so the confirm sheet can pre-select it.
-		var acctID *int64
-		if parsed.Amount > 0 {
-			acctID = matchAccountByHint(deps.DB, uid, parsed.AccountHint)
+	var acctID *int64
+	if parsed.Amount > 0 {
+		acctID = matchAccountByHint(deps.DB, uid, parsed.AccountHint)
+	}
+
+	txnAt := composeTxnAt(loc, parsed.Date, parsed.Time, now)
+	return map[string]any{
+		"amount":        parsed.Amount,
+		"type":          parsed.Type,
+		"description":   parsed.Description,
+		"note":          parsed.Note,
+		"txn_at":        txnAt.Format(time.RFC3339),
+		"account_hint":  parsed.AccountHint,
+		"account_id":    acctID,
+		"category_id":   catID,
+		"category_name": catName,
+		"ref_id":        parsed.RefID,
+	}
+}
+
+func parseTransactionImage(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if deps.AI == nil {
+			errJSON(w, http.StatusServiceUnavailable, "AI is not configured on this server")
+			return
+		}
+		uid := userID(r.Context())
+
+		var imgBytes []byte
+		var mimeType string
+
+		ct := r.Header.Get("Content-Type")
+		if strings.HasPrefix(ct, "multipart/form-data") {
+			if err := r.ParseMultipartForm(10 << 20); err != nil {
+				errJSON(w, 400, "malformed multipart form")
+				return
+			}
+			if r.MultipartForm != nil {
+				defer r.MultipartForm.RemoveAll()
+			}
+			file, header, err := r.FormFile("image")
+			if err != nil {
+				file, header, err = r.FormFile("file")
+			}
+			if err != nil {
+				errJSON(w, 400, "missing image file")
+				return
+			}
+			defer file.Close()
+			data, err := io.ReadAll(io.LimitReader(file, 10<<20))
+			if err != nil {
+				errJSON(w, 400, "cannot read file")
+				return
+			}
+			imgBytes = data
+			mimeType = header.Header.Get("Content-Type")
+			if mimeType == "" {
+				mimeType = http.DetectContentType(imgBytes)
+			}
+		} else {
+			var body struct {
+				Image    string `json:"image"`
+				MIMEType string `json:"mime_type"`
+			}
+			if err := readJSON(r, &body); err != nil {
+				errJSON(w, 400, "invalid json")
+				return
+			}
+			raw := strings.TrimSpace(body.Image)
+			if raw == "" {
+				errJSON(w, 400, "missing image")
+				return
+			}
+			if idx := strings.Index(raw, ";base64,"); idx != -1 {
+				if body.MIMEType == "" {
+					body.MIMEType = strings.TrimPrefix(raw[:idx], "data:")
+				}
+				raw = raw[idx+8:]
+			}
+			data, err := base64.StdEncoding.DecodeString(raw)
+			if err != nil {
+				errJSON(w, 400, "invalid base64 image")
+				return
+			}
+			imgBytes = data
+			mimeType = body.MIMEType
+			if mimeType == "" {
+				mimeType = http.DetectContentType(imgBytes)
+			}
 		}
 
-		// Compose the prefill instant: parsed date + parsed time, falling back
-		// to the current minute when the message stated no time.
-		txnAt := composeTxnAt(loc, parsed.Date, parsed.Time, now)
-		writeJSON(w, 200, map[string]any{
-			"amount":        parsed.Amount,
-			"type":          parsed.Type,
-			"description":   parsed.Description,
-			"note":          parsed.Note,
-			"txn_at":        txnAt.Format(time.RFC3339),
-			"account_hint":  parsed.AccountHint,
-			"account_id":    acctID,
-			"category_id":   catID,
-			"category_name": catName,
-			// Duplicate key for the android capture pipeline. The client
-			// regexes the raw message first and only falls back to this when
-			// its own patterns miss an unusual format.
-			"ref_id": parsed.RefID,
-		})
+		if len(imgBytes) == 0 {
+			errJSON(w, 400, "empty image")
+			return
+		}
+
+		if ok, retryAfter := deps.AILimiter.check(uid); !ok {
+			secs := int(math.Ceil(retryAfter.Seconds()))
+			if secs < 1 {
+				secs = 1
+			}
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
+			errJSON(w, 429, "AI hourly limit reached — try again later")
+			return
+		}
+
+		loc := userLocation(deps.DB, uid)
+		now := userNow(deps.DB, uid)
+		today := now.Format("2006-01-02")
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+
+		parsed, tokens, err := deps.AI.ParseTransactionImage(ctx, imgBytes, mimeType, today)
+		if tokens <= 0 {
+			tokens = 250
+		}
+		deps.AILimiter.record(uid, tokens)
+		if err != nil {
+			writeJSON(w, 200, map[string]any{
+				"amount": 0, "type": "expense", "description": "", "note": "",
+				"txn_at": now.Format(time.RFC3339), "account_hint": "", "account_id": nil, "category_id": nil, "category_name": "", "ref_id": "",
+			})
+			return
+		}
+
+		out := resolveParsedTransaction(ctx, deps, uid, parsed, loc, now)
+		writeJSON(w, 200, out)
 	}
 }

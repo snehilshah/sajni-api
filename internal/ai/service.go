@@ -730,3 +730,87 @@ Rules:
 	}
 	return p, cost, nil
 }
+
+// ParseTransactionImage extracts structured transaction fields from a screenshot,
+// bill photo, or receipt image using Gemini multimodal vision.
+func (s *Service) ParseTransactionImage(ctx context.Context, imgBytes []byte, mimeType, today string) (ParsedTxn, int, error) {
+	var zero ParsedTxn
+	if len(imgBytes) == 0 {
+		return zero, 0, nil
+	}
+	if mimeType == "" {
+		mimeType = "image/jpeg"
+	}
+
+	sys := `You inspect an image of a financial transaction — such as a UPI payment confirmation (POP UPI, GPay, PhonePe, Paytm, BHIM, CRED), a bank receipt, a credit or debit card swipe slip, a checkout confirmation (Swiggy, Zomato, Amazon, Uber), an order invoice, or a bill — and extract its transaction fields as JSON.
+
+Reply with ONLY a JSON object — no markdown, no prose:
+{"amount": number, "type": "expense"|"income", "description": string, "note": string, "date": "YYYY-MM-DD", "time": "HH:MM", "account_hint": string, "ref_id": string}
+
+Rules:
+- amount: the final transaction amount paid or received as a positive number (no currency symbol, no commas).
+- type: "expense" if money was paid, spent, debited, or transferred out; "income" if money was received, credited, or refunded.
+- description: a SHORT, clean merchant or recipient name (e.g. "Chai Point", "Swiggy", "Rahul Sharma", "Uber"). Title-case it. Do NOT include amounts or reference numbers in description.
+- note: payment method, app, or relevant order details visible on screen (e.g. "Paid via UPI Lite", "POP UPI", "HDFC Credit Card"). Keep to one short line. Empty string if nothing useful.
+- date: the transaction date as YYYY-MM-DD. If missing or relative, use today's date provided below.
+- time: 24-hour "HH:MM" if visible on screen (e.g. "18:35"). Empty string if no time is visible — do NOT guess.
+- account_hint: the bank name, "UPI Lite", "Credit Card", or account/card last-4 digits if visible on the screen; else empty string.
+- ref_id: the transaction's reference number EXACTLY as printed — UPI Ref / RRN / UTR / Txn ID / Order ID. Digits and letters only, strip spaces and labels. Empty string if none is visible.
+- If the image is not a financial transaction or payment screen, set amount to 0.`
+
+	prompt := "Today is " + today + ". Extract the transaction from this image."
+
+	temp := float32(0)
+	maxOut := int32(250)
+	thinkBudget := int32(0)
+	cfg := &genai.GenerateContentConfig{
+		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: sys}}},
+		Temperature:       &temp,
+		MaxOutputTokens:   maxOut,
+		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
+	}
+	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
+		{
+			Role: "user",
+			Parts: []*genai.Part{
+				{InlineData: &genai.Blob{MIMEType: mimeType, Data: imgBytes}},
+				{Text: prompt},
+			},
+		},
+	}, cfg)
+	if err != nil {
+		return zero, 0, fmt.Errorf("parse image: %w", err)
+	}
+
+	cost := 0
+	if resp != nil && resp.UsageMetadata != nil {
+		cost = int(resp.UsageMetadata.TotalTokenCount)
+	}
+	if cost == 0 {
+		cost = 250 // conservative estimate for vision token cost
+	}
+
+	raw := strings.TrimSpace(collectText(resp))
+	if i := strings.IndexByte(raw, '{'); i >= 0 {
+		if j := strings.LastIndexByte(raw, '}'); j >= i {
+			raw = raw[i : j+1]
+		}
+	}
+	var p ParsedTxn
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		return zero, cost, fmt.Errorf("parse image: bad json: %w", err)
+	}
+	if p.Type != "income" {
+		p.Type = "expense"
+	}
+	if p.Amount < 0 {
+		p.Amount = -p.Amount
+	}
+	if p.Date == "" {
+		p.Date = today
+	}
+	if !reClockHHM.MatchString(p.Time) {
+		p.Time = ""
+	}
+	return p, cost, nil
+}
