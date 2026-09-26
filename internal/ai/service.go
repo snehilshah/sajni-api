@@ -165,6 +165,7 @@ func friendlyAIError(err error) string {
 // by background workers (insights narration) where we want a short
 // deterministic answer without the chat-loop overhead.
 func (s *Service) QuickGenerate(ctx context.Context, system, user string) (string, error) {
+	system += "\nUse commas, colons, or full stops instead of em dashes in generated text."
 	temp := float32(0.3)
 	maxOut := int32(300)
 	thinkBudget := int32(0)

@@ -87,23 +87,23 @@ func exportReadme(_ context.Context, zw *zip.Writer, _ Deps, _ string) error {
 This archive contains all your Sajni data.
 
 Layout:
-  memos.md                — every memo, separated by '---'
-  tasks.csv               — your tasks, including completed ones
-  task_lists.csv          — your custom task lists
-  habits.csv              — habits and their colours
-  habit_logs.csv          — every day you ticked a habit
-  events.csv              — tracked life events
-  event_variables.csv     — numeric fields configured for events
-  event_entries.csv       — timestamped event occurrences
-  event_values.csv        — numeric values recorded on occurrences
-  media.csv               — your movies/shows/books/games library
-  notes/<title>.md        — one file per long-form note
-  journal/<date>.md       — one file per journal day
-  tags.csv                — tag <-> entity mappings
-  finance/                — accounts, categories, transactions, budgets, investments
+  memos.md                - every memo, separated by '---'
+  tasks.csv               - your tasks, including completed ones
+  task_lists.csv          - your custom task lists
+  habits.csv              - habits and their colours
+  habit_logs.csv          - every day you ticked a habit
+  events.csv              - tracked life events
+  event_variables.csv     - numeric fields configured for events
+  event_entries.csv       - timestamped event occurrences
+  event_values.csv        - numeric values recorded on occurrences
+  media.csv               - your movies/shows/books/games library
+  notes/<title>.md        - one file per long-form note
+  journal/<date>.md       - one file per journal day
+  tags.csv                - tag <-> entity mappings
+  finance/                - accounts, categories, transactions, budgets, investments
 
 To restore: POST this same .zip to /api/takeout/import or use the
-"Import" button on the Settings page. Best-effort — IDs are remapped.
+"Import" button on the Settings page. IDs are remapped where possible.
 `
 	writeZipText(zw, "README.md", body)
 	return nil

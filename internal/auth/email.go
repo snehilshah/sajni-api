@@ -225,9 +225,9 @@ func (s *Service) SendTaskDigest(ctx context.Context, to, name, kind, periodLabe
 	if displayName == "" {
 		displayName = strings.SplitN(to, "@", 2)[0]
 	}
-	heading, intro, subject := "Pending this week", "Still open on your week tasks —", "Your week tasks · "+periodLabel
+	heading, intro, subject := "Pending this week", "Still open on your week tasks:", "Your week tasks · "+periodLabel
 	if kind == "month" {
-		heading, intro, subject = "Pending this month", "Still open on your month tasks —", "Your month tasks · "+periodLabel
+		heading, intro, subject = "Pending this month", "Still open on your month tasks:", "Your month tasks · "+periodLabel
 	}
 	appURL := strings.TrimRight(s.AppURL, "/")
 	var buf bytes.Buffer

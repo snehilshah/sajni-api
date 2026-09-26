@@ -2659,7 +2659,7 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 				secs = 1
 			}
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
-			errJSON(w, 429, "AI hourly limit reached — try again later")
+			errJSON(w, 429, "AI hourly limit reached. Try again later.")
 			return
 		}
 
@@ -2898,7 +2898,7 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 				secs = 1
 			}
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
-			errJSON(w, 429, "AI hourly limit reached — try again later")
+			errJSON(w, 429, "AI hourly limit reached. Try again later.")
 			return
 		}
 
@@ -3074,7 +3074,7 @@ func parseTransactionImage(deps Deps) http.HandlerFunc {
 				secs = 1
 			}
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
-			errJSON(w, 429, "AI hourly limit reached — try again later")
+			errJSON(w, 429, "AI hourly limit reached. Try again later.")
 			return
 		}
 

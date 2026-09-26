@@ -165,7 +165,7 @@ func deliverTaskReminder(ctx context.Context, deps Deps, uid, email, name, chann
 	pushed := notifyPush(ctx, deps, uid, push.Notification{
 		Type:  push.TypeTaskReminder,
 		Title: "Task reminder",
-		Body:  title + " — " + whenLabel,
+		Body:  title + " · " + whenLabel,
 		Route: "/tasks",
 	})
 

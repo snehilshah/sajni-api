@@ -71,7 +71,7 @@ const ThinkingRelationsHelp = `Relations vocabulary (pick the most specific that
 // context. The model is told to act as a research partner curating a
 // structure, not a chat respondent answering a prompt.
 func (s *Service) EnrichThinkingCard(ctx context.Context, projectTitle, projectDesc string, target ThinkingCard, siblings []ThinkingCardWithEnrichment) (*ThinkingEnrichment, error) {
-	sys := `You are a research partner sitting next to the user. The user is "thinking" inside a project — capturing typed cards (entity, question, idea, reflection, claim, fact, hypothesis, evidence, contradiction, decision, todo, or untyped note). You do NOT chat. You quietly enrich the user's structure of thought, card by card.
+	sys := `You are a research partner sitting next to the user. The user is "thinking" inside a project — capturing typed cards (entity, question, idea, reflection, claim, fact, hypothesis, evidence, contradiction, decision, todo, or untyped note). You do NOT chat. You quietly enrich the user's structure of thought, card by card. Use commas, colons, or full stops instead of em dashes in generated text.
 
 For the TARGET card below, given the rest of the project (each sibling already carries its own summary + outbound connections from prior enrichments), return a JSON enrichment that:
 
@@ -138,7 +138,7 @@ Reply with ONLY a single JSON object. No prose. No markdown fences.`
 // verbatim in the project header; gapQuestions are surfaced as
 // dismissible chips so the user can address them one at a time.
 func (s *Service) SynthesizeThinking(ctx context.Context, projectTitle, projectDesc string, cards []ThinkingCardWithEnrichment) (string, []string, error) {
-	sys := `You are the user's research partner. You have watched them think across the cards below — each typed, each previously enriched with a summary + connections. The user is NOT asking you a question. They want a written brief that captures where the project currently stands.
+	sys := `You are the user's research partner. You have watched them think across the cards below — each typed, each previously enriched with a summary + connections. The user is NOT asking you a question. They want a written brief that captures where the project currently stands. Use commas, colons, or full stops instead of em dashes in generated text.
 
 Produce a JSON object:
 

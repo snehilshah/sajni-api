@@ -135,7 +135,7 @@ func registerAIRoutes(mux *http.ServeMux, deps Deps, svc *ai.Service) {
 				secs = 1
 			}
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
-			errJSON(w, 429, "AI hourly limit reached — try again later")
+			errJSON(w, 429, "AI hourly limit reached. Try again later.")
 			return
 		}
 

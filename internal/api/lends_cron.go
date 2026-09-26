@@ -95,7 +95,7 @@ func notifyLendDue(ctx context.Context, deps Deps, uid, borrower, dueDate string
 	markup := "<p>Hi " + html.EscapeString(name) + ",</p><p><strong>" +
 		html.EscapeString(borrower) + "</strong> has <strong>₹" +
 		strconv.FormatFloat(outstanding, 'f', 2, 64) + "</strong> outstanding, due " +
-		html.EscapeString(dueDate) + ".</p><p>— Sajni</p>"
+		html.EscapeString(dueDate) + ".</p><p>Sajni</p>"
 	if err := deps.Auth.SendEmail(ctx, email, subject, markup); err != nil {
 		log.Warn().Err(err).Msg("lend reminder email failed")
 	}

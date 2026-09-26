@@ -185,7 +185,7 @@ func notifyInvestmentDebit(ctx context.Context, deps Deps, uid, name string, amo
 	pushed := notifyPush(ctx, deps, uid, push.Notification{
 		Type:  push.TypeInvestmentAuto,
 		Title: "Invested in " + name,
-		Body:  fmt.Sprintf("₹%.2f auto-debited — next on %s", amount, nextDate),
+		Body:  fmt.Sprintf("₹%.2f auto-debited. Next on %s", amount, nextDate),
 		Route: "/finance/investments",
 	})
 	if deps.Auth == nil {
@@ -206,7 +206,7 @@ func notifyInvestmentDebit(ctx context.Context, deps Deps, uid, name string, amo
 		"<p>Your recurring investment <strong>" + name + "</strong> was auto-debited " +
 		"<strong>₹" + strconv.FormatFloat(amount, 'f', 2, 64) + "</strong>. " +
 		"The next contribution is scheduled for <strong>" + nextDate + "</strong>.</p>" +
-		"<p>— Sajni</p>"
+		"<p>Sajni</p>"
 	if err := deps.Auth.SendEmail(ctx, email, subject, html); err != nil {
 		log.Warn().Err(err).Str("investment", name).Msg("investment auto-debit email failed")
 	}
