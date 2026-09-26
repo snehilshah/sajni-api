@@ -70,7 +70,7 @@ func (d *DB) migrate() error {
 		-- 'email' | 'push' | 'both'. push-only still falls back to email
 		-- when no push delivery lands, so nudges never silently vanish.
 		notify_channel TEXT         NOT NULL DEFAULT 'both',
-		onboarded_at   TIMESTAMPTZ,
+		onboarded_at   TIMESTAMPTZ, -- Legacy tour state retained for older clients.
 		created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 		deleted_at     TIMESTAMPTZ
 	);

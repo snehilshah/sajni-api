@@ -90,7 +90,7 @@ users
   id            uuid       PK  (UUIDv7, minted in Go)
   email         citext     UNIQUE NOT NULL
   name          text       NOT NULL DEFAULT ''
-  onboarded_at  timestamptz NULL   — null until the first-run tour ends
+  onboarded_at  timestamptz NULL   — legacy tour timestamp retained for older clients
   created_at    timestamptz NOT NULL DEFAULT now()
   deleted_at    timestamptz NULL   — set during the 7-day grace before purge
 
@@ -384,7 +384,7 @@ Logout (`POST /api/auth/logout`):
   `requestJSON`, in-memory `accessToken`.
 - `src/auth/AuthContext.tsx` — React context exposing `user`,
   `startEmail`, `verifyEmailCode`, `beginOAuth`, `hydrateFromAccessToken`,
-  `markOnboarded`, `updateName`, `logout`. On mount it does a one-shot
+  `updateName`, `logout`. On mount it does a one-shot
   `/auth/refresh` so a returning user with a live cookie skips the
   sign-in page.
 - `src/pages/Auth/SignIn.tsx` — the single sign-in page. OAuth
@@ -395,8 +395,8 @@ Logout (`POST /api/auth/logout`):
   "provider returned an unverified email collision" path.
 - `src/auth/RequireAuth.tsx` — wraps protected routes; bounces to
   `/signin` when there's no user.
-- `src/components/Onboarding.tsx` — the first-run tour with sidebar
-  popovers, gated on `user.onboarded_at === null`.
+- New web signups open Today directly. The first-run tour has been removed.
+  The API keeps `onboarded_at` and `POST /auth/onboarded` for older clients.
 
 ---
 

@@ -632,8 +632,8 @@ func (s *Service) HandleRerollAvatar(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, u)
 }
 
-// HandleOnboarded marks the user's walkthrough complete. Idempotent —
-// repeat calls keep the first timestamp.
+// HandleOnboarded is retained for older clients after the web tour's removal.
+// It is idempotent: repeat calls keep the first timestamp.
 func (s *Service) HandleOnboarded(w http.ResponseWriter, r *http.Request) {
 	id := MustUserID(r.Context())
 	if _, err := s.DB.ExecContext(r.Context(),
