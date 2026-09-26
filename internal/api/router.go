@@ -52,7 +52,6 @@ func Router(deps Deps) http.Handler {
 	apiMux.HandleFunc("GET /api/auth/me", deps.Auth.HandleMe)
 	apiMux.HandleFunc("POST /api/auth/profile", deps.Auth.HandleUpdateProfile)
 	apiMux.HandleFunc("POST /api/auth/profile/avatar/reroll", deps.Auth.HandleRerollAvatar)
-	apiMux.HandleFunc("POST /api/auth/onboarded", deps.Auth.HandleOnboarded)
 	apiMux.HandleFunc("POST /api/auth/timezone", deps.Auth.HandleSetTimezone)
 	apiMux.HandleFunc("POST /api/auth/notify-channel", deps.Auth.HandleSetNotifyChannel)
 	registerMemoRoutes(apiMux, deps)
@@ -84,7 +83,7 @@ func Router(deps Deps) http.Handler {
 
 	// Top-level dispatcher: route the unauthenticated auth endpoints
 	// directly to authMux, fall through to the protected mux for
-	// everything else (including /api/auth/me + /api/auth/onboarded).
+	// everything else (including /api/auth/me).
 	root := http.NewServeMux()
 	root.Handle("/api/auth/google/start", authMux)
 	root.Handle("/api/auth/google/callback", authMux)

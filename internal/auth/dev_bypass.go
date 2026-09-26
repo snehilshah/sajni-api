@@ -84,7 +84,6 @@ func (s *Service) ensureDevBypassUser(ctx context.Context) (string, error) {
 		if _, err := s.DB.ExecContext(ctx,
 			`UPDATE users
 			    SET name = CASE WHEN COALESCE(name,'') = '' THEN $2 ELSE name END,
-			        onboarded_at = COALESCE(onboarded_at, NOW()),
 			        deleted_at = NULL
 			  WHERE id = $1`,
 			userID, name,
@@ -94,7 +93,7 @@ func (s *Service) ensureDevBypassUser(ctx context.Context) (string, error) {
 	case errors.Is(err, sql.ErrNoRows):
 		userID = NewID()
 		if _, err := s.DB.ExecContext(ctx,
-			`INSERT INTO users (id, email, name, onboarded_at) VALUES ($1, $2, $3, NOW())`,
+			`INSERT INTO users (id, email, name) VALUES ($1, $2, $3)`,
 			userID, email, name,
 		); err != nil {
 			return "", err

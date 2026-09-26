@@ -70,11 +70,12 @@ func (d *DB) migrate() error {
 		-- 'email' | 'push' | 'both'. push-only still falls back to email
 		-- when no push delivery lands, so nudges never silently vanish.
 		notify_channel TEXT         NOT NULL DEFAULT 'both',
-		onboarded_at   TIMESTAMPTZ, -- Legacy tour state retained for older clients.
 		created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 		deleted_at     TIMESTAMPTZ
 	);
 	ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_revision BIGINT NOT NULL DEFAULT 0;
+	-- The first-run tour and its completion state have been removed.
+	ALTER TABLE users DROP COLUMN IF EXISTS onboarded_at;
 	CREATE INDEX IF NOT EXISTS idx_users_deleted_at ON users(deleted_at) WHERE deleted_at IS NOT NULL;
 
 	-- One row per (provider, provider_subject) — Google sub, GitHub user

@@ -117,7 +117,6 @@ type userResponse struct {
 	AvatarRevision int64              `json:"avatar_revision"`
 	Timezone       string             `json:"timezone"`
 	NotifyChannel  string             `json:"notify_channel"`
-	OnboardedAt    *string            `json:"onboarded_at"`
 	Identities     []identityResponse `json:"identities"`
 	DeletedAt      *string            `json:"deleted_at,omitempty"`
 }
@@ -148,20 +147,15 @@ func (s *Service) loadUser(ctx context.Context, id string) (*userResponse, error
 		tz             sql.NullString
 		channel        string
 		avatarRevision int64
-		onboarded      sql.NullTime
 		deleted        sql.NullTime
 	)
 	err := s.DB.QueryRowContext(ctx,
-		`SELECT email, name, avatar_revision, timezone, COALESCE(notify_channel,'both'), onboarded_at, deleted_at FROM users WHERE id=$1`, id,
-	).Scan(&email, &name, &avatarRevision, &tz, &channel, &onboarded, &deleted)
+		`SELECT email, name, avatar_revision, timezone, COALESCE(notify_channel,'both'), deleted_at FROM users WHERE id=$1`, id,
+	).Scan(&email, &name, &avatarRevision, &tz, &channel, &deleted)
 	if err != nil {
 		return nil, err
 	}
 	resp := &userResponse{ID: id, Email: email, Name: name, AvatarRevision: avatarRevision, Timezone: tz.String, NotifyChannel: channel, Identities: []identityResponse{}}
-	if onboarded.Valid {
-		v := onboarded.Time.UTC().Format(time.RFC3339)
-		resp.OnboardedAt = &v
-	}
 	if deleted.Valid {
 		v := deleted.Time.UTC().Format(time.RFC3339)
 		resp.DeletedAt = &v
@@ -630,19 +624,6 @@ func (s *Service) HandleRerollAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, u)
-}
-
-// HandleOnboarded is retained for older clients after the web tour's removal.
-// It is idempotent: repeat calls keep the first timestamp.
-func (s *Service) HandleOnboarded(w http.ResponseWriter, r *http.Request) {
-	id := MustUserID(r.Context())
-	if _, err := s.DB.ExecContext(r.Context(),
-		`UPDATE users SET onboarded_at = COALESCE(onboarded_at, NOW()) WHERE id = $1`, id,
-	); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // HandleSetNotifyChannel stores how reminder/digest/auto-pay nudges reach the
