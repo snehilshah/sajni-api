@@ -49,13 +49,12 @@ func TestValidateProductionRejectsLocalFlags(t *testing.T) {
 	cfg := validConfig(Production)
 	cfg.Auth.CookieInsecure = true
 	cfg.Auth.DevAuthBypass = true
-	cfg.Database.DropAndReseed = true
 
 	err := validate(cfg)
 	if err == nil {
 		t.Fatal("expected production validation error")
 	}
-	for _, name := range []string{"COOKIE_INSECURE", "DEV_AUTH_BYPASS", "DROP_AND_RESEED"} {
+	for _, name := range []string{"COOKIE_INSECURE", "DEV_AUTH_BYPASS"} {
 		if !strings.Contains(err.Error(), name) {
 			t.Errorf("validation error does not mention %s: %v", name, err)
 		}

@@ -340,6 +340,19 @@ make docker-run # build the Cloud Run image and run with .env
 `.env` permissions to `600`. Optional integrations such as TMDB, Gemini,
 Google Places, Cloud Tasks, and Firebase may stay blank in local development.
 
+Set `DATABASE_URL` to an empty database owned by your local Postgres role.
+For a Homebrew installation initialized under your OS account:
+
+```sh
+createdb -h localhost -U "$USER" sajni_dev
+```
+
+Then use `postgres://YOUR_LOCAL_ROLE@localhost:5432/sajni_dev?sslmode=disable`
+in `.env`. Docker's default `postgres` role applies only to the Docker example
+in `.env.example`. The API creates the current schema on first start. Completed
+historical upgrades and the destructive reset flag have been retired. Preserve
+old databases separately; they must have the current schema before reuse.
+
 ---
 
 ## Why blobs go to GCS, not the filesystem

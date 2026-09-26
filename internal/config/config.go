@@ -14,8 +14,7 @@ const (
 )
 
 type Database struct {
-	URL           string
-	DropAndReseed bool
+	URL string
 }
 
 type Logging struct {
@@ -90,10 +89,6 @@ func Load(dotEnvPath string) (Config, error) {
 		return Config{}, err
 	}
 
-	database, err := readDatabase()
-	if err != nil {
-		return Config{}, err
-	}
 	cookieInsecure, err := readBool("COOKIE_INSECURE")
 	if err != nil {
 		return Config{}, err
@@ -112,7 +107,7 @@ func Load(dotEnvPath string) (Config, error) {
 	}
 	cfg := Config{
 		Environment: Environment(strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV")))),
-		Database:    database,
+		Database:    readDatabase(),
 		Logging:     Logging{Level: strings.ToLower(strings.TrimSpace(os.Getenv("LOG_LEVEL")))},
 		HTTP: HTTP{
 			CORSOrigin:     strings.TrimRight(strings.TrimSpace(os.Getenv("CORS_ORIGIN")), "/"),
@@ -168,26 +163,15 @@ func LoadDatabase(dotEnvPath string) (Database, error) {
 	if err := LoadDotEnv(dotEnvPath); err != nil {
 		return Database{}, err
 	}
-	database, err := readDatabase()
-	if err != nil {
-		return Database{}, err
-	}
+	database := readDatabase()
 	if database.URL == "" {
 		return Database{}, fmt.Errorf("DATABASE_URL is required")
 	}
 	return database, nil
 }
 
-func readDatabase() (Database, error) {
-	dropAndReseed, err := readBool("DROP_AND_RESEED")
-	if err != nil {
-		return Database{}, err
-	}
-	database := Database{
-		URL:           strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		DropAndReseed: dropAndReseed,
-	}
-	return database, nil
+func readDatabase() Database {
+	return Database{URL: strings.TrimSpace(os.Getenv("DATABASE_URL"))}
 }
 
 func applyDefaults(cfg *Config) {
@@ -299,9 +283,6 @@ func validate(cfg Config) error {
 		}
 		if cfg.Auth.DevAuthBypass {
 			problems = append(problems, "DEV_AUTH_BYPASS cannot be enabled in production")
-		}
-		if cfg.Database.DropAndReseed {
-			problems = append(problems, "DROP_AND_RESEED cannot be enabled in production")
 		}
 	}
 

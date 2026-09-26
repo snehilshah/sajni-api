@@ -466,9 +466,6 @@ These are worth knowing because they show up as opaque
   direct LAN API calls work when `CORS_ORIGIN` is pinned.
 - **Env vars on the web**: `VITE_API_URL` only. The frontend never
   needs the OAuth client ids.
-- **Schema reset**: `DROP_AND_RESEED=1 go run ./cmd/...` wipes the
-  public schema and re-runs the migrate. Use sparingly; flip back off
-  after the next boot.
 - **Resend domain**: until a verified domain is configured, use
   `onboarding@resend.dev` as `EMAIL_FROM`. The user will see "via
   resend.dev" — fine for staging.

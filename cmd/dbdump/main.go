@@ -12,8 +12,8 @@
 //
 //	go run ./cmd/dbdump [out_dir]      # default out_dir = ./backups
 //
-// Restore (deliberate, manual): start the server once so migrations recreate
-// the empty schema, then for each table — in any order, FK checks deferred:
+// Restore (deliberate, manual): start the server once against an empty database
+// to create the current schema, then restore each table with FK checks deferred:
 //
 //	BEGIN;
 //	SET session_replication_role = replica;   -- skip FK/trigger checks
@@ -130,7 +130,7 @@ func writeManifest(outDir, stamp, dsn string, tables []string, counts map[string
 		fmt.Fprintf(&b, "| %s | %d |\n", t, counts[t])
 	}
 	b.WriteString("\n## Restore\n\n")
-	b.WriteString("1. Start the API once against the target DB so migrations recreate the empty schema.\n")
+	b.WriteString("1. Start the API once against an empty target DB to create the current schema.\n")
 	b.WriteString("2. Then, with FK/trigger checks deferred, COPY each CSV back:\n\n")
 	b.WriteString("```sql\nBEGIN;\nSET session_replication_role = replica;\n")
 	for _, t := range tables {

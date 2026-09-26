@@ -41,7 +41,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	database, err := db.New(cfg.Database.URL, cfg.Database.DropAndReseed)
+	database, err := db.New(cfg.Database.URL)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize database")
 	}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/rs/zerolog/log"
 )
 
 // DB wraps the sql.DB connection to Postgres.
@@ -13,15 +12,10 @@ type DB struct {
 	*sql.DB
 }
 
-// New opens a Postgres connection using the provided DSN
-// (e.g. "postgres://user:pass@host:5432/dbname?sslmode=disable")
-// and ensures the schema is up to date.
-//
-// Setting DROP_AND_RESEED=1 wipes the public schema before re-running
-// migrations. Used once when switching the schema (e.g. the auth
-// rework that flipped users.id to UUID). Flip the flag back off after
-// the next successful boot.
-func New(dsn string, dropAndReseed bool) (*DB, error) {
+// New opens Postgres and creates the current schema in an empty database.
+// Existing databases must already use the current schema; historical data
+// upgrades and destructive resets are deliberately not run at startup.
+func New(dsn string) (*DB, error) {
 	if dsn == "" {
 		return nil, fmt.Errorf("empty DATABASE_URL")
 	}
@@ -31,25 +25,31 @@ func New(dsn string, dropAndReseed bool) (*DB, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	if err := conn.Ping(); err != nil {
+		conn.Close()
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
 
-	d := &DB{DB: conn}
-
-	if dropAndReseed {
-		log.Warn().Msg("DROP_AND_RESEED=1 — wiping public schema before migrate")
-		if _, err := d.Exec(`DROP SCHEMA public CASCADE; CREATE SCHEMA public;`); err != nil {
-			return nil, fmt.Errorf("drop schema: %w", err)
-		}
+	var userIDType string
+	err = conn.QueryRow(`SELECT data_type FROM information_schema.columns
+		WHERE table_schema='public' AND table_name='users' AND column_name='id'`).Scan(&userIDType)
+	if err != nil && err != sql.ErrNoRows {
+		conn.Close()
+		return nil, fmt.Errorf("inspect schema: %w", err)
+	}
+	if err == nil && userIDType != "uuid" {
+		conn.Close()
+		return nil, fmt.Errorf("legacy database schema: users.id is %s; use a new empty development database or restore a current-schema backup", userIDType)
 	}
 
-	if err := d.migrate(); err != nil {
-		return nil, fmt.Errorf("migrate: %w", err)
+	d := &DB{DB: conn}
+	if err := d.ensureSchema(); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("initialize schema: %w", err)
 	}
 	return d, nil
 }
 
-func (d *DB) migrate() error {
+func (d *DB) ensureSchema() error {
 	schema := `
 	CREATE EXTENSION IF NOT EXISTS citext;
 
@@ -73,9 +73,6 @@ func (d *DB) migrate() error {
 		created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 		deleted_at     TIMESTAMPTZ
 	);
-	ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_revision BIGINT NOT NULL DEFAULT 0;
-	-- The first-run tour and its completion state have been removed.
-	ALTER TABLE users DROP COLUMN IF EXISTS onboarded_at;
 	CREATE INDEX IF NOT EXISTS idx_users_deleted_at ON users(deleted_at) WHERE deleted_at IS NOT NULL;
 
 	-- One row per (provider, provider_subject) — Google sub, GitHub user
@@ -196,12 +193,6 @@ func (d *DB) migrate() error {
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
-	-- Existing databases skip CREATE TABLE, so add dependency column before
-	-- any index references it. Fresh databases already have it; IF NOT EXISTS
-	-- makes this path safe for both.
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS blocked_by_task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL;
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reminder_claimed_until TIMESTAMPTZ;
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS color TEXT;
 	CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_list ON tasks(list_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
@@ -345,16 +336,12 @@ func (d *DB) migrate() error {
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
-	ALTER TABLE media ADD COLUMN IF NOT EXISTS release_reminded_for DATE;
-	ALTER TABLE media ADD COLUMN IF NOT EXISTS release_reminder_claimed_until TIMESTAMPTZ;
-	ALTER TABLE media ADD COLUMN IF NOT EXISTS metadata_checked_at TIMESTAMPTZ;
 	CREATE INDEX IF NOT EXISTS idx_media_user ON media(user_id);
 	CREATE INDEX IF NOT EXISTS idx_media_collection ON media(user_id, collection_id) WHERE collection_id <> '';
 	CREATE INDEX IF NOT EXISTS idx_media_upcoming_release_all ON media(user_id, release_date)
 		WHERE type IN ('movie', 'show') AND status = 'upcoming' AND release_date IS NOT NULL;
 	CREATE INDEX IF NOT EXISTS idx_media_completed_show_refresh ON media(user_id, metadata_checked_at)
 		WHERE type = 'show' AND status = 'complete' AND external_id LIKE 'tmdb:tv:%';
-	DROP INDEX IF EXISTS idx_media_upcoming_release;
 
 	CREATE TABLE IF NOT EXISTS media_events (
 		id         BIGSERIAL   PRIMARY KEY,
@@ -456,10 +443,6 @@ func (d *DB) migrate() error {
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		PRIMARY KEY (user_id, path)
 	);
-	-- Safe adds for databases created before the pinned columns landed
-	-- (CREATE IF NOT EXISTS skips existing tables). Idempotent, no backfill.
-	ALTER TABLE notes        ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE;
-	ALTER TABLE note_folders ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE;
 
 	CREATE TABLE IF NOT EXISTS task_due_history (
 		id          BIGSERIAL   PRIMARY KEY,
@@ -521,6 +504,7 @@ func (d *DB) migrate() error {
 		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_accounts_user_id ON fin_accounts(user_id,id);
 	CREATE INDEX IF NOT EXISTS idx_fin_accounts_user ON fin_accounts(user_id);
 
 	CREATE TABLE IF NOT EXISTS fin_categories (
@@ -532,7 +516,30 @@ func (d *DB) migrate() error {
 		icon       TEXT      NOT NULL DEFAULT '',
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_categories_user_id ON fin_categories(user_id,id);
 	CREATE INDEX IF NOT EXISTS idx_fin_categories_user ON fin_categories(user_id);
+
+	-- ─── Slates: is this normal life, or not? ─────────────────────────
+	-- Every transaction carries exactly one slate. Plain is the system
+	-- slate: seeded per user, undeletable, and the default for everything
+	-- including cron-posted txns (biller pay, auto-renew, investment
+	-- auto-debit) — those no longer need a special case, they just don't
+	-- set a slate. Every other slate is an outlier the user named.
+	-- Budgets ignore slates they do not explicitly name; that exclusion is
+	-- what keeps the baseline clean. See SLATES.md.
+	CREATE TABLE IF NOT EXISTS fin_slates (
+		id         BIGSERIAL   PRIMARY KEY,
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		name       TEXT        NOT NULL DEFAULT '',
+		color      TEXT        NOT NULL DEFAULT '#2D5A4F',
+		is_plain   BOOLEAN     NOT NULL DEFAULT FALSE,
+		archived   BOOLEAN     NOT NULL DEFAULT FALSE,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_slates_user ON fin_slates(user_id);
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_slates_plain
+		ON fin_slates(user_id) WHERE is_plain;
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_slates_user_id ON fin_slates(user_id, id);
 
 	CREATE TABLE IF NOT EXISTS fin_transactions (
 		id              BIGSERIAL   PRIMARY KEY,
@@ -546,12 +553,18 @@ func (d *DB) migrate() error {
 		txn_at          TIMESTAMPTZ NOT NULL,
 		transfer_pair   BIGINT,
 		linked_account  BIGINT      REFERENCES fin_accounts(id) ON DELETE SET NULL,
+		slate_id        BIGINT      NOT NULL,
 		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		CONSTRAINT fk_fin_txn_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE CASCADE,
+		CONSTRAINT fk_fin_txn_linked_user FOREIGN KEY(user_id,linked_account) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (linked_account),
+		CONSTRAINT fk_fin_txn_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id),
+		CONSTRAINT fk_fin_txn_slate_user FOREIGN KEY(user_id,slate_id) REFERENCES fin_slates(user_id,id) ON DELETE RESTRICT
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_user ON fin_transactions(user_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_account ON fin_transactions(account_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_at ON fin_transactions(user_id, txn_at);
+	CREATE INDEX IF NOT EXISTS idx_fin_transactions_slate ON fin_transactions(user_id, slate_id);
 
 	-- A lend is a receivable, not spending. source_transaction_id is the
 	-- account outflow; repayments each own an account inflow. Keeping those
@@ -602,6 +615,7 @@ func (d *DB) migrate() error {
 		total_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
 		created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_budgets_user_id ON fin_budgets(user_id,id);
 	CREATE INDEX IF NOT EXISTS idx_fin_budgets_user ON fin_budgets(user_id);
 
 	CREATE TABLE IF NOT EXISTS fin_budget_items (
@@ -609,7 +623,9 @@ func (d *DB) migrate() error {
 		budget_id   BIGINT    NOT NULL REFERENCES fin_budgets(id) ON DELETE CASCADE,
 		user_id     UUID      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		category_id BIGINT    REFERENCES fin_categories(id) ON DELETE SET NULL,
-		amount      NUMERIC(14,2) NOT NULL DEFAULT 0
+		amount      NUMERIC(14,2) NOT NULL DEFAULT 0,
+		CONSTRAINT fk_fin_budget_item_budget_user FOREIGN KEY(user_id,budget_id) REFERENCES fin_budgets(user_id,id) ON DELETE CASCADE,
+		CONSTRAINT fk_fin_budget_item_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id)
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_budget_items_budget ON fin_budget_items(budget_id);
 
@@ -634,7 +650,8 @@ func (d *DB) migrate() error {
 		anchor_day      INTEGER,
 		notes           TEXT        NOT NULL DEFAULT '',
 		last_updated    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		CONSTRAINT fk_fin_investment_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (account_id)
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_investments_user ON fin_investments(user_id);
 
@@ -686,9 +703,7 @@ func (d *DB) migrate() error {
 	-- amount is an optional estimate, user marks paid with the actual).
 	-- remind_task: opt-in — when on (and not auto_renew) the biller cron
 	-- spawns one bill-pay reminder task per due cycle. variable /
-	-- is_subscription are legacy columns kept until android parity (the
-	-- kind backfill below reads variable — convert it to a column-exists
-	-- guard before ever dropping).
+	-- is_subscription remain for older client read compatibility.
 	CREATE TABLE IF NOT EXISTS fin_billers (
 		id              BIGSERIAL   PRIMARY KEY,
 		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -710,7 +725,9 @@ func (d *DB) migrate() error {
 		archived        BOOLEAN     NOT NULL DEFAULT FALSE,
 		last_run_at     TIMESTAMPTZ,
 		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		CONSTRAINT fk_fin_biller_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (account_id),
+		CONSTRAINT fk_fin_biller_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id)
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_billers_user ON fin_billers(user_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_billers_due ON fin_billers(user_id, next_due_date) WHERE archived = FALSE;
@@ -751,50 +768,6 @@ func (d *DB) migrate() error {
 		PRIMARY KEY (payment_id, txn_id)
 	);
 
-	-- ─── Slates: is this normal life, or not? ─────────────────────────
-	-- Every transaction carries exactly one slate. Plain is the system
-	-- slate: seeded per user, undeletable, and the default for everything
-	-- including cron-posted txns (biller pay, auto-renew, investment
-	-- auto-debit) — those no longer need a special case, they just don't
-	-- set a slate. Every other slate is an outlier the user named.
-	-- Budgets ignore slates they do not explicitly name; that exclusion is
-	-- what keeps the baseline clean. See SLATES.md.
-	CREATE TABLE IF NOT EXISTS fin_slates (
-		id         BIGSERIAL   PRIMARY KEY,
-		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		name       TEXT        NOT NULL DEFAULT '',
-		color      TEXT        NOT NULL DEFAULT '#2D5A4F',
-		is_plain   BOOLEAN     NOT NULL DEFAULT FALSE,
-		archived   BOOLEAN     NOT NULL DEFAULT FALSE,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_fin_slates_user ON fin_slates(user_id);
-	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_slates_plain
-		ON fin_slates(user_id) WHERE is_plain;
-	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_slates_user_id ON fin_slates(user_id, id);
-
-	-- Plain for every existing user, then One-offs (an ordinary slate that
-	-- merely ships pre-made — nothing in the code treats it specially). The
-	-- NOT EXISTS guard means a user who deleted it does not get it back.
-	INSERT INTO fin_slates (user_id, name, color, is_plain)
-		SELECT id, 'Plain', '#6B7280', TRUE FROM users
-		ON CONFLICT (user_id) WHERE is_plain DO NOTHING;
-	INSERT INTO fin_slates (user_id, name, color)
-		SELECT u.id, 'One-offs', '#A14B4F' FROM users u
-		WHERE NOT EXISTS (SELECT 1 FROM fin_slates s WHERE s.user_id = u.id AND NOT s.is_plain);
-
-	-- Nullable → backfill to Plain → NOT NULL. RESTRICT, not SET NULL:
-	-- there is no null state to fall back to, so deleting a slate that
-	-- still holds transactions must be refused at the DB and reassigned
-	-- explicitly by the API.
-	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS slate_id BIGINT;
-	UPDATE fin_transactions t SET slate_id = s.id
-		FROM fin_slates s
-		WHERE s.user_id = t.user_id AND s.is_plain AND t.slate_id IS NULL;
-	ALTER TABLE fin_transactions ALTER COLUMN slate_id SET NOT NULL;
-	CREATE INDEX IF NOT EXISTS idx_fin_transactions_slate
-		ON fin_transactions(user_id, slate_id);
-
 	-- System paths (biller autopay, investment auto-debit, statement import,
 	-- takeout restore) omit slate_id entirely. This fills it with the user's
 	-- Plain slate, so "ambient money is normal life" is enforced in one place
@@ -807,8 +780,7 @@ func (d *DB) migrate() error {
 		END IF;
 		RETURN NEW;
 	END $fn$ LANGUAGE plpgsql;
-	DROP TRIGGER IF EXISTS trg_fin_txn_default_slate ON fin_transactions;
-	CREATE TRIGGER trg_fin_txn_default_slate BEFORE INSERT ON fin_transactions
+	CREATE OR REPLACE TRIGGER trg_fin_txn_default_slate BEFORE INSERT ON fin_transactions
 		FOR EACH ROW EXECUTE FUNCTION fin_txn_default_slate();
 
 	-- Which slates a budget counts. No rows = Plain only.
@@ -816,25 +788,10 @@ func (d *DB) migrate() error {
 		budget_id BIGINT NOT NULL REFERENCES fin_budgets(id) ON DELETE CASCADE,
 		user_id   UUID   NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		slate_id  BIGINT NOT NULL REFERENCES fin_slates(id) ON DELETE CASCADE,
-		PRIMARY KEY (budget_id, slate_id)
+		PRIMARY KEY (budget_id, slate_id),
+		CONSTRAINT fk_fin_budget_slate_budget_user FOREIGN KEY(user_id,budget_id) REFERENCES fin_budgets(user_id,id) ON DELETE CASCADE,
+		CONSTRAINT fk_fin_budget_slate_user FOREIGN KEY(user_id,slate_id) REFERENCES fin_slates(user_id,id) ON DELETE CASCADE
 	);
-
-	-- ─── Pockets: dropped outright ────────────────────────────────────
-	-- Not migrated into slates: personal and shared alike are dropped, and
-	-- every transaction lands in Plain. Amounts, dates, accounts and
-	-- categories are untouched — only the pocket relation dies. Children
-	-- first so the FKs unwind cleanly.
-	ALTER TABLE fin_transactions DROP COLUMN IF EXISTS pocket_id;
-	ALTER TABLE fin_transactions DROP COLUMN IF EXISTS shared_expense_id;
-	ALTER TABLE fin_transactions DROP COLUMN IF EXISTS settlement_id;
-	DROP TABLE IF EXISTS fin_budget_pockets;
-	DROP TABLE IF EXISTS fin_expense_shares;
-	DROP TABLE IF EXISTS fin_shared_expenses;
-	DROP TABLE IF EXISTS fin_pocket_settlements;
-	DROP TABLE IF EXISTS fin_pocket_activity;
-	DROP TABLE IF EXISTS fin_pocket_invites;
-	DROP TABLE IF EXISTS fin_pocket_members;
-	DROP TABLE IF EXISTS fin_pockets;
 
 	-- One row per auto-debited investment cycle; UNIQUE key is the
 	-- idempotency gate (mirrors fin_biller_payments).
@@ -850,93 +807,6 @@ func (d *DB) migrate() error {
 		UNIQUE(investment_id, due_date)
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_inv_contrib_user ON fin_investment_contributions(user_id);
-
-	-- Tenant-consistent finance references. Backfill child ownership from the
-	-- parent budget, then stop migration if any direct reference crosses users.
-	ALTER TABLE fin_budget_items ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE CASCADE;
-	UPDATE fin_budget_items i SET user_id=b.user_id FROM fin_budgets b WHERE i.budget_id=b.id AND i.user_id IS NULL;
-	ALTER TABLE fin_budget_items ALTER COLUMN user_id SET NOT NULL;
-	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_accounts_user_id ON fin_accounts(user_id,id);
-	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_categories_user_id ON fin_categories(user_id,id);
-	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_budgets_user_id ON fin_budgets(user_id,id);
-	DO $$
-	DECLARE bad_count BIGINT;
-	BEGIN
-		SELECT COUNT(*) INTO bad_count FROM fin_transactions t JOIN fin_accounts a ON a.id=t.account_id WHERE t.user_id<>a.user_id;
-		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_transactions.account_id count=%', bad_count; END IF;
-		SELECT COUNT(*) INTO bad_count FROM fin_transactions t JOIN fin_accounts a ON a.id=t.linked_account WHERE t.linked_account IS NOT NULL AND t.user_id<>a.user_id;
-		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_transactions.linked_account count=%', bad_count; END IF;
-		SELECT COUNT(*) INTO bad_count FROM fin_transactions t JOIN fin_categories c ON c.id=t.category_id WHERE t.category_id IS NOT NULL AND t.user_id<>c.user_id;
-		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_transactions.category_id count=%', bad_count; END IF;
-		SELECT COUNT(*) INTO bad_count FROM fin_transactions t JOIN fin_slates s ON s.id=t.slate_id WHERE t.user_id<>s.user_id;
-		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_transactions.slate_id count=%', bad_count; END IF;
-		SELECT COUNT(*) INTO bad_count FROM fin_budget_slates b JOIN fin_slates s ON s.id=b.slate_id WHERE b.user_id<>s.user_id;
-		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_budget_slates.slate_id count=%', bad_count; END IF;
-		SELECT COUNT(*) INTO bad_count FROM fin_budget_items i JOIN fin_categories c ON c.id=i.category_id WHERE i.category_id IS NOT NULL AND i.user_id<>c.user_id;
-		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_budget_items.category_id count=%', bad_count; END IF;
-		SELECT COUNT(*) INTO bad_count FROM fin_investments i JOIN fin_accounts a ON a.id=i.account_id WHERE i.account_id IS NOT NULL AND i.user_id<>a.user_id;
-		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_investments.account_id count=%', bad_count; END IF;
-		SELECT COUNT(*) INTO bad_count FROM fin_billers b JOIN fin_accounts a ON a.id=b.account_id WHERE b.account_id IS NOT NULL AND b.user_id<>a.user_id;
-		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_billers.account_id count=%', bad_count; END IF;
-		SELECT COUNT(*) INTO bad_count FROM fin_billers b JOIN fin_categories c ON c.id=b.category_id WHERE b.category_id IS NOT NULL AND b.user_id<>c.user_id;
-		IF bad_count>0 THEN RAISE EXCEPTION 'cross-tenant rows: fin_billers.category_id count=%', bad_count; END IF;
-	END $$;
-	DO $$ BEGIN
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_account_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE CASCADE; END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_linked_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_linked_user FOREIGN KEY(user_id,linked_account) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (linked_account); END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_category_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id); END IF;
-		-- RESTRICT: slate_id has no null state, so a slate holding transactions
-		-- must be reassigned to Plain by the API before it can be deleted.
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_txn_slate_user') THEN ALTER TABLE fin_transactions ADD CONSTRAINT fk_fin_txn_slate_user FOREIGN KEY(user_id,slate_id) REFERENCES fin_slates(user_id,id) ON DELETE RESTRICT; END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_slate_budget_user') THEN ALTER TABLE fin_budget_slates ADD CONSTRAINT fk_fin_budget_slate_budget_user FOREIGN KEY(user_id,budget_id) REFERENCES fin_budgets(user_id,id) ON DELETE CASCADE; END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_slate_user') THEN ALTER TABLE fin_budget_slates ADD CONSTRAINT fk_fin_budget_slate_user FOREIGN KEY(user_id,slate_id) REFERENCES fin_slates(user_id,id) ON DELETE CASCADE; END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_item_budget_user') THEN ALTER TABLE fin_budget_items ADD CONSTRAINT fk_fin_budget_item_budget_user FOREIGN KEY(user_id,budget_id) REFERENCES fin_budgets(user_id,id) ON DELETE CASCADE; END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_budget_item_category_user') THEN ALTER TABLE fin_budget_items ADD CONSTRAINT fk_fin_budget_item_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id); END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_investment_account_user') THEN ALTER TABLE fin_investments ADD CONSTRAINT fk_fin_investment_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (account_id); END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_biller_account_user') THEN ALTER TABLE fin_billers ADD CONSTRAINT fk_fin_biller_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (account_id); END IF;
-		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_fin_biller_category_user') THEN ALTER TABLE fin_billers ADD CONSTRAINT fk_fin_biller_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id); END IF;
-	END $$;
-
-	-- Budgets lost their rolling period: every budget is discrete now, and a
-	-- slate-scoped one needs no window at all.
-	ALTER TABLE fin_budgets DROP COLUMN IF EXISTS period;
-	ALTER TABLE fin_budgets ALTER COLUMN start_date DROP NOT NULL;
-	ALTER TABLE fin_budgets ALTER COLUMN end_date DROP NOT NULL;
-
-	-- ─── Finance migrations for pre-existing DBs (idempotent) ─────────
-
-	-- Biller kind backfill (fresh DBs get kind via CREATE TABLE).
-	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT '';
-	UPDATE fin_billers SET kind = CASE WHEN variable THEN 'bill' ELSE 'subscription' END WHERE kind = '';
-	ALTER TABLE fin_billers ALTER COLUMN kind SET DEFAULT 'subscription';
-	-- Bills never auto-pay (auto_renew is a subscription-only concept now).
-	UPDATE fin_billers SET auto_renew = FALSE WHERE kind = 'bill' AND auto_renew;
-
-	-- Investment auto-debit columns (fresh DBs get them via CREATE TABLE).
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS auto_debit BOOLEAN NOT NULL DEFAULT FALSE;
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS next_debit_date DATE;
-	ALTER TABLE fin_investments ADD COLUMN IF NOT EXISTS anchor_day INTEGER;
-	UPDATE fin_investments
-	   SET anchor_day = EXTRACT(DAY FROM COALESCE(start_date, next_debit_date))::INTEGER
-	 WHERE anchor_day IS NULL AND COALESCE(start_date, next_debit_date) IS NOT NULL;
-	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS anchor_day INTEGER;
-	UPDATE fin_billers
-	   SET anchor_day = EXTRACT(DAY FROM next_due_date)::INTEGER
-	 WHERE anchor_day IS NULL;
-
-	-- Trading purge (2026-07): market trading removed from the product.
-	-- Idempotent — the API no longer creates these types, so re-runs
-	-- match zero rows.
-	DELETE FROM fin_investments WHERE type IN ('stock','etf');
-	DELETE FROM fin_accounts WHERE type = 'trading';
-	UPDATE fin_accounts SET type = 'savings' WHERE type = 'checking';
-	DELETE FROM fin_transactions WHERE type IN ('buy','sell');
-	ALTER TABLE fin_investments
-		DROP COLUMN IF EXISTS quantity, DROP COLUMN IF EXISTS avg_buy_price,
-		DROP COLUMN IF EXISTS realized_pl, DROP COLUMN IF EXISTS status,
-		DROP COLUMN IF EXISTS sold_at, DROP COLUMN IF EXISTS symbol,
-		DROP COLUMN IF EXISTS exchange, DROP COLUMN IF EXISTS last_price,
-		DROP COLUMN IF EXISTS price_error, DROP COLUMN IF EXISTS price_at;
 
 	-- ─── Insights / Themes / AI ───────────────────────────────────────
 	CREATE TABLE IF NOT EXISTS insights (
@@ -1060,7 +930,6 @@ func (d *DB) migrate() error {
 		claimed_until TIMESTAMPTZ,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
-	ALTER TABLE task_reminders ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMPTZ;
 	CREATE INDEX IF NOT EXISTS idx_task_reminders_task ON task_reminders(task_id);
 	CREATE INDEX IF NOT EXISTS idx_task_reminders_due  ON task_reminders(remind_at) WHERE sent_at IS NULL;
 
@@ -1092,67 +961,10 @@ func (d *DB) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id);
 
-	-- Merge duplicate finance categories before enforcing uniqueness. Names are
-	-- case-insensitive within each kind; legacy "Other" and "Others" are one
-	-- canonical bucket. Repoint every category FK before deleting duplicates.
-	WITH ranked AS (
-		SELECT id,
-		       MIN(id) OVER (PARTITION BY user_id, kind,
-		         CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END) AS keep_id
-		FROM fin_categories
-	), dup AS (SELECT id, keep_id FROM ranked WHERE id <> keep_id)
-	UPDATE fin_transactions t SET category_id=d.keep_id FROM dup d WHERE t.category_id=d.id;
-
-	WITH ranked AS (
-		SELECT id,
-		       MIN(id) OVER (PARTITION BY user_id, kind,
-		         CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END) AS keep_id
-		FROM fin_categories
-	), dup AS (SELECT id, keep_id FROM ranked WHERE id <> keep_id)
-	UPDATE fin_budget_items i SET category_id=d.keep_id FROM dup d WHERE i.category_id=d.id;
-
-	WITH ranked AS (
-		SELECT id,
-		       MIN(id) OVER (PARTITION BY user_id, kind,
-		         CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END) AS keep_id
-		FROM fin_categories
-	), dup AS (SELECT id, keep_id FROM ranked WHERE id <> keep_id)
-	UPDATE fin_billers b SET category_id=d.keep_id FROM dup d WHERE b.category_id=d.id;
-
-	WITH ranked AS (
-		SELECT id,
-		       MIN(id) OVER (PARTITION BY user_id, kind,
-		         CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END) AS keep_id
-		FROM fin_categories
-	), dup AS (SELECT id, keep_id FROM ranked WHERE id <> keep_id)
-	UPDATE fin_merchant_categories m SET category_id=d.keep_id FROM dup d WHERE m.category_id=d.id;
-
-	WITH ranked AS (
-		SELECT id,
-		       MIN(id) OVER (PARTITION BY user_id, kind,
-		         CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END) AS keep_id
-		FROM fin_categories
-	)
-	DELETE FROM fin_categories c USING ranked r WHERE c.id=r.id AND r.id <> r.keep_id;
-
-	UPDATE fin_categories SET name='Others' WHERE LOWER(BTRIM(name)) IN ('other','others');
+	-- Category names are case-insensitive within each kind.
 	CREATE UNIQUE INDEX IF NOT EXISTS uq_fin_categories_user_kind_name
 	ON fin_categories (user_id, kind,
 		(CASE WHEN LOWER(BTRIM(name)) IN ('other','others') THEN 'others' ELSE LOWER(BTRIM(name)) END));
-
-	-- ─── Mood removal (idempotent) ────────────────────────────────────
-	-- Mood is gone from the journal at every level. Dropping the columns
-	-- rather than blanking them: a nullable column nothing reads is a
-	-- standing invitation to half-revive the feature. Lives at the tail of
-	-- the schema because the whole string runs as one ordered batch, and
-	-- the DELETE below needs the insights table to exist first.
-	ALTER TABLE journal_entries DROP COLUMN IF EXISTS mood;
-	ALTER TABLE journal_weekly  DROP COLUMN IF EXISTS mood;
-	ALTER TABLE journal_monthly DROP COLUMN IF EXISTS mood;
-	-- The mood_vs_tasks detector is gone with it, so these rows can never
-	-- regenerate and nothing left in the app can explain them. Scoped to
-	-- that one kind — every other insight is untouched.
-	DELETE FROM insights WHERE kind = 'mood_vs_tasks';
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err
