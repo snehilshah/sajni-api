@@ -32,8 +32,6 @@ func registerBillerRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /api/finance/billers/alerts/{id}/seen", markBillerAlertSeen(deps))
 }
 
-// is_subscription/variable are legacy fields kept in the JSON until android
-// parity ships; variable is derived from kind so old clients keep working.
 type billerResp struct {
 	ID             int64    `json:"id"`
 	Name           string   `json:"name"`
@@ -46,10 +44,8 @@ type billerResp struct {
 	CategoryID     *int64   `json:"category_id"`
 	CategoryName   *string  `json:"category_name"`
 	CategoryColor  *string  `json:"category_color"`
-	IsSubscription bool     `json:"is_subscription"`
 	AutoRenew      bool     `json:"auto_renew"`
 	RemindTask     bool     `json:"remind_task"`
-	Variable       bool     `json:"variable"`
 	AlertDays      int      `json:"alert_days"`
 	Color          string   `json:"color"`
 	Notes          string   `json:"notes"`
@@ -96,7 +92,7 @@ func listBillers(deps Deps) http.HandlerFunc {
 
 		q := `SELECT b.id, b.name, b.kind, b.amount, b.frequency, b.next_due_date::text,
 			b.account_id, a.name, b.category_id, c.name, c.color,
-			b.is_subscription, b.auto_renew, b.remind_task, b.alert_days, b.color, b.notes, b.archived,
+			b.auto_renew, b.remind_task, b.alert_days, b.color, b.notes, b.archived,
 			(SELECT MAX(paid_date)::text FROM fin_biller_payments p WHERE p.biller_id = b.id),
 			(SELECT amount FROM fin_biller_payments p WHERE p.biller_id = b.id ORDER BY paid_date DESC, id DESC LIMIT 1),
 			b.created_at::text
@@ -120,9 +116,8 @@ func listBillers(deps Deps) http.HandlerFunc {
 			var b billerResp
 			rows.Scan(&b.ID, &b.Name, &b.Kind, &b.Amount, &b.Frequency, &b.NextDueDate,
 				&b.AccountID, &b.AccountName, &b.CategoryID, &b.CategoryName, &b.CategoryColor,
-				&b.IsSubscription, &b.AutoRenew, &b.RemindTask, &b.AlertDays, &b.Color, &b.Notes, &b.Archived,
+				&b.AutoRenew, &b.RemindTask, &b.AlertDays, &b.Color, &b.Notes, &b.Archived,
 				&b.LastPaidDate, &b.LastPaidAmount, &b.CreatedAt)
-			b.Variable = b.Kind == "bill"
 			out = append(out, b)
 		}
 		writeJSON(w, 200, out)
@@ -134,20 +129,18 @@ func createBiller(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
 		var body struct {
-			Name           string  `json:"name"`
-			Kind           string  `json:"kind"`
-			Amount         float64 `json:"amount"`
-			Frequency      string  `json:"frequency"`
-			NextDueDate    string  `json:"next_due_date"`
-			AccountID      *int64  `json:"account_id"`
-			CategoryID     *int64  `json:"category_id"`
-			IsSubscription bool    `json:"is_subscription"`
-			AutoRenew      bool    `json:"auto_renew"`
-			RemindTask     bool    `json:"remind_task"`
-			Variable       bool    `json:"variable"` // legacy clients: variable=true → kind=bill
-			AlertDays      *int    `json:"alert_days"`
-			Color          string  `json:"color"`
-			Notes          string  `json:"notes"`
+			Name        string  `json:"name"`
+			Kind        string  `json:"kind"`
+			Amount      float64 `json:"amount"`
+			Frequency   string  `json:"frequency"`
+			NextDueDate string  `json:"next_due_date"`
+			AccountID   *int64  `json:"account_id"`
+			CategoryID  *int64  `json:"category_id"`
+			AutoRenew   bool    `json:"auto_renew"`
+			RemindTask  bool    `json:"remind_task"`
+			AlertDays   *int    `json:"alert_days"`
+			Color       string  `json:"color"`
+			Notes       string  `json:"notes"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -158,11 +151,7 @@ func createBiller(deps Deps) http.HandlerFunc {
 			return
 		}
 		if body.Kind == "" {
-			if body.Variable {
-				body.Kind = "bill"
-			} else {
-				body.Kind = "subscription"
-			}
+			body.Kind = "subscription"
 		}
 		if !validBillerKind(body.Kind) {
 			errJSON(w, 400, "invalid kind")
@@ -217,10 +206,10 @@ func createBiller(deps Deps) http.HandlerFunc {
 		var id int64
 		err = d.QueryRow(`INSERT INTO fin_billers
 			(user_id, name, kind, amount, frequency, next_due_date, anchor_day, account_id, category_id,
-			 is_subscription, auto_renew, remind_task, variable, alert_days, color, notes)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+			 auto_renew, remind_task, alert_days, color, notes)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
 			uid, body.Name, body.Kind, body.Amount, body.Frequency, body.NextDueDate, due.Day(), body.AccountID, body.CategoryID,
-			body.IsSubscription, body.AutoRenew, body.RemindTask, body.Kind == "bill", alertDays, body.Color, body.Notes).Scan(&id)
+			body.AutoRenew, body.RemindTask, alertDays, body.Color, body.Notes).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
@@ -239,32 +228,23 @@ func updateBiller(deps Deps) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			Name           *string  `json:"name"`
-			Kind           *string  `json:"kind"`
-			Amount         *float64 `json:"amount"`
-			Frequency      *string  `json:"frequency"`
-			NextDueDate    *string  `json:"next_due_date"`
-			AccountID      *int64   `json:"account_id"`
-			CategoryID     *int64   `json:"category_id"`
-			IsSubscription *bool    `json:"is_subscription"`
-			AutoRenew      *bool    `json:"auto_renew"`
-			RemindTask     *bool    `json:"remind_task"`
-			Variable       *bool    `json:"variable"` // legacy alias for kind
-			AlertDays      *int     `json:"alert_days"`
-			Color          *string  `json:"color"`
-			Notes          *string  `json:"notes"`
-			Archived       *bool    `json:"archived"`
+			Name        *string  `json:"name"`
+			Kind        *string  `json:"kind"`
+			Amount      *float64 `json:"amount"`
+			Frequency   *string  `json:"frequency"`
+			NextDueDate *string  `json:"next_due_date"`
+			AccountID   *int64   `json:"account_id"`
+			CategoryID  *int64   `json:"category_id"`
+			AutoRenew   *bool    `json:"auto_renew"`
+			RemindTask  *bool    `json:"remind_task"`
+			AlertDays   *int     `json:"alert_days"`
+			Color       *string  `json:"color"`
+			Notes       *string  `json:"notes"`
+			Archived    *bool    `json:"archived"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
 			return
-		}
-		if body.Kind == nil && body.Variable != nil {
-			k := "subscription"
-			if *body.Variable {
-				k = "bill"
-			}
-			body.Kind = &k
 		}
 		if body.Kind != nil && !validBillerKind(*body.Kind) {
 			errJSON(w, 400, "invalid kind")
@@ -319,7 +299,6 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		}
 		if body.Kind != nil {
 			add("kind", *body.Kind)
-			add("variable", *body.Kind == "bill")
 		}
 		if body.Amount != nil {
 			add("amount", *body.Amount)
@@ -345,9 +324,6 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		}
 		if body.CategoryID != nil {
 			add("category_id", *body.CategoryID)
-		}
-		if body.IsSubscription != nil {
-			add("is_subscription", *body.IsSubscription)
 		}
 		if body.AutoRenew != nil {
 			add("auto_renew", *body.AutoRenew)
@@ -517,10 +493,6 @@ func postBillerTxn(ctx context.Context, deps Deps, uid string, billerID, account
 		return 0, false, err
 	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE fin_biller_payments SET txn_id = $1 WHERE id = $2`, txnID, paymentID); err != nil {
-		return 0, false, err
-	}
-	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO fin_biller_payment_txns (payment_id, txn_id) VALUES ($1,$2)`,
 		paymentID, txnID); err != nil {
 		return 0, false, err
@@ -581,7 +553,7 @@ func attachBillerTxns(ctx context.Context, deps Deps, uid string, billerID int64
 }
 
 // listBillerPayments returns the payment history for one biller with each
-// cycle's linked txns (the link table plus the legacy single txn_id).
+// cycle's linked txns.
 func listBillerPayments(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -625,14 +597,10 @@ func listBillerPayments(deps Deps) http.HandlerFunc {
 		rows.Close()
 		if len(ids) > 0 {
 			trows, terr := d.Query(`SELECT l.payment_id, t.id, t.amount, t.description, t.txn_at::text, a.name
-				FROM (
-					SELECT payment_id, txn_id FROM fin_biller_payment_txns WHERE payment_id = ANY($1)
-					UNION
-					SELECT p.id, p.txn_id FROM fin_biller_payments p
-					WHERE p.id = ANY($1) AND p.txn_id IS NOT NULL
-				) l
+				FROM fin_biller_payment_txns l
 				JOIN fin_transactions t ON t.id = l.txn_id
 				LEFT JOIN fin_accounts a ON a.id = t.account_id
+				WHERE l.payment_id = ANY($1)
 				ORDER BY t.txn_at DESC`, ids)
 			if terr == nil {
 				byPayment := map[int64][]payTxn{}

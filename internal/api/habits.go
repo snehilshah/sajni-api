@@ -311,7 +311,7 @@ func toggleLog(d *db.DB, uid string, habitID int64, date string, w http.Response
 }
 
 // recentHabitLogs returns logged dates for all habits in either an explicit
-// from/to range or the legacy trailing-days window. Results are keyed by habit
+// from/to range or a trailing-days window. Results are keyed by habit
 // id as strings so they serialize as a JSON object.
 func recentHabitLogs(deps Deps) http.HandlerFunc {
 	d := deps.DB

@@ -96,10 +96,10 @@ func createBillerTool(ctx context.Context, d *db.DB, uid string, args map[string
 	var id int64
 	err := d.QueryRowContext(ctx, `INSERT INTO fin_billers
 		(user_id, name, kind, amount, frequency, next_due_date, account_id, category_id,
-		 auto_renew, remind_task, variable, alert_days, notes)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+		 auto_renew, remind_task, alert_days, notes)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
 		uid, name, kind, amount, freq, due, accountArg, categoryArg,
-		autoRenew, argBool(args, "remind_task", false), kind == "bill", alertDays, argStr(args, "notes")).Scan(&id)
+		autoRenew, argBool(args, "remind_task", false), alertDays, argStr(args, "notes")).Scan(&id)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -204,9 +204,6 @@ func payBillerTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 			`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_at)
 			 VALUES ($1,$2,$3,'expense',$4,$5,($6::timestamp AT TIME ZONE 'Asia/Kolkata')) RETURNING id`,
 			uid, accountID.Int64, catArg, amount, name, paid).Scan(&txnID); err != nil {
-			return nil, nil, err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE fin_biller_payments SET txn_id = $1 WHERE id = $2`, txnID, paymentID); err != nil {
 			return nil, nil, err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO fin_biller_payment_txns (payment_id, txn_id) VALUES ($1,$2)`, paymentID, txnID); err != nil {

@@ -364,7 +364,7 @@ func sendSingleTaskReminder(ctx context.Context, deps Deps, id int64) (bool, err
 }
 
 // processTaskReminders emails every due, un-sent row in task_reminders and
-// stamps sent_at. Same window/grace/idempotency model as the legacy path.
+// stamps sent_at. Same window/grace/idempotency model as the task's own-time reminder.
 func processTaskReminders(ctx context.Context, deps Deps) (int, error) {
 	d := deps.DB
 	rows, err := d.QueryContext(ctx, `

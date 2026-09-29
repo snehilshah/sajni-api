@@ -29,18 +29,6 @@ func New(dsn string) (*DB, error) {
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
 
-	var userIDType string
-	err = conn.QueryRow(`SELECT data_type FROM information_schema.columns
-		WHERE table_schema='public' AND table_name='users' AND column_name='id'`).Scan(&userIDType)
-	if err != nil && err != sql.ErrNoRows {
-		conn.Close()
-		return nil, fmt.Errorf("inspect schema: %w", err)
-	}
-	if err == nil && userIDType != "uuid" {
-		conn.Close()
-		return nil, fmt.Errorf("legacy database schema: users.id is %s; use a new empty development database or restore a current-schema backup", userIDType)
-	}
-
 	d := &DB{DB: conn}
 	if err := d.ensureSchema(); err != nil {
 		conn.Close()
@@ -702,8 +690,7 @@ func (d *DB) ensureSchema() error {
 	-- txn) or 'bill' (variable amount unknown upfront, e.g. electricity —
 	-- amount is an optional estimate, user marks paid with the actual).
 	-- remind_task: opt-in — when on (and not auto_renew) the biller cron
-	-- spawns one bill-pay reminder task per due cycle. variable /
-	-- is_subscription remain for older client read compatibility.
+	-- spawns one bill-pay reminder task per due cycle.
 	CREATE TABLE IF NOT EXISTS fin_billers (
 		id              BIGSERIAL   PRIMARY KEY,
 		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -715,10 +702,8 @@ func (d *DB) ensureSchema() error {
 		anchor_day      INTEGER,
 		account_id      BIGINT      REFERENCES fin_accounts(id) ON DELETE SET NULL,
 		category_id     BIGINT      REFERENCES fin_categories(id) ON DELETE SET NULL,
-		is_subscription BOOLEAN     NOT NULL DEFAULT FALSE,
 		auto_renew      BOOLEAN     NOT NULL DEFAULT FALSE,
 		remind_task     BOOLEAN     NOT NULL DEFAULT FALSE,
-		variable        BOOLEAN     NOT NULL DEFAULT FALSE,
 		alert_days      INTEGER     NOT NULL DEFAULT 3,
 		color           TEXT        NOT NULL DEFAULT '#2D5A4F',
 		notes           TEXT        NOT NULL DEFAULT '',
@@ -736,7 +721,6 @@ func (d *DB) ensureSchema() error {
 		id          BIGSERIAL   PRIMARY KEY,
 		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		biller_id   BIGINT      NOT NULL REFERENCES fin_billers(id) ON DELETE CASCADE,
-		txn_id      BIGINT      REFERENCES fin_transactions(id) ON DELETE SET NULL,
 		due_date    DATE        NOT NULL,
 		paid_date   DATE        NOT NULL,
 		amount      NUMERIC(14,2) NOT NULL DEFAULT 0,
@@ -760,8 +744,6 @@ func (d *DB) ensureSchema() error {
 
 	-- Links payments to their transactions — both the txn a payment
 	-- created and any pre-existing txns the user attached instead.
-	-- fin_biller_payments.txn_id stays populated for created txns
-	-- (legacy/android read compat); reads should UNION both.
 	CREATE TABLE IF NOT EXISTS fin_biller_payment_txns (
 		payment_id BIGINT NOT NULL REFERENCES fin_biller_payments(id) ON DELETE CASCADE,
 		txn_id     BIGINT NOT NULL REFERENCES fin_transactions(id) ON DELETE CASCADE,

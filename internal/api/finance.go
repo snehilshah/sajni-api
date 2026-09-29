@@ -613,15 +613,13 @@ type txnResp struct {
 
 // istDateExpr is the SQL that projects a txn_at TIMESTAMPTZ down to its IST
 // calendar date — used wherever a query filters/groups by day, so the existing
-// date-string params (from/to, month boundaries) keep their exact semantics
-// after the txn_date→txn_at migration.
+// date-string params (from/to, month boundaries) mean IST calendar days.
 const istDateExpr = "(%s AT TIME ZONE 'Asia/Kolkata')::date"
 
 func istDate(col string) string { return fmt.Sprintf(istDateExpr, col) }
 
 // resolveTxnAt parses the request's ISO txn_at, falling back to `now` when
-// absent or unparseable. The legacy date-only txn_date shim is gone: both
-// clients (web, android) send txn_at.
+// absent or unparseable.
 func resolveTxnAt(txnAt string, now time.Time) time.Time {
 	if txnAt != "" {
 		if t, err := time.Parse(time.RFC3339, txnAt); err == nil {
@@ -2334,17 +2332,17 @@ func financeOverview(deps Deps) http.HandlerFunc {
 
 		// Upcoming billers — next 14d, plus any past-due rows still pending.
 		type UpcomingBill struct {
-			ID             int64   `json:"id"`
-			Name           string  `json:"name"`
-			Amount         float64 `json:"amount"`
-			DueDate        string  `json:"due_date"`
-			AccountName    *string `json:"account_name"`
-			IsSubscription bool    `json:"is_subscription"`
-			AutoRenew      bool    `json:"auto_renew"`
+			ID          int64   `json:"id"`
+			Name        string  `json:"name"`
+			Amount      float64 `json:"amount"`
+			DueDate     string  `json:"due_date"`
+			AccountName *string `json:"account_name"`
+			Kind        string  `json:"kind"`
+			AutoRenew   bool    `json:"auto_renew"`
 		}
 		var upcomingBills []UpcomingBill
 		brows, _ := d.Query(`SELECT b.id, b.name, b.amount, b.next_due_date::text, a.name,
-			b.is_subscription, b.auto_renew
+			b.kind, b.auto_renew
 			FROM fin_billers b LEFT JOIN fin_accounts a ON a.id = b.account_id
 			WHERE b.user_id = $1 AND b.archived = FALSE
 			  AND b.next_due_date <= (CURRENT_DATE + INTERVAL '14 days')
@@ -2352,7 +2350,7 @@ func financeOverview(deps Deps) http.HandlerFunc {
 		if brows != nil {
 			for brows.Next() {
 				var u UpcomingBill
-				brows.Scan(&u.ID, &u.Name, &u.Amount, &u.DueDate, &u.AccountName, &u.IsSubscription, &u.AutoRenew)
+				brows.Scan(&u.ID, &u.Name, &u.Amount, &u.DueDate, &u.AccountName, &u.Kind, &u.AutoRenew)
 				upcomingBills = append(upcomingBills, u)
 			}
 			brows.Close()
@@ -2708,11 +2706,8 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 		// label without a binding.
 		var matchedID *int64
 		matchedName := picked
-		// Treat "Other" and "Others" as the same bucket so a legacy "Other"
-		// category still binds when the model picks the canonical "Others".
-		isOthers := func(s string) bool { return strings.EqualFold(s, "Others") || strings.EqualFold(s, "Other") }
 		for _, c := range cats {
-			if strings.EqualFold(c.name, picked) || (isOthers(picked) && isOthers(c.name)) {
+			if strings.EqualFold(c.name, picked) {
 				id := c.id
 				matchedID = &id
 				matchedName = c.name
@@ -2960,9 +2955,8 @@ func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed
 			}
 			deps.AILimiter.record(uid, ctoks)
 			if cerr == nil {
-				isOthers := func(s string) bool { return strings.EqualFold(s, "Others") || strings.EqualFold(s, "Other") }
 				for _, c := range cats {
-					if strings.EqualFold(c.name, picked) || (isOthers(picked) && isOthers(c.name)) {
+					if strings.EqualFold(c.name, picked) {
 						id := c.id
 						catID, catName = &id, c.name
 						break
