@@ -556,13 +556,16 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "complete_task",
-			Description: "Mark a task as done.",
+			Description: "Mark a task as done. Refused while any of its subtasks are still open — tell the user which ones remain.",
 			Mutating:    true,
 			Schema:      obj(map[string]*genai.Schema{"id": intg("Task id.")}, "id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				id := argInt(args, "id", 0)
 				if id == 0 {
 					return nil, nil, fmt.Errorf("missing id")
+				}
+				if n := db.OpenSubtaskCount(ctx, d, uid, int64(id)); n > 0 {
+					return nil, nil, fmt.Errorf("%s", db.OpenSubtasksMessage(n))
 				}
 				_, err := d.Exec(`UPDATE tasks SET status='done', blocked_by_task_id=NULL, updated_at=NOW() WHERE id=$1 AND user_id=$2`, id, uid)
 				if err != nil {

@@ -446,24 +446,9 @@ func listTasks(deps Deps) http.HandlerFunc {
 			args = append(args, cd)
 		}
 
-		// My Day is a derived view (not manually drag-ordered), so it leads
-		// with priority then the day's clock time. Explicit lists keep their
-		// sort_order drag-ordering.
-		orderBy := `ORDER BY t.sort_order ASC,
-			         CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
-			         t.created_at DESC`
-		if queryParam(r, "smart") == "my_day" {
-			orderBy = `ORDER BY CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
-			         t.scheduled_at ASC NULLS LAST,
-			         t.created_at DESC`
-		}
-		// Missed leads with the oldest overdue day so the longest-ignored
-		// task is first to reschedule.
-		if queryParam(r, "smart") == "missed" {
-			orderBy = `ORDER BY t.due_date ASC,
-			         CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
-			         t.created_at DESC`
-		}
+		// Every task view (open, done, scratched alike) reads most recently
+		// touched first — one predictable order across web, Android and AI.
+		orderBy := `ORDER BY t.updated_at DESC, t.id DESC`
 
 		q := `
 			SELECT t.id, t.title, t.description, t.status, t.priority, t.color,
@@ -858,6 +843,12 @@ func updateTask(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "blocked task requires an active, cycle-safe blocker")
 			return
 		}
+		if proposedStatus == "done" && currentStatus != "done" {
+			if n := db.OpenSubtaskCount(r.Context(), tx, uid, id); n > 0 {
+				errJSON(w, 409, db.OpenSubtasksMessage(n))
+				return
+			}
+		}
 
 		var contentForTags string
 		if body.Title != nil {
@@ -1111,7 +1102,7 @@ func reorderTasks(deps Deps) http.HandlerFunc {
 			return
 		}
 		for i, id := range body.IDs {
-			d.Exec("UPDATE tasks SET sort_order=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", i, id, uid)
+			d.Exec("UPDATE tasks SET sort_order=$1 WHERE id=$2 AND user_id=$3", i, id, uid)
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
