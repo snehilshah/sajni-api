@@ -79,6 +79,10 @@ const (
 	TypeInvestmentAuto = "investment_auto"
 	TypeLendDue        = "lend_due"
 	TypeMediaRelease   = "media_release"
+	// TypeSync is a silent "your data changed" ping (Data["scope"] names
+	// what: "habits"). Never shown; native surfaces that cache data (home
+	// screen widgets) refetch on it.
+	TypeSync = "sync"
 )
 
 // channelID names the android notification channel this push belongs in.
@@ -178,6 +182,18 @@ func (s *Sender) send(ctx context.Context, token string, n Notification) error {
 				"channel_id": n.channelID(),
 			},
 		},
+	}
+	if n.Type == TypeSync {
+		// Pure data message: no notification block (that would render one),
+		// normal priority (no Doze wake-up of its own), and a collapse key so
+		// FCM keeps only the newest ping per scope while the device sleeps —
+		// a burst of edits costs one delivery. Stale after an hour: the app
+		// refreshes on open anyway.
+		message["android"] = map[string]any{
+			"priority":     "normal",
+			"collapse_key": "sync_" + n.Data["scope"],
+			"ttl":          "3600s",
+		}
 	}
 	if !n.DataOnly {
 		message["notification"] = map[string]string{"title": n.Title, "body": n.Body}

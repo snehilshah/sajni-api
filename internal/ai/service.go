@@ -80,6 +80,9 @@ type Service struct {
 	tools         []Tool
 	tmdbAPIKey    string
 	reminderQueue reminderqueue.Queue
+	// OnChange, when set, is told after a mutating tool writes data in a
+	// scope ("habits") so devices can be pinged to refresh.
+	OnChange func(uid, scope string)
 }
 
 // modelClient is the part of Gemini consumed by Sajni. Keeping this interface

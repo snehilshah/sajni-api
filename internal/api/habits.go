@@ -15,12 +15,12 @@ func registerHabitRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/habits/status", habitStatusForDate(deps))
 	mux.HandleFunc("GET /api/habits/period-status", habitPeriodStatusForDate(deps))
 	mux.HandleFunc("GET /api/habits/logs", recentHabitLogs(deps))
-	mux.HandleFunc("POST /api/habits", createHabit(deps))
-	mux.HandleFunc("PUT /api/habits/{id}", updateHabit(deps))
-	mux.HandleFunc("DELETE /api/habits/{id}", deleteHabit(deps))
-	mux.HandleFunc("POST /api/habits/{id}/log", toggleHabitLog(deps))
-	mux.HandleFunc("POST /api/habits/{id}/log/{date}", toggleHabitLogForDate(deps))
-	mux.HandleFunc("POST /api/habits/{id}/period/{date}", toggleHabitPeriodForDate(deps))
+	mux.HandleFunc("POST /api/habits", withSync(deps, "habits", createHabit(deps)))
+	mux.HandleFunc("PUT /api/habits/{id}", withSync(deps, "habits", updateHabit(deps)))
+	mux.HandleFunc("DELETE /api/habits/{id}", withSync(deps, "habits", deleteHabit(deps)))
+	mux.HandleFunc("POST /api/habits/{id}/log", withSync(deps, "habits", toggleHabitLog(deps)))
+	mux.HandleFunc("POST /api/habits/{id}/log/{date}", withSync(deps, "habits", toggleHabitLogForDate(deps)))
+	mux.HandleFunc("POST /api/habits/{id}/period/{date}", withSync(deps, "habits", toggleHabitPeriodForDate(deps)))
 	mux.HandleFunc("GET /api/habits/{id}/logs", getHabitLogs(deps))
 }
 

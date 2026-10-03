@@ -100,6 +100,9 @@ func main() {
 		AI:            aiSvc,
 		Push:          pushSvc,
 	}
+	if aiSvc != nil {
+		aiSvc.OnChange = func(uid, scope string) { api.NotifySync(deps, uid, scope) }
+	}
 	handler := api.Router(deps)
 
 	// Background ticks. All work below is idempotent so missed ticks during

@@ -46,7 +46,14 @@ type Tool struct {
 func (s *Service) dispatch(ctx context.Context, uid string, name string, args map[string]any) (any, map[string]any, error) {
 	for _, t := range s.tools {
 		if t.Name == name {
-			return t.Handler(ctx, uid, args)
+			data, meta, err := t.Handler(ctx, uid, args)
+			// Let native caches (widgets) know a write landed.
+			if err == nil && s.OnChange != nil {
+				if kind, _ := meta["kind"].(string); strings.HasPrefix(kind, "habit") {
+					s.OnChange(uid, "habits")
+				}
+			}
+			return data, meta, err
 		}
 	}
 	return nil, nil, fmt.Errorf("unknown tool: %s", name)
