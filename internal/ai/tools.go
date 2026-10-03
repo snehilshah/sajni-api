@@ -49,8 +49,12 @@ func (s *Service) dispatch(ctx context.Context, uid string, name string, args ma
 			data, meta, err := t.Handler(ctx, uid, args)
 			// Let native caches (widgets) know a write landed.
 			if err == nil && s.OnChange != nil {
-				if kind, _ := meta["kind"].(string); strings.HasPrefix(kind, "habit") {
+				kind, _ := meta["kind"].(string)
+				switch {
+				case strings.HasPrefix(kind, "habit"):
 					s.OnChange(uid, "habits")
+				case strings.HasPrefix(kind, "task"):
+					s.OnChange(uid, "tasks")
 				}
 			}
 			return data, meta, err

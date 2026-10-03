@@ -8,12 +8,12 @@ import (
 // "Home"). Task rows reference one optionally; rows with NULL list_id
 // land in the smart "Inbox" view on the frontend.
 func registerTaskListRoutes(mux *http.ServeMux, deps Deps) {
-	mux.HandleFunc("PUT /api/task-lists/reorder", reorderTaskLists(deps))
+	mux.HandleFunc("PUT /api/task-lists/reorder", withSync(deps, "tasks", reorderTaskLists(deps)))
 
 	mux.HandleFunc("GET /api/task-lists", listTaskLists(deps))
-	mux.HandleFunc("POST /api/task-lists", createTaskList(deps))
-	mux.HandleFunc("PUT /api/task-lists/{id}", updateTaskList(deps))
-	mux.HandleFunc("DELETE /api/task-lists/{id}", deleteTaskList(deps))
+	mux.HandleFunc("POST /api/task-lists", withSync(deps, "tasks", createTaskList(deps)))
+	mux.HandleFunc("PUT /api/task-lists/{id}", withSync(deps, "tasks", updateTaskList(deps)))
+	mux.HandleFunc("DELETE /api/task-lists/{id}", withSync(deps, "tasks", deleteTaskList(deps)))
 }
 
 type taskListRow struct {

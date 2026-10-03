@@ -187,20 +187,20 @@ func completeParentGoalIfDone(d sqlRunner, uid string, childID int64) {
 func registerTaskRoutes(mux *http.ServeMux, deps Deps) {
 	// Specific paths must register before /{id}.
 	mux.HandleFunc("GET /api/tasks/missed", listMissedTasks(deps))
-	mux.HandleFunc("PUT /api/tasks/reorder", reorderTasks(deps))
+	mux.HandleFunc("PUT /api/tasks/reorder", withSync(deps, "tasks", reorderTasks(deps)))
 	mux.HandleFunc("GET /api/tasks/{id}/history", getTaskHistory(deps))
 	mux.HandleFunc("GET /api/tasks/{id}/events", getTaskEvents(deps))
 	mux.HandleFunc("GET /api/tasks/{id}/subtasks", listSubtasks(deps))
 	mux.HandleFunc("GET /api/tasks/{id}/reminders", listTaskReminders(deps))
 	mux.HandleFunc("POST /api/tasks/{id}/reminders", addTaskReminder(deps))
 	mux.HandleFunc("DELETE /api/tasks/{id}/reminders/{rid}", deleteTaskReminder(deps))
-	mux.HandleFunc("POST /api/tasks/{id}/reschedule", rescheduleTaskDate(deps))
+	mux.HandleFunc("POST /api/tasks/{id}/reschedule", withSync(deps, "tasks", rescheduleTaskDate(deps)))
 
 	mux.HandleFunc("GET /api/tasks", listTasks(deps))
-	mux.HandleFunc("POST /api/tasks", createTask(deps))
+	mux.HandleFunc("POST /api/tasks", withSync(deps, "tasks", createTask(deps)))
 	mux.HandleFunc("GET /api/tasks/{id}", getTask(deps))
-	mux.HandleFunc("PUT /api/tasks/{id}", updateTask(deps))
-	mux.HandleFunc("DELETE /api/tasks/{id}", deleteTask(deps))
+	mux.HandleFunc("PUT /api/tasks/{id}", withSync(deps, "tasks", updateTask(deps)))
+	mux.HandleFunc("DELETE /api/tasks/{id}", withSync(deps, "tasks", deleteTask(deps)))
 }
 
 // getTask returns a single task by id. Used by the global task detail
