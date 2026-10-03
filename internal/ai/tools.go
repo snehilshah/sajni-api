@@ -674,7 +674,7 @@ func (s *Service) buildTools() []Tool {
 			Description: "Create a new habit to track.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"name":      str("Required."),
+				"name":      str("Required. Short label, 20 characters max (e.g. 'Morning walk')."),
 				"frequency": str("'daily' | 'weekly' | 'fortnightly' | 'monthly'. Default 'daily'."),
 				"color":     str("Hex like '#2D5A4F'."),
 			}, "name"),
@@ -2580,9 +2580,9 @@ func updateTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 }
 
 func createHabitTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
-	name := argStr(args, "name")
-	if name == "" {
-		return nil, nil, fmt.Errorf("missing name")
+	name, err := habitperiod.CleanName(argStr(args, "name"))
+	if err != nil {
+		return nil, nil, err
 	}
 	freq := argStr(args, "frequency")
 	if freq == "" {
@@ -2596,7 +2596,7 @@ func createHabitTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		color = "#2D5A4F"
 	}
 	var id int64
-	err := d.QueryRowContext(ctx, `INSERT INTO habits (user_id, name, frequency, color) VALUES ($1,$2,$3,$4) RETURNING id`,
+	err = d.QueryRowContext(ctx, `INSERT INTO habits (user_id, name, frequency, color) VALUES ($1,$2,$3,$4) RETURNING id`,
 		uid, name, freq, color).Scan(&id)
 	if err != nil {
 		return nil, nil, err

@@ -107,6 +107,12 @@ func createHabit(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid json")
 			return
 		}
+		name, nameErr := habitperiod.CleanName(body.Name)
+		if nameErr != nil {
+			errJSON(w, 400, nameErr.Error())
+			return
+		}
+		body.Name = name
 		if body.Frequency == "" {
 			body.Frequency = "daily"
 		}
@@ -153,7 +159,12 @@ func updateHabit(deps Deps) http.HandlerFunc {
 			return
 		}
 		if body.Name != nil {
-			d.Exec("UPDATE habits SET name = $1 WHERE id = $2 AND user_id = $3", *body.Name, id, uid)
+			name, nameErr := habitperiod.CleanName(*body.Name)
+			if nameErr != nil {
+				errJSON(w, 400, nameErr.Error())
+				return
+			}
+			d.Exec("UPDATE habits SET name = $1 WHERE id = $2 AND user_id = $3", name, id, uid)
 		}
 		if body.Frequency != nil {
 			d.Exec("UPDATE habits SET frequency = $1 WHERE id = $2 AND user_id = $3", *body.Frequency, id, uid)
