@@ -571,6 +571,9 @@ func (d *DB) ensureSchema() error {
 		due_date              DATE,
 		remind                BOOLEAN       NOT NULL DEFAULT FALSE,
 		last_reminded_due_date DATE,
+		-- 'lend' = money lent (the lend created its transaction);
+		-- 'paid_for' = an existing expense marked as paid for someone.
+		origin                TEXT          NOT NULL DEFAULT 'lend',
 		created_at            TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
 		updated_at            TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 	);
@@ -582,13 +585,31 @@ func (d *DB) ensureSchema() error {
 		user_id                UUID          NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		lend_id                BIGINT        NOT NULL REFERENCES fin_lends(id) ON DELETE CASCADE,
 		destination_account_id BIGINT        NOT NULL REFERENCES fin_accounts(id) ON DELETE RESTRICT,
-		transaction_id         BIGINT        NOT NULL UNIQUE REFERENCES fin_transactions(id) ON DELETE RESTRICT,
+		-- Not unique: one settlement credit can be spread across several lends.
+		transaction_id         BIGINT        NOT NULL REFERENCES fin_transactions(id) ON DELETE RESTRICT,
 		amount                 NUMERIC(14,2) NOT NULL CHECK (amount > 0),
 		repaid_at              TIMESTAMPTZ   NOT NULL,
 		note                   TEXT          NOT NULL DEFAULT '',
 		created_at             TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_lend_repayments_lend ON fin_lend_repayments(lend_id, repaid_at);
+	CREATE INDEX IF NOT EXISTS idx_fin_lend_repayments_txn ON fin_lend_repayments(transaction_id);
+
+	-- A credit the user marked as settling a person's lends. Its repayment
+	-- rows are derived (db.RebalanceLends: oldest credit → oldest lend), so
+	-- surplus simply waits for that person's next lend.
+	CREATE TABLE IF NOT EXISTS fin_lend_settlements (
+		id             BIGSERIAL   PRIMARY KEY,
+		user_id        UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		borrower       TEXT        NOT NULL,
+		transaction_id BIGINT      NOT NULL UNIQUE REFERENCES fin_transactions(id) ON DELETE RESTRICT,
+		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_lend_settlements_borrower ON fin_lend_settlements(user_id, LOWER(BTRIM(borrower)));
+
+	-- One-time prod patch (2026-10 paid-for/settle). Delete once shipped.
+	ALTER TABLE fin_lends ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'lend';
+	ALTER TABLE fin_lend_repayments DROP CONSTRAINT IF EXISTS fin_lend_repayments_transaction_id_key;
 
 	CREATE TABLE IF NOT EXISTS fin_budgets (
 		id          BIGSERIAL   PRIMARY KEY,

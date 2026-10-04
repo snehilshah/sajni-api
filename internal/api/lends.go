@@ -20,6 +20,11 @@ func registerLendRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("DELETE /api/finance/lends/{id}", deleteLend(deps))
 	mux.HandleFunc("POST /api/finance/lends/{id}/repayments", createLendRepayment(deps))
 	mux.HandleFunc("DELETE /api/finance/lends/{id}/repayments/{repaymentID}", deleteLendRepayment(deps))
+	mux.HandleFunc("GET /api/finance/lends/people", listLendPeople(deps))
+	mux.HandleFunc("GET /api/finance/lends/candidates", listLendCandidates(deps))
+	mux.HandleFunc("POST /api/finance/lends/paid-for", markPaidFor(deps))
+	mux.HandleFunc("POST /api/finance/lends/settle", settleLends(deps))
+	mux.HandleFunc("DELETE /api/finance/lends/settlements/{id}", deleteSettlement(deps))
 }
 
 type lendRepaymentResp struct {
@@ -29,6 +34,8 @@ type lendRepaymentResp struct {
 	Amount               float64 `json:"amount"`
 	RepaidAt             string  `json:"repaid_at"`
 	Note                 string  `json:"note"`
+	TransactionID        int64   `json:"transaction_id"`
+	Settled              bool    `json:"settled"` // derived from a settlement credit
 }
 
 type lendResp struct {
@@ -46,6 +53,7 @@ type lendResp struct {
 	DueDate           *string             `json:"due_date"`
 	Remind            bool                `json:"remind"`
 	Status            string              `json:"status"`
+	Origin            string              `json:"origin"`
 	Repayments        []lendRepaymentResp `json:"repayments"`
 }
 
@@ -71,7 +79,7 @@ func loadLends(ctx context.Context, d *db.DB, uid string, loc *time.Location) ([
 	rows, err := d.QueryContext(ctx, `
 		SELECT l.id, l.source_account_id, a.name, a.type, l.borrower, l.principal,
 		       COALESCE(SUM(r.amount),0), l.description, l.note, l.lent_at,
-		       l.due_date::text, l.remind
+		       l.due_date::text, l.remind, l.origin
 		FROM fin_lends l
 		JOIN fin_accounts a ON a.id = l.source_account_id AND a.user_id = l.user_id
 		LEFT JOIN fin_lend_repayments r ON r.lend_id = l.id AND r.user_id = l.user_id
@@ -90,7 +98,7 @@ func loadLends(ctx context.Context, d *db.DB, uid string, loc *time.Location) ([
 		var lentAt time.Time
 		if err := rows.Scan(&item.ID, &item.SourceAccountID, &item.SourceAccount, &item.SourceAccountType,
 			&item.Borrower, &item.Principal, &item.Repaid, &item.Description, &item.Note,
-			&lentAt, &item.DueDate, &item.Remind); err != nil {
+			&lentAt, &item.DueDate, &item.Remind, &item.Origin); err != nil {
 			return nil, err
 		}
 		item.Principal = roundMoney(item.Principal)
@@ -110,7 +118,8 @@ func loadLends(ctx context.Context, d *db.DB, uid string, loc *time.Location) ([
 	}
 
 	repaymentRows, err := d.QueryContext(ctx, `
-		SELECT r.id, r.lend_id, r.destination_account_id, a.name, r.amount, r.repaid_at, r.note
+		SELECT r.id, r.lend_id, r.destination_account_id, a.name, r.amount, r.repaid_at, r.note, r.transaction_id,
+		       EXISTS (SELECT 1 FROM fin_lend_settlements s WHERE s.transaction_id = r.transaction_id)
 		FROM fin_lend_repayments r
 		JOIN fin_accounts a ON a.id = r.destination_account_id AND a.user_id = r.user_id
 		WHERE r.user_id = $1 ORDER BY r.repaid_at DESC, r.id DESC`, uid)
@@ -123,7 +132,8 @@ func loadLends(ctx context.Context, d *db.DB, uid string, loc *time.Location) ([
 		var lendID int64
 		var repaidAt time.Time
 		if err := repaymentRows.Scan(&repayment.ID, &lendID, &repayment.DestinationAccountID,
-			&repayment.DestinationAccount, &repayment.Amount, &repaidAt, &repayment.Note); err != nil {
+			&repayment.DestinationAccount, &repayment.Amount, &repaidAt, &repayment.Note,
+			&repayment.TransactionID, &repayment.Settled); err != nil {
 			return nil, err
 		}
 		repayment.Amount = roundMoney(repayment.Amount)
@@ -208,6 +218,10 @@ func createLend(deps Deps) http.HandlerFunc {
 			internalError(w, r, "create lend", err)
 			return
 		}
+		if err := db.RebalanceLends(ctx, tx, uid, borrower); err != nil {
+			internalError(w, r, "rebalance lends", err)
+			return
+		}
 		if err := tx.Commit(); err != nil {
 			internalError(w, r, "commit lend", err)
 			return
@@ -268,10 +282,12 @@ func updateLend(deps Deps) http.HandlerFunc {
 		var txnID, sourceAccountID int64
 		var principal, repaid float64
 		var lentAt time.Time
-		if err := tx.QueryRowContext(ctx, `SELECT l.source_transaction_id, l.source_account_id, l.principal, l.lent_at,
-			COALESCE((SELECT SUM(amount) FROM fin_lend_repayments WHERE lend_id=l.id),0)
+		var oldBorrower string
+		if err := tx.QueryRowContext(ctx, `SELECT l.source_transaction_id, l.source_account_id, l.principal, l.lent_at, l.borrower,
+			COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r WHERE r.lend_id=l.id
+				AND NOT EXISTS (SELECT 1 FROM fin_lend_settlements s WHERE s.transaction_id=r.transaction_id)),0)
 			FROM fin_lends l WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE`, id, uid,
-		).Scan(&txnID, &sourceAccountID, &principal, &lentAt, &repaid); err != nil {
+		).Scan(&txnID, &sourceAccountID, &principal, &lentAt, &oldBorrower, &repaid); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				errJSON(w, http.StatusNotFound, "lend not found")
 			} else {
@@ -316,6 +332,12 @@ func updateLend(deps Deps) http.HandlerFunc {
 			strings.TrimSpace(body.Note), lentAt, txnID, uid); err != nil {
 			internalError(w, r, "update lend transaction", err)
 			return
+		}
+		for _, b := range []string{oldBorrower, strings.TrimSpace(body.Borrower)} {
+			if err := db.RebalanceLends(ctx, tx, uid, b); err != nil {
+				internalError(w, r, "rebalance lends", err)
+				return
+			}
 		}
 		if err := tx.Commit(); err != nil {
 			internalError(w, r, "commit lend update", err)
@@ -410,6 +432,10 @@ func createLendRepayment(deps Deps) http.HandlerFunc {
 			internalError(w, r, "create lend repayment", err)
 			return
 		}
+		if err := db.RebalanceLends(ctx, tx, uid, borrower); err != nil {
+			internalError(w, r, "rebalance lends", err)
+			return
+		}
 		if err := tx.Commit(); err != nil {
 			internalError(w, r, "commit lend repayment", err)
 			return
@@ -435,6 +461,21 @@ func deleteLendRepayment(deps Deps) http.HandlerFunc {
 			return
 		}
 		defer tx.Rollback()
+		var settlementID int64
+		tx.QueryRowContext(ctx, `SELECT s.id FROM fin_lend_repayments r JOIN fin_lend_settlements s ON s.transaction_id=r.transaction_id
+			WHERE r.id=$1 AND r.lend_id=$2 AND r.user_id=$3`, repaymentID, lendID, uid).Scan(&settlementID)
+		if settlementID != 0 {
+			if err := db.Unsettle(ctx, tx, uid, settlementID); err != nil {
+				lendError(w, r, "unsettle", err)
+				return
+			}
+			if err := tx.Commit(); err != nil {
+				internalError(w, r, "commit unsettle", err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
 		var txnID int64
 		if err := tx.QueryRowContext(ctx, `DELETE FROM fin_lend_repayments
 			WHERE id=$1 AND lend_id=$2 AND user_id=$3 RETURNING transaction_id`, repaymentID, lendID, uid).Scan(&txnID); err != nil {
@@ -474,7 +515,8 @@ func deleteLend(deps Deps) http.HandlerFunc {
 		}
 		defer tx.Rollback()
 		var sourceTxnID int64
-		if err := tx.QueryRowContext(ctx, `SELECT source_transaction_id FROM fin_lends WHERE id=$1 AND user_id=$2 FOR UPDATE`, lendID, uid).Scan(&sourceTxnID); err != nil {
+		var borrower, origin string
+		if err := tx.QueryRowContext(ctx, `SELECT source_transaction_id, borrower, origin FROM fin_lends WHERE id=$1 AND user_id=$2 FOR UPDATE`, lendID, uid).Scan(&sourceTxnID, &borrower, &origin); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				errJSON(w, http.StatusNotFound, "lend not found")
 			} else {
@@ -482,7 +524,21 @@ func deleteLend(deps Deps) http.HandlerFunc {
 			}
 			return
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT transaction_id FROM fin_lend_repayments WHERE lend_id=$1 AND user_id=$2`, lendID, uid)
+		if origin == "paid_for" {
+			// The transaction pre-existed: hand it back as an expense.
+			if err := db.UnmarkPaidFor(ctx, tx, uid, lendID); err != nil {
+				lendError(w, r, "unmark paid for", err)
+				return
+			}
+			if err := tx.Commit(); err != nil {
+				internalError(w, r, "commit unmark", err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT r.transaction_id FROM fin_lend_repayments r WHERE r.lend_id=$1 AND r.user_id=$2
+			AND NOT EXISTS (SELECT 1 FROM fin_lend_settlements s WHERE s.transaction_id=r.transaction_id)`, lendID, uid)
 		if err != nil {
 			internalError(w, r, "list repayment transactions", err)
 			return
@@ -513,6 +569,10 @@ func deleteLend(deps Deps) http.HandlerFunc {
 				internalError(w, r, "delete lend transaction", err)
 				return
 			}
+		}
+		if err := db.RebalanceLends(ctx, tx, uid, borrower); err != nil {
+			internalError(w, r, "rebalance lends", err)
+			return
 		}
 		if err := tx.Commit(); err != nil {
 			internalError(w, r, "commit lend delete", err)
@@ -546,5 +606,13 @@ func loadOutstandingLends(ctx context.Context, d *db.DB, uid string) (float64, [
 		total += asset.Outstanding
 		assets = append(assets, asset)
 	}
-	return roundMoney(total), assets, rows.Err()
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+	// Settled beyond what is owed is held for that person: it nets off.
+	var credit float64
+	d.QueryRowContext(ctx, `SELECT COALESCE(SUM(t.amount),0) - COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r
+		JOIN fin_lend_settlements s2 ON s2.transaction_id = r.transaction_id WHERE s2.user_id = $1),0)
+		FROM fin_lend_settlements s JOIN fin_transactions t ON t.id = s.transaction_id WHERE s.user_id = $1`, uid).Scan(&credit)
+	return roundMoney(total - credit), assets, nil
 }

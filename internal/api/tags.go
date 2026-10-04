@@ -58,6 +58,7 @@ func getTagEntities(deps Deps) http.HandlerFunc {
 			ID       int64  `json:"id"`
 			Title    string `json:"title"`
 			Subtitle string `json:"subtitle,omitempty"`
+			Kind     string `json:"kind,omitempty"`
 		}
 		var entities []Entity
 		for rows.Next() {
@@ -87,6 +88,16 @@ func getTagEntities(deps Deps) http.HandlerFunc {
 					e.Title = ttype
 				}
 				e.Subtitle = fmt.Sprintf("₹%.0f · %s", amount, ttype)
+			case "media":
+				d.QueryRow("SELECT title, type FROM media WHERE user_id = $1 AND id = $2", uid, e.ID).Scan(&e.Title, &e.Kind)
+			case "bookmark":
+				var title, site, url string
+				d.QueryRow("SELECT title, site_name, url, kind FROM bookmarks WHERE user_id = $1 AND id = $2", uid, e.ID).Scan(&title, &site, &url, &e.Kind)
+				e.Title = title
+				if e.Title == "" {
+					e.Title = url
+				}
+				e.Subtitle = site
 			}
 			if e.Title == "" {
 				continue

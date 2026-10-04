@@ -415,6 +415,9 @@ func deleteAccount(deps Deps) http.HandlerFunc {
 			SELECT 1 FROM fin_lends WHERE user_id=$1 AND source_account_id=$2
 			UNION ALL
 			SELECT 1 FROM fin_lend_repayments WHERE user_id=$1 AND destination_account_id=$2
+			UNION ALL
+			SELECT 1 FROM fin_lend_settlements s JOIN fin_transactions t ON t.id=s.transaction_id
+			WHERE s.user_id=$1 AND t.account_id=$2
 		)`, uid, id).Scan(&usedByLend); err != nil {
 			internalError(w, r, "check account lends", err)
 			return
@@ -608,6 +611,7 @@ type txnResp struct {
 	SlateID       int64   `json:"slate_id"`   // never zero; Plain when unfiled
 	SlateName     string  `json:"slate_name"` // joined for display
 	LendID        *int64  `json:"lend_id"`    // source or repayment row's receivable
+	LendBorrower  *string `json:"lend_borrower"`
 	CreatedAt     string  `json:"created_at"`
 }
 
@@ -699,13 +703,16 @@ func listTransactions(deps Deps) http.HandlerFunc {
 
 		q := `SELECT t.id, t.account_id, a.name, t.category_id, c.name, c.color, t.type, t.amount,
 			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.slate_id, s.name,
-			  COALESCE(l.id, r.lend_id), t.created_at::text
+			  COALESCE(l.id, r.lend_id), COALESCE(l.borrower, ls.borrower, r.borrower), t.created_at::text
 			  FROM fin_transactions t
 			  JOIN fin_accounts a ON a.id = t.account_id
 			  LEFT JOIN fin_categories c ON c.id = t.category_id
 			  JOIN fin_slates s ON s.id = t.slate_id
 			  LEFT JOIN fin_lends l ON l.source_transaction_id=t.id AND l.user_id=t.user_id
-			  LEFT JOIN fin_lend_repayments r ON r.transaction_id=t.id AND r.user_id=t.user_id
+			  LEFT JOIN fin_lend_settlements ls ON ls.transaction_id=t.id AND ls.user_id=t.user_id
+			  LEFT JOIN LATERAL (SELECT rr.lend_id, rl.borrower FROM fin_lend_repayments rr
+			    JOIN fin_lends rl ON rl.id = rr.lend_id
+			    WHERE rr.transaction_id=t.id AND rr.user_id=t.user_id ORDER BY rr.id LIMIT 1) r ON TRUE
 			  WHERE ` + strings.Join(clauses, " AND ") +
 			` ORDER BY t.txn_at DESC, t.id DESC LIMIT ` + itoa(limit)
 
@@ -722,7 +729,7 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			var at time.Time
 			rows.Scan(&t.ID, &t.AccountID, &t.AccountName, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
 				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount,
-				&t.SlateID, &t.SlateName, &t.LendID, &t.CreatedAt)
+				&t.SlateID, &t.SlateName, &t.LendID, &t.LendBorrower, &t.CreatedAt)
 			t.TxnAt = at.In(loc).Format(time.RFC3339)
 			out = append(out, t)
 		}

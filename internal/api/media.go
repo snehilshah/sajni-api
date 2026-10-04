@@ -401,6 +401,7 @@ func createMedia(deps Deps) http.HandlerFunc {
 			errJSON(w, 500, err.Error())
 			return
 		}
+		syncTags(d, uid, "media", id, body.Notes)
 
 		// Watch-history: log the add and any "started" / "completed"
 		// state implied by the initial status.
@@ -736,6 +737,9 @@ func updateMedia(deps Deps) http.HandlerFunc {
 			errJSON(w, 500, err.Error())
 			return
 		}
+		if notes, ok := body["notes"].(string); ok {
+			syncTags(d, uid, "media", id, notes)
+		}
 
 		// Watch-history: emit events for any user-visible state change.
 		// Read the post-update row once and diff against the snapshot.
@@ -801,6 +805,7 @@ func deleteMedia(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid id")
 			return
 		}
+		d.Exec("DELETE FROM tags WHERE user_id = $1 AND entity_type = 'media' AND entity_id = $2", uid, id)
 		d.Exec("DELETE FROM media WHERE id = $1 AND user_id = $2", id, uid)
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}

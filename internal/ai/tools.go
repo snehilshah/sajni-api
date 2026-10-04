@@ -1202,6 +1202,31 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "mark_paid_for",
+			Description: "Mark existing expenses as paid on someone's behalf (e.g. Dad's electricity bill on the user's card, a friend's purchase on the user's discount card). Each whole transaction becomes money that person owes; it leaves spending. Card charges default their due date to that card cycle's bill due date. Get ids from list_finance_transactions.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"borrower":        str("Required. The person, e.g. 'Dad'. Reuse the exact name from list_lends when they already owe."),
+				"transaction_ids": arrayOf(intg(""), "Required. Expense ids from list_finance_transactions."),
+				"due_date":        str("Optional ISO due date. Omit for the card-cycle default."),
+			}, "borrower", "transaction_ids"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return markPaidForTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "settle_lends",
+			Description: "Mark existing credits (money received) as that person paying back what they owe. A credit pays off their oldest items first; partial payments leave the rest owed, and any extra is held against their next item. Get credit ids from list_finance_transactions (type income).",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"borrower":        str("Required. The person, as named in list_lends."),
+				"transaction_ids": arrayOf(intg(""), "Required. Income transaction ids."),
+			}, "borrower", "transaction_ids"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return settleLendsTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "update_transaction",
 			Description: "Update an existing finance transaction by id — change its account, category, slate, amount, type, description, or date. To move it to another account pass account_id (balances recompute automatically). To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. To move it between slates pass slate_id (0 = Plain). Use list_finance_transactions to find the id first.",
 			Mutating:    true,
@@ -3665,6 +3690,9 @@ func createLendTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 		transactionID, borrower, amount, description, note, lentAt, dueArg, remind).Scan(&lendID); err != nil {
 		return nil, nil, err
 	}
+	if err := db.RebalanceLends(ctx, tx, uid, borrower); err != nil {
+		return nil, nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, nil, err
 	}
@@ -3734,6 +3762,9 @@ func recordLendRepaymentTool(ctx context.Context, d *db.DB, uid string, args map
 		(user_id,lend_id,destination_account_id,transaction_id,amount,repaid_at,note)
 		VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`, uid, lendID, destinationID,
 		transactionID, amount, repaidAt, note).Scan(&repaymentID); err != nil {
+		return nil, nil, err
+	}
+	if err := db.RebalanceLends(ctx, tx, uid, borrower); err != nil {
 		return nil, nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -4057,4 +4088,46 @@ func aiBudgetLens(uid, from, to string, slateIDs []int64, catID int64) (string, 
 		q += fmt.Sprintf(" AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $%d AND $%d", len(args)-1, len(args))
 	}
 	return q, args
+}
+
+func markPaidForTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	borrower := strings.TrimSpace(argStr(args, "borrower"))
+	var due *string
+	if v := argStr(args, "due_date"); v != "" {
+		if _, err := time.Parse("2006-01-02", v); err != nil {
+			return nil, nil, fmt.Errorf("due_date must be YYYY-MM-DD")
+		}
+		due = &v
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	ids, err := db.MarkPaidFor(ctx, tx, uid, borrower, argInt64Slice(args, "transaction_ids"), due, false, userTZLoc(ctx, d, uid))
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"lend_ids": ids, "borrower": borrower},
+		map[string]any{"kind": "lend_created", "id": ids[0], "title": borrower, "route": "/finance/lends"}, nil
+}
+
+func settleLendsTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	borrower := strings.TrimSpace(argStr(args, "borrower"))
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	if err := db.SettleWith(ctx, tx, uid, borrower, argInt64Slice(args, "transaction_ids")); err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"settled": true, "borrower": borrower},
+		map[string]any{"kind": "lend_repayment_created", "id": 0, "title": borrower, "route": "/finance/lends"}, nil
 }
