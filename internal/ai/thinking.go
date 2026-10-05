@@ -90,14 +90,11 @@ Reply with ONLY a single JSON object. No prose. No markdown fences.`
 	prompt := fmt.Sprintf("Project: %s\nDescription: %s\n\nTarget card:\n%s\n\nSibling cards (%d, with prior enrichments):\n%s",
 		projectTitle, projectDesc, string(targetJSON), len(siblings), string(siblingJSON))
 
-	temp := float32(0.4)
-	maxOut := int32(900)
-	thinkBudget := int32(0)
+	maxOut := int32(maxOutputTokens)
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: sys}}},
-		Temperature:       &temp,
 		MaxOutputTokens:   maxOut,
-		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
+		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelMedium},
 		ResponseMIMEType:  "application/json",
 	}
 	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
@@ -172,14 +169,11 @@ Reply with ONLY a single JSON object. The thesis VALUE must be a single markdown
 	prompt := fmt.Sprintf("Project: %s\nDescription: %s\n\nCards (%d, with prior enrichments):\n%s",
 		projectTitle, projectDesc, len(cards), string(body))
 
-	temp := float32(0.5)
-	maxOut := int32(2200)
-	thinkBudget := int32(0)
+	maxOut := int32(maxOutputTokens)
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: sys}}},
-		Temperature:       &temp,
 		MaxOutputTokens:   maxOut,
-		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
+		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelMedium},
 		ResponseMIMEType:  "application/json",
 	}
 	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{

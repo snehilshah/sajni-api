@@ -136,7 +136,7 @@ func Load(dotEnvPath string) (Config, error) {
 		},
 		AI: AI{
 			GeminiAPIKey: os.Getenv("GEMINI_API_KEY"),
-			GeminiModel:  "gemini-3.7-flash",
+			GeminiModel:  "gemini-3.8-flash",
 		},
 		Media: Media{
 			TMDBAPIKey:         os.Getenv("TMDB_API_KEY"),

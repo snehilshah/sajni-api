@@ -60,17 +60,14 @@ Strict rules:
 
 	prompt := "Options:\n" + list.String() + "\n<input>" + input + "</input>"
 
-	temp := float32(0)
 	// The answer is one word, but leave headroom: a thinking-tier model can
 	// spend a tight cap before writing anything, and an empty reply would
 	// silently become the fallback.
-	maxOut := int32(256)
-	thinkBudget := int32(0)
+	maxOut := int32(quickMaxOutputTokens)
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: sys}}},
-		Temperature:       &temp,
 		MaxOutputTokens:   maxOut,
-		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
+		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow},
 	}
 	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: prompt}}},

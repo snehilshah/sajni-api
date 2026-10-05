@@ -45,10 +45,12 @@ const (
 	// add_media + tmdb_search + media_taste + list_media + final text
 	// without tripping the round limit on the lite tier (which tends to
 	// split steps across more rounds than the full flash model).
-	maxToolRounds   = 10
-	paletteRounds   = 6
-	maxOutputTokens = 2048
-	temperature     = 0.4
+	maxToolRounds = 10
+	paletteRounds = 6
+	// GenerateContent caps include reasoning tokens as well as visible output.
+	// Leave headroom for Gemini 3.8, which cannot disable thinking.
+	maxOutputTokens      = 8192
+	quickMaxOutputTokens = 4096
 )
 
 // Event is one item pushed onto the SSE stream during a chat turn.
@@ -169,14 +171,11 @@ func friendlyAIError(err error) string {
 // deterministic answer without the chat-loop overhead.
 func (s *Service) QuickGenerate(ctx context.Context, system, user string) (string, error) {
 	system += "\nUse commas, colons, or full stops instead of em dashes in generated text."
-	temp := float32(0.3)
-	maxOut := int32(300)
-	thinkBudget := int32(0)
+	maxOut := int32(quickMaxOutputTokens)
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: system}}},
-		Temperature:       &temp,
 		MaxOutputTokens:   maxOut,
-		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
+		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow},
 	}
 	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: user}}},
@@ -199,9 +198,7 @@ func (s *Service) QuickGenerate(ctx context.Context, system, user string) (strin
 // Unlike QuickGenerate, Gemini is constrained to return the exact palette
 // object, so callers do not need markdown-fence or stray-prose cleanup.
 func (s *Service) GenerateThemePalette(ctx context.Context, system, user string) (string, error) {
-	temp := float32(0.4)
-	maxOut := int32(160)
-	thinkBudget := int32(0)
+	maxOut := int32(quickMaxOutputTokens)
 	hex := &genai.Schema{
 		Type:        genai.TypeString,
 		Pattern:     `^#[0-9A-Fa-f]{6}$`,
@@ -209,9 +206,8 @@ func (s *Service) GenerateThemePalette(ctx context.Context, system, user string)
 	}
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: system}}},
-		Temperature:       &temp,
 		MaxOutputTokens:   maxOut,
-		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
+		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow},
 		ResponseMIMEType:  "application/json",
 		ResponseSchema: &genai.Schema{
 			Type: genai.TypeObject,
@@ -296,16 +292,12 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			Parameters:  t.Schema,
 		}
 	}
-	temp := float32(temperature)
-	// Disable model "thinking" on the agent loop. The lite tier otherwise
-	// spends the whole MaxOutputTokens budget on internal reasoning and
-	// emits zero visible text — the palette then shows "the model didn't
-	// return text for this one" and the sidebar chat renders an empty
-	// reply. Same fix already applied to QuickGenerate / CategorizeExpense
-	// / ParseTransactionMessage; the chat loop was the one path that
-	// missed it. Function calling does not require thinking, so tool use
-	// is unaffected.
-	thinkBudget := int32(0)
+	level := genai.ThinkingLevelMedium
+	maxOut := int32(maxOutputTokens)
+	if req.Mode == "palette" {
+		level = genai.ThinkingLevelLow
+		maxOut = quickMaxOutputTokens
+	}
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: &genai.Content{
 			Parts: []*genai.Part{{Text: sysPrompt}},
@@ -320,9 +312,8 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 				Mode: genai.FunctionCallingConfigModeAuto,
 			},
 		},
-		MaxOutputTokens: maxOutputTokens,
-		Temperature:     &temp,
-		ThinkingConfig:  &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
+		MaxOutputTokens: maxOut,
+		ThinkingConfig:  &genai.ThinkingConfig{ThinkingLevel: level},
 	}
 
 	rounds := maxToolRounds
@@ -546,17 +537,11 @@ Strict rules:
 
 	prompt := "Categories:\n" + list.String() + "\n<title>" + title + "</title>"
 
-	temp := float32(0.0)
-	maxOut := int32(32)
-	// Disable thinking so the model does not burn the entire output
-	// budget on internal reasoning tokens and returns empty text, which
-	// previously made every categorize call fall back to "Others".
-	thinkBudget := int32(0)
+	maxOut := int32(quickMaxOutputTokens)
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: sys}}},
-		Temperature:       &temp,
 		MaxOutputTokens:   maxOut,
-		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
+		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow},
 	}
 
 	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
@@ -685,14 +670,11 @@ Rules:
 	msg = cleanTxnMessage(msg)
 	prompt := "Today is " + today + ".\n<msg>" + msg + "</msg>"
 
-	temp := float32(0)
-	maxOut := int32(200)
-	thinkBudget := int32(0)
+	maxOut := int32(quickMaxOutputTokens)
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: sys}}},
-		Temperature:       &temp,
 		MaxOutputTokens:   maxOut,
-		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
+		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow},
 	}
 	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: prompt}}},
@@ -764,14 +746,11 @@ Rules:
 
 	prompt := "Today is " + today + ". Extract the transaction from this image."
 
-	temp := float32(0)
-	maxOut := int32(250)
-	thinkBudget := int32(0)
+	maxOut := int32(quickMaxOutputTokens)
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: sys}}},
-		Temperature:       &temp,
 		MaxOutputTokens:   maxOut,
-		ThinkingConfig:    &genai.ThinkingConfig{ThinkingBudget: &thinkBudget},
+		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow},
 	}
 	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
 		{

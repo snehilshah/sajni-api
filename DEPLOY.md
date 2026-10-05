@@ -340,6 +340,20 @@ make docker-run # build the Cloud Run image and run with .env
 `.env` permissions to `600`. Optional integrations such as TMDB, Gemini,
 Google Places, Cloud Tasks, and Firebase may stay blank in local development.
 
+All AI features in web and Android use the shared backend model
+`gemini-3.8-flash`, pinned in `internal/config/config.go`. A model change takes
+effect when the API is deployed; there is no model environment override.
+Thinking effort is `low` for palette actions, insights narration, themes,
+classification, and transaction text/image parsing, and `medium` for chat,
+project enrichment, and synthesis. `internal/ai/` uses named thinking levels
+and default sampling parameters. Output caps of 4096 (`low`) and 8192
+(`medium`) include reasoning tokens, not just the visible reply.
+Insights narration is the short written explanation in Analytics → Insights:
+the backend detects findings from user data, then Gemini rewrites them into
+readable summaries with `low` thinking effort.
+See [Google’s Gemini 3.8 migration guide](https://ai.google.dev/gemini-api/docs/latest-model)
+and [GenerateContent thinking guide](https://ai.google.dev/gemini-api/docs/generate-content/thinking).
+
 Set `DATABASE_URL` to an empty database owned by your local Postgres role.
 For a Homebrew installation initialized under your OS account:
 

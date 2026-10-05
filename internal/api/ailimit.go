@@ -16,10 +16,8 @@ import (
 // token budget, so legit users hitting them at typing speed are fine.
 // Heavy chat turns (≈ 1–3k tok each) are gated by the token cap before
 // the message cap, which is the desired behaviour.
-// Caps are bumped 4× from their original (60 / 100k) values. The
-// Gemini 3.7 Flash makes each token meaningfully
-// cheaper, so the budget can absorb the new ceiling without changing
-// monthly spend.
+// Caps apply across Gemini 3.8 Flash workloads. Token usage includes
+// reasoning where reported; these are usage limits, not a spending guarantee.
 const (
 	aiWindow      = time.Hour
 	aiMaxMessages = 240
