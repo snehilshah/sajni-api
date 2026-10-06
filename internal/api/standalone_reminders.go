@@ -19,6 +19,7 @@ import (
 func registerReminderRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/reminders", listStandaloneReminders(deps))
 	mux.HandleFunc("GET /api/reminders/recent", listReminderHistory(deps))
+	mux.HandleFunc("DELETE /api/reminders/recent/{id}", deleteReminderHistory(deps))
 	mux.HandleFunc("GET /api/reminders/{id}", getStandaloneReminder(deps))
 	mux.HandleFunc("POST /api/reminders", createStandaloneReminder(deps))
 	mux.HandleFunc("PUT /api/reminders/{id}", updateStandaloneReminder(deps))
@@ -49,6 +50,21 @@ func listReminderHistory(deps Deps) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, items)
+	}
+}
+
+func deleteReminderHistory(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		if err := reminder.DeleteOccurrence(r.Context(), deps.DB, userID(r.Context()), id); err != nil {
+			writeReminderResult(w, r, reminder.Reminder{}, err, http.StatusOK)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
 	}
 }
 

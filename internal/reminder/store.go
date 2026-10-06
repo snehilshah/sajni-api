@@ -59,6 +59,9 @@ type HistoryItem struct {
 	ReminderID int64  `json:"reminder_id"`
 	Message    string `json:"message"`
 	Notes      string `json:"notes"`
+	// Active is the reminder's own state: true means the series is still
+	// running, so deleting this entry leaves the reminder in place.
+	Active bool `json:"active"`
 }
 
 type SaveInput struct {
@@ -243,7 +246,7 @@ func History(ctx context.Context, d *db.DB, uid string, limit, offset int) ([]Hi
 	}
 	rows, err := d.QueryContext(ctx, `
 		SELECT o.id,o.sequence,o.scheduled_at,o.fire_at,o.status,o.delivered_at,o.skipped_at,
-		       r.id,r.message,r.notes
+		       r.id,r.message,r.notes,r.active
 		FROM reminder_occurrences o JOIN reminders r ON r.id=o.reminder_id
 		WHERE o.user_id=$1 AND o.status IN ('delivered','skipped')
 		ORDER BY COALESCE(o.delivered_at,o.skipped_at,o.fire_at) DESC LIMIT $2 OFFSET $3`, uid, limit, offset)
@@ -254,7 +257,7 @@ func History(ctx context.Context, d *db.DB, uid string, limit, offset int) ([]Hi
 	items := []HistoryItem{}
 	for rows.Next() {
 		var item HistoryItem
-		if err := rows.Scan(&item.ID, &item.Sequence, &item.ScheduledAt, &item.FireAt, &item.Status, &item.DeliveredAt, &item.SkippedAt, &item.ReminderID, &item.Message, &item.Notes); err != nil {
+		if err := rows.Scan(&item.ID, &item.Sequence, &item.ScheduledAt, &item.FireAt, &item.Status, &item.DeliveredAt, &item.SkippedAt, &item.ReminderID, &item.Message, &item.Notes, &item.Active); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -315,6 +318,33 @@ func Delete(ctx context.Context, d *db.DB, uid string, id int64) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// DeleteOccurrence removes one finished history entry. Pending occurrences
+// are not history (skip or delete the series instead), so they 404. A
+// finished reminder whose last visible entry goes is removed with it, so a
+// one-time reminder leaves nothing behind; an active series keeps running.
+func DeleteOccurrence(ctx context.Context, d *db.DB, uid string, occurrenceID int64) error {
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var reminderID int64
+	err = tx.QueryRowContext(ctx, `DELETE FROM reminder_occurrences WHERE id=$1 AND user_id=$2 AND status IN ('delivered','skipped') RETURNING reminder_id`, occurrenceID, uid).Scan(&reminderID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM reminders r WHERE r.id=$1 AND r.user_id=$2 AND r.active=FALSE
+		   AND NOT EXISTS (SELECT 1 FROM reminder_occurrences o WHERE o.reminder_id=r.id AND o.status<>'cancelled')`,
+		reminderID, uid); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Complete marks one claimed occurrence delivered and atomically creates the

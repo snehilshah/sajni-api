@@ -172,6 +172,21 @@ func standaloneReminderTools(d *db.DB, queue reminderqueue.Queue) []Tool {
 				}, nil
 			},
 		},
+		{
+			Name:        "delete_reminder_history",
+			Description: "Delete one finished (delivered or skipped) reminder entry from history. Get its id from list_reminders with include_recent (the recent item's id, not reminder_id). A finished one-time reminder is removed entirely; a recurring series keeps running. Finished reminders cannot be edited.",
+			Mutating:    true,
+			Schema:      obj(map[string]*genai.Schema{"occurrence_id": intg("Required id of the recent history entry.")}, "occurrence_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				id := argInt(args, "occurrence_id", 0)
+				if err := standalonereminder.DeleteOccurrence(ctx, d, uid, id); err != nil {
+					return nil, nil, err
+				}
+				return map[string]any{"occurrence_id": id, "deleted": true}, map[string]any{
+					"kind": "reminder_deleted", "id": id, "route": "/tasks?tab=reminders",
+				}, nil
+			},
+		},
 	}
 }
 
