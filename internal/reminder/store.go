@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog/log"
+
 	"sajni/internal/db"
 	"sajni/internal/reminderqueue"
 )
@@ -19,6 +21,15 @@ var (
 )
 
 func invalid(message string) error { return fmt.Errorf("%w: %s", ErrInvalid, message) }
+
+// enqueue schedules the exact Cloud Tasks fire for an occurrence. Failure is
+// logged, not returned: the row is already committed and the reminder sweep
+// still picks it up within the grace window.
+func enqueue(ctx context.Context, queue reminderqueue.Queue, occurrenceID int64, fireAt time.Time) {
+	if err := queue.EnqueueStandalone(ctx, occurrenceID, fireAt); err != nil {
+		log.Warn().Err(err).Int64("occurrence", occurrenceID).Msg("standalone reminder cloud task enqueue failed")
+	}
+}
 
 type Occurrence struct {
 	ID          int64      `json:"id"`
@@ -125,7 +136,7 @@ func Create(ctx context.Context, d *db.DB, queue reminderqueue.Queue, uid string
 	if err := tx.Commit(); err != nil {
 		return Reminder{}, err
 	}
-	_ = queue.EnqueueStandalone(ctx, occurrenceID, startsAt)
+	enqueue(ctx, queue, occurrenceID, startsAt)
 	return Get(ctx, d, uid, id)
 }
 
@@ -169,7 +180,7 @@ func Replace(ctx context.Context, d *db.DB, queue reminderqueue.Queue, uid strin
 	if err := tx.Commit(); err != nil {
 		return Reminder{}, err
 	}
-	_ = queue.EnqueueStandalone(ctx, occurrenceID, startsAt)
+	enqueue(ctx, queue, occurrenceID, startsAt)
 	return Get(ctx, d, uid, id)
 }
 
@@ -263,7 +274,7 @@ func Snooze(ctx context.Context, d *db.DB, queue reminderqueue.Queue, uid string
 	if err != nil {
 		return Reminder{}, err
 	}
-	_ = queue.EnqueueStandalone(ctx, oid, fireAt)
+	enqueue(ctx, queue, oid, fireAt)
 	return Get(ctx, d, uid, id)
 }
 
@@ -290,7 +301,7 @@ func Skip(ctx context.Context, d *db.DB, queue reminderqueue.Queue, uid string, 
 		return Reminder{}, err
 	}
 	if nextID > 0 {
-		_ = queue.EnqueueStandalone(ctx, nextID, nextAt)
+		enqueue(ctx, queue, nextID, nextAt)
 	}
 	return Get(ctx, d, uid, id)
 }
@@ -335,7 +346,7 @@ func Complete(ctx context.Context, d *db.DB, queue reminderqueue.Queue, occurren
 		return err
 	}
 	if nextID > 0 {
-		_ = queue.EnqueueStandalone(ctx, nextID, nextAt)
+		enqueue(ctx, queue, nextID, nextAt)
 	}
 	return nil
 }

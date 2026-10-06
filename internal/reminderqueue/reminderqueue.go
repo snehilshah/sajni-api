@@ -21,6 +21,8 @@ const (
 	KindTask       = "task"
 	KindMulti      = "multi"
 	KindStandalone = "standalone"
+
+	enqueueTimeout = 10 * time.Second
 )
 
 type fireBody struct {
@@ -81,6 +83,11 @@ func (c Queue) Enqueue(ctx context.Context, kind string, id int64, at time.Time)
 	if err != nil {
 		return err
 	}
+	// Cloud Tasks rejects RPCs whose deadline is more than 30s out, so a
+	// caller's long deadline (the 50s AI chat turn) must not leak through.
+	// WithoutCancel also keeps the enqueue alive if the request ends first.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), enqueueTimeout)
+	defer cancel()
 	client, err := cloudtasks.NewClient(ctx)
 	if err != nil {
 		return err
