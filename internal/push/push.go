@@ -158,8 +158,12 @@ func isGoneToken(err error) bool {
 	return ok
 }
 
-// send posts one message to the FCM v1 endpoint.
-func (s *Sender) send(ctx context.Context, token string, n Notification) error {
+// buildMessage shapes one FCM v1 message. Any android.notification block,
+// even one holding only channel_id, makes FCM treat the push as a
+// notification-message: backgrounded, the system renders it itself and
+// onMessageReceived never runs. Data-only pushes must therefore carry no
+// notification block at all, or the tray shows a blank card.
+func buildMessage(token string, n Notification) map[string]any {
 	priority := "normal"
 	if n.interrupts() {
 		priority = "high"
@@ -173,35 +177,33 @@ func (s *Sender) send(ctx context.Context, token string, n Notification) error {
 	for key, value := range n.Data {
 		data[key] = value
 	}
+	android := map[string]any{"priority": priority}
 	message := map[string]any{
-		"token": token,
-		"data":  data,
-		"android": map[string]any{
-			"priority": priority,
-			"notification": map[string]string{
-				"channel_id": n.channelID(),
-			},
-		},
+		"token":   token,
+		"data":    data,
+		"android": android,
 	}
-	if n.Type == TypeSync {
-		// Pure data message: no notification block (that would render one),
-		// normal priority (no Doze wake-up of its own), and a collapse key so
-		// FCM keeps only the newest ping per scope while the device sleeps —
-		// a burst of edits costs one delivery. Stale after an hour: the app
-		// refreshes on open anyway.
-		message["android"] = map[string]any{
-			"priority":     "normal",
-			"collapse_key": "sync_" + n.Data["scope"],
-			"ttl":          "3600s",
-		}
-	}
-	if !n.DataOnly {
+	switch {
+	case n.Type == TypeSync:
+		// Pure data message: normal priority (no Doze wake-up of its own),
+		// and a collapse key so FCM keeps only the newest ping per scope
+		// while the device sleeps — a burst of edits costs one delivery.
+		// Stale after an hour: the app refreshes on open anyway.
+		android["priority"] = "normal"
+		android["collapse_key"] = "sync_" + n.Data["scope"]
+		android["ttl"] = "3600s"
+	case n.DataOnly:
+		// The client builds the notification (channel, actions) itself.
+	default:
+		android["notification"] = map[string]string{"channel_id": n.channelID()}
 		message["notification"] = map[string]string{"title": n.Title, "body": n.Body}
 	}
-	payload := map[string]any{
-		"message": message,
-	}
-	body, err := json.Marshal(payload)
+	return message
+}
+
+// send posts one message to the FCM v1 endpoint.
+func (s *Sender) send(ctx context.Context, token string, n Notification) error {
+	body, err := json.Marshal(map[string]any{"message": buildMessage(token, n)})
 	if err != nil {
 		return err
 	}
