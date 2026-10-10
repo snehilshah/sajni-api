@@ -189,7 +189,8 @@ func categoryNameExists(d *db.DB, uid, kind, name string, excludeID int64) bool 
 }
 
 // computeBalance returns the current signed balance of an account based on
-// opening_balance + income - expense + transfer_in - transfer_out - lends + repayments.
+// opening_balance + income + refunds - expense + transfer_in - transfer_out
+// - lends + repayments. Writeoffs move no money, so they never count.
 // For credit cards this comes out negative when money is owed.
 func computeBalance(deps Deps, uid string, accountID int64) float64 {
 	d := deps.DB
@@ -197,7 +198,7 @@ func computeBalance(deps Deps, uid string, accountID int64) float64 {
 	d.QueryRow("SELECT opening_balance FROM fin_accounts WHERE id = $1 AND user_id = $2", accountID, uid).Scan(&opening)
 
 	var income, expense, transferIn, transferOut, lent, repaid float64
-	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'income'", uid, accountID).Scan(&income)
+	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type IN ('income','refund')", uid, accountID).Scan(&income)
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'expense'", uid, accountID).Scan(&expense)
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_in'", uid, accountID).Scan(&transferIn)
 	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_out'", uid, accountID).Scan(&transferOut)
@@ -612,7 +613,18 @@ type txnResp struct {
 	SlateName     string  `json:"slate_name"` // joined for display
 	LendID        *int64  `json:"lend_id"`    // source or repayment row's receivable
 	LendBorrower  *string `json:"lend_borrower"`
-	CreatedAt     string  `json:"created_at"`
+	// Split is set on a bill shared with someone. Amount is then the user's
+	// own part; the bill as charged is Amount + Split.Share. The share's own
+	// lend row (split_of) is folded into the bill and never listed alone.
+	Split     *txnSplit `json:"split"`
+	RefundOf  *int64    `json:"refund_of"` // refund: the purchase it came back for
+	CreatedAt string    `json:"created_at"`
+}
+
+type txnSplit struct {
+	LendID   int64   `json:"lend_id"`
+	Borrower string  `json:"borrower"`
+	Share    float64 `json:"share"`
 }
 
 // istDateExpr is the SQL that projects a txn_at TIMESTAMPTZ down to its IST
@@ -655,7 +667,7 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		uid := userID(r.Context())
 
 		args := []any{uid}
-		clauses := []string{"t.user_id = $1"}
+		clauses := []string{"t.user_id = $1", "t.split_of IS NULL"}
 		ph := 2
 		if v := queryParam(r, "account_id"); v != "" {
 			clauses = append(clauses, "t.account_id = $"+itoa(ph))
@@ -703,7 +715,8 @@ func listTransactions(deps Deps) http.HandlerFunc {
 
 		q := `SELECT t.id, t.account_id, a.name, t.category_id, c.name, c.color, t.type, t.amount,
 			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.slate_id, s.name,
-			  COALESCE(l.id, r.lend_id), COALESCE(l.borrower, ls.borrower, r.borrower), t.created_at::text
+			  COALESCE(l.id, r.lend_id), COALESCE(l.borrower, ls.borrower, r.borrower), t.created_at::text,
+			  spl.id, spl.borrower, sp.amount, t.refund_of
 			  FROM fin_transactions t
 			  JOIN fin_accounts a ON a.id = t.account_id
 			  LEFT JOIN fin_categories c ON c.id = t.category_id
@@ -713,6 +726,8 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			  LEFT JOIN LATERAL (SELECT rr.lend_id, rl.borrower FROM fin_lend_repayments rr
 			    JOIN fin_lends rl ON rl.id = rr.lend_id
 			    WHERE rr.transaction_id=t.id AND rr.user_id=t.user_id ORDER BY rr.id LIMIT 1) r ON TRUE
+			  LEFT JOIN fin_transactions sp ON sp.split_of=t.id AND sp.user_id=t.user_id
+			  LEFT JOIN fin_lends spl ON spl.source_transaction_id=sp.id AND spl.user_id=t.user_id
 			  WHERE ` + strings.Join(clauses, " AND ") +
 			` ORDER BY t.txn_at DESC, t.id DESC LIMIT ` + itoa(limit)
 
@@ -727,9 +742,16 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		for rows.Next() {
 			var t txnResp
 			var at time.Time
+			var splitLend sql.NullInt64
+			var splitBorrower sql.NullString
+			var splitShare sql.NullFloat64
 			rows.Scan(&t.ID, &t.AccountID, &t.AccountName, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
 				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount,
-				&t.SlateID, &t.SlateName, &t.LendID, &t.LendBorrower, &t.CreatedAt)
+				&t.SlateID, &t.SlateName, &t.LendID, &t.LendBorrower, &t.CreatedAt,
+				&splitLend, &splitBorrower, &splitShare, &t.RefundOf)
+			if splitLend.Valid {
+				t.Split = &txnSplit{LendID: splitLend.Int64, Borrower: splitBorrower.String, Share: roundMoney(splitShare.Float64)}
+			}
 			t.TxnAt = at.In(loc).Format(time.RFC3339)
 			out = append(out, t)
 		}
@@ -754,6 +776,18 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			TxnAt         string  `json:"txn_at"` // RFC3339 (IST)
 			LinkedAccount *int64  `json:"linked_account"`
 			SlateID       *int64  `json:"slate_id"` // absent/0 → Plain; N → that slate
+			// refund only: the purchase it came back for (optional). Its
+			// category and slate are reused when none is sent.
+			RefundOf *int64 `json:"refund_of"`
+			// expense only: someone owes part of this bill (Paid for, split).
+			Split *struct {
+				Borrower string  `json:"borrower"`
+				Share    float64 `json:"share"`
+				DueDate  *string `json:"due_date"` // absent → card cycle; "" → none
+				Remind   bool    `json:"remind"`
+			} `json:"split"`
+			// income only: this is that person paying the user back.
+			SettleWith string `json:"settle_with"`
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -798,9 +832,46 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			errJSON(w, http.StatusBadRequest, "Enter an amount above zero.")
 			return
 		}
-		if b.Type != "expense" && b.Type != "income" && b.Type != "transfer" {
-			errJSON(w, http.StatusBadRequest, "Pick expense, income or transfer. Lending is managed from Lends.")
+		if b.Type != "expense" && b.Type != "income" && b.Type != "transfer" && b.Type != "refund" {
+			errJSON(w, http.StatusBadRequest, "Pick expense, income, refund or transfer. Lending is managed from Lends.")
 			return
+		}
+		if b.Split != nil && (b.Type != "expense" || strings.TrimSpace(b.Split.Borrower) == "" || b.Split.Share <= 0 || roundMoney(b.Split.Share) > roundMoney(b.Amount)) {
+			errJSON(w, http.StatusBadRequest, "A split needs a person and a share between zero and the bill.")
+			return
+		}
+		if b.SettleWith = strings.TrimSpace(b.SettleWith); b.SettleWith != "" && b.Type != "income" {
+			errJSON(w, http.StatusBadRequest, "Only money received can pay someone's lends back.")
+			return
+		}
+		if b.Type == "refund" {
+			if b.CategoryID != nil {
+				var kind string
+				d.QueryRowContext(ctx, `SELECT kind FROM fin_categories WHERE id=$1 AND user_id=$2`, *b.CategoryID, uid).Scan(&kind)
+				if kind != "expense" {
+					errJSON(w, http.StatusBadRequest, "A refund goes back to an expense category.")
+					return
+				}
+			}
+			if b.RefundOf != nil && *b.RefundOf != 0 {
+				var origCat sql.NullInt64
+				var origSlate int64
+				if err := d.QueryRowContext(ctx, `SELECT category_id, slate_id FROM fin_transactions WHERE id=$1 AND user_id=$2 AND type='expense'`,
+					*b.RefundOf, uid).Scan(&origCat, &origSlate); err != nil {
+					errJSON(w, http.StatusBadRequest, "Pick one of your expenses as the original purchase.")
+					return
+				}
+				if b.CategoryID == nil && origCat.Valid {
+					b.CategoryID = &origCat.Int64
+				}
+				if b.SlateID == nil {
+					b.SlateID = &origSlate
+				}
+			} else {
+				b.RefundOf = nil
+			}
+		} else {
+			b.RefundOf = nil
 		}
 		slateID, serrMsg := resolveSlateID(d, uid, b.SlateID)
 		if serrMsg != "" {
@@ -870,12 +941,34 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			}
 		}
 
-		var id int64
-		err := d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, note, txn_at, slate_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-			uid, b.AccountID, b.CategoryID, b.Type, b.Amount, b.Description, b.Note, txnAt, slateID,
-		).Scan(&id)
+		tx, err := d.BeginTx(ctx, nil)
 		if err != nil {
-			errJSON(w, 500, err.Error())
+			internalError(w, r, "begin transaction", err)
+			return
+		}
+		defer tx.Rollback()
+		var id int64
+		if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, note, txn_at, slate_id, refund_of) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+			uid, b.AccountID, b.CategoryID, b.Type, b.Amount, b.Description, b.Note, txnAt, slateID, b.RefundOf,
+		).Scan(&id); err != nil {
+			internalError(w, r, "insert transaction", err)
+			return
+		}
+		if b.Split != nil {
+			share := b.Split.Share
+			if _, err := db.MarkPaidFor(ctx, tx, uid, b.Split.Borrower, []int64{id}, b.Split.DueDate, b.Split.Remind, userLocation(d, uid), share); err != nil {
+				lendError(w, r, "split transaction", err)
+				return
+			}
+		}
+		if b.SettleWith != "" {
+			if err := db.SettleWith(ctx, tx, uid, b.SettleWith, []int64{id}); err != nil {
+				lendError(w, r, "settle transaction", err)
+				return
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit transaction", err)
 			return
 		}
 		// Index #hashtags from the note into the shared tag system.
@@ -902,8 +995,12 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			Amount      *float64 `json:"amount"`
 			Description *string  `json:"description"`
 			Note        *string  `json:"note"`
-			TxnAt       *string  `json:"txn_at"`   // RFC3339 (IST)
-			SlateID     *int64   `json:"slate_id"` // 0 → Plain; N → that slate; absent → untouched
+			TxnAt       *string  `json:"txn_at"`    // RFC3339 (IST)
+			SlateID     *int64   `json:"slate_id"`  // 0 → Plain; N → that slate; absent → untouched
+			RefundOf    *int64   `json:"refund_of"` // refund only; 0 clears
+			// income ↔ refund only: a credit can be re-read as money back on
+			// a purchase (or not). Its category follows the new kind.
+			Type *string `json:"type"`
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -932,6 +1029,22 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 		if storedType == "lend" || storedType == "lend_repayment" {
 			errJSON(w, http.StatusConflict, "This is a lending entry. Change it from Lends.")
 			return
+		}
+		if storedType == "writeoff" {
+			errJSON(w, http.StatusConflict, "This is a forgiven amount. Change it from Lends.")
+			return
+		}
+		if b.Amount != nil && *b.Amount <= 0 {
+			errJSON(w, http.StatusBadRequest, "Enter an amount above zero.")
+			return
+		}
+		retype := b.Type != nil && *b.Type != storedType
+		if retype {
+			if (storedType != "income" && storedType != "refund") || (*b.Type != "income" && *b.Type != "refund") {
+				errJSON(w, http.StatusBadRequest, "Only money received can switch between income and refund.")
+				return
+			}
+			storedType = *b.Type
 		}
 		for _, ref := range []struct {
 			table string
@@ -980,8 +1093,41 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			add(&mainSets, &mainArgs, "account_id", *b.AccountID)
 			add(&pairSets, &pairArgs, "linked_account", *b.AccountID)
 		}
+		if retype {
+			// The category belongs to the old kind unless one of the new
+			// kind came with the switch.
+			add(&mainSets, &mainArgs, "type", storedType)
+			kind := "income"
+			if storedType == "refund" {
+				kind = "expense"
+			}
+			ok := false
+			if b.CategoryID != nil {
+				tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_categories WHERE id=$1 AND user_id=$2 AND kind=$3)`, *b.CategoryID, uid, kind).Scan(&ok)
+			}
+			if !ok {
+				b.CategoryID = nil
+				add(&mainSets, &mainArgs, "category_id", nil)
+			}
+			if storedType == "income" {
+				add(&mainSets, &mainArgs, "refund_of", nil)
+			}
+		}
 		if b.CategoryID != nil {
 			add(&mainSets, &mainArgs, "category_id", *b.CategoryID)
+		}
+		if b.RefundOf != nil && storedType == "refund" {
+			if *b.RefundOf == 0 {
+				add(&mainSets, &mainArgs, "refund_of", nil)
+			} else {
+				var ok bool
+				tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_transactions WHERE id=$1 AND user_id=$2 AND type='expense')`, *b.RefundOf, uid).Scan(&ok)
+				if !ok {
+					errJSON(w, http.StatusBadRequest, "Pick one of your expenses as the original purchase.")
+					return
+				}
+				add(&mainSets, &mainArgs, "refund_of", *b.RefundOf)
+			}
 		}
 		for _, value := range []struct {
 			column string
@@ -1018,6 +1164,11 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 				return
 			}
 		}
+		// A split bill's share follows the bill (no-op for anything else).
+		if err := db.SyncSplit(ctx, tx, uid, id); err != nil {
+			internalError(w, r, "sync split", err)
+			return
+		}
 		if err := tx.Commit(); err != nil {
 			internalError(w, r, "commit transaction edit", err)
 			return
@@ -1052,6 +1203,17 @@ func deleteTransaction(deps Deps) http.HandlerFunc {
 		}
 		if storedType == "lend" || storedType == "lend_repayment" {
 			errJSON(w, http.StatusConflict, "This is a lending entry. Change it from Lends.")
+			return
+		}
+		if storedType == "writeoff" {
+			errJSON(w, http.StatusConflict, "This is a forgiven amount. Undo it from Lends.")
+			return
+		}
+		var splitWith string
+		d.QueryRow(`SELECT l.borrower FROM fin_transactions sp JOIN fin_lends l ON l.source_transaction_id = sp.id
+			WHERE sp.split_of = $1 AND sp.user_id = $2`, id, uid).Scan(&splitWith)
+		if splitWith != "" {
+			errJSON(w, http.StatusConflict, "This bill is split with "+splitWith+". Remove the split first.")
 			return
 		}
 		// delete pair if any
@@ -1096,9 +1258,9 @@ type budgetResp struct {
 //   - empty from/to   → no date bound.
 //   - catID > 0       → restrict to that category cap.
 func budgetLens(uid, from, to string, slateIDs []int64, catID int64) (string, []any) {
-	q := `SELECT COALESCE(SUM(t.amount),0) FROM fin_transactions t
+	q := `SELECT COALESCE(SUM(` + db.Spend("t") + `),0) FROM fin_transactions t
 		JOIN fin_slates s ON s.id = t.slate_id
-		WHERE t.user_id = $1 AND t.type = 'expense'`
+		WHERE t.user_id = $1 AND t.type IN ` + db.SpendTypes
 	args := []any{uid}
 	if len(slateIDs) > 0 {
 		args = append(args, slateIDs)
@@ -1951,7 +2113,7 @@ func computeStatementTotals(d *db.DB, uid string, acctID int64, in statementCalc
 			WHERE user_id = $1 AND account_id = $2 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
 			uid, acctID, from, in.StatementDate).Scan(&personalSpend)
 		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND account_id = $2 AND type IN ('income','lend_repayment') AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
+			WHERE user_id = $1 AND account_id = $2 AND type IN ('income','refund','lend_repayment') AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
 			uid, acctID, from, in.StatementDate).Scan(&refund)
 		newCharges = personalSpend + lendCharges - refund
 	}
@@ -2271,7 +2433,7 @@ func financeOverview(deps Deps) http.HandlerFunc {
 		monthEnd := now.Format("2006-01-02")
 		var monthIncome, monthExpense float64
 		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND type = 'income' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`, uid, monthStart, monthEnd).Scan(&monthIncome)
-		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`, uid, monthStart, monthEnd).Scan(&monthExpense)
+		d.QueryRow(`SELECT COALESCE(SUM(`+db.Spend("")+`),0) FROM fin_transactions WHERE user_id = $1 AND type IN `+db.SpendTypes+` AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`, uid, monthStart, monthEnd).Scan(&monthExpense)
 
 		// Top expense categories this month
 		type CatStat struct {
@@ -2281,10 +2443,10 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			Amount float64 `json:"amount"`
 		}
 		var topCats []CatStat
-		crows, _ := d.Query(`SELECT c.id, COALESCE(c.name, 'Uncategorized'), COALESCE(c.color, '#6B7280'), SUM(t.amount)
+		crows, _ := d.Query(`SELECT c.id, COALESCE(c.name, 'Uncategorized'), COALESCE(c.color, '#6B7280'), SUM(`+db.Spend("t")+`)
 			FROM fin_transactions t LEFT JOIN fin_categories c ON c.id = t.category_id
-			WHERE t.user_id = $1 AND t.type = 'expense' AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3
-			GROUP BY c.id, c.name, c.color ORDER BY SUM(t.amount) DESC LIMIT 8`, uid, monthStart, monthEnd)
+			WHERE t.user_id = $1 AND t.type IN `+db.SpendTypes+` AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3
+			GROUP BY c.id, c.name, c.color HAVING SUM(`+db.Spend("t")+`) > 0 ORDER BY 4 DESC LIMIT 8`, uid, monthStart, monthEnd)
 		if crows != nil {
 			for crows.Next() {
 				var c CatStat
@@ -2303,8 +2465,8 @@ func financeOverview(deps Deps) http.HandlerFunc {
 		trendStart := now.AddDate(0, 0, -29).Format("2006-01-02")
 		drows, _ := d.Query(`SELECT (txn_at AT TIME ZONE 'Asia/Kolkata')::date::text AS d,
 			COALESCE(SUM(CASE WHEN type='income' THEN amount END), 0),
-			COALESCE(SUM(CASE WHEN type='expense' THEN amount END), 0)
-			FROM fin_transactions WHERE user_id = $1 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date >= $2 AND type IN ('income','expense')
+			COALESCE(SUM(CASE WHEN type IN `+db.SpendTypes+` THEN `+db.Spend("")+` END), 0)
+			FROM fin_transactions WHERE user_id = $1 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date >= $2 AND type IN ('income','expense','writeoff','refund')
 			GROUP BY d ORDER BY d ASC`, uid, trendStart)
 		var trend []DayPoint
 		if drows != nil {

@@ -25,6 +25,8 @@ func registerLendRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /api/finance/lends/paid-for", markPaidFor(deps))
 	mux.HandleFunc("POST /api/finance/lends/settle", settleLends(deps))
 	mux.HandleFunc("DELETE /api/finance/lends/settlements/{id}", deleteSettlement(deps))
+	mux.HandleFunc("POST /api/finance/lends/forgive", forgiveLends(deps))
+	mux.HandleFunc("PUT /api/finance/lends/{id}/share", setLendShare(deps))
 }
 
 type lendRepaymentResp struct {
@@ -35,7 +37,8 @@ type lendRepaymentResp struct {
 	RepaidAt             string  `json:"repaid_at"`
 	Note                 string  `json:"note"`
 	TransactionID        int64   `json:"transaction_id"`
-	Settled              bool    `json:"settled"` // derived from a settlement credit
+	Settled              bool    `json:"settled"`  // derived from a settlement credit
+	Forgiven             bool    `json:"forgiven"` // derived from a writeoff
 }
 
 type lendResp struct {
@@ -119,9 +122,10 @@ func loadLends(ctx context.Context, d *db.DB, uid string, loc *time.Location) ([
 
 	repaymentRows, err := d.QueryContext(ctx, `
 		SELECT r.id, r.lend_id, r.destination_account_id, a.name, r.amount, r.repaid_at, r.note, r.transaction_id,
-		       EXISTS (SELECT 1 FROM fin_lend_settlements s WHERE s.transaction_id = r.transaction_id)
+		       EXISTS (SELECT 1 FROM fin_lend_settlements s WHERE s.transaction_id = r.transaction_id), t.type = 'writeoff'
 		FROM fin_lend_repayments r
 		JOIN fin_accounts a ON a.id = r.destination_account_id AND a.user_id = r.user_id
+		JOIN fin_transactions t ON t.id = r.transaction_id
 		WHERE r.user_id = $1 ORDER BY r.repaid_at DESC, r.id DESC`, uid)
 	if err != nil {
 		return nil, err
@@ -133,7 +137,7 @@ func loadLends(ctx context.Context, d *db.DB, uid string, loc *time.Location) ([
 		var repaidAt time.Time
 		if err := repaymentRows.Scan(&repayment.ID, &lendID, &repayment.DestinationAccountID,
 			&repayment.DestinationAccount, &repayment.Amount, &repaidAt, &repayment.Note,
-			&repayment.TransactionID, &repayment.Settled); err != nil {
+			&repayment.TransactionID, &repayment.Settled, &repayment.Forgiven); err != nil {
 			return nil, err
 		}
 		repayment.Amount = roundMoney(repayment.Amount)
@@ -302,9 +306,25 @@ func updateLend(deps Deps) http.HandlerFunc {
 			}
 			sourceAccountID = *body.SourceAccountID
 		}
-		if body.Amount != nil {
+		// A paid-for lend is part of a bill: its amount is the borrower's
+		// share, and changing it moves the line between their part and the
+		// user's (the bill's total, and so the card, never changes).
+		var origin string
+		tx.QueryRowContext(ctx, `SELECT origin FROM fin_lends WHERE id=$1`, id).Scan(&origin)
+		if origin == "paid_for" && body.Amount != nil && roundMoney(*body.Amount) != roundMoney(principal) {
+			if err := db.SetPaidForShare(ctx, tx, uid, id, *body.Amount); err != nil {
+				lendError(w, r, "set paid-for share", err)
+				return
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT source_transaction_id, principal FROM fin_lends WHERE id=$1`, id).Scan(&txnID, &principal); err != nil {
+				internalError(w, r, "reload lend", err)
+				return
+			}
+		} else if body.Amount != nil {
 			principal = roundMoney(*body.Amount)
 		}
+		var billID sql.NullInt64
+		tx.QueryRowContext(ctx, `SELECT split_of FROM fin_transactions WHERE id=$1`, txnID).Scan(&billID)
 		if principal < roundMoney(repaid) {
 			errJSON(w, http.StatusBadRequest, fmt.Sprintf("Principal can't be below the ₹%.2f already repaid.", roundMoney(repaid)))
 			return
@@ -326,7 +346,19 @@ func updateLend(deps Deps) http.HandlerFunc {
 		if description == "" {
 			description = "Lent to " + strings.TrimSpace(body.Borrower)
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET account_id=$1, amount=$2,
+		if billID.Valid {
+			// A split share lives on its bill: account and date move the
+			// bill, and the share follows it.
+			if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET account_id=$1, txn_at=$2, updated_at=NOW()
+				WHERE id=$3 AND user_id=$4`, sourceAccountID, lentAt, billID.Int64, uid); err != nil {
+				internalError(w, r, "update split bill", err)
+				return
+			}
+			if err := db.SyncSplit(ctx, tx, uid, billID.Int64); err != nil {
+				internalError(w, r, "sync split", err)
+				return
+			}
+		} else if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET account_id=$1, amount=$2,
 			description=$3, note=$4, txn_at=$5, updated_at=NOW()
 			WHERE id=$6 AND user_id=$7`, sourceAccountID, principal, description,
 			strings.TrimSpace(body.Note), lentAt, txnID, uid); err != nil {
@@ -615,4 +647,40 @@ func loadOutstandingLends(ctx context.Context, d *db.DB, uid string) (float64, [
 		JOIN fin_lend_settlements s2 ON s2.transaction_id = r.transaction_id WHERE s2.user_id = $1),0)
 		FROM fin_lend_settlements s JOIN fin_transactions t ON t.id = s.transaction_id WHERE s.user_id = $1`, uid).Scan(&credit)
 	return roundMoney(total - credit), assets, nil
+}
+
+// setLendShare moves the line on a paid-for bill: share is what the borrower
+// owes, the rest stays the user's expense. The bill's total never changes.
+func setLendShare(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		var body struct {
+			Share float64 `json:"share"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		ctx := r.Context()
+		tx, err := deps.DB.BeginTx(ctx, nil)
+		if err != nil {
+			internalError(w, r, "begin lend share", err)
+			return
+		}
+		defer tx.Rollback()
+		if err := db.SetPaidForShare(ctx, tx, uid, id, body.Share); err != nil {
+			lendError(w, r, "set lend share", err)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit lend share", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}
 }

@@ -319,13 +319,13 @@ func detectHabitStreaks(ctx context.Context, d *db.DB, uid string, cutoff string
 
 func detectSpendingSpikes(ctx context.Context, d *db.DB, uid string, cutoff string, days int) []detected {
 	rows, err := d.QueryContext(ctx, `WITH recent AS (
-		SELECT category_id, SUM(amount) AS amt
-		FROM fin_transactions WHERE user_id=$1 AND type='expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date >= $2
+		SELECT category_id, SUM(`+db.Spend("")+`) AS amt
+		FROM fin_transactions WHERE user_id=$1 AND type IN `+db.SpendTypes+` AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date >= $2
 		GROUP BY category_id),
 	baseline AS (
 		SELECT category_id, AVG(daily) AS avg_daily FROM (
-			SELECT category_id, (txn_at AT TIME ZONE 'Asia/Kolkata')::date AS d, SUM(amount) AS daily
-			FROM fin_transactions WHERE user_id=$1 AND type='expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date < $2
+			SELECT category_id, (txn_at AT TIME ZONE 'Asia/Kolkata')::date AS d, SUM(`+db.Spend("")+`) AS daily
+			FROM fin_transactions WHERE user_id=$1 AND type IN `+db.SpendTypes+` AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date < $2
 			GROUP BY category_id, d
 		) x GROUP BY category_id)
 	SELECT c.name, r.amt, COALESCE(b.avg_daily,0) * $3

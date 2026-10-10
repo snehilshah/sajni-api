@@ -97,9 +97,9 @@ func listSlates(deps Deps) http.HandlerFunc {
 		to := time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
 
 		q := `SELECT s.id, s.name, s.color, s.is_plain, s.archived,
-			COUNT(t.id) FILTER (WHERE t.type NOT IN ('lend','lend_repayment')),
-			COALESCE(SUM(t.amount) FILTER (WHERE t.type = 'expense'), 0),
-			COALESCE(SUM(t.amount) FILTER (WHERE t.type = 'expense'
+			COUNT(t.id) FILTER (WHERE t.type NOT IN ('lend','lend_repayment','writeoff')),
+			COALESCE(SUM(` + db.Spend("t") + `) FILTER (WHERE t.type IN ` + db.SpendTypes + `), 0),
+			COALESCE(SUM(` + db.Spend("t") + `) FILTER (WHERE t.type IN ` + db.SpendTypes + `
 				AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3), 0)
 		FROM fin_slates s
 		LEFT JOIN fin_transactions t ON t.slate_id = s.id

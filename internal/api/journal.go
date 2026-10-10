@@ -812,8 +812,8 @@ func weeklySummary(deps Deps) http.HandlerFunc {
 
 		// --- Finance: total expense + top category. ---
 		var expenseTotal float64
-		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
+		d.QueryRow(`SELECT COALESCE(SUM(`+db.Spend("")+`),0) FROM fin_transactions
+			WHERE user_id = $1 AND type IN `+db.SpendTypes+` AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
 			uid, startStr, endStr).Scan(&expenseTotal)
 
 		type TopCat struct {
@@ -822,10 +822,10 @@ func weeklySummary(deps Deps) http.HandlerFunc {
 			Amount float64 `json:"amount"`
 		}
 		var top *TopCat
-		if rows, err := d.Query(`SELECT t.category_id, COALESCE(c.name, 'Uncategorized'), SUM(t.amount) AS total
+		if rows, err := d.Query(`SELECT t.category_id, COALESCE(c.name, 'Uncategorized'), SUM(`+db.Spend("t")+`) AS total
 			FROM fin_transactions t
 			LEFT JOIN fin_categories c ON c.id = t.category_id
-			WHERE t.user_id = $1 AND t.type = 'expense' AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3
+			WHERE t.user_id = $1 AND t.type IN `+db.SpendTypes+` AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3
 			GROUP BY t.category_id, c.name
 			ORDER BY total DESC
 			LIMIT 1`, uid, startStr, endStr); err == nil {
@@ -1120,8 +1120,8 @@ func monthlySummary(deps Deps) http.HandlerFunc {
 
 		// Finance: total expense + top category for the month (IST day window).
 		var expenseTotal float64
-		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
+		d.QueryRow(`SELECT COALESCE(SUM(`+db.Spend("")+`),0) FROM fin_transactions
+			WHERE user_id = $1 AND type IN `+db.SpendTypes+` AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3`,
 			uid, firstStr, lastStr).Scan(&expenseTotal)
 		type TopCat struct {
 			ID     int64   `json:"id"`
@@ -1129,10 +1129,10 @@ func monthlySummary(deps Deps) http.HandlerFunc {
 			Amount float64 `json:"amount"`
 		}
 		var top *TopCat
-		if rows, err := d.Query(`SELECT t.category_id, COALESCE(c.name, 'Uncategorized'), SUM(t.amount) AS total
+		if rows, err := d.Query(`SELECT t.category_id, COALESCE(c.name, 'Uncategorized'), SUM(`+db.Spend("t")+`) AS total
 			FROM fin_transactions t
 			LEFT JOIN fin_categories c ON c.id = t.category_id
-			WHERE t.user_id = $1 AND t.type = 'expense' AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3
+			WHERE t.user_id = $1 AND t.type IN `+db.SpendTypes+` AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3
 			GROUP BY t.category_id, c.name
 			ORDER BY total DESC
 			LIMIT 1`, uid, firstStr, lastStr); err == nil {

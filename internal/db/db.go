@@ -529,6 +529,17 @@ func (d *DB) ensureSchema() error {
 		ON fin_slates(user_id) WHERE is_plain;
 	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_slates_user_id ON fin_slates(user_id, id);
 
+	-- type: expense | income | transfer_out | transfer_in | lend |
+	-- lend_repayment | refund | writeoff.
+	--   refund   = money back on a purchase. A credit to the account that
+	--              carries an expense category and nets off spending (never
+	--              income). refund_of optionally points at the original charge.
+	--   writeoff = the part of a lend the user forgave. Counts as spending on
+	--              the day it was forgiven but moves no money (the lend already
+	--              did), so balances and card statements ignore it.
+	-- split_of: set on the lend row cut from a bill the user shared ("Split").
+	-- The bill keeps its id and holds the user's share; bill + split rows sum
+	-- to the original charge, so balances and statements stay whole.
 	CREATE TABLE IF NOT EXISTS fin_transactions (
 		id              BIGSERIAL   PRIMARY KEY,
 		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -542,6 +553,8 @@ func (d *DB) ensureSchema() error {
 		transfer_pair   BIGINT,
 		linked_account  BIGINT      REFERENCES fin_accounts(id) ON DELETE SET NULL,
 		slate_id        BIGINT      NOT NULL,
+		split_of        BIGINT      REFERENCES fin_transactions(id),
+		refund_of       BIGINT      REFERENCES fin_transactions(id) ON DELETE SET NULL,
 		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		CONSTRAINT fk_fin_txn_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE CASCADE,
@@ -610,6 +623,13 @@ func (d *DB) ensureSchema() error {
 	-- One-time prod patch (2026-10 paid-for/settle). Delete once shipped.
 	ALTER TABLE fin_lends ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'lend';
 	ALTER TABLE fin_lend_repayments DROP CONSTRAINT IF EXISTS fin_lend_repayments_transaction_id_key;
+	-- One-time prod patch (2026-10 split/refund/forgive). Delete once shipped.
+	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS split_of BIGINT REFERENCES fin_transactions(id);
+	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS refund_of BIGINT REFERENCES fin_transactions(id) ON DELETE SET NULL;
+
+	-- A bill has at most one split row. (Kept below the patch above: it needs
+	-- the column on prod.)
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_transactions_split_of ON fin_transactions(split_of) WHERE split_of IS NOT NULL;
 
 	CREATE TABLE IF NOT EXISTS fin_budgets (
 		id          BIGSERIAL   PRIMARY KEY,

@@ -14,7 +14,7 @@ import (
 func listSlatesTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
 	rows, err := d.QueryContext(ctx, `SELECT s.id, s.name, s.is_plain,
 			COUNT(t.id),
-			COALESCE(SUM(t.amount) FILTER (WHERE t.type = 'expense'), 0)
+			COALESCE(SUM(`+db.Spend("t")+`) FILTER (WHERE t.type IN `+db.SpendTypes+`), 0)
 		FROM fin_slates s
 		LEFT JOIN fin_transactions t ON t.slate_id = s.id
 		WHERE s.user_id = $1 AND NOT s.archived

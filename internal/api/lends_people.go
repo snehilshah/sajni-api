@@ -28,6 +28,7 @@ type lendSettlementResp struct {
 	Account       string  `json:"account"`
 	Amount        float64 `json:"amount"`
 	Applied       float64 `json:"applied"`
+	Forgiven      bool    `json:"forgiven"` // a writeoff, not money received
 	Description   string  `json:"description"`
 	TxnAt         string  `json:"txn_at"`
 }
@@ -97,7 +98,7 @@ func loadLendPeople(r *http.Request, d *db.DB, uid string) ([]lendPersonResp, er
 
 	srows, err := d.QueryContext(ctx, `
 		SELECT LOWER(BTRIM(s.borrower)), s.id, t.id, t.account_id, a.name, t.amount, t.description, t.txn_at,
-		       COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r WHERE r.transaction_id = t.id),0)
+		       COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r WHERE r.transaction_id = t.id),0), t.type = 'writeoff'
 		FROM fin_lend_settlements s
 		JOIN fin_transactions t ON t.id = s.transaction_id
 		JOIN fin_accounts a ON a.id = t.account_id
@@ -110,7 +111,7 @@ func loadLendPeople(r *http.Request, d *db.DB, uid string) ([]lendPersonResp, er
 		var k string
 		var s lendSettlementResp
 		var at time.Time
-		if err := srows.Scan(&k, &s.ID, &s.TransactionID, &s.AccountID, &s.Account, &s.Amount, &s.Description, &at, &s.Applied); err != nil {
+		if err := srows.Scan(&k, &s.ID, &s.TransactionID, &s.AccountID, &s.Account, &s.Amount, &s.Description, &at, &s.Applied, &s.Forgiven); err != nil {
 			return nil, err
 		}
 		s.Amount = roundMoney(s.Amount)
@@ -161,7 +162,8 @@ func listLendCandidates(deps Deps) http.HandlerFunc {
 		clauses := []string{"t.user_id = $1", "t.type = $2", "t.transfer_pair IS NULL"}
 		args := []any{uid, typ}
 		if typ == "expense" {
-			clauses = append(clauses, "NOT EXISTS (SELECT 1 FROM fin_investment_contributions c WHERE c.txn_id = t.id)")
+			clauses = append(clauses, "NOT EXISTS (SELECT 1 FROM fin_investment_contributions c WHERE c.txn_id = t.id)",
+				"NOT EXISTS (SELECT 1 FROM fin_transactions sp WHERE sp.split_of = t.id)")
 		}
 		if v := queryParam(r, "account_id"); v != "" {
 			args = append(args, v)
@@ -235,6 +237,7 @@ func markPaidFor(deps Deps) http.HandlerFunc {
 			TransactionIDs []int64 `json:"transaction_ids"`
 			DueDate        *string `json:"due_date"` // absent → card cycle due date; "" → none
 			Remind         bool    `json:"remind"`
+			Share          float64 `json:"share"` // > 0, one transaction: their part of the bill
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid json")
@@ -253,7 +256,7 @@ func markPaidFor(deps Deps) http.HandlerFunc {
 			return
 		}
 		defer tx.Rollback()
-		ids, err := db.MarkPaidFor(ctx, tx, uid, body.Borrower, body.TransactionIDs, body.DueDate, body.Remind, userLocation(deps.DB, uid))
+		ids, err := db.MarkPaidFor(ctx, tx, uid, body.Borrower, body.TransactionIDs, body.DueDate, body.Remind, userLocation(deps.DB, uid), body.Share)
 		if err != nil {
 			lendError(w, r, "mark paid for", err)
 			return
@@ -337,5 +340,48 @@ func deleteSettlement(deps Deps) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}
+}
+
+// forgiveLends writes off part or all of what a person owes (db.Forgive).
+func forgiveLends(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		var body struct {
+			Borrower   string  `json:"borrower"`
+			Amount     float64 `json:"amount"`
+			CategoryID *int64  `json:"category_id"`
+			ForgivenAt string  `json:"forgiven_at"`
+			Note       string  `json:"note"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		ctx := r.Context()
+		if body.CategoryID != nil {
+			if err := requireOwnedFinanceRef(ctx, deps.DB, "fin_categories", uid, *body.CategoryID); err != nil {
+				errJSON(w, http.StatusNotFound, "That category no longer exists.")
+				return
+			}
+		}
+		tx, err := deps.DB.BeginTx(ctx, nil)
+		if err != nil {
+			internalError(w, r, "begin forgive", err)
+			return
+		}
+		defer tx.Rollback()
+		at := resolveTxnAt(body.ForgivenAt, userNow(deps.DB, uid))
+		txnID, err := db.Forgive(ctx, tx, uid, body.Borrower, body.Amount, body.CategoryID, at, body.Note)
+		if err != nil {
+			lendError(w, r, "forgive", err)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit forgive", err)
+			return
+		}
+		syncTags(deps.DB, uid, "transaction", txnID, body.Note)
+		writeJSON(w, http.StatusCreated, map[string]int64{"transaction_id": txnID})
 	}
 }
