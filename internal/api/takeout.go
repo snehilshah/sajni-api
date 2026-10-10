@@ -654,7 +654,7 @@ func takeoutImport(deps Deps) http.HandlerFunc {
 
 		zr, err := zip.NewReader(f, hdr.Size)
 		if err != nil {
-			errJSON(w, 400, "not a valid zip")
+			errJSON(w, 400, "That file isn't a valid Sajni export (.zip).")
 			return
 		}
 

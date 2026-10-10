@@ -147,19 +147,19 @@ func createBiller(deps Deps) http.HandlerFunc {
 			return
 		}
 		if strings.TrimSpace(body.Name) == "" {
-			errJSON(w, 400, "name required")
+			errJSON(w, 400, "Give the biller a name.")
 			return
 		}
 		if body.Kind == "" {
 			body.Kind = "subscription"
 		}
 		if !validBillerKind(body.Kind) {
-			errJSON(w, 400, "invalid kind")
+			errJSON(w, 400, "Pick subscription or bill.")
 			return
 		}
 		// Subscriptions have a fixed price; bills carry an optional estimate.
 		if body.Kind == "subscription" && body.Amount <= 0 {
-			errJSON(w, 400, "subscription needs a fixed amount")
+			errJSON(w, 400, "A subscription needs a fixed amount.")
 			return
 		}
 		// Bills never auto-pay — the amount isn't known until the bill lands.
@@ -170,7 +170,7 @@ func createBiller(deps Deps) http.HandlerFunc {
 			body.Frequency = "monthly"
 		}
 		if !validFrequency(body.Frequency) {
-			errJSON(w, 400, "invalid frequency")
+			errJSON(w, 400, "Pick how often it repeats.")
 			return
 		}
 		if body.NextDueDate == "" {
@@ -178,7 +178,7 @@ func createBiller(deps Deps) http.HandlerFunc {
 		}
 		due, err := time.Parse("2006-01-02", body.NextDueDate)
 		if err != nil {
-			errJSON(w, 400, "invalid next_due_date")
+			errJSON(w, 400, "Pick a valid next due date.")
 			return
 		}
 		if body.Color == "" {
@@ -189,7 +189,7 @@ func createBiller(deps Deps) http.HandlerFunc {
 			alertDays = *body.AlertDays
 		}
 		if body.AutoRenew && body.AccountID == nil {
-			errJSON(w, 400, "auto_renew requires account_id")
+			errJSON(w, 400, "Auto-renew needs an account to charge.")
 			return
 		}
 		for _, ref := range []struct {
@@ -247,7 +247,7 @@ func updateBiller(deps Deps) http.HandlerFunc {
 			return
 		}
 		if body.Kind != nil && !validBillerKind(*body.Kind) {
-			errJSON(w, 400, "invalid kind")
+			errJSON(w, 400, "Pick subscription or bill.")
 			return
 		}
 		for _, ref := range []struct {
@@ -277,7 +277,7 @@ func updateBiller(deps Deps) http.HandlerFunc {
 			effAmount = *body.Amount
 		}
 		if effKind == "subscription" && effAmount <= 0 {
-			errJSON(w, 400, "subscription needs a fixed amount")
+			errJSON(w, 400, "A subscription needs a fixed amount.")
 			return
 		}
 		if effKind == "bill" {
@@ -305,7 +305,7 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		}
 		if body.Frequency != nil {
 			if !validFrequency(*body.Frequency) {
-				errJSON(w, 400, "invalid frequency")
+				errJSON(w, 400, "Pick how often it repeats.")
 				return
 			}
 			add("frequency", *body.Frequency)
@@ -313,7 +313,7 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		if body.NextDueDate != nil {
 			due, err := time.Parse("2006-01-02", *body.NextDueDate)
 			if err != nil {
-				errJSON(w, 400, "invalid next_due_date")
+				errJSON(w, 400, "Pick a valid next due date.")
 				return
 			}
 			add("next_due_date", *body.NextDueDate)
@@ -424,7 +424,7 @@ func payBiller(deps Deps) http.HandlerFunc {
 			}
 		} else {
 			if !accountID.Valid {
-				errJSON(w, 400, "biller has no account; assign one before paying")
+				errJSON(w, 400, "This biller has no account. Pick one before paying.")
 				return
 			}
 			txnID, alreadyPaid, err = postBillerTxn(r.Context(), deps, uid, id, accountID.Int64, categoryID,

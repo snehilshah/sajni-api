@@ -676,7 +676,7 @@ func updateMedia(deps Deps) http.HandlerFunc {
 			seasonsTotal = value
 		}
 		if (episodesTotal > 0 && episodesWatched > episodesTotal) || (seasonsTotal > 0 && seasonsWatched > seasonsTotal) {
-			errJSON(w, 400, "watched count exceeds total")
+			errJSON(w, 400, "Watched can't be more than the total.")
 			return
 		}
 

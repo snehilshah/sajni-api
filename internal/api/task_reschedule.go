@@ -65,7 +65,7 @@ func rescheduleTaskDate(deps Deps) http.HandlerFunc {
 			return
 		}
 		if !oldDue.Valid {
-			errJSON(w, 400, "task has no day to reschedule")
+			errJSON(w, 400, "This task has no day to move.")
 			return
 		}
 		oldDate, err := time.ParseInLocation("2006-01-02", oldDue.String, loc)

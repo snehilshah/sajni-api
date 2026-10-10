@@ -73,7 +73,7 @@ func createTaskList(deps Deps) http.HandlerFunc {
 			return
 		}
 		if body.Name == "" {
-			errJSON(w, 400, "name required")
+			errJSON(w, 400, "Give the list a name.")
 			return
 		}
 		if body.Color == "" {

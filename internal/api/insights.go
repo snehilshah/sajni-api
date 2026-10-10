@@ -354,7 +354,7 @@ func detectSpendingSpikes(ctx context.Context, d *db.DB, uid string, cutoff stri
 		out = append(out, detected{
 			kind:  "spend_spike_" + label,
 			title: "Spending spike: " + label,
-			body: fmt.Sprintf("%s spend over the last %dd is %.0f vs an expected %.0f (+%.0f).",
+			body: fmt.Sprintf("%s spend over the last %dd is ₹%.2f vs an expected ₹%.2f (+₹%.2f).",
 				label, days, actual, expected, delta),
 			score:    (actual - expected) / expected,
 			evidence: map[string]any{"category": label, "actual": actual, "expected": expected},

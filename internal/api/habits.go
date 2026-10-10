@@ -117,7 +117,7 @@ func createHabit(deps Deps) http.HandlerFunc {
 			body.Frequency = "daily"
 		}
 		if !habitperiod.ValidFrequency(body.Frequency) {
-			errJSON(w, 400, "frequency must be daily, weekly, fortnightly, or monthly")
+			errJSON(w, 400, "Pick daily, weekly, fortnightly or monthly.")
 			return
 		}
 		if body.Color == "" {
@@ -155,7 +155,7 @@ func updateHabit(deps Deps) http.HandlerFunc {
 			return
 		}
 		if body.Frequency != nil && !habitperiod.ValidFrequency(*body.Frequency) {
-			errJSON(w, 400, "frequency must be daily, weekly, fortnightly, or monthly")
+			errJSON(w, 400, "Pick daily, weekly, fortnightly or monthly.")
 			return
 		}
 		if body.Name != nil {
@@ -225,7 +225,7 @@ func toggleHabitLogForDate(deps Deps) http.HandlerFunc {
 		}
 		// Backfilling past days is allowed; logging the future is not.
 		if date > userNow(d, uid).Format("2006-01-02") {
-			errJSON(w, 400, "cannot log a future date")
+			errJSON(w, 400, "You can't log a future day.")
 			return
 		}
 		toggleLog(d, uid, id, date, w)
@@ -256,7 +256,7 @@ func toggleHabitPeriodForDate(deps Deps) http.HandlerFunc {
 		period := habitperiod.ForDate(target, frequency)
 		current := habitperiod.ForDate(userNow(d, uid), frequency)
 		if period.Start.After(current.Start) {
-			errJSON(w, 400, "cannot log a future period")
+			errJSON(w, 400, "You can't log a future period.")
 			return
 		}
 

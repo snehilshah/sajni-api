@@ -66,7 +66,7 @@ func resolveSlateID(d *db.DB, uid string, requested *int64) (int64, string) {
 	d.QueryRow(`SELECT EXISTS (SELECT 1 FROM fin_slates WHERE id = $1 AND user_id = $2 AND NOT archived)`,
 		*requested, uid).Scan(&ok)
 	if !ok {
-		return 0, "slate not found"
+		return 0, "That slate no longer exists."
 	}
 	return *requested, ""
 }
@@ -140,14 +140,14 @@ func createSlate(deps Deps) http.HandlerFunc {
 		}
 		b.Name = strings.TrimSpace(b.Name)
 		if b.Name == "" {
-			errJSON(w, 400, "name required")
+			errJSON(w, 400, "Give the slate a name.")
 			return
 		}
 		var dup int
 		d.QueryRow(`SELECT 1 FROM fin_slates WHERE user_id = $1 AND LOWER(name) = LOWER($2) AND NOT archived`,
 			uid, b.Name).Scan(&dup)
 		if dup == 1 {
-			errJSON(w, 400, "a slate with that name already exists")
+			errJSON(w, 400, "A slate with that name already exists.")
 			return
 		}
 		if b.Color == "" {
@@ -189,13 +189,13 @@ func updateSlate(deps Deps) http.HandlerFunc {
 		// Plain is where everything lands by default; renaming or retiring it
 		// would leave the default with no name, so it stays fixed.
 		if isPlain {
-			errJSON(w, 400, "Plain cannot be renamed or archived")
+			errJSON(w, 400, "Plain can't be renamed or archived.")
 			return
 		}
 		if b.Name != nil {
 			n := strings.TrimSpace(*b.Name)
 			if n == "" {
-				errJSON(w, 400, "name required")
+				errJSON(w, 400, "Give the slate a name.")
 				return
 			}
 			d.Exec(`UPDATE fin_slates SET name = $1 WHERE id = $2 AND user_id = $3`, n, id, uid)
@@ -227,7 +227,7 @@ func moveTransactionsToSlate(deps Deps) http.HandlerFunc {
 			return
 		}
 		if len(b.TransactionIDs) == 0 {
-			errJSON(w, 400, "transaction_ids required")
+			errJSON(w, 400, "Select at least one transaction.")
 			return
 		}
 
@@ -278,7 +278,7 @@ func deleteSlate(deps Deps) http.HandlerFunc {
 			return
 		}
 		if isPlain {
-			errJSON(w, 400, "Plain cannot be deleted")
+			errJSON(w, 400, "Plain can't be deleted.")
 			return
 		}
 		var n int64

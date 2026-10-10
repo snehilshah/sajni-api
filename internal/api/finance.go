@@ -423,7 +423,7 @@ func deleteAccount(deps Deps) http.HandlerFunc {
 			return
 		}
 		if usedByLend {
-			errJSON(w, http.StatusConflict, "this account is used by a lend or repayment; remove the linked lending record first")
+			errJSON(w, http.StatusConflict, "This account has lending activity on it. Undo its lends, repayments and settlements in Lends first.")
 			return
 		}
 		if _, err := d.Exec("DELETE FROM fin_accounts WHERE id = $1 AND user_id = $2", id, uid); err != nil {
@@ -495,15 +495,15 @@ func createCategory(deps Deps) http.HandlerFunc {
 		}
 		b.Name = strings.TrimSpace(b.Name)
 		if b.Name == "" {
-			errJSON(w, 400, "category name is required")
+			errJSON(w, 400, "Give the category a name.")
 			return
 		}
 		if b.Kind != "expense" && b.Kind != "income" {
-			errJSON(w, 400, "category kind must be expense or income")
+			errJSON(w, 400, "A category is either expense or income.")
 			return
 		}
 		if isDefaultCategoryName(b.Kind, b.Name) || categoryNameExists(d, uid, b.Kind, b.Name, 0) {
-			errJSON(w, 409, "category already exists or is predefined for this type")
+			errJSON(w, 409, "A category with that name already exists.")
 			return
 		}
 		if b.Color == "" {
@@ -516,7 +516,7 @@ func createCategory(deps Deps) http.HandlerFunc {
 		).Scan(&id)
 		if err != nil {
 			if categoryNameExists(d, uid, b.Kind, b.Name, 0) {
-				errJSON(w, 409, "category already exists for this type")
+				errJSON(w, 409, "A category with that name already exists.")
 			} else {
 				errJSON(w, 500, err.Error())
 			}
@@ -552,16 +552,16 @@ func updateCategory(deps Deps) http.HandlerFunc {
 			}
 			name := strings.TrimSpace(*b.Name)
 			if name == "" {
-				errJSON(w, 400, "category name is required")
+				errJSON(w, 400, "Give the category a name.")
 				return
 			}
 			if categoryNameExists(d, uid, kind, name, id) || (categoryNameKey(currentName) != categoryNameKey(name) && isDefaultCategoryName(kind, name)) {
-				errJSON(w, 409, "category already exists or is predefined for this type")
+				errJSON(w, 409, "A category with that name already exists.")
 				return
 			}
 			if _, err := d.Exec("UPDATE fin_categories SET name = $1 WHERE id = $2 AND user_id = $3", name, id, uid); err != nil {
 				if categoryNameExists(d, uid, kind, name, id) {
-					errJSON(w, 409, "category already exists for this type")
+					errJSON(w, 409, "A category with that name already exists.")
 				} else {
 					errJSON(w, 500, err.Error())
 				}
@@ -760,7 +760,7 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		if b.AccountID == 0 {
-			errJSON(w, 400, "account_id required")
+			errJSON(w, 400, "Pick an account.")
 			return
 		}
 		ctx := r.Context()
@@ -795,11 +795,11 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			b.Type = "expense"
 		}
 		if b.Amount <= 0 {
-			errJSON(w, http.StatusBadRequest, "amount must be positive")
+			errJSON(w, http.StatusBadRequest, "Enter an amount above zero.")
 			return
 		}
 		if b.Type != "expense" && b.Type != "income" && b.Type != "transfer" {
-			errJSON(w, http.StatusBadRequest, "type must be expense, income, or transfer; use the lends endpoint for lending")
+			errJSON(w, http.StatusBadRequest, "Pick expense, income or transfer. Lending is managed from Lends.")
 			return
 		}
 		slateID, serrMsg := resolveSlateID(d, uid, b.SlateID)
@@ -812,7 +812,7 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		// Transfer: insert a pair (transfer_out from source, transfer_in to dest)
 		if b.Type == "transfer" {
 			if b.LinkedAccount == nil || *b.LinkedAccount == b.AccountID {
-				errJSON(w, 400, "transfer requires distinct linked_account")
+				errJSON(w, 400, "Pick a different account to transfer to.")
 				return
 			}
 			tx, err := d.Begin()
@@ -930,7 +930,7 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		if storedType == "lend" || storedType == "lend_repayment" {
-			errJSON(w, http.StatusConflict, "manage lending entries from Lends")
+			errJSON(w, http.StatusConflict, "This is a lending entry. Change it from Lends.")
 			return
 		}
 		for _, ref := range []struct {
@@ -1051,7 +1051,7 @@ func deleteTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		if storedType == "lend" || storedType == "lend_repayment" {
-			errJSON(w, http.StatusConflict, "manage lending entries from Lends")
+			errJSON(w, http.StatusConflict, "This is a lending entry. Change it from Lends.")
 			return
 		}
 		// delete pair if any
@@ -1439,16 +1439,16 @@ func validInvestmentType(t string) bool {
 // debit, a per-cycle amount, and a recurring frequency.
 func validateAutoDebit(accountID *int64, monthlyAmount float64, frequency string) string {
 	if accountID == nil {
-		return "auto-debit needs a linked account"
+		return "Auto-debit needs an account to debit from."
 	}
 	if monthlyAmount <= 0 {
-		return "auto-debit needs a per-cycle amount"
+		return "Auto-debit needs an amount per cycle."
 	}
 	switch frequency {
 	case "monthly", "quarterly", "yearly":
 		return ""
 	}
-	return "auto-debit needs a recurring frequency (monthly/quarterly/yearly)"
+	return "Auto-debit needs a monthly, quarterly or yearly frequency."
 }
 
 func createInvestment(deps Deps) http.HandlerFunc {
@@ -1478,7 +1478,7 @@ func createInvestment(deps Deps) http.HandlerFunc {
 			b.Type = "sip"
 		}
 		if !validInvestmentType(b.Type) {
-			errJSON(w, 400, "invalid investment type")
+			errJSON(w, 400, "Pick an investment type.")
 			return
 		}
 		// Recurring contributions (sip/rd) default monthly; the rest one-off.
@@ -1520,7 +1520,7 @@ func createInvestment(deps Deps) http.HandlerFunc {
 		if nextDebit != nil && *nextDebit != "" {
 			next, err := time.Parse("2006-01-02", *nextDebit)
 			if err != nil {
-				errJSON(w, 400, "invalid next_debit_date")
+				errJSON(w, 400, "Pick a valid next debit date.")
 				return
 			}
 			anchorDay = next.Day()
@@ -1570,7 +1570,7 @@ func updateInvestment(deps Deps) http.HandlerFunc {
 			return
 		}
 		if b.Type != nil && !validInvestmentType(*b.Type) {
-			errJSON(w, 400, "invalid investment type")
+			errJSON(w, 400, "Pick an investment type.")
 			return
 		}
 		if b.AccountID != nil {
@@ -1664,7 +1664,7 @@ func updateInvestment(deps Deps) http.HandlerFunc {
 		if b.NextDebitDate != nil && *b.NextDebitDate != "" {
 			next, err := time.Parse("2006-01-02", *b.NextDebitDate)
 			if err != nil {
-				errJSON(w, 400, "invalid next_debit_date")
+				errJSON(w, 400, "Pick a valid next debit date.")
 				return
 			}
 			add("next_debit_date", *b.NextDebitDate)

@@ -87,7 +87,7 @@ func getTagEntities(deps Deps) http.HandlerFunc {
 				} else {
 					e.Title = ttype
 				}
-				e.Subtitle = fmt.Sprintf("₹%.0f · %s", amount, ttype)
+				e.Subtitle = fmt.Sprintf("₹%.2f · %s", amount, ttype)
 			case "media":
 				d.QueryRow("SELECT title, type FROM media WHERE user_id = $1 AND id = $2", uid, e.ID).Scan(&e.Title, &e.Kind)
 			case "bookmark":

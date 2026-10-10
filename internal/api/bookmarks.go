@@ -112,7 +112,7 @@ func createBookmark(deps Deps) http.HandlerFunc {
 		}
 		u, err := url.Parse(strings.TrimSpace(body.URL))
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			errJSON(w, 400, "invalid url")
+			errJSON(w, 400, "That doesn't look like a valid link.")
 			return
 		}
 

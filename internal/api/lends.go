@@ -164,12 +164,12 @@ func createLend(deps Deps) http.HandlerFunc {
 		}
 		borrower := strings.TrimSpace(body.Borrower)
 		if borrower == "" || body.SourceAccountID == 0 || body.Amount <= 0 {
-			errJSON(w, http.StatusBadRequest, "borrower, source_account_id and a positive amount are required")
+			errJSON(w, http.StatusBadRequest, "Enter who it's for, the account it came from and an amount above zero.")
 			return
 		}
 		if body.DueDate != nil && *body.DueDate != "" {
 			if _, err := time.Parse("2006-01-02", *body.DueDate); err != nil {
-				errJSON(w, http.StatusBadRequest, "invalid due_date")
+				errJSON(w, http.StatusBadRequest, "Pick a valid due date.")
 				return
 			}
 		}
@@ -181,7 +181,7 @@ func createLend(deps Deps) http.HandlerFunc {
 		}
 		defer tx.Rollback()
 		if err := requireOwnedFinanceRef(ctx, tx, "fin_accounts", uid, body.SourceAccountID); err != nil {
-			errJSON(w, http.StatusNotFound, "account not found")
+			errJSON(w, http.StatusNotFound, "That account no longer exists.")
 			return
 		}
 		plainID, err := plainSlateID(deps.DB, uid)
@@ -250,24 +250,24 @@ func updateLend(deps Deps) http.HandlerFunc {
 			Remind          bool     `json:"remind"`
 		}
 		if err := readJSON(r, &body); err != nil || strings.TrimSpace(body.Borrower) == "" {
-			errJSON(w, http.StatusBadRequest, "borrower required")
+			errJSON(w, http.StatusBadRequest, "Enter who it's for.")
 			return
 		}
 		if body.DueDate != "" {
 			if _, err := time.Parse("2006-01-02", body.DueDate); err != nil {
-				errJSON(w, http.StatusBadRequest, "invalid due_date")
+				errJSON(w, http.StatusBadRequest, "Pick a valid due date.")
 				return
 			}
 		}
 		if body.Amount != nil && *body.Amount <= 0 {
-			errJSON(w, http.StatusBadRequest, "amount must be positive")
+			errJSON(w, http.StatusBadRequest, "Enter an amount above zero.")
 			return
 		}
 		var requestedLentAt *time.Time
 		if body.LentAt != nil {
 			parsed, err := time.Parse(time.RFC3339, *body.LentAt)
 			if err != nil {
-				errJSON(w, http.StatusBadRequest, "invalid lent_at")
+				errJSON(w, http.StatusBadRequest, "Pick a valid date.")
 				return
 			}
 			requestedLentAt = &parsed
@@ -289,7 +289,7 @@ func updateLend(deps Deps) http.HandlerFunc {
 			FROM fin_lends l WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE`, id, uid,
 		).Scan(&txnID, &sourceAccountID, &principal, &lentAt, &oldBorrower, &repaid); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				errJSON(w, http.StatusNotFound, "lend not found")
+				errJSON(w, http.StatusNotFound, "That lend no longer exists.")
 			} else {
 				internalError(w, r, "update lend", err)
 			}
@@ -297,7 +297,7 @@ func updateLend(deps Deps) http.HandlerFunc {
 		}
 		if body.SourceAccountID != nil {
 			if err := requireOwnedFinanceRef(ctx, tx, "fin_accounts", uid, *body.SourceAccountID); err != nil {
-				errJSON(w, http.StatusNotFound, "account not found")
+				errJSON(w, http.StatusNotFound, "That account no longer exists.")
 				return
 			}
 			sourceAccountID = *body.SourceAccountID
@@ -306,7 +306,7 @@ func updateLend(deps Deps) http.HandlerFunc {
 			principal = roundMoney(*body.Amount)
 		}
 		if principal < roundMoney(repaid) {
-			errJSON(w, http.StatusBadRequest, fmt.Sprintf("principal cannot be below the %.2f already repaid", roundMoney(repaid)))
+			errJSON(w, http.StatusBadRequest, fmt.Sprintf("Principal can't be below the ₹%.2f already repaid.", roundMoney(repaid)))
 			return
 		}
 		if requestedLentAt != nil {
@@ -363,7 +363,7 @@ func createLendRepayment(deps Deps) http.HandlerFunc {
 			Note                 string  `json:"note"`
 		}
 		if err := readJSON(r, &body); err != nil || body.Amount <= 0 {
-			errJSON(w, http.StatusBadRequest, "positive amount required")
+			errJSON(w, http.StatusBadRequest, "Enter an amount above zero.")
 			return
 		}
 		ctx := r.Context()
@@ -384,7 +384,7 @@ func createLendRepayment(deps Deps) http.HandlerFunc {
 			WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE`, lendID, uid,
 		).Scan(&borrower, &sourceAccountID, &sourceAccountType, &principal, &repaid, &plainID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				errJSON(w, http.StatusNotFound, "lend not found")
+				errJSON(w, http.StatusNotFound, "That lend no longer exists.")
 			} else {
 				internalError(w, r, "find lend", err)
 			}
@@ -403,13 +403,13 @@ func createLendRepayment(deps Deps) http.HandlerFunc {
 			}
 		}
 		if err := requireOwnedFinanceRef(ctx, tx, "fin_accounts", uid, body.DestinationAccountID); err != nil {
-			errJSON(w, http.StatusNotFound, "destination account not found")
+			errJSON(w, http.StatusNotFound, "That account no longer exists.")
 			return
 		}
 		outstanding := roundMoney(principal - repaid)
 		amount := roundMoney(body.Amount)
 		if amount > outstanding {
-			errJSON(w, http.StatusBadRequest, fmt.Sprintf("repayment exceeds outstanding amount %.2f", outstanding))
+			errJSON(w, http.StatusBadRequest, fmt.Sprintf("That's more than the ₹%.2f still owed.", outstanding))
 			return
 		}
 		repaidAt := resolveTxnAt(body.RepaidAt, userNow(deps.DB, uid))
@@ -480,7 +480,7 @@ func deleteLendRepayment(deps Deps) http.HandlerFunc {
 		if err := tx.QueryRowContext(ctx, `DELETE FROM fin_lend_repayments
 			WHERE id=$1 AND lend_id=$2 AND user_id=$3 RETURNING transaction_id`, repaymentID, lendID, uid).Scan(&txnID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				errJSON(w, http.StatusNotFound, "repayment not found")
+				errJSON(w, http.StatusNotFound, "That repayment no longer exists.")
 			} else {
 				internalError(w, r, "delete repayment", err)
 			}
@@ -518,7 +518,7 @@ func deleteLend(deps Deps) http.HandlerFunc {
 		var borrower, origin string
 		if err := tx.QueryRowContext(ctx, `SELECT source_transaction_id, borrower, origin FROM fin_lends WHERE id=$1 AND user_id=$2 FOR UPDATE`, lendID, uid).Scan(&sourceTxnID, &borrower, &origin); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				errJSON(w, http.StatusNotFound, "lend not found")
+				errJSON(w, http.StatusNotFound, "That lend no longer exists.")
 			} else {
 				internalError(w, r, "find lend", err)
 			}

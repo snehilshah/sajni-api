@@ -190,11 +190,11 @@ func createEvent(deps Deps) http.HandlerFunc {
 		body.Color = strings.TrimSpace(body.Color)
 		body.Icon = strings.TrimSpace(body.Icon)
 		if body.Name == "" {
-			errJSON(w, http.StatusBadRequest, "name is required")
+			errJSON(w, http.StatusBadRequest, "Give the event a name.")
 			return
 		}
 		if len(body.Variables) > maxEventVariables {
-			errJSON(w, http.StatusBadRequest, "an event can have at most 6 variables")
+			errJSON(w, http.StatusBadRequest, "An event can have at most 6 variables.")
 			return
 		}
 		if body.Color == "" {
@@ -224,7 +224,7 @@ func createEvent(deps Deps) http.HandlerFunc {
 		for index, variable := range body.Variables {
 			name := strings.TrimSpace(variable.Name)
 			if name == "" {
-				errJSON(w, http.StatusBadRequest, "variable name is required")
+				errJSON(w, http.StatusBadRequest, "Give the variable a name.")
 				return
 			}
 			if _, err := tx.ExecContext(r.Context(), `
@@ -276,7 +276,7 @@ func updateEvent(deps Deps) http.HandlerFunc {
 		if body.Name != nil {
 			name := strings.TrimSpace(*body.Name)
 			if name == "" {
-				errJSON(w, http.StatusBadRequest, "name is required")
+				errJSON(w, http.StatusBadRequest, "Give the event a name.")
 				return
 			}
 			args = append(args, name)
@@ -376,7 +376,7 @@ func createEventVariable(deps Deps) http.HandlerFunc {
 		body.Name = strings.TrimSpace(body.Name)
 		body.Unit = strings.TrimSpace(body.Unit)
 		if body.Name == "" {
-			errJSON(w, http.StatusBadRequest, "variable name is required")
+			errJSON(w, http.StatusBadRequest, "Give the variable a name.")
 			return
 		}
 		var count int
@@ -390,7 +390,7 @@ func createEventVariable(deps Deps) http.HandlerFunc {
 			return
 		}
 		if count >= maxEventVariables {
-			errJSON(w, http.StatusBadRequest, "an event can have at most 6 variables")
+			errJSON(w, http.StatusBadRequest, "An event can have at most 6 variables.")
 			return
 		}
 
@@ -434,7 +434,7 @@ func updateEventVariable(deps Deps) http.HandlerFunc {
 		if body.Name != nil {
 			name := strings.TrimSpace(*body.Name)
 			if name == "" {
-				errJSON(w, http.StatusBadRequest, "variable name is required")
+				errJSON(w, http.StatusBadRequest, "Give the variable a name.")
 				return
 			}
 			if _, err := d.ExecContext(r.Context(), `

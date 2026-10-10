@@ -646,7 +646,7 @@ func createTask(deps Deps) http.HandlerFunc {
 		}
 		if body.Status == "blocked" {
 			if body.BlockedByTaskID == nil || validateTaskBlocker(d, uid, 0, *body.BlockedByTaskID) != nil {
-				errJSON(w, 400, "blocked task requires an active blocker")
+				errJSON(w, 400, "Pick the open task that's blocking this one.")
 				return
 			}
 		} else {
@@ -840,7 +840,7 @@ func updateTask(deps Deps) http.HandlerFunc {
 			proposedBlocker = sql.NullInt64{}
 		}
 		if proposedStatus == "blocked" && (!proposedBlocker.Valid || validateTaskBlocker(q, uid, id, proposedBlocker.Int64) != nil) {
-			errJSON(w, 400, "blocked task requires an active, cycle-safe blocker")
+			errJSON(w, 400, "Pick an open task that isn't itself waiting on this one.")
 			return
 		}
 		if proposedStatus == "done" && currentStatus != "done" {

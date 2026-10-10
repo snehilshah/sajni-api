@@ -515,7 +515,7 @@ func updateThinkingCard(deps Deps) http.HandlerFunc {
 			return
 		}
 		if body.Kind != nil && status == "closed" && normalizeKind(*body.Kind) != oldKind {
-			errJSON(w, 409, "reopen the card before changing its kind")
+			errJSON(w, 409, "Reopen the card before changing its kind.")
 			return
 		}
 		if body.Kind != nil {

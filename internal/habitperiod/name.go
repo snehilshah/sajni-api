@@ -14,10 +14,10 @@ const NameMax = 20
 func CleanName(name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return "", fmt.Errorf("name is required")
+		return "", fmt.Errorf("Give the habit a name.")
 	}
 	if utf8.RuneCountInString(name) > NameMax {
-		return "", fmt.Errorf("name must be %d characters or fewer", NameMax)
+		return "", fmt.Errorf("Habit names can be at most %d characters.", NameMax)
 	}
 	return name, nil
 }

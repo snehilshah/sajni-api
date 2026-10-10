@@ -242,7 +242,7 @@ func markPaidFor(deps Deps) http.HandlerFunc {
 		}
 		if body.DueDate != nil && *body.DueDate != "" {
 			if _, err := time.Parse("2006-01-02", *body.DueDate); err != nil {
-				errJSON(w, http.StatusBadRequest, "invalid due_date")
+				errJSON(w, http.StatusBadRequest, "Pick a valid due date.")
 				return
 			}
 		}

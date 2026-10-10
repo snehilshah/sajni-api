@@ -30,7 +30,7 @@ func uploadFile(deps Deps) http.HandlerFunc {
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) || errors.Is(err, multipart.ErrMessageTooLarge) {
-				errJSON(w, http.StatusRequestEntityTooLarge, "file exceeds 10 MiB limit")
+				errJSON(w, http.StatusRequestEntityTooLarge, "Files can be at most 10 MB.")
 				return
 			}
 			errJSON(w, http.StatusBadRequest, "invalid multipart form")
@@ -42,7 +42,7 @@ func uploadFile(deps Deps) http.HandlerFunc {
 
 		file, header, err := r.FormFile("file")
 		if err != nil {
-			errJSON(w, 400, "no file uploaded")
+			errJSON(w, 400, "Choose a file to upload.")
 			return
 		}
 		defer file.Close()
@@ -53,7 +53,7 @@ func uploadFile(deps Deps) http.HandlerFunc {
 			return
 		}
 		if int64(len(data)) > maxUploadBytes {
-			errJSON(w, http.StatusRequestEntityTooLarge, "file exceeds 10 MiB limit")
+			errJSON(w, http.StatusRequestEntityTooLarge, "Files can be at most 10 MB.")
 			return
 		}
 

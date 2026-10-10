@@ -49,7 +49,7 @@ func CardCycleDue(at time.Time, statementDay, dueDay int) time.Time {
 func MarkPaidFor(ctx context.Context, tx *sql.Tx, uid, borrower string, txnIDs []int64, dueDate *string, remind bool, loc *time.Location) ([]int64, error) {
 	borrower = strings.TrimSpace(borrower)
 	if borrower == "" || len(txnIDs) == 0 {
-		return nil, lendErr("borrower and transactions required")
+		return nil, lendErr("Pick a person and at least one transaction.")
 	}
 	var ids []int64
 	for _, txnID := range txnIDs {
@@ -67,13 +67,13 @@ func MarkPaidFor(ctx context.Context, tx *sql.Tx, uid, borrower string, txnIDs [
 			WHERE t.id = $1 AND t.user_id = $2 FOR UPDATE OF t`, txnID, uid,
 		).Scan(&typ, &amount, &accountID, &description, &note, &at, &transferPair, &accountType, &statementDay, &dueDay, &invested)
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, lendErr("transaction %d not found", txnID)
+			return nil, lendErr("A selected transaction no longer exists (#%d).", txnID)
 		}
 		if err != nil {
 			return nil, err
 		}
 		if typ != "expense" || transferPair.Valid || invested {
-			return nil, lendErr("only plain expenses can be marked paid for (transaction %d)", txnID)
+			return nil, lendErr("Only plain expenses can be marked paid for (#%d is already a lend, transfer or income).", txnID)
 		}
 		var due any
 		switch {
@@ -105,25 +105,25 @@ func MarkPaidFor(ctx context.Context, tx *sql.Tx, uid, borrower string, txnIDs [
 func SettleWith(ctx context.Context, tx *sql.Tx, uid, borrower string, txnIDs []int64) error {
 	borrower = strings.TrimSpace(borrower)
 	if borrower == "" || len(txnIDs) == 0 {
-		return lendErr("borrower and transactions required")
+		return lendErr("Pick a person and at least one transaction.")
 	}
 	var known bool
 	tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_lends WHERE user_id = $1 AND `+borrowerMatch+`)`, uid, borrower).Scan(&known)
 	if !known {
-		return lendErr("nothing is owed by %s", borrower)
+		return lendErr("%s doesn't owe anything right now.", borrower)
 	}
 	for _, txnID := range txnIDs {
 		var typ string
 		var transferPair sql.NullInt64
 		err := tx.QueryRowContext(ctx, `SELECT type, transfer_pair FROM fin_transactions WHERE id = $1 AND user_id = $2 FOR UPDATE`, txnID, uid).Scan(&typ, &transferPair)
 		if errors.Is(err, sql.ErrNoRows) {
-			return lendErr("transaction %d not found", txnID)
+			return lendErr("A selected transaction no longer exists (#%d).", txnID)
 		}
 		if err != nil {
 			return err
 		}
 		if typ != "income" || transferPair.Valid {
-			return lendErr("only plain credits can settle (transaction %d)", txnID)
+			return lendErr("Only plain income can settle a lend (#%d is already linked to something else).", txnID)
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET type = 'lend_repayment', updated_at = NOW() WHERE id = $1 AND user_id = $2`, txnID, uid); err != nil {
 			return err
@@ -140,7 +140,7 @@ func SettleWith(ctx context.Context, tx *sql.Tx, uid, borrower string, txnIDs []
 func RecordSettlement(ctx context.Context, tx *sql.Tx, uid, borrower string, accountID int64, amount float64, at time.Time, note string) (int64, error) {
 	borrower = strings.TrimSpace(borrower)
 	if borrower == "" || accountID == 0 || amount <= 0 {
-		return 0, lendErr("borrower, account and a positive amount are required")
+		return 0, lendErr("Enter who it's from, an account and an amount above zero.")
 	}
 	var txnID int64
 	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_at)
@@ -148,7 +148,7 @@ func RecordSettlement(ctx context.Context, tx *sql.Tx, uid, borrower string, acc
 		uid, accountID, math.Round(amount*100)/100, "Received from "+borrower, strings.TrimSpace(note), at,
 	).Scan(&txnID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return 0, lendErr("account not found")
+			return 0, lendErr("That account no longer exists.")
 		}
 		return 0, err
 	}
@@ -161,7 +161,7 @@ func Unsettle(ctx context.Context, tx *sql.Tx, uid string, settlementID int64) e
 	var txnID int64
 	err := tx.QueryRowContext(ctx, `DELETE FROM fin_lend_settlements WHERE id = $1 AND user_id = $2 RETURNING borrower, transaction_id`, settlementID, uid).Scan(&borrower, &txnID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return lendErr("settlement not found")
+		return lendErr("That settlement no longer exists.")
 	}
 	if err != nil {
 		return err
@@ -182,13 +182,13 @@ func UnmarkPaidFor(ctx context.Context, tx *sql.Tx, uid string, lendID int64) er
 	var txnID int64
 	err := tx.QueryRowContext(ctx, `SELECT borrower, origin, source_transaction_id FROM fin_lends WHERE id = $1 AND user_id = $2 FOR UPDATE`, lendID, uid).Scan(&borrower, &origin, &txnID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return lendErr("lend not found")
+		return lendErr("That lend no longer exists.")
 	}
 	if err != nil {
 		return err
 	}
 	if origin != "paid_for" {
-		return lendErr("lend was not marked from a transaction")
+		return lendErr("This lend wasn't made from a transaction, so there's nothing to undo. Delete it instead.")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET type = 'income', updated_at = NOW()
 		WHERE user_id = $1 AND id IN (
