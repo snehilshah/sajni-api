@@ -566,6 +566,8 @@ func (d *DB) ensureSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_account ON fin_transactions(account_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_at ON fin_transactions(user_id, txn_at);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_slate ON fin_transactions(user_id, slate_id);
+	-- A bill has at most one split row.
+	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_transactions_split_of ON fin_transactions(split_of) WHERE split_of IS NOT NULL;
 
 	-- A lend is a receivable, not spending. source_transaction_id is the
 	-- account outflow; repayments each own an account inflow. Keeping those
@@ -619,17 +621,6 @@ func (d *DB) ensureSchema() error {
 		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_lend_settlements_borrower ON fin_lend_settlements(user_id, LOWER(BTRIM(borrower)));
-
-	-- One-time prod patch (2026-10 paid-for/settle). Delete once shipped.
-	ALTER TABLE fin_lends ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'lend';
-	ALTER TABLE fin_lend_repayments DROP CONSTRAINT IF EXISTS fin_lend_repayments_transaction_id_key;
-	-- One-time prod patch (2026-10 split/refund/forgive). Delete once shipped.
-	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS split_of BIGINT REFERENCES fin_transactions(id);
-	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS refund_of BIGINT REFERENCES fin_transactions(id) ON DELETE SET NULL;
-
-	-- A bill has at most one split row. (Kept below the patch above: it needs
-	-- the column on prod.)
-	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_transactions_split_of ON fin_transactions(split_of) WHERE split_of IS NOT NULL;
 
 	CREATE TABLE IF NOT EXISTS fin_budgets (
 		id          BIGSERIAL   PRIMARY KEY,

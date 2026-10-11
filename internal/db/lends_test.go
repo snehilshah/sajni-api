@@ -46,10 +46,6 @@ func TestPaidForSettleFlow(t *testing.T) {
 		}
 	}
 
-	// Upgrade path: an old database still has the unique constraint.
-	d.Exec(`ALTER TABLE fin_lend_repayments ADD CONSTRAINT fin_lend_repayments_transaction_id_key UNIQUE (transaction_id)`)
-	must(d.ensureSchema())
-
 	uid := "01900000-0000-7000-8000-000000000001"
 	d.Exec(`DELETE FROM users WHERE id = $1`, uid)
 	must(exec(d, `INSERT INTO users (id, email, name) VALUES ($1, 'lends@test', 'T')`, uid))
