@@ -235,32 +235,27 @@ The same non-sensitive values are tracked in `github-variables.env`; run
 
 ---
 
-## Scheduler cleanup
+## Scheduler jobs
 
-Reminders are delivered by Cloud Tasks now. Keep the old reminder
-Cloud Scheduler job only as a safety sweep, and slow it down from
-`*/5` to once daily:
+| Job | Schedule | Target |
+| --- | --- | --- |
+| `sajni-digest` | `*/15 * * * *` UTC | `/internal/notifications/run` (see below) |
+| `sajni-reminders` | `*/5 * * * *` UTC | `/internal/reminders/run`, a safety sweep behind Cloud Tasks |
+
+Both send `X-Reminder-Cron: $REMINDER_CRON_SECRET`; that is the only
+webhook secret. Insights have no job: they regenerate when the user
+presses Run in Analytics → Insights.
+
+Reminders are delivered by Cloud Tasks, so the reminder sweep only catches
+missed deliveries. Slow it to once a day, and delete it after a month of
+clean logs:
 
 ```sh
-gcloud scheduler jobs list --location="$REGION"
-gcloud scheduler jobs update http REMINDER_JOB_NAME \
+gcloud scheduler jobs update http sajni-reminders \
   --location="$REGION" \
   --schedule="0 3 * * *" \
   --time-zone="Asia/Kolkata"
 ```
-
-Trading (and with it stock/ETF price fetching) was removed in 2026-07.
-Delete the old price scheduler job and its secret after this revision
-is deployed:
-
-```sh
-gcloud scheduler jobs delete PRICE_JOB_NAME --location="$REGION"
-gcloud secrets delete PRICE_CRON_SECRET
-```
-
-After a month of clean reminder logs, you can delete the daily reminder
-sweep too. Until then it catches missed Cloud Tasks deliveries with the
-same idempotency gates.
 
 ## Scheduled notifications
 
@@ -338,7 +333,16 @@ make docker-run # build the Cloud Run image and run with .env
 
 `make setup` is safe to rerun: it does not overwrite existing values and fixes
 `.env` permissions to `600`. Optional integrations such as TMDB, Gemini,
-Google Places, Cloud Tasks, and Firebase may stay blank in local development.
+Cloud Tasks, and Firebase may stay blank in local development.
+
+### Prod `.env` (ops only)
+
+`.env` may instead hold the prod values pulled from Secret Manager, for
+one-off prod work such as migrations, never for testing. Rebuild it with
+`gcloud secrets versions access latest --secret=NAME` for each secret
+listed above, with `APP_ENV=local` and `COOKIE_INSECURE=1`. Leave
+`REMINDER_CRON_SECRET` and the Cloud Tasks vars blank: config validation
+requires them together, and a local run must never enqueue prod reminders.
 
 All AI features in web and Android use the shared backend model
 `gemini-3.8-flash`, pinned in `internal/config/config.go`. A model change takes

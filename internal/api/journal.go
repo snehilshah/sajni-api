@@ -1,11 +1,8 @@
 package api
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -38,11 +35,6 @@ func registerJournalRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("PUT /api/journal/{date}", upsertJournalEntry(deps))
 	mux.HandleFunc("DELETE /api/journal/{date}", deleteJournalEntry(deps))
 
-	// Places lookup — proxies Google Places (New) so the API key never
-	// reaches the browser. Both endpoints expect a `session` token so the
-	// autocomplete + details pair is billed as a single session.
-	mux.HandleFunc("GET /api/places/autocomplete", placesAutocomplete(deps))
-	mux.HandleFunc("GET /api/places/details", placesDetails(deps))
 }
 
 func journalKey(uid string, date string) string {
@@ -314,161 +306,6 @@ func upsertJournalEntry(deps Deps) http.HandlerFunc {
 		syncTags(d, uid, "journal", id, body.Content)
 		syncBacklinks(d, uid, "journal", id, body.Content)
 		writeJSON(w, 200, map[string]int64{"id": id})
-	}
-}
-
-// --- Google Places (New) proxy --------------------------------------------
-//
-// Cost model: passing a `session` token bundles autocomplete + a single
-// details call into one "session" priced at the Place Details tier
-// (~$5/1k for basic data, FREE under the Essentials SKU when we only
-// ask for `id,displayName,location`). Without the token every keystroke
-// is its own ~$3/1k charge — so the frontend MUST pass session.
-
-var placesHTTP = &http.Client{Timeout: 6 * time.Second}
-
-func placesAutocomplete(deps Deps) http.HandlerFunc {
-	key := deps.Media.GooglePlacesAPIKey
-	return func(w http.ResponseWriter, r *http.Request) {
-		if key == "" {
-			errJSON(w, 503, "places not configured")
-			return
-		}
-		q := strings.TrimSpace(queryParam(r, "q"))
-		if len(q) < 2 {
-			writeJSON(w, 200, map[string]any{"predictions": []any{}})
-			return
-		}
-		session := queryParam(r, "session")
-		lat := queryParam(r, "lat")
-		lon := queryParam(r, "lon")
-
-		body := map[string]any{
-			"input":        q,
-			"sessionToken": session,
-			// Bias toward "small label" results — establishments and POIs
-			// beat full street addresses for journal pills.
-			"includedPrimaryTypes": []string{"establishment", "point_of_interest"},
-		}
-		if lat != "" && lon != "" {
-			body["locationBias"] = map[string]any{
-				"circle": map[string]any{
-					"center": map[string]string{"latitude": lat, "longitude": lon},
-					"radius": 50000,
-				},
-			}
-		}
-		buf, _ := json.Marshal(body)
-		req, _ := http.NewRequestWithContext(r.Context(), "POST",
-			"https://places.googleapis.com/v1/places:autocomplete", bytes.NewReader(buf))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Goog-Api-Key", key)
-		// Trim the field mask to just what the UI needs — billing scales
-		// with returned fields.
-		req.Header.Set("X-Goog-FieldMask",
-			"suggestions.placePrediction.placeId,"+
-				"suggestions.placePrediction.structuredFormat.mainText,"+
-				"suggestions.placePrediction.structuredFormat.secondaryText")
-
-		resp, err := placesHTTP.Do(req)
-		if err != nil {
-			errJSON(w, 502, err.Error())
-			return
-		}
-		defer resp.Body.Close()
-		raw, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode >= 400 {
-			http.Error(w, string(raw), resp.StatusCode)
-			return
-		}
-		var parsed struct {
-			Suggestions []struct {
-				PlacePrediction struct {
-					PlaceID          string `json:"placeId"`
-					StructuredFormat struct {
-						MainText struct {
-							Text string `json:"text"`
-						} `json:"mainText"`
-						SecondaryText struct {
-							Text string `json:"text"`
-						} `json:"secondaryText"`
-					} `json:"structuredFormat"`
-				} `json:"placePrediction"`
-			} `json:"suggestions"`
-		}
-		json.Unmarshal(raw, &parsed)
-		out := make([]map[string]string, 0, len(parsed.Suggestions))
-		for _, s := range parsed.Suggestions {
-			out = append(out, map[string]string{
-				"place_id":  s.PlacePrediction.PlaceID,
-				"primary":   s.PlacePrediction.StructuredFormat.MainText.Text,
-				"secondary": s.PlacePrediction.StructuredFormat.SecondaryText.Text,
-			})
-		}
-		writeJSON(w, 200, map[string]any{"predictions": out})
-	}
-}
-
-func placesDetails(deps Deps) http.HandlerFunc {
-	key := deps.Media.GooglePlacesAPIKey
-	return func(w http.ResponseWriter, r *http.Request) {
-		if key == "" {
-			errJSON(w, 503, "places not configured")
-			return
-		}
-		placeID := queryParam(r, "place_id")
-		if placeID == "" {
-			errJSON(w, 400, "missing place_id")
-			return
-		}
-		session := queryParam(r, "session")
-		url := "https://places.googleapis.com/v1/places/" + placeID
-		if session != "" {
-			url += "?sessionToken=" + session
-		}
-		req, _ := http.NewRequestWithContext(r.Context(), "GET", url, nil)
-		req.Header.Set("X-Goog-Api-Key", key)
-		req.Header.Set("X-Goog-FieldMask", "id,displayName,location,shortFormattedAddress")
-		resp, err := placesHTTP.Do(req)
-		if err != nil {
-			errJSON(w, 502, err.Error())
-			return
-		}
-		defer resp.Body.Close()
-		raw, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode >= 400 {
-			http.Error(w, string(raw), resp.StatusCode)
-			return
-		}
-		var parsed struct {
-			ID          string `json:"id"`
-			DisplayName struct {
-				Text string `json:"text"`
-			} `json:"displayName"`
-			ShortFormattedAddress string `json:"shortFormattedAddress"`
-			Location              struct {
-				Latitude  float64 `json:"latitude"`
-				Longitude float64 `json:"longitude"`
-			} `json:"location"`
-		}
-		json.Unmarshal(raw, &parsed)
-		// Short label like "Cinepolis, Vashi". Falls back to display name
-		// alone if the address line isn't useful.
-		label := parsed.DisplayName.Text
-		if parsed.ShortFormattedAddress != "" {
-			// Pull the locality/neighborhood from the formatted address —
-			// the part right after the first comma is usually enough.
-			parts := strings.SplitN(parsed.ShortFormattedAddress, ",", 3)
-			if len(parts) >= 2 {
-				label = parsed.DisplayName.Text + ", " + strings.TrimSpace(parts[1])
-			}
-		}
-		writeJSON(w, 200, map[string]any{
-			"place_id": parsed.ID,
-			"label":    label,
-			"lat":      parsed.Location.Latitude,
-			"lon":      parsed.Location.Longitude,
-		})
 	}
 }
 

@@ -37,13 +37,6 @@ func registerInsightRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/time-travel", timeTravelHandler(deps))
 }
 
-// RegisterInsightCronHandler mounts the unauthenticated webhook used by
-// Cloud Scheduler (or any external trigger). Header X-Insight-Cron must
-// match INSIGHT_CRON_SECRET. Call from main once the root mux exists.
-func RegisterInsightCronHandler(mux *http.ServeMux, deps Deps) {
-	mux.HandleFunc("POST /internal/insights/run", insightCronHandler(deps))
-}
-
 // windowDays maps a window key to its lookback in days.
 var windowDays = map[string]int{
 	"1w": 7, "2w": 14, "1m": 30, "6m": 180, "1y": 365,
@@ -150,61 +143,6 @@ func unpinInsight(deps Deps) http.HandlerFunc {
 		d.Exec(`UPDATE insights SET pinned = FALSE WHERE id = $1 AND user_id = $2`, id, uid)
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
-}
-
-func insightCronHandler(deps Deps) http.HandlerFunc {
-	expected := deps.Reminders.InsightCronSecret
-	return func(w http.ResponseWriter, r *http.Request) {
-		if expected == "" || r.Header.Get("X-Insight-Cron") != expected {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		n, err := RunDailyInsightCron(r.Context(), deps)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		writeJSON(w, 200, map[string]int{"generated": n})
-	}
-}
-
-// RunDailyInsightCron iterates every user. Each window has its own
-// cadence (1w → every day; 2w → every 2d; 1m → every 7d; 6m → every
-// 30d; 1y → every 60d). Cadence is enforced by checking insight_runs.
-func RunDailyInsightCron(ctx context.Context, deps Deps) (int, error) {
-	d := deps.DB
-	cadenceDays := map[string]int{"1w": 1, "2w": 2, "1m": 7, "6m": 30, "1y": 60}
-
-	rows, err := d.QueryContext(ctx, `SELECT id FROM users WHERE deleted_at IS NULL`)
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-	var uids []string
-	for rows.Next() {
-		var id string
-		rows.Scan(&id)
-		uids = append(uids, id)
-	}
-	total := 0
-	for _, uid := range uids {
-		for win, days := range cadenceDays {
-			var lastRun *time.Time
-			d.QueryRowContext(ctx, `SELECT run_at FROM insight_runs
-				WHERE user_id = $1 AND window_key = $2 ORDER BY run_at DESC LIMIT 1`,
-				uid, win).Scan(&lastRun)
-			if lastRun != nil && time.Since(*lastRun) < time.Duration(days)*24*time.Hour {
-				continue
-			}
-			n, err := RunInsightsForUser(ctx, deps, uid, win)
-			if err != nil {
-				log.Warn().Err(err).Str("uid", uid).Str("window", win).Msg("insights run failed")
-				continue
-			}
-			total += n
-		}
-	}
-	return total, nil
 }
 
 // RunInsightsForUser computes a small bundle of correlation/aggregate

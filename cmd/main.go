@@ -83,7 +83,6 @@ func main() {
 		cfg.Reminders.CronSecret != ""
 	evt = evt.
 		Bool("tmdb", cfg.Media.TMDBAPIKey != "").
-		Bool("places", cfg.Media.GooglePlacesAPIKey != "").
 		Bool("cloud_tasks", cloudTasksEnabled).
 		Bool("push", pushSvc != nil)
 	evt.Msg("sajni started")
@@ -111,7 +110,8 @@ func main() {
 	//   hourly  — purge soft-deleted users past the 7d window
 	//           — process billers (post auto-renew txns, raise upcoming alerts)
 	//           — process investment auto-debits (post contribution txns)
-	//   daily   — generate per-window insights (1w / 2w / 1m / 6m / 1y)
+	//
+	// Insights regenerate only when the user presses Run.
 	go func() {
 		// Run a pass at boot so a long downtime doesn't leave the queue stale.
 		if n, err := api.PurgeExpiredDeletedUsers(context.Background(), deps); err == nil && n > 0 {
@@ -130,38 +130,27 @@ func main() {
 		}
 
 		hourly := time.NewTicker(time.Hour)
-		daily := time.NewTicker(24 * time.Hour)
 		defer hourly.Stop()
-		defer daily.Stop()
-		for {
-			select {
-			case <-hourly.C:
-				if n, err := api.PurgeExpiredDeletedUsers(context.Background(), deps); err != nil {
-					log.Warn().Err(err).Msg("purge expired accounts failed")
-				} else if n > 0 {
-					log.Info().Int64("users_purged", n).Msg("expired accounts purged")
-				}
-				if posted, alerts, err := api.ProcessBillerCron(context.Background(), deps); err != nil {
-					log.Warn().Err(err).Msg("biller cron failed")
-				} else if posted+alerts > 0 {
-					log.Info().Int("auto_posted", posted).Int("upcoming", alerts).Msg("billers processed")
-				}
-				if posted, err := api.ProcessInvestmentDebits(context.Background(), deps); err != nil {
-					log.Warn().Err(err).Msg("investment debit cron failed")
-				} else if posted > 0 {
-					log.Info().Int("debits", posted).Msg("investment auto-debits posted")
-				}
-				if reminded, graduated, err := api.ProcessMediaReleaseCron(context.Background(), deps); err != nil {
-					log.Warn().Err(err).Msg("media release processing failed")
-				} else if reminded+graduated > 0 {
-					log.Info().Int("reminded", reminded).Int("graduated", graduated).Msg("media releases processed")
-				}
-			case <-daily.C:
-				if n, err := api.RunDailyInsightCron(context.Background(), deps); err != nil {
-					log.Warn().Err(err).Msg("insight cron failed")
-				} else if n > 0 {
-					log.Info().Int("insights", n).Msg("insights generated")
-				}
+		for range hourly.C {
+			if n, err := api.PurgeExpiredDeletedUsers(context.Background(), deps); err != nil {
+				log.Warn().Err(err).Msg("purge expired accounts failed")
+			} else if n > 0 {
+				log.Info().Int64("users_purged", n).Msg("expired accounts purged")
+			}
+			if posted, alerts, err := api.ProcessBillerCron(context.Background(), deps); err != nil {
+				log.Warn().Err(err).Msg("biller cron failed")
+			} else if posted+alerts > 0 {
+				log.Info().Int("auto_posted", posted).Int("upcoming", alerts).Msg("billers processed")
+			}
+			if posted, err := api.ProcessInvestmentDebits(context.Background(), deps); err != nil {
+				log.Warn().Err(err).Msg("investment debit cron failed")
+			} else if posted > 0 {
+				log.Info().Int("debits", posted).Msg("investment auto-debits posted")
+			}
+			if reminded, graduated, err := api.ProcessMediaReleaseCron(context.Background(), deps); err != nil {
+				log.Warn().Err(err).Msg("media release processing failed")
+			} else if reminded+graduated > 0 {
+				log.Info().Int("reminded", reminded).Int("graduated", graduated).Msg("media releases processed")
 			}
 		}
 	}()

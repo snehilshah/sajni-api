@@ -112,9 +112,8 @@ func Router(deps Deps) http.Handler {
 	root.HandleFunc("/readyz", healthHandler)
 
 	// Internal webhooks. Auth is by a shared secret header; each 401s without
-	// it. Insights and reminder sweeps run by Cloud Scheduler; exact reminder
-	// fires run by Cloud Tasks.
-	RegisterInsightCronHandler(root, deps)
+	// it. Reminder and notification sweeps run by Cloud Scheduler; exact
+	// reminder fires run by Cloud Tasks.
 	RegisterReminderCronHandler(root, deps)
 	RegisterDigestCronHandler(root, deps)
 	RegisterScheduledNotificationHandler(root, deps)

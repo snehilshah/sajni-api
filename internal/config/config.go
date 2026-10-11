@@ -55,8 +55,7 @@ type AI struct {
 }
 
 type Media struct {
-	TMDBAPIKey         string
-	GooglePlacesAPIKey string
+	TMDBAPIKey string
 }
 
 type Reminders struct {
@@ -64,7 +63,6 @@ type Reminders struct {
 	CloudTasksLocation string
 	CloudTasksQueue    string
 	CronSecret         string
-	InsightCronSecret  string
 }
 
 type Push struct {
@@ -139,15 +137,13 @@ func Load(dotEnvPath string) (Config, error) {
 			GeminiModel:  "gemini-3.8-flash",
 		},
 		Media: Media{
-			TMDBAPIKey:         os.Getenv("TMDB_API_KEY"),
-			GooglePlacesAPIKey: os.Getenv("GOOGLE_PLACES_KEY"),
+			TMDBAPIKey: os.Getenv("TMDB_API_KEY"),
 		},
 		Reminders: Reminders{
 			CloudTasksProject:  strings.TrimSpace(os.Getenv("CLOUD_TASKS_PROJECT")),
 			CloudTasksLocation: strings.TrimSpace(os.Getenv("CLOUD_TASKS_LOCATION")),
 			CloudTasksQueue:    strings.TrimSpace(os.Getenv("CLOUD_TASKS_QUEUE")),
 			CronSecret:         os.Getenv("REMINDER_CRON_SECRET"),
-			InsightCronSecret:  os.Getenv("INSIGHT_CRON_SECRET"),
 		},
 		Push: Push{FirebaseProjectID: strings.TrimSpace(os.Getenv("FIREBASE_PROJECT_ID"))},
 	}
