@@ -1400,7 +1400,8 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	             COALESCE(due_date::text,''),COALESCE(scheduled_at::text,''),
 	             COALESCE(duration_minutes,30),
 	             list_id,parent_task_id,blocked_by_task_id,important,
-	             (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id = tasks.id)
+	             (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id = tasks.id),
+	             COALESCE((SELECT p.title FROM tasks p WHERE p.id = tasks.parent_task_id), '')
 	      FROM tasks WHERE ` + strings.Join(clauses, " AND ") +
 		fmt.Sprintf(` ORDER BY (status='done') ASC, important DESC NULLS LAST, due_date NULLS LAST, created_at DESC LIMIT %d`, limit)
 	rows, err := d.QueryContext(ctx, q, vals...)
@@ -1416,8 +1417,9 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		var listID, parentID, blockedByID sql.NullInt64
 		var important bool
 		var subCount int
+		var parentTitle string
 		rows.Scan(&id, &title, &desc, &status, &priority, &color, &due, &sched, &dur,
-			&listID, &parentID, &blockedByID, &important, &subCount)
+			&listID, &parentID, &blockedByID, &important, &subCount, &parentTitle)
 		row := map[string]any{
 			"id": id, "title": title, "description": desc,
 			"status": status, "priority": priority,
@@ -1430,6 +1432,7 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		}
 		if parentID.Valid {
 			row["parent_task_id"] = parentID.Int64
+			row["parent_task_title"] = parentTitle
 		}
 		if blockedByID.Valid {
 			row["blocked_by_task_id"] = blockedByID.Int64

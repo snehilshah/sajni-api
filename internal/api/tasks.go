@@ -221,7 +221,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			SELECT t.id, t.title, t.description, t.status, t.priority, t.color,
 			       t.due_date::text, t.week_of::text, t.month_of::text, t.scheduled_at::text,
 			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
-			       t.list_id, t.parent_task_id, t.blocked_by_task_id,
+			       t.list_id, t.parent_task_id, parent.title, t.blocked_by_task_id,
 			       blocker.title, blocker.status, t.important, t.steps,
 			       COALESCE(t.sort_order, 0),
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
@@ -236,11 +236,12 @@ func getTask(deps Deps) http.HandlerFunc {
 				GROUP BY parent_task_id
 			) c ON c.parent_task_id = t.id
 			LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
+			LEFT JOIN tasks parent ON parent.id=t.parent_task_id AND parent.user_id=t.user_id
 			WHERE t.user_id = $1 AND t.id = $2`, uid, id).Scan(
 			&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority, &t.Color,
 			&t.DueDate, &t.WeekOf, &t.MonthOf, &t.ScheduledAt,
 			&t.Remind, &t.RemindedAt, &emailsRaw,
-			&t.ListID, &t.ParentTaskID, &t.BlockedByTaskID,
+			&t.ListID, &t.ParentTaskID, &t.ParentTaskTitle, &t.BlockedByTaskID,
 			&t.BlockedByTaskTitle, &t.BlockedByTaskStatus, &t.Important, &stepsRaw,
 			&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
 			&t.CreatedAt, &t.UpdatedAt,
@@ -272,30 +273,33 @@ func getTask(deps Deps) http.HandlerFunc {
 // subtask_count so the list-view can show the nested-tasks hint
 // without a separate request per row.
 type taskRow struct {
-	ID                  int64    `json:"id"`
-	Title               string   `json:"title"`
-	Description         string   `json:"description"`
-	Status              string   `json:"status"`
-	Priority            string   `json:"priority"`
-	Color               *string  `json:"color"`
-	Tags                []string `json:"tags"`
-	DueDate             *string  `json:"due_date"`
-	WeekOf              *string  `json:"week_of"`
-	MonthOf             *string  `json:"month_of"`
-	ScheduledAt         *string  `json:"scheduled_at"`
-	Remind              bool     `json:"remind"`
-	RemindedAt          *string  `json:"reminded_at"`
-	NotifyEmails        []string `json:"notify_emails"`
-	ListID              *int64   `json:"list_id"`
-	ParentTaskID        *int64   `json:"parent_task_id"`
-	BlockedByTaskID     *int64   `json:"blocked_by_task_id"`
-	BlockedByTaskTitle  *string  `json:"blocked_by_task_title"`
-	BlockedByTaskStatus *string  `json:"blocked_by_task_status"`
-	Important           bool     `json:"important"`
-	Steps               []Step   `json:"steps"`
-	SortOrder           int      `json:"sort_order"`
-	SubtaskCount        int      `json:"subtask_count"`
-	SubtasksDone        int      `json:"subtasks_done"`
+	ID           int64    `json:"id"`
+	Title        string   `json:"title"`
+	Description  string   `json:"description"`
+	Status       string   `json:"status"`
+	Priority     string   `json:"priority"`
+	Color        *string  `json:"color"`
+	Tags         []string `json:"tags"`
+	DueDate      *string  `json:"due_date"`
+	WeekOf       *string  `json:"week_of"`
+	MonthOf      *string  `json:"month_of"`
+	ScheduledAt  *string  `json:"scheduled_at"`
+	Remind       bool     `json:"remind"`
+	RemindedAt   *string  `json:"reminded_at"`
+	NotifyEmails []string `json:"notify_emails"`
+	ListID       *int64   `json:"list_id"`
+	ParentTaskID *int64   `json:"parent_task_id"`
+	// ParentTaskTitle lets a subtask listed flat (smart lists, planner,
+	// Today) say which task it belongs to.
+	ParentTaskTitle     *string `json:"parent_task_title"`
+	BlockedByTaskID     *int64  `json:"blocked_by_task_id"`
+	BlockedByTaskTitle  *string `json:"blocked_by_task_title"`
+	BlockedByTaskStatus *string `json:"blocked_by_task_status"`
+	Important           bool    `json:"important"`
+	Steps               []Step  `json:"steps"`
+	SortOrder           int     `json:"sort_order"`
+	SubtaskCount        int     `json:"subtask_count"`
+	SubtasksDone        int     `json:"subtasks_done"`
 	// Subtasks are embedded (brief shape) so the list view can render the
 	// nested children instantly on expand — no per-row /subtasks round-trip.
 	Subtasks  []subtaskBrief `json:"subtasks"`
@@ -454,7 +458,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 			SELECT t.id, t.title, t.description, t.status, t.priority, t.color,
 			       t.due_date::text, t.week_of::text, t.month_of::text, t.scheduled_at::text,
 			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
-			       t.list_id, t.parent_task_id, t.blocked_by_task_id,
+			       t.list_id, t.parent_task_id, parent.title, t.blocked_by_task_id,
 			       blocker.title, blocker.status, t.important, t.steps,
 			       COALESCE(t.sort_order, 0),
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
@@ -469,6 +473,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 				GROUP BY parent_task_id
 			) c ON c.parent_task_id = t.id
 			LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
+			LEFT JOIN tasks parent ON parent.id=t.parent_task_id AND parent.user_id=t.user_id
 			WHERE ` + strings.Join(clauses, " AND ") + `
 			` + orderBy
 
@@ -487,7 +492,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 				&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority, &t.Color,
 				&t.DueDate, &t.WeekOf, &t.MonthOf, &t.ScheduledAt,
 				&t.Remind, &t.RemindedAt, &emailsRaw,
-				&t.ListID, &t.ParentTaskID, &t.BlockedByTaskID,
+				&t.ListID, &t.ParentTaskID, &t.ParentTaskTitle, &t.BlockedByTaskID,
 				&t.BlockedByTaskTitle, &t.BlockedByTaskStatus, &t.Important, &stepsRaw,
 				&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
 				&t.CreatedAt, &t.UpdatedAt,
