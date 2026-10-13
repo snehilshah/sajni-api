@@ -2452,14 +2452,19 @@ func rescheduleTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue
 	}
 
 	if sched != "" && due == "" {
-		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET scheduled_at=$1,reminded_at=NULL,reminder_claimed_until=NULL,updated_at=NOW() WHERE id=$2 AND user_id=$3`, nextScheduled, id, uid); err != nil {
+		// Only a real change re-arms; the same time restated must not re-fire.
+		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET scheduled_at=$1::timestamptz,
+			reminded_at = CASE WHEN date_trunc('minute', scheduled_at) IS DISTINCT FROM date_trunc('minute', $1::timestamptz) THEN NULL ELSE reminded_at END,
+			reminder_claimed_until=NULL,updated_at=NOW() WHERE id=$2 AND user_id=$3`, nextScheduled, id, uid); err != nil {
 			return nil, nil, err
 		}
 	}
 
 	if hasRemind {
 		remind = argBool(args, "remind", false)
-		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET remind=$1,reminded_at=NULL,reminder_claimed_until=NULL,updated_at=NOW() WHERE id=$2 AND user_id=$3`, remind, id, uid); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET remind=$1,
+			reminded_at = CASE WHEN remind IS DISTINCT FROM $1 THEN NULL ELSE reminded_at END,
+			reminder_claimed_until=NULL,updated_at=NOW() WHERE id=$2 AND user_id=$3`, remind, id, uid); err != nil {
 			return nil, nil, err
 		}
 	}

@@ -982,16 +982,20 @@ func updateTask(deps Deps) http.HandlerFunc {
 			}
 			q.Exec("UPDATE tasks SET parent_task_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", v, id, uid)
 		}
-		// scheduled_at: set or clear the event time. Either change clears
+		// scheduled_at: set or clear the event time. A real change clears
 		// reminded_at so the reminder re-arms (an edited time should fire
-		// again). When a time is set and the client didn't override due_date,
-		// keep due_date aligned to the new local day for the smart-lists.
+		// again). Autosaves resend the same time with every edit (a title,
+		// a step tick); that must not re-arm, or a reminder that already
+		// fired goes off again. When a time is set and the client didn't
+		// override due_date, keep due_date aligned to the new local day.
 		if body.ScheduledAt != nil || body.ClearScheduled {
 			var schedArg any
 			if body.ScheduledAt != nil && !body.ClearScheduled && strings.TrimSpace(*body.ScheduledAt) != "" {
 				schedArg = *body.ScheduledAt
 			}
-			q.Exec("UPDATE tasks SET scheduled_at=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3", schedArg, id, uid)
+			q.Exec(`UPDATE tasks SET scheduled_at=$1::timestamptz,
+				reminded_at = CASE WHEN date_trunc('minute', scheduled_at) IS DISTINCT FROM date_trunc('minute', $1::timestamptz) THEN NULL ELSE reminded_at END,
+				updated_at=NOW() WHERE id=$2 AND user_id=$3`, schedArg, id, uid)
 			if s, ok := schedArg.(string); ok && body.DueDate == nil {
 				if t, err := time.Parse(time.RFC3339, s); err == nil {
 					q.Exec("UPDATE tasks SET due_date=$1 WHERE id=$2 AND user_id=$3", t.In(userLocation(d, uid)).Format("2006-01-02"), id, uid)
@@ -999,8 +1003,11 @@ func updateTask(deps Deps) http.HandlerFunc {
 			}
 		}
 		if body.Remind != nil {
-			// Toggling remind re-arms too (turning it back on should re-send).
-			q.Exec("UPDATE tasks SET remind=$1, reminded_at=NULL, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.Remind, id, uid)
+			// Toggling remind re-arms too (turning it back on should re-send);
+			// the same value resent by an autosave leaves the stamp alone.
+			q.Exec(`UPDATE tasks SET remind=$1,
+				reminded_at = CASE WHEN remind IS DISTINCT FROM $1 THEN NULL ELSE reminded_at END,
+				updated_at=NOW() WHERE id=$2 AND user_id=$3`, *body.Remind, id, uid)
 		}
 		if body.Important != nil {
 			q.Exec("UPDATE tasks SET important=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.Important, id, uid)
