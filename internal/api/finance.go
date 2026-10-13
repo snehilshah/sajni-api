@@ -919,12 +919,25 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 
+		tx, err := d.BeginTx(ctx, nil)
+		if err != nil {
+			internalError(w, r, "begin transaction", err)
+			return
+		}
+		defer tx.Rollback()
+
 		// Duplicate check: if not forced, check if an identical transaction was recorded in the last 5 minutes.
+		// The per-user lock (held until commit) makes check + insert atomic: one SMS reaching
+		// the phone twice at once used to slip both copies past a plain SELECT.
 		force := r.URL.Query().Get("force") == "true" || r.Header.Get("X-Force") == "true"
 		if !force && b.Type != "transfer" {
+			if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('fin_txn_create:' || $1::text, 0))`, uid); err != nil {
+				internalError(w, r, "lock transaction create", err)
+				return
+			}
 			var dupID int64
 			var existingNote string
-			err := d.QueryRowContext(ctx, `
+			err := tx.QueryRowContext(ctx, `
 				SELECT id, COALESCE(note, '')
 				FROM fin_transactions
 				WHERE user_id = $1 AND account_id = $2 AND type = $3
@@ -934,19 +947,14 @@ func createTransaction(deps Deps) http.HandlerFunc {
 				ORDER BY id DESC LIMIT 1`, uid, b.AccountID, b.Type, b.Amount, txnAt).Scan(&dupID, &existingNote)
 			if err == nil && dupID > 0 {
 				if existingNote == "" && b.Note != "" {
-					d.ExecContext(ctx, `UPDATE fin_transactions SET note = $1 WHERE id = $2`, b.Note, dupID)
+					tx.ExecContext(ctx, `UPDATE fin_transactions SET note = $1 WHERE id = $2`, b.Note, dupID)
+					tx.Commit()
 				}
 				writeJSON(w, 200, map[string]any{"id": dupID, "duplicate": true})
 				return
 			}
 		}
 
-		tx, err := d.BeginTx(ctx, nil)
-		if err != nil {
-			internalError(w, r, "begin transaction", err)
-			return
-		}
-		defer tx.Rollback()
 		var id int64
 		if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, note, txn_at, slate_id, refund_of) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
 			uid, b.AccountID, b.CategoryID, b.Type, b.Amount, b.Description, b.Note, txnAt, slateID, b.RefundOf,
