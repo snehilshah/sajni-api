@@ -49,6 +49,8 @@ func takeoutExport(deps Deps) http.HandlerFunc {
 			exportTaskLists,
 			exportHabits,
 			exportHabitLogs,
+			exportRoutines,
+			exportRoutineRuns,
 			exportEvents,
 			exportEventVariables,
 			exportEventEntries,
@@ -92,6 +94,8 @@ Layout:
   task_lists.csv          - your custom task lists
   habits.csv              - habits and their colours
   habit_logs.csv          - every day you ticked a habit
+  routines.csv            - Journal routines, their days, time and checklist
+  routine_runs.csv        - checklist items ticked on each routine day
   events.csv              - tracked life events
   event_variables.csv     - numeric fields configured for events
   event_entries.csv       - timestamped event occurrences
@@ -225,6 +229,48 @@ func exportHabitLogs(ctx context.Context, zw *zip.Writer, deps Deps, uid string)
 			var d time.Time
 			if err := rows.Scan(&hid, &d); err == nil {
 				emit([]string{strconv.FormatInt(hid, 10), d.Format("2006-01-02")})
+			}
+		}
+	})
+}
+
+func exportRoutines(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
+	rows, err := deps.DB.QueryContext(ctx, `
+		SELECT id, name, color, weekdays::text, start_time, notify, items::text, created_at
+		  FROM routines WHERE user_id = $1 ORDER BY start_time, id`, uid)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return writeCSV(zw, "routines.csv",
+		[]string{"id", "name", "color", "weekdays", "start_time", "notify", "items", "created_at"},
+		func(emit func([]string)) {
+			for rows.Next() {
+				var id int64
+				var name, color, days, start, items string
+				var notify bool
+				var created time.Time
+				if err := rows.Scan(&id, &name, &color, &days, &start, &notify, &items, &created); err == nil {
+					emit([]string{strconv.FormatInt(id, 10), name, color, days, start, strconv.FormatBool(notify), items, created.Format(time.RFC3339)})
+				}
+			}
+		})
+}
+
+func exportRoutineRuns(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
+	rows, err := deps.DB.QueryContext(ctx, `
+		SELECT routine_id, run_date, done::text FROM routine_runs WHERE user_id = $1 ORDER BY run_date, routine_id`, uid)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return writeCSV(zw, "routine_runs.csv", []string{"routine_id", "date", "done"}, func(emit func([]string)) {
+		for rows.Next() {
+			var rid int64
+			var d time.Time
+			var done string
+			if err := rows.Scan(&rid, &d, &done); err == nil {
+				emit([]string{strconv.FormatInt(rid, 10), d.Format("2006-01-02"), done})
 			}
 		}
 	})

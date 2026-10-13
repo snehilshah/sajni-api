@@ -94,7 +94,8 @@ func plannerTasks(r *http.Request, deps Deps, uid string, from, to, weekStart, w
 		       t.remind,t.reminded_at::text,COALESCE(t.notify_emails,'[]'::jsonb),
 		       t.list_id,t.parent_task_id,parent.title,t.blocked_by_task_id,blocker.title,blocker.status,
 		       t.important,t.steps,COALESCE(t.sort_order,0),
-		       COALESCE(c.cnt,0)::int,COALESCE(c.done,0)::int,t.created_at,t.updated_at
+		       COALESCE(c.cnt,0)::int,COALESCE(c.done,0)::int,t.created_at,t.updated_at,
+		       t.routine_id,routine.name
 		FROM tasks t
 		LEFT JOIN (
 			SELECT parent_task_id,COUNT(*) cnt,COUNT(*) FILTER (WHERE status='done') done
@@ -102,6 +103,7 @@ func plannerTasks(r *http.Request, deps Deps, uid string, from, to, weekStart, w
 		) c ON c.parent_task_id=t.id
 		LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
 		LEFT JOIN tasks parent ON parent.id=t.parent_task_id AND parent.user_id=t.user_id
+		LEFT JOIN routines routine ON routine.id=t.routine_id AND routine.user_id=t.user_id
 		WHERE t.user_id=$1 AND t.status<>'scratched' AND (
 			t.due_date BETWEEN $2 AND $3 OR t.week_of BETWEEN $4 AND $5 OR t.month_of BETWEEN $6 AND $7
 		)
@@ -123,7 +125,7 @@ func plannerTasks(r *http.Request, deps Deps, uid string, from, to, weekStart, w
 			&task.Remind, &task.RemindedAt, &emailsRaw, &task.ListID, &task.ParentTaskID, &task.ParentTaskTitle,
 			&task.BlockedByTaskID, &task.BlockedByTaskTitle, &task.BlockedByTaskStatus,
 			&task.Important, &stepsRaw, &task.SortOrder, &task.SubtaskCount, &task.SubtasksDone,
-			&task.CreatedAt, &task.UpdatedAt,
+			&task.CreatedAt, &task.UpdatedAt, &task.RoutineID, &task.RoutineName,
 		); err != nil {
 			return nil, err
 		}

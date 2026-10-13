@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"sajni/internal/routine"
 )
 
 // systemPromptTemplate is the persona + house rules. Kept terse to
@@ -42,8 +44,8 @@ Finance & Budget Analysis:
 - Distinguish essentials (groceries, rent, utilities, bills) from discretionary/non-essential items (cafes, dining out, gifts, entertainment, subscriptions) and call out specific transactions to cut to stay under budget.
 
 Boundaries:
-- Read: memos, tasks, habits, journal, notes, media, finance.
-- Write: tasks, habits, memos, journal, media, transactions.
+- Read: memos, tasks, habits, journal, routines, notes, media, finance.
+- Write: tasks, habits, memos, journal, routines, media, transactions.
 - Can't: delete habits, archive accounts, change settings other than themes, or send anything outside the app. State this only if asked.
 
 Today's snapshot:
@@ -77,5 +79,14 @@ func (s *Service) buildSystemInstruction(ctx context.Context, uid string) string
 	}
 	habitsTotal, habitsDone := currentHabitPeriodProgress(ctx, s.db, uid, now)
 	parts = append(parts, fmt.Sprintf("- Current habit periods: %d/%d done", habitsDone, habitsTotal))
+	// Today's routines by name and time ("Office start 09:00 (id 3)") so
+	// "add X to office start" resolves without a lookup round.
+	if day, err := routine.Day(ctx, s.db, uid, today); err == nil && len(day) > 0 {
+		names := make([]string, 0, len(day))
+		for _, r := range day {
+			names = append(names, fmt.Sprintf("%s %s (id %d)", r.Name, r.StartTime, r.ID))
+		}
+		parts = append(parts, "- Routines today: "+strings.Join(names, ", "))
+	}
 	return fmt.Sprintf(systemPromptTemplate, strings.Join(parts, "\n"))
 }

@@ -21,6 +21,7 @@ import (
 	mediastatus "sajni/internal/media"
 	sharednote "sajni/internal/note"
 	"sajni/internal/reminderqueue"
+	"sajni/internal/routine"
 	"sajni/internal/storage"
 )
 
@@ -495,6 +496,7 @@ func (s *Service) buildTools() []Tool {
 				"important":        boolean("Optional. Star the task (Important smart list)."),
 				"steps":            arrayOf(str(""), "Optional inline checklist (array of step text strings)."),
 				"tags":             arrayOf(str(""), "Optional tag list."),
+				"routine_id":       intg("Optional. Adds the task to a Journal routine's agenda (from list_routines): it lands on due_date when the routine runs that day, else on the routine's next occurrence, timed at its start. The routine's own alert covers it, so leave remind off."),
 			}, "title"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createTaskTool(ctx, d, queue, uid, args)
@@ -1292,6 +1294,7 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 	}
+	tools = append(tools, routineTools(d, queue)...)
 	return append(tools, standaloneReminderTools(d, queue)...)
 }
 
@@ -2309,13 +2312,28 @@ func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, ui
 		}
 	}
 
+	// A routine agenda item lands on an occurrence, timed at its start.
+	var routineArg any
+	route := "/tasks"
+	if rid := argInt(args, "routine_id", 0); rid != 0 {
+		date, at, err := routine.Occurrence(ctx, d, uid, rid, dueDate)
+		if err != nil {
+			return nil, nil, err
+		}
+		routineArg, dueArg, weekArg, monthArg = rid, date, nil, nil
+		if scheduled == "" {
+			schArg = at
+		}
+		route = "/journal?date=" + date
+	}
+
 	var scheduledAt sql.NullTime
 	err := d.QueryRowContext(ctx, `
 		INSERT INTO tasks (user_id, title, description, priority, color, status, due_date, week_of, month_of, scheduled_at, remind,
-		                   notify_emails, duration_minutes, list_id, parent_task_id, important, steps)
-		VALUES ($1,$2,$3,$4,$5,'todo',$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16::jsonb)
+		                   notify_emails, duration_minutes, list_id, parent_task_id, important, steps, routine_id)
+		VALUES ($1,$2,$3,$4,$5,'todo',$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16::jsonb,$17)
 		RETURNING id, scheduled_at`,
-		uid, title, desc, priority, colorArg, dueArg, weekArg, monthArg, schArg, remind, notifyJSON, dur, listArg, parentArg, important, stepsJSON,
+		uid, title, desc, priority, colorArg, dueArg, weekArg, monthArg, schArg, remind, notifyJSON, dur, listArg, parentArg, important, stepsJSON, routineArg,
 	).Scan(&id, &scheduledAt)
 	if err != nil {
 		return nil, nil, err
@@ -2331,7 +2349,7 @@ func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, ui
 		return nil, nil, err
 	}
 	return map[string]any{"id": id, "title": title},
-		map[string]any{"kind": "task_created", "id": id, "title": title, "route": "/tasks"}, nil
+		map[string]any{"kind": "task_created", "id": id, "title": title, "route": route}, nil
 }
 
 // rescheduleTaskTool moves a task's due_date and/or scheduled_at. Mirrors the

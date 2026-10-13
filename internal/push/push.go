@@ -79,6 +79,8 @@ const (
 	TypeInvestmentAuto = "investment_auto"
 	TypeLendDue        = "lend_due"
 	TypeMediaRelease   = "media_release"
+	// TypeRoutine is a Journal routine's start alert ("Office start · 9:00").
+	TypeRoutine = "routine"
 	// TypeSync is a silent "your data changed" ping (Data["scope"] names
 	// what: "habits"). Never shown; native surfaces that cache data (home
 	// screen widgets) refetch on it.
@@ -112,7 +114,7 @@ func (n Notification) channelID() string {
 // interrupts reports whether this push is worth a heads-up display: true only
 // when there is still something the user can act on in time.
 func (n Notification) interrupts() bool {
-	return n.Type == TypeTaskReminder || n.Type == TypeReminder || n.Type == TypeBillDue || n.Type == TypeLendDue || n.Type == ""
+	return n.Type == TypeTaskReminder || n.Type == TypeReminder || n.Type == TypeRoutine || n.Type == TypeBillDue || n.Type == TypeLendDue || n.Type == ""
 }
 
 // SendToUser delivers n to every device the user has registered and returns

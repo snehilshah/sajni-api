@@ -58,6 +58,7 @@ func Router(deps Deps) http.Handler {
 	registerTaskRoutes(apiMux, deps)
 	registerPlannerRoutes(apiMux, deps)
 	registerReminderRoutes(apiMux, deps)
+	registerRoutineRoutes(apiMux, deps)
 	registerTaskListRoutes(apiMux, deps)
 	registerHabitRoutes(apiMux, deps)
 	registerEventRoutes(apiMux, deps)
