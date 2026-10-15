@@ -14,10 +14,10 @@ import (
 // share below the bill it is a split: the bill keeps the user's part and the
 // share is cut into its own lend row (split_of = bill), so the two still sum
 // to the charge. "Settle" turns an existing credit into a settlement for a
-// person; "forgive" books a writeoff that settles like a credit. Settlement
-// credits are pooled per person and allocated oldest-lend-first by Rebalance,
-// so a single transfer can clear several lends and any surplus waits for that
-// person's next lend.
+// person; "forgive" books a writeoff that settles like a credit. Every
+// settlement reduces the person's total. One pinned to a lend (lend_id) also
+// pays that lend off (Rebalance derives fin_lend_repayments from the pins);
+// one left "overall" is never attributed to any lend. See fin_lend_state.
 
 var ErrLendInput = errors.New("lend input")
 
@@ -127,11 +127,8 @@ func SetPaidForShare(ctx context.Context, tx *sql.Tx, uid string, lendID int64, 
 	share = roundMoney(share)
 	var origin, borrower string
 	var lendTxn int64
-	var direct float64
-	err := tx.QueryRowContext(ctx, `SELECT l.origin, l.borrower, l.source_transaction_id,
-		COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r WHERE r.lend_id = l.id
-			AND NOT EXISTS (SELECT 1 FROM fin_lend_settlements s WHERE s.transaction_id = r.transaction_id)),0)
-		FROM fin_lends l WHERE l.id = $1 AND l.user_id = $2 FOR UPDATE`, lendID, uid).Scan(&origin, &borrower, &lendTxn, &direct)
+	err := tx.QueryRowContext(ctx, `SELECT origin, borrower, source_transaction_id
+		FROM fin_lends WHERE id = $1 AND user_id = $2 FOR UPDATE`, lendID, uid).Scan(&origin, &borrower, &lendTxn)
 	if errors.Is(err, sql.ErrNoRows) {
 		return lendErr("That lend no longer exists.")
 	}
@@ -157,9 +154,6 @@ func SetPaidForShare(ctx context.Context, tx *sql.Tx, uid string, lendID int64, 
 	total = roundMoney(total)
 	if share <= 0 || share > total {
 		return lendErr("Their share has to be above zero and at most the bill's ₹%.2f.", total)
-	}
-	if share < roundMoney(direct) {
-		return lendErr("Their share can't be below the ₹%.2f already repaid.", roundMoney(direct))
 	}
 
 	switch {
@@ -209,10 +203,10 @@ func SetPaidForShare(ctx context.Context, tx *sql.Tx, uid string, lendID int64, 
 
 // Forgive writes off up to what borrower still owes. The amount becomes a
 // 'writeoff' row: spending on the day it was forgiven (in categoryID), with
-// no money moving, since the lend already moved it. It is pooled with the
-// person's settlements, so it clears their oldest lends first, and undoing
-// it (Unsettle) deletes it.
-func Forgive(ctx context.Context, tx *sql.Tx, uid, borrower string, amount float64, categoryID *int64, at time.Time, note string) (int64, error) {
+// no money moving, since the lend already moved it. It settles like a
+// payment (toward lendID, or overall when nil), and undoing it (Unsettle)
+// deletes it.
+func Forgive(ctx context.Context, tx *sql.Tx, uid, borrower string, amount float64, categoryID *int64, at time.Time, note string, lendID *int64) (int64, error) {
 	borrower = strings.TrimSpace(borrower)
 	amount = roundMoney(amount)
 	if borrower == "" || amount <= 0 {
@@ -222,9 +216,6 @@ func Forgive(ctx context.Context, tx *sql.Tx, uid, borrower string, amount float
 	var accountID sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `SELECT
 		COALESCE(SUM(l.principal),0)
-		- COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r JOIN fin_lends rl ON rl.id = r.lend_id
-			WHERE rl.user_id = $1 AND LOWER(BTRIM(rl.borrower)) = LOWER(BTRIM($2))
-			AND NOT EXISTS (SELECT 1 FROM fin_lend_settlements s WHERE s.transaction_id = r.transaction_id)),0)
 		- COALESCE((SELECT SUM(t.amount) FROM fin_lend_settlements s JOIN fin_transactions t ON t.id = s.transaction_id
 			WHERE s.user_id = $1 AND LOWER(BTRIM(s.borrower)) = LOWER(BTRIM($2))),0),
 		(SELECT source_account_id FROM fin_lends WHERE user_id = $1 AND `+borrowerMatch+` ORDER BY lent_at DESC, id DESC LIMIT 1)
@@ -238,6 +229,9 @@ func Forgive(ctx context.Context, tx *sql.Tx, uid, borrower string, amount float
 	if amount > owed {
 		return 0, lendErr("%s owes ₹%.2f, so you can forgive up to that.", borrower, owed)
 	}
+	if err := checkPin(ctx, tx, uid, borrower, lendID); err != nil {
+		return 0, err
+	}
 	var txnID int64
 	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, note, txn_at)
 		VALUES ($1,$2,$3,'writeoff',$4,$5,$6,$7) RETURNING id`,
@@ -245,14 +239,31 @@ func Forgive(ctx context.Context, tx *sql.Tx, uid, borrower string, amount float
 	).Scan(&txnID); err != nil {
 		return 0, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO fin_lend_settlements (user_id, borrower, transaction_id) VALUES ($1,$2,$3)`, uid, borrower, txnID); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO fin_lend_settlements (user_id, borrower, transaction_id, lend_id) VALUES ($1,$2,$3,$4)`, uid, borrower, txnID, lendID); err != nil {
 		return 0, err
 	}
 	return txnID, RebalanceLends(ctx, tx, uid, borrower)
 }
 
-// SettleWith converts credits into settlements from borrower.
-func SettleWith(ctx context.Context, tx *sql.Tx, uid, borrower string, txnIDs []int64) error {
+// checkPin makes sure a pinned lend is one of borrower's. nil = overall.
+func checkPin(ctx context.Context, tx *sql.Tx, uid, borrower string, lendID *int64) error {
+	if lendID == nil {
+		return nil
+	}
+	var ok bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_lends WHERE id = $3 AND user_id = $1 AND `+borrowerMatch+`)`,
+		uid, borrower, *lendID).Scan(&ok); err != nil {
+		return err
+	}
+	if !ok {
+		return lendErr("That lend isn't one of %s's.", borrower)
+	}
+	return nil
+}
+
+// SettleWith converts credits into settlements from borrower, toward lendID
+// (nil = their overall total).
+func SettleWith(ctx context.Context, tx *sql.Tx, uid, borrower string, txnIDs []int64, lendID *int64) error {
 	borrower = strings.TrimSpace(borrower)
 	if borrower == "" || len(txnIDs) == 0 {
 		return lendErr("Pick a person and at least one transaction.")
@@ -264,6 +275,9 @@ func SettleWith(ctx context.Context, tx *sql.Tx, uid, borrower string, txnIDs []
 		return lendErr("%s doesn't owe anything right now.", borrower)
 	}
 	borrower = known
+	if err := checkPin(ctx, tx, uid, borrower, lendID); err != nil {
+		return err
+	}
 	for _, txnID := range txnIDs {
 		var typ string
 		var transferPair sql.NullInt64
@@ -280,31 +294,31 @@ func SettleWith(ctx context.Context, tx *sql.Tx, uid, borrower string, txnIDs []
 		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET type = 'lend_repayment', updated_at = NOW() WHERE id = $1 AND user_id = $2`, txnID, uid); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO fin_lend_settlements (user_id, borrower, transaction_id) VALUES ($1,$2,$3)`, uid, borrower, txnID); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO fin_lend_settlements (user_id, borrower, transaction_id, lend_id) VALUES ($1,$2,$3,$4)`, uid, borrower, txnID, lendID); err != nil {
 			return err
 		}
 	}
 	return RebalanceLends(ctx, tx, uid, borrower)
 }
 
-// RecordSettlement books money received that has no transaction yet (cash,
-// an uncaptured transfer) and settles it in one step.
-func RecordSettlement(ctx context.Context, tx *sql.Tx, uid, borrower string, accountID int64, amount float64, at time.Time, note string) (int64, error) {
-	borrower = strings.TrimSpace(borrower)
-	if borrower == "" || accountID == 0 || amount <= 0 {
-		return 0, lendErr("Enter who it's from, an account and an amount above zero.")
+// SetSettlementLend re-points a payment (or forgive) toward one of the
+// person's lends, or back to their overall total (nil).
+func SetSettlementLend(ctx context.Context, tx *sql.Tx, uid string, settlementID int64, lendID *int64) error {
+	var borrower string
+	err := tx.QueryRowContext(ctx, `SELECT borrower FROM fin_lend_settlements WHERE id = $1 AND user_id = $2 FOR UPDATE`, settlementID, uid).Scan(&borrower)
+	if errors.Is(err, sql.ErrNoRows) {
+		return lendErr("That payment no longer exists.")
 	}
-	var txnID int64
-	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions (user_id, account_id, type, amount, description, note, txn_at)
-		SELECT $1, id, 'income', $3, $4, $5, $6 FROM fin_accounts WHERE id = $2 AND user_id = $1 RETURNING id`,
-		uid, accountID, math.Round(amount*100)/100, "Received from "+borrower, strings.TrimSpace(note), at,
-	).Scan(&txnID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, lendErr("That account no longer exists.")
-		}
-		return 0, err
+	if err != nil {
+		return err
 	}
-	return txnID, SettleWith(ctx, tx, uid, borrower, []int64{txnID})
+	if err := checkPin(ctx, tx, uid, borrower, lendID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE fin_lend_settlements SET lend_id = $1 WHERE id = $2 AND user_id = $3`, lendID, settlementID, uid); err != nil {
+		return err
+	}
+	return RebalanceLends(ctx, tx, uid, borrower)
 }
 
 // Unsettle turns a settlement back into a plain credit.
@@ -332,7 +346,7 @@ func Unsettle(ctx context.Context, tx *sql.Tx, uid string, settlementID int64) e
 }
 
 // UnmarkPaidFor turns a paid-for lend back into the expense it came from.
-// Repayments recorded directly against it stay as received money (income).
+// Payments pinned to it fall back to the person's overall total.
 func UnmarkPaidFor(ctx context.Context, tx *sql.Tx, uid string, lendID int64) error {
 	var borrower, origin string
 	var txnID int64
@@ -345,12 +359,6 @@ func UnmarkPaidFor(ctx context.Context, tx *sql.Tx, uid string, lendID int64) er
 	}
 	if origin != "paid_for" {
 		return lendErr("This lend wasn't made from a transaction, so there's nothing to undo. Delete it instead.")
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET type = 'income', updated_at = NOW()
-		WHERE user_id = $1 AND id IN (
-			SELECT r.transaction_id FROM fin_lend_repayments r
-			WHERE r.lend_id = $2 AND NOT EXISTS (SELECT 1 FROM fin_lend_settlements s WHERE s.transaction_id = r.transaction_id))`, uid, lendID); err != nil {
-		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM fin_lends WHERE id = $1 AND user_id = $2`, lendID, uid); err != nil {
 		return err
@@ -376,86 +384,71 @@ func UnmarkPaidFor(ctx context.Context, tx *sql.Tx, uid string, lendID int64) er
 	return RebalanceLends(ctx, tx, uid, borrower)
 }
 
-// RebalanceLends re-derives how a person's settlement credits cover their
-// lends: oldest credit to oldest lend, after repayments recorded directly
-// against a lend. Deterministic, so it runs after every change.
+// RebalanceLends re-derives which of a person's lends their pinned payments
+// cover, oldest payment first, each up to what is left of its lend. Anything
+// beyond that, and every unpinned payment, only lowers the person's total
+// (fin_lend_state). Deterministic, so it runs after every change.
 func RebalanceLends(ctx context.Context, tx *sql.Tx, uid, borrower string) error {
-	type lend struct {
-		id   int64
-		room float64
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT id, principal FROM fin_lends WHERE user_id = $1 AND `+borrowerMatch+` ORDER BY lent_at, id FOR UPDATE`, uid, borrower)
+	rows, err := tx.QueryContext(ctx, `SELECT id, principal FROM fin_lends WHERE user_id = $1 AND `+borrowerMatch+` ORDER BY id FOR UPDATE`, uid, borrower)
 	if err != nil {
 		return err
 	}
-	var lends []lend
+	room := map[int64]float64{}
 	for rows.Next() {
-		var l lend
-		if err := rows.Scan(&l.id, &l.room); err != nil {
+		var id int64
+		var principal float64
+		if err := rows.Scan(&id, &principal); err != nil {
 			rows.Close()
 			return err
 		}
-		lends = append(lends, l)
+		room[id] = principal
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
-
 	if _, err := tx.ExecContext(ctx, `DELETE FROM fin_lend_repayments r USING fin_lend_settlements s
 		WHERE r.user_id = $1 AND s.user_id = $1 AND r.transaction_id = s.transaction_id AND LOWER(BTRIM(s.borrower)) = LOWER(BTRIM($2))`, uid, borrower); err != nil {
 		return err
 	}
-	for i := range lends {
-		var direct float64
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount),0) FROM fin_lend_repayments WHERE lend_id = $1`, lends[i].id).Scan(&direct); err != nil {
-			return err
-		}
-		lends[i].room = math.Max(lends[i].room-direct, 0)
-	}
 
-	credits, err := tx.QueryContext(ctx, `SELECT t.id, t.account_id, t.amount, t.txn_at FROM fin_lend_settlements s
+	pins, err := tx.QueryContext(ctx, `SELECT s.lend_id, t.id, t.account_id, t.amount, t.txn_at FROM fin_lend_settlements s
 		JOIN fin_transactions t ON t.id = s.transaction_id
-		WHERE s.user_id = $1 AND LOWER(BTRIM(s.borrower)) = LOWER(BTRIM($2)) ORDER BY t.txn_at, t.id`, uid, borrower)
+		WHERE s.user_id = $1 AND LOWER(BTRIM(s.borrower)) = LOWER(BTRIM($2)) AND s.lend_id IS NOT NULL
+		ORDER BY t.txn_at, t.id`, uid, borrower)
 	if err != nil {
 		return err
 	}
-	type credit struct {
-		txnID, accountID int64
-		amount           float64
-		at               time.Time
+	type pin struct {
+		lendID, txnID, accountID int64
+		amount                   float64
+		at                       time.Time
 	}
-	var pool []credit
-	for credits.Next() {
-		var c credit
-		if err := credits.Scan(&c.txnID, &c.accountID, &c.amount, &c.at); err != nil {
-			credits.Close()
+	var list []pin
+	for pins.Next() {
+		var p pin
+		if err := pins.Scan(&p.lendID, &p.txnID, &p.accountID, &p.amount, &p.at); err != nil {
+			pins.Close()
 			return err
 		}
-		pool = append(pool, c)
+		list = append(list, p)
 	}
-	credits.Close()
-	if err := credits.Err(); err != nil {
+	pins.Close()
+	if err := pins.Err(); err != nil {
 		return err
 	}
-
-	li := 0
-	for _, c := range pool {
-		left := c.amount
-		for left > 0.004 && li < len(lends) {
-			if lends[li].room <= 0.004 {
-				li++
-				continue
-			}
-			part := math.Round(math.Min(left, lends[li].room)*100) / 100
-			if _, err := tx.ExecContext(ctx, `INSERT INTO fin_lend_repayments
-				(user_id, lend_id, destination_account_id, transaction_id, amount, repaid_at) VALUES ($1,$2,$3,$4,$5,$6)`,
-				uid, lends[li].id, c.accountID, c.txnID, part, c.at); err != nil {
-				return err
-			}
-			lends[li].room -= part
-			left -= part
+	for _, p := range list {
+		left, ok := room[p.lendID] // a pin to someone else's lend counts overall
+		if !ok || left <= 0.004 {
+			continue
 		}
+		part := roundMoney(math.Min(p.amount, left))
+		if _, err := tx.ExecContext(ctx, `INSERT INTO fin_lend_repayments
+			(user_id, lend_id, destination_account_id, transaction_id, amount, repaid_at) VALUES ($1,$2,$3,$4,$5,$6)`,
+			uid, p.lendID, p.accountID, p.txnID, part, p.at); err != nil {
+			return err
+		}
+		room[p.lendID] = left - part
 	}
 	return nil
 }

@@ -415,8 +415,6 @@ func deleteAccount(deps Deps) http.HandlerFunc {
 		if err := d.QueryRow(`SELECT EXISTS(
 			SELECT 1 FROM fin_lends WHERE user_id=$1 AND source_account_id=$2
 			UNION ALL
-			SELECT 1 FROM fin_lend_repayments WHERE user_id=$1 AND destination_account_id=$2
-			UNION ALL
 			SELECT 1 FROM fin_lend_settlements s JOIN fin_transactions t ON t.id=s.transaction_id
 			WHERE s.user_id=$1 AND t.account_id=$2
 		)`, uid, id).Scan(&usedByLend); err != nil {
@@ -611,14 +609,49 @@ type txnResp struct {
 	LinkedAccount *int64  `json:"linked_account"`
 	SlateID       int64   `json:"slate_id"`   // never zero; Plain when unfiled
 	SlateName     string  `json:"slate_name"` // joined for display
-	LendID        *int64  `json:"lend_id"`    // source or repayment row's receivable
+	LendID        *int64  `json:"lend_id"`    // the lend it is, or the lend a payment is pinned to
 	LendBorrower  *string `json:"lend_borrower"`
+	// Settlement is set on a payment back (or a forgive): who it is from and
+	// the lend it counts toward (LendID nil = their overall total).
+	Settlement *txnSettlement `json:"settlement"`
 	// Split is set on a bill shared with someone. Amount is then the user's
 	// own part; the bill as charged is Amount + Split.Share. The share's own
 	// lend row (split_of) is folded into the bill and never listed alone.
 	Split     *txnSplit `json:"split"`
 	RefundOf  *int64    `json:"refund_of"` // refund: the purchase it came back for
 	CreatedAt string    `json:"created_at"`
+}
+
+type txnSettlement struct {
+	ID       int64   `json:"id"`
+	Borrower string  `json:"borrower"`
+	LendID   *int64  `json:"lend_id"`
+	Toward   *string `json:"toward"` // the pinned lend's title
+}
+
+const errTitleRequired = "Add a title."
+
+// fallbackTitle names a transaction that arrived without one (an SMS the
+// parser couldn't name): its category, else its kind. Titles are never blank.
+func fallbackTitle(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, uid string, categoryID *int64, typ string) string {
+	if categoryID != nil {
+		var name string
+		q.QueryRowContext(ctx, `SELECT name FROM fin_categories WHERE id=$1 AND user_id=$2`, *categoryID, uid).Scan(&name)
+		if strings.TrimSpace(name) != "" {
+			return name
+		}
+	}
+	switch typ {
+	case "income":
+		return "Income"
+	case "refund":
+		return "Refund"
+	case "transfer":
+		return "Transfer"
+	}
+	return "Expense"
 }
 
 type txnSplit struct {
@@ -635,12 +668,14 @@ const istDateExpr = "(%s AT TIME ZONE 'Asia/Kolkata')::date"
 func istDate(col string) string { return fmt.Sprintf(istDateExpr, col) }
 
 // resolveTxnAt parses the request's ISO txn_at, falling back to `now` when
-// absent or unparseable.
+// absent or unparseable. A bare date ("YYYY-MM-DD", sent by older clients)
+// lands on that day at now's clock rather than being dropped for today.
 func resolveTxnAt(txnAt string, now time.Time) time.Time {
 	if txnAt != "" {
 		if t, err := time.Parse(time.RFC3339, txnAt); err == nil {
 			return t
 		}
+		return composeTxnAt(now.Location(), txnAt, "", now)
 	}
 	return now
 }
@@ -669,9 +704,20 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		args := []any{uid}
 		clauses := []string{"t.user_id = $1", "t.split_of IS NULL"}
 		ph := 2
+		// account_id=1,4,7: any of these accounts.
 		if v := queryParam(r, "account_id"); v != "" {
-			clauses = append(clauses, "t.account_id = $"+itoa(ph))
-			args = append(args, v)
+			var ids []int64
+			for _, part := range strings.Split(v, ",") {
+				if n, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64); err == nil {
+					ids = append(ids, n)
+				}
+			}
+			if len(ids) == 0 {
+				errJSON(w, http.StatusBadRequest, "invalid account_id")
+				return
+			}
+			clauses = append(clauses, "t.account_id = ANY($"+itoa(ph)+")")
+			args = append(args, ids)
 			ph++
 		}
 		if v := queryParam(r, "category_id"); v != "" {
@@ -715,17 +761,17 @@ func listTransactions(deps Deps) http.HandlerFunc {
 
 		q := `SELECT t.id, t.account_id, a.name, t.category_id, c.name, c.color, t.type, t.amount,
 			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.slate_id, s.name,
-			  COALESCE(l.id, r.lend_id), COALESCE(l.borrower, ls.borrower, r.borrower), t.created_at::text,
-			  spl.id, spl.borrower, sp.amount, t.refund_of
+			  COALESCE(l.id, ls.lend_id), COALESCE(l.borrower, ls.borrower), t.created_at::text,
+			  spl.id, spl.borrower, sp.amount, t.refund_of,
+			  ls.id, COALESCE(NULLIF(pt.description,''), pl.description)
 			  FROM fin_transactions t
 			  JOIN fin_accounts a ON a.id = t.account_id
 			  LEFT JOIN fin_categories c ON c.id = t.category_id
 			  JOIN fin_slates s ON s.id = t.slate_id
 			  LEFT JOIN fin_lends l ON l.source_transaction_id=t.id AND l.user_id=t.user_id
 			  LEFT JOIN fin_lend_settlements ls ON ls.transaction_id=t.id AND ls.user_id=t.user_id
-			  LEFT JOIN LATERAL (SELECT rr.lend_id, rl.borrower FROM fin_lend_repayments rr
-			    JOIN fin_lends rl ON rl.id = rr.lend_id
-			    WHERE rr.transaction_id=t.id AND rr.user_id=t.user_id ORDER BY rr.id LIMIT 1) r ON TRUE
+			  LEFT JOIN fin_lends pl ON pl.id = ls.lend_id
+			  LEFT JOIN fin_transactions pt ON pt.id = pl.source_transaction_id
 			  LEFT JOIN fin_transactions sp ON sp.split_of=t.id AND sp.user_id=t.user_id
 			  LEFT JOIN fin_lends spl ON spl.source_transaction_id=sp.id AND spl.user_id=t.user_id
 			  WHERE ` + strings.Join(clauses, " AND ") +
@@ -745,10 +791,15 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			var splitLend sql.NullInt64
 			var splitBorrower sql.NullString
 			var splitShare sql.NullFloat64
+			var settlementID sql.NullInt64
+			var toward *string
 			rows.Scan(&t.ID, &t.AccountID, &t.AccountName, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
 				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount,
 				&t.SlateID, &t.SlateName, &t.LendID, &t.LendBorrower, &t.CreatedAt,
-				&splitLend, &splitBorrower, &splitShare, &t.RefundOf)
+				&splitLend, &splitBorrower, &splitShare, &t.RefundOf, &settlementID, &toward)
+			if settlementID.Valid && t.LendBorrower != nil {
+				t.Settlement = &txnSettlement{ID: settlementID.Int64, Borrower: *t.LendBorrower, LendID: t.LendID, Toward: toward}
+			}
 			if splitLend.Valid {
 				t.Split = &txnSplit{LendID: splitLend.Int64, Borrower: splitBorrower.String, Share: roundMoney(splitShare.Float64)}
 			}
@@ -786,8 +837,10 @@ func createTransaction(deps Deps) http.HandlerFunc {
 				DueDate  *string `json:"due_date"` // absent → card cycle; "" → none
 				Remind   bool    `json:"remind"`
 			} `json:"split"`
-			// income only: this is that person paying the user back.
-			SettleWith string `json:"settle_with"`
+			// income only: this is that person paying the user back, toward
+			// one of their lends (settle_lend_id) or their overall total.
+			SettleWith   string `json:"settle_with"`
+			SettleLendID *int64 `json:"settle_lend_id"`
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -879,6 +932,9 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		txnAt := resolveTxnAt(b.TxnAt, userNow(d, uid))
+		if b.Description = strings.TrimSpace(b.Description); b.Description == "" {
+			b.Description = fallbackTitle(ctx, d, uid, b.CategoryID, b.Type)
+		}
 
 		// Transfer: insert a pair (transfer_out from source, transfer_in to dest)
 		if b.Type == "transfer" {
@@ -970,7 +1026,7 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			}
 		}
 		if b.SettleWith != "" {
-			if err := db.SettleWith(ctx, tx, uid, b.SettleWith, []int64{id}); err != nil {
+			if err := db.SettleWith(ctx, tx, uid, b.SettleWith, []int64{id}, b.SettleLendID); err != nil {
 				lendError(w, r, "settle transaction", err)
 				return
 			}
@@ -1014,6 +1070,12 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid json")
 			return
 		}
+		if b.Description != nil {
+			if *b.Description = strings.TrimSpace(*b.Description); *b.Description == "" {
+				errJSON(w, http.StatusBadRequest, errTitleRequired)
+				return
+			}
+		}
 		ctx := r.Context()
 		tx, err := d.BeginTx(ctx, nil)
 		if err != nil {
@@ -1034,11 +1096,12 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			internalError(w, r, "read transaction type", err)
 			return
 		}
-		if storedType == "lend_repayment" {
-			// The money in a repayment belongs to the lends it pays off, but
-			// its words are the user's: title and note can always change.
+		if storedType == "lend_repayment" || storedType == "writeoff" {
+			// The money in a payment back (or a forgive) belongs to the lends
+			// it settles, but its words are the user's: title and note can
+			// always change. Unmark it to change the rest.
 			if b.AccountID != nil || b.CategoryID != nil || b.Amount != nil || b.TxnAt != nil || b.SlateID != nil || b.RefundOf != nil || b.Type != nil {
-				errJSON(w, http.StatusConflict, "Only a repayment's title and note can change here. Change the rest from Lends.")
+				errJSON(w, http.StatusConflict, "Only a repayment's title and note can change. Unmark it to change the rest.")
 				return
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET description=COALESCE($1, description), note=COALESCE($2, note), updated_at=NOW()

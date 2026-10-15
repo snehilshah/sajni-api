@@ -350,7 +350,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_lends",
-			Description: "List money the user has lent, including borrower, source account, principal, repaid amount, outstanding principal, optional due date, and status. A lend is a receivable asset, not an expense.",
+			Description: "List money the user has lent, including borrower, source account, principal, repaid (payments pinned to this lend), outstanding (what is left of it, never more than the person's overall total), optional due date, and status. A lend is a receivable asset, not an expense.",
 			Schema:      obj(map[string]*genai.Schema{}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listLendsTool(ctx, d, uid)
@@ -1154,57 +1154,25 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "create_transaction",
-			Description: "Record a finance transaction against an existing account and assign a category. Use list_finance_accounts to get account_id. Specify either category_id or category_name; if category_name is specified, the backend will auto-match it to the closest existing category. Slates: omit slate_id and it files under Plain (normal life); pass a slate id from list_slates for an outlier like a trip. A refund (money back on a purchase) is type 'refund' with the purchase's expense category: it lowers that spending and is not income. A bill shared with someone is an expense with split_with + split_share (their part). Money received from someone who owes the user is income with from_person, which settles their oldest lends.",
+			Description: "Record a finance transaction against an existing account and assign a category. Use list_finance_accounts to get account_id. Specify either category_id or category_name; if category_name is specified, the backend will auto-match it to the closest existing category. Slates: omit slate_id and it files under Plain (normal life); pass a slate id from list_slates for an outlier like a trip. A refund (money back on a purchase) is type 'refund' with the purchase's expense category: it lowers that spending and is not income. A bill shared with someone is an expense with split_with + split_share (their part). Lending money is an expense with split_with and split_share equal to amount. Money received from someone who owes the user is income with from_person; add toward_lend_id only when it was clearly for one of their lends (from list_lends), otherwise it counts toward their overall total.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"account_id":    intg("Required. The target account ID."),
-				"category_id":   intg("Optional category identifier."),
-				"category_name": str("Optional category name (e.g. 'Food', 'Groceries', 'Rent') to auto-match on backend. For a refund, the expense category it came back to."),
-				"type":          str("'expense' | 'income' | 'refund'. Default 'expense'."),
-				"amount":        num("Positive amount. For a split bill, the whole bill."),
-				"description":   str("What it was for."),
-				"date":          str("ISO date. Defaults to today."),
-				"slate_id":      intg("Omit → Plain (normal life); N → that slate."),
-				"refund_of":     intg("Refund only, optional: the original expense id from list_finance_transactions. Its category and slate are reused when none is given."),
-				"split_with":    str("Expense only, optional: the person who owes part of this bill. Reuse the exact name from list_lends."),
-				"split_share":   num("With split_with: their part of the bill. Equal to amount when all of it is theirs."),
-				"from_person":   str("Income only, optional: the person paying the user back (as named in list_lends)."),
-			}, "account_id", "amount"),
+				"account_id":     intg("Required. The target account ID."),
+				"category_id":    intg("Optional category identifier."),
+				"category_name":  str("Optional category name (e.g. 'Food', 'Groceries', 'Rent') to auto-match on backend. For a refund, the expense category it came back to."),
+				"type":           str("'expense' | 'income' | 'refund'. Default 'expense'."),
+				"amount":         num("Positive amount. For a split bill, the whole bill."),
+				"description":    str("Required. A short title for what it was."),
+				"date":           str("ISO date. Defaults to today."),
+				"slate_id":       intg("Omit → Plain (normal life); N → that slate."),
+				"refund_of":      intg("Refund only, optional: the original expense id from list_finance_transactions. Its category and slate are reused when none is given."),
+				"split_with":     str("Expense only, optional: the person who owes part of this bill. Reuse the exact name from list_lends."),
+				"split_share":    num("With split_with: their part of the bill. Equal to amount when all of it is theirs."),
+				"from_person":    str("Income only, optional: the person paying the user back (as named in list_lends)."),
+				"toward_lend_id": intg("With from_person, optional: the lend id (list_lends) this payment was for. Omit for their overall total."),
+			}, "account_id", "amount", "description"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createTxnTool(ctx, d, uid, args)
-			},
-		},
-		{
-			Name:        "create_lend",
-			Description: "Record principal lent to someone. This debits the source bank, cash, or card account and creates an equal receivable so net worth does not change. Use this instead of an expense. Interest is separate income when received.",
-			Mutating:    true,
-			Schema: obj(map[string]*genai.Schema{
-				"source_account_id": intg("Required. Account or card from list_finance_accounts."),
-				"borrower":          str("Required. Free-text borrower name."),
-				"amount":            num("Required positive principal amount."),
-				"description":       str("Optional reason or description."),
-				"note":              str("Optional note."),
-				"date":              str("ISO date. Defaults to today."),
-				"due_date":          str("Optional ISO repayment due date."),
-				"remind":            boolean("Opt in to one reminder when the due date arrives. Requires due_date."),
-			}, "source_account_id", "borrower", "amount"),
-			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
-				return createLendTool(ctx, d, uid, args)
-			},
-		},
-		{
-			Name:        "record_lend_repayment",
-			Description: "Record principal repaid against an existing lend. It credits any destination account, defaults to the original source account, and reduces the receivable by the same amount. Record interest separately as income.",
-			Mutating:    true,
-			Schema: obj(map[string]*genai.Schema{
-				"lend_id":                intg("Required. From list_lends."),
-				"amount":                 num("Required positive principal repayment, no more than outstanding."),
-				"destination_account_id": intg("Optional receiving account. Defaults to the lend source account."),
-				"date":                   str("ISO date. Defaults to today."),
-				"note":                   str("Optional note."),
-			}, "lend_id", "amount"),
-			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
-				return recordLendRepaymentTool(ctx, d, uid, args)
 			},
 		},
 		{
@@ -1238,11 +1206,12 @@ func (s *Service) buildTools() []Tool {
 			Description: "Forgive part or all of what a person owes. The forgiven amount stops being owed and counts as the user's spending on that day (no money moves). Only when the user clearly says to forgive or write it off.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"borrower":      str("Required. The person, as named in list_lends."),
-				"amount":        num("Required. At most what they owe."),
-				"category_name": str("Optional expense category it counts under, e.g. 'Gifts'. Defaults to Others."),
-				"date":          str("ISO date. Defaults to today."),
-				"note":          str("Optional note."),
+				"borrower":       str("Required. The person, as named in list_lends."),
+				"amount":         num("Required. At most what they owe."),
+				"category_name":  str("Optional expense category it counts under, e.g. 'Gifts'. Defaults to Others."),
+				"date":           str("ISO date. Defaults to today."),
+				"note":           str("Optional note."),
+				"toward_lend_id": intg("Optional. The lend id (list_lends) being forgiven. Omit for their overall total."),
 			}, "borrower", "amount"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return forgiveLendTool(ctx, d, uid, args)
@@ -1250,14 +1219,27 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "settle_lends",
-			Description: "Mark existing credits (money received) as that person paying back what they owe. A credit pays off their oldest items first; partial payments leave the rest owed, and any extra is held against their next item. Get credit ids from list_finance_transactions (type income).",
+			Description: "Mark existing credits (money received) as that person paying back what they owe. Every payment lowers their overall total; with toward_lend_id it also pays off that one lend (any extra still counts overall). Without it no single lend is marked as paid. Get credit ids from list_finance_transactions (type income).",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"borrower":        str("Required. The person, as named in list_lends."),
 				"transaction_ids": arrayOf(intg(""), "Required. Income transaction ids."),
+				"toward_lend_id":  intg("Optional. The lend id (list_lends) these were for. Omit for their overall total."),
 			}, "borrower", "transaction_ids"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return settleLendsTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "set_payment_toward",
+			Description: "Change which lend a payment back (or a forgive) counts toward: one of that person's lends, or their overall total. Get the payment's transaction id from list_finance_transactions (type lend_repayment) and lend ids from list_lends.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"transaction_id": intg("Required. The payment's transaction id."),
+				"toward_lend_id": intg("The lend id it was for. 0 or omitted = the person's overall total."),
+			}, "transaction_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return setPaymentTowardTool(ctx, d, uid, args)
 			},
 		},
 		{
@@ -3661,16 +3643,16 @@ func financeToolMoney(value float64) float64 {
 func listLendsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
 	rows, err := d.QueryContext(ctx, `
 		SELECT l.id, l.source_account_id, a.name, l.borrower, l.principal,
-		       COALESCE(SUM(r.amount),0), l.description, l.note,
+		       st.repaid, st.outstanding, COALESCE(NULLIF(t.description,''), l.description), l.note,
 		       (l.lent_at AT TIME ZONE COALESCE(NULLIF(u.timezone,''),'Asia/Kolkata'))::date::text,
 		       l.due_date::text
 		FROM fin_lends l
+		JOIN fin_lend_state st ON st.lend_id=l.id
 		JOIN fin_accounts a ON a.id=l.source_account_id AND a.user_id=l.user_id
+		JOIN fin_transactions t ON t.id=l.source_transaction_id
 		JOIN users u ON u.id=l.user_id
-		LEFT JOIN fin_lend_repayments r ON r.lend_id=l.id AND r.user_id=l.user_id
 		WHERE l.user_id=$1
-		GROUP BY l.id, a.name, u.timezone
-		ORDER BY (l.principal-COALESCE(SUM(r.amount),0)>0) DESC, l.lent_at DESC`, uid)
+		ORDER BY (st.outstanding>0) DESC, l.lent_at DESC`, uid)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -3679,15 +3661,15 @@ func listLendsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]a
 	for rows.Next() {
 		var id, accountID int64
 		var account, borrower, description, note, lentAt string
-		var principal, repaid float64
+		var principal, repaid, outstanding float64
 		var dueDate sql.NullString
-		if err := rows.Scan(&id, &accountID, &account, &borrower, &principal, &repaid,
+		if err := rows.Scan(&id, &accountID, &account, &borrower, &principal, &repaid, &outstanding,
 			&description, &note, &lentAt, &dueDate); err != nil {
 			return nil, nil, err
 		}
 		principal = financeToolMoney(principal)
 		repaid = financeToolMoney(repaid)
-		outstanding := financeToolMoney(math.Max(principal-repaid, 0))
+		outstanding = financeToolMoney(outstanding)
 		status := "open"
 		if outstanding == 0 {
 			status = "settled"
@@ -3709,145 +3691,6 @@ func listLendsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]a
 	return map[string]any{"items": items, "count": len(items)}, nil, nil
 }
 
-func createLendTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
-	accountID := argInt(args, "source_account_id", 0)
-	borrower := strings.TrimSpace(argStr(args, "borrower"))
-	amount := financeToolMoney(argFloat(args, "amount"))
-	if accountID == 0 || borrower == "" || amount <= 0 {
-		return nil, nil, fmt.Errorf("source_account_id, borrower, and a positive amount are required")
-	}
-	lentAt, err := financeToolTimestamp(ctx, d, uid, argStr(args, "date"))
-	if err != nil {
-		return nil, nil, err
-	}
-	dueDate := argStr(args, "due_date")
-	var dueArg any
-	if dueDate != "" {
-		if _, err := time.Parse("2006-01-02", dueDate); err != nil {
-			return nil, nil, fmt.Errorf("due_date must be YYYY-MM-DD")
-		}
-		dueArg = dueDate
-	}
-	description := strings.TrimSpace(argStr(args, "description"))
-	if description == "" {
-		description = "Lent to " + borrower
-	}
-	note := strings.TrimSpace(argStr(args, "note"))
-
-	tx, err := d.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer tx.Rollback()
-	var accountExists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM fin_accounts WHERE id=$1 AND user_id=$2 AND NOT archived)`, accountID, uid).Scan(&accountExists); err != nil || !accountExists {
-		return nil, nil, fmt.Errorf("source account not found")
-	}
-	var plainID int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM fin_slates WHERE user_id=$1 AND is_plain`, uid).Scan(&plainID); err != nil {
-		return nil, nil, fmt.Errorf("no Plain slate available")
-	}
-	var transactionID int64
-	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions
-		(user_id,account_id,type,amount,description,note,txn_at,slate_id)
-		VALUES($1,$2,'lend',$3,$4,$5,$6,$7) RETURNING id`, uid, accountID, amount,
-		description, note, lentAt, plainID).Scan(&transactionID); err != nil {
-		return nil, nil, err
-	}
-	var lendID int64
-	remind := argBool(args, "remind", false) && dueArg != nil
-	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_lends
-		(user_id,source_account_id,source_transaction_id,borrower,principal,description,note,lent_at,due_date,remind)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, uid, accountID,
-		transactionID, borrower, amount, description, note, lentAt, dueArg, remind).Scan(&lendID); err != nil {
-		return nil, nil, err
-	}
-	if err := db.RebalanceLends(ctx, tx, uid, borrower); err != nil {
-		return nil, nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, nil, err
-	}
-	_ = d.SyncTags(ctx, uid, "transaction", transactionID, description+" "+note)
-	return map[string]any{"id": lendID, "transaction_id": transactionID, "borrower": borrower, "principal": amount, "outstanding": amount},
-		map[string]any{"kind": "lend_created", "id": lendID, "title": borrower, "route": "/finance/lends"}, nil
-}
-
-func recordLendRepaymentTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
-	lendID := argInt(args, "lend_id", 0)
-	amount := financeToolMoney(argFloat(args, "amount"))
-	if lendID == 0 || amount <= 0 {
-		return nil, nil, fmt.Errorf("lend_id and a positive amount are required")
-	}
-	repaidAt, err := financeToolTimestamp(ctx, d, uid, argStr(args, "date"))
-	if err != nil {
-		return nil, nil, err
-	}
-	note := strings.TrimSpace(argStr(args, "note"))
-	tx, err := d.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer tx.Rollback()
-	var borrower, sourceAccountType string
-	var sourceAccountID int64
-	var principal, alreadyRepaid float64
-	if err := tx.QueryRowContext(ctx, `SELECT l.borrower,l.source_account_id,a.type,l.principal,
-		COALESCE((SELECT SUM(amount) FROM fin_lend_repayments WHERE lend_id=l.id),0)
-		FROM fin_lends l JOIN fin_accounts a ON a.id=l.source_account_id
-		WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE`, lendID, uid).Scan(
-		&borrower, &sourceAccountID, &sourceAccountType, &principal, &alreadyRepaid); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil, fmt.Errorf("lend not found")
-		}
-		return nil, nil, err
-	}
-	outstanding := financeToolMoney(principal - alreadyRepaid)
-	if amount > outstanding {
-		return nil, nil, fmt.Errorf("repayment exceeds outstanding amount %.2f", outstanding)
-	}
-	destinationID := argInt(args, "destination_account_id", sourceAccountID)
-	if _, supplied := args["destination_account_id"]; !supplied && sourceAccountType == "credit_card" {
-		tx.QueryRowContext(ctx, `SELECT id FROM fin_accounts
-			WHERE user_id=$1 AND NOT archived AND type<>'credit_card'
-			ORDER BY CASE type WHEN 'salary' THEN 0 WHEN 'savings' THEN 1 WHEN 'cash' THEN 2 ELSE 3 END, id
-			LIMIT 1`, uid).Scan(&destinationID)
-	}
-	var destinationExists bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM fin_accounts WHERE id=$1 AND user_id=$2 AND NOT archived)`, destinationID, uid).Scan(&destinationExists); err != nil || !destinationExists {
-		return nil, nil, fmt.Errorf("destination account not found")
-	}
-	var plainID int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM fin_slates WHERE user_id=$1 AND is_plain`, uid).Scan(&plainID); err != nil {
-		return nil, nil, fmt.Errorf("no Plain slate available")
-	}
-	var transactionID int64
-	description := "Repayment from " + borrower
-	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions
-		(user_id,account_id,type,amount,description,note,txn_at,slate_id)
-		VALUES($1,$2,'lend_repayment',$3,$4,$5,$6,$7) RETURNING id`, uid, destinationID,
-		amount, description, note, repaidAt, plainID).Scan(&transactionID); err != nil {
-		return nil, nil, err
-	}
-	var repaymentID int64
-	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_lend_repayments
-		(user_id,lend_id,destination_account_id,transaction_id,amount,repaid_at,note)
-		VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`, uid, lendID, destinationID,
-		transactionID, amount, repaidAt, note).Scan(&repaymentID); err != nil {
-		return nil, nil, err
-	}
-	if err := db.RebalanceLends(ctx, tx, uid, borrower); err != nil {
-		return nil, nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, nil, err
-	}
-	_ = d.SyncTags(ctx, uid, "transaction", transactionID, description+" "+note)
-	remaining := financeToolMoney(outstanding - amount)
-	return map[string]any{"id": repaymentID, "transaction_id": transactionID, "lend_id": lendID, "amount": amount, "outstanding": remaining},
-		map[string]any{"kind": "lend_repayment_created", "id": lendID, "title": borrower, "route": "/finance/lends"}, nil
-}
-
 func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	acct := argInt(args, "account_id", 0)
 	if acct == 0 {
@@ -3858,13 +3701,16 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		ttype = "expense"
 	}
 	if ttype != "expense" && ttype != "income" && ttype != "refund" {
-		return nil, nil, fmt.Errorf("type must be expense, income or refund; use create_lend for lending")
+		return nil, nil, fmt.Errorf("type must be expense, income or refund; lending is an expense with split_with")
 	}
 	amount := argFloat(args, "amount")
 	if amount <= 0 {
 		return nil, nil, fmt.Errorf("amount must be positive")
 	}
-	desc := argStr(args, "description")
+	desc := strings.TrimSpace(argStr(args, "description"))
+	if desc == "" {
+		return nil, nil, fmt.Errorf("description is required: give it a short title")
+	}
 	date := argStr(args, "date")
 
 	// Resolve Category
@@ -3961,7 +3807,7 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 			return nil, nil, err
 		}
 	case fromPerson != "":
-		if err := db.SettleWith(ctx, tx, uid, fromPerson, []int64{id}); err != nil {
+		if err := db.SettleWith(ctx, tx, uid, fromPerson, []int64{id}, optLendID(args)); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -3999,20 +3845,23 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	if owned != 1 {
 		return nil, nil, fmt.Errorf("transaction not found")
 	}
-	if storedType == "lend_repayment" {
-		// A repayment's money is the lends' business; only its title can change.
+	if v, ok := args["description"]; ok && v != nil && strings.TrimSpace(argStr(args, "description")) == "" {
+		return nil, nil, fmt.Errorf("description can't be blank")
+	}
+	if storedType == "lend_repayment" || storedType == "writeoff" {
+		// A payment's money is the lends' business; only its title can change.
 		if v, ok := args["description"]; !ok || v == nil {
-			return nil, nil, fmt.Errorf("only a repayment's description can change; manage the money with list_lends")
+			return nil, nil, fmt.Errorf("only a repayment's description can change; to re-point it use settle_lends' toward_lend_id when settling")
 		}
 		if _, err := d.ExecContext(ctx, `UPDATE fin_transactions SET description=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`,
-			argStr(args, "description"), id, uid); err != nil {
+			strings.TrimSpace(argStr(args, "description")), id, uid); err != nil {
 			return nil, nil, err
 		}
 		return map[string]any{"id": id, "updated": true},
 			map[string]any{"kind": "transaction_updated", "id": id, "route": "/finance/transactions"}, nil
 	}
-	if storedType == "lend" || storedType == "writeoff" {
-		return nil, nil, fmt.Errorf("manage lending entries with list_lends and record_lend_repayment")
+	if storedType == "lend" {
+		return nil, nil, fmt.Errorf("manage lending entries with list_lends, settle_lends and forgive_lend")
 	}
 	var isSplit bool
 	d.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_transactions WHERE split_of = $1 AND user_id = $2)`, id, uid).Scan(&isSplit)
@@ -4311,7 +4160,7 @@ func forgiveLendTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		return nil, nil, err
 	}
 	defer tx.Rollback()
-	txnID, err := db.Forgive(ctx, tx, uid, borrower, argFloat(args, "amount"), catArg, at, argStr(args, "note"))
+	txnID, err := db.Forgive(ctx, tx, uid, borrower, argFloat(args, "amount"), catArg, at, argStr(args, "note"), optLendID(args))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -4322,6 +4171,36 @@ func forgiveLendTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		map[string]any{"kind": "lend_updated", "id": txnID, "title": borrower, "route": "/finance/lends"}, nil
 }
 
+// optLendID reads toward_lend_id; absent or 0 = the person's overall total.
+func optLendID(args map[string]any) *int64 {
+	if id := int64(argInt(args, "toward_lend_id", 0)); id > 0 {
+		return &id
+	}
+	return nil
+}
+
+func setPaymentTowardTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	var settlementID int64
+	if err := d.QueryRowContext(ctx, `SELECT id FROM fin_lend_settlements WHERE transaction_id = $1 AND user_id = $2`,
+		argInt(args, "transaction_id", 0), uid).Scan(&settlementID); err != nil {
+		return nil, nil, fmt.Errorf("that transaction isn't a payment back")
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	lendID := optLendID(args)
+	if err := db.SetSettlementLend(ctx, tx, uid, settlementID, lendID); err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"updated": true, "toward_lend_id": lendID},
+		map[string]any{"kind": "lend_updated", "id": settlementID, "title": "Payment", "route": "/finance/lends"}, nil
+}
+
 func settleLendsTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	borrower := strings.TrimSpace(argStr(args, "borrower"))
 	tx, err := d.BeginTx(ctx, nil)
@@ -4329,7 +4208,7 @@ func settleLendsTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		return nil, nil, err
 	}
 	defer tx.Rollback()
-	if err := db.SettleWith(ctx, tx, uid, borrower, argInt64Slice(args, "transaction_ids")); err != nil {
+	if err := db.SettleWith(ctx, tx, uid, borrower, argInt64Slice(args, "transaction_ids"), optLendID(args)); err != nil {
 		return nil, nil, err
 	}
 	if err := tx.Commit(); err != nil {

@@ -17,14 +17,12 @@ import (
 // eligible without producing repeated overdue notifications every 15 minutes.
 func ProcessLendReminders(ctx context.Context, deps Deps) (int, error) {
 	rows, err := deps.DB.QueryContext(ctx, `
-		SELECT l.id, l.user_id, l.borrower, l.due_date::text,
-		       GREATEST(l.principal - COALESCE(SUM(r.amount),0),0)
+		SELECT l.id, l.user_id, l.borrower, l.due_date::text, st.outstanding
 		FROM fin_lends l
-		LEFT JOIN fin_lend_repayments r ON r.lend_id=l.id AND r.user_id=l.user_id
+		JOIN fin_lend_state st ON st.lend_id=l.id
 		WHERE l.remind AND l.due_date IS NOT NULL
 		  AND l.last_reminded_due_date IS DISTINCT FROM l.due_date
-		GROUP BY l.id
-		HAVING GREATEST(l.principal - COALESCE(SUM(r.amount),0),0) > 0`)
+		  AND st.outstanding > 0`)
 	if err != nil {
 		return 0, err
 	}

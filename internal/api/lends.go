@@ -4,8 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
-	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -18,15 +16,13 @@ func registerLendRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /api/finance/lends", createLend(deps))
 	mux.HandleFunc("PUT /api/finance/lends/{id}", updateLend(deps))
 	mux.HandleFunc("DELETE /api/finance/lends/{id}", deleteLend(deps))
-	mux.HandleFunc("POST /api/finance/lends/{id}/repayments", createLendRepayment(deps))
-	mux.HandleFunc("DELETE /api/finance/lends/{id}/repayments/{repaymentID}", deleteLendRepayment(deps))
 	mux.HandleFunc("GET /api/finance/lends/people", listLendPeople(deps))
 	mux.HandleFunc("GET /api/finance/lends/candidates", listLendCandidates(deps))
 	mux.HandleFunc("POST /api/finance/lends/paid-for", markPaidFor(deps))
 	mux.HandleFunc("POST /api/finance/lends/settle", settleLends(deps))
+	mux.HandleFunc("PUT /api/finance/lends/settlements/{id}", updateSettlement(deps))
 	mux.HandleFunc("DELETE /api/finance/lends/settlements/{id}", deleteSettlement(deps))
 	mux.HandleFunc("POST /api/finance/lends/forgive", forgiveLends(deps))
-	mux.HandleFunc("PUT /api/finance/lends/{id}/share", setLendShare(deps))
 }
 
 type lendRepaymentResp struct {
@@ -42,22 +38,25 @@ type lendRepaymentResp struct {
 }
 
 type lendResp struct {
-	ID                int64               `json:"id"`
-	SourceAccountID   int64               `json:"source_account_id"`
-	SourceAccount     string              `json:"source_account"`
-	SourceAccountType string              `json:"source_account_type"`
-	Borrower          string              `json:"borrower"`
-	Principal         float64             `json:"principal"`
-	Repaid            float64             `json:"repaid"`
-	Outstanding       float64             `json:"outstanding"`
-	Description       string              `json:"description"`
-	Note              string              `json:"note"`
-	LentAt            string              `json:"lent_at"`
-	DueDate           *string             `json:"due_date"`
-	Remind            bool                `json:"remind"`
-	Status            string              `json:"status"`
-	Origin            string              `json:"origin"`
-	Repayments        []lendRepaymentResp `json:"repayments"`
+	ID                int64   `json:"id"`
+	SourceAccountID   int64   `json:"source_account_id"`
+	SourceAccount     string  `json:"source_account"`
+	SourceAccountType string  `json:"source_account_type"`
+	Borrower          string  `json:"borrower"`
+	Principal         float64 `json:"principal"`
+	Repaid            float64 `json:"repaid"`
+	Outstanding       float64 `json:"outstanding"`
+	Description       string  `json:"description"`
+	Note              string  `json:"note"`
+	LentAt            string  `json:"lent_at"`
+	DueDate           *string `json:"due_date"`
+	Remind            bool    `json:"remind"`
+	Status            string  `json:"status"`
+	Origin            string  `json:"origin"`
+	// Split: a share cut from a bill. Its title, account, date and note are
+	// the bill's (edited on the bill); the lend holds who, share and due.
+	Split      bool                `json:"split"`
+	Repayments []lendRepaymentResp `json:"repayments"` // pinned payments it covers
 }
 
 type lendAsset struct {
@@ -79,16 +78,17 @@ func listLends(deps Deps) http.HandlerFunc {
 }
 
 func loadLends(ctx context.Context, d *db.DB, uid string, loc *time.Location) ([]lendResp, error) {
+	// The title is the transaction's (a split share mirrors its bill's).
 	rows, err := d.QueryContext(ctx, `
 		SELECT l.id, l.source_account_id, a.name, a.type, l.borrower, l.principal,
-		       COALESCE(SUM(r.amount),0), l.description, l.note, l.lent_at,
-		       l.due_date::text, l.remind, l.origin
+		       st.repaid, st.outstanding, COALESCE(NULLIF(t.description,''), l.description), l.note, l.lent_at,
+		       l.due_date::text, l.remind, l.origin, t.split_of IS NOT NULL
 		FROM fin_lends l
+		JOIN fin_lend_state st ON st.lend_id = l.id
 		JOIN fin_accounts a ON a.id = l.source_account_id AND a.user_id = l.user_id
-		LEFT JOIN fin_lend_repayments r ON r.lend_id = l.id AND r.user_id = l.user_id
+		JOIN fin_transactions t ON t.id = l.source_transaction_id
 		WHERE l.user_id = $1
-		GROUP BY l.id, a.name, a.type
-		ORDER BY (l.principal - COALESCE(SUM(r.amount),0) > 0) DESC, l.lent_at DESC, l.id DESC`, uid)
+		ORDER BY (st.outstanding > 0) DESC, l.lent_at DESC, l.id DESC`, uid)
 	if err != nil {
 		return nil, err
 	}
@@ -100,13 +100,13 @@ func loadLends(ctx context.Context, d *db.DB, uid string, loc *time.Location) ([
 		var item lendResp
 		var lentAt time.Time
 		if err := rows.Scan(&item.ID, &item.SourceAccountID, &item.SourceAccount, &item.SourceAccountType,
-			&item.Borrower, &item.Principal, &item.Repaid, &item.Description, &item.Note,
-			&lentAt, &item.DueDate, &item.Remind, &item.Origin); err != nil {
+			&item.Borrower, &item.Principal, &item.Repaid, &item.Outstanding, &item.Description, &item.Note,
+			&lentAt, &item.DueDate, &item.Remind, &item.Origin, &item.Split); err != nil {
 			return nil, err
 		}
 		item.Principal = roundMoney(item.Principal)
 		item.Repaid = roundMoney(item.Repaid)
-		item.Outstanding = roundMoney(math.Max(item.Principal-item.Repaid, 0))
+		item.Outstanding = roundMoney(item.Outstanding)
 		item.Status = "open"
 		if item.Outstanding == 0 {
 			item.Status = "settled"
@@ -171,6 +171,11 @@ func createLend(deps Deps) http.HandlerFunc {
 			errJSON(w, http.StatusBadRequest, "Enter who it's for, the account it came from and an amount above zero.")
 			return
 		}
+		description := strings.TrimSpace(body.Description)
+		if description == "" {
+			errJSON(w, http.StatusBadRequest, errTitleRequired)
+			return
+		}
 		if body.DueDate != nil && *body.DueDate != "" {
 			if _, err := time.Parse("2006-01-02", *body.DueDate); err != nil {
 				errJSON(w, http.StatusBadRequest, "Pick a valid due date.")
@@ -194,10 +199,6 @@ func createLend(deps Deps) http.HandlerFunc {
 			return
 		}
 		lentAt := resolveTxnAt(body.LentAt, userNow(deps.DB, uid))
-		description := strings.TrimSpace(body.Description)
-		if description == "" {
-			description = "Lent to " + borrower
-		}
 		var txnID int64
 		if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions
 			(user_id, account_id, type, amount, description, note, txn_at, slate_id)
@@ -235,6 +236,10 @@ func createLend(deps Deps) http.HandlerFunc {
 	}
 }
 
+// updateLend edits a lend. A whole-transaction lend owns its title, account,
+// date and note; a split share's are the bill's, so only who, their share and
+// the due date change here. Changing who it's for drops its pinned payments
+// back to the old person's overall total.
 func updateLend(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
@@ -257,6 +262,7 @@ func updateLend(deps Deps) http.HandlerFunc {
 			errJSON(w, http.StatusBadRequest, "Enter who it's for.")
 			return
 		}
+		borrower := strings.TrimSpace(body.Borrower)
 		if body.DueDate != "" {
 			if _, err := time.Parse("2006-01-02", body.DueDate); err != nil {
 				errJSON(w, http.StatusBadRequest, "Pick a valid due date.")
@@ -284,14 +290,15 @@ func updateLend(deps Deps) http.HandlerFunc {
 		}
 		defer tx.Rollback()
 		var txnID, sourceAccountID int64
-		var principal, repaid float64
+		var principal float64
 		var lentAt time.Time
-		var oldBorrower string
-		if err := tx.QueryRowContext(ctx, `SELECT l.source_transaction_id, l.source_account_id, l.principal, l.lent_at, l.borrower,
-			COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r WHERE r.lend_id=l.id
-				AND NOT EXISTS (SELECT 1 FROM fin_lend_settlements s WHERE s.transaction_id=r.transaction_id)),0)
-			FROM fin_lends l WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE`, id, uid,
-		).Scan(&txnID, &sourceAccountID, &principal, &lentAt, &oldBorrower, &repaid); err != nil {
+		var oldBorrower, origin string
+		var split bool
+		if err := tx.QueryRowContext(ctx, `SELECT l.source_transaction_id, l.source_account_id, l.principal, l.lent_at, l.borrower, l.origin,
+			t.split_of IS NOT NULL
+			FROM fin_lends l JOIN fin_transactions t ON t.id = l.source_transaction_id
+			WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE OF l`, id, uid,
+		).Scan(&txnID, &sourceAccountID, &principal, &lentAt, &oldBorrower, &origin, &split); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				errJSON(w, http.StatusNotFound, "That lend no longer exists.")
 			} else {
@@ -299,73 +306,71 @@ func updateLend(deps Deps) http.HandlerFunc {
 			}
 			return
 		}
-		if body.SourceAccountID != nil {
-			if err := requireOwnedFinanceRef(ctx, tx, "fin_accounts", uid, *body.SourceAccountID); err != nil {
-				errJSON(w, http.StatusNotFound, "That account no longer exists.")
-				return
-			}
-			sourceAccountID = *body.SourceAccountID
+		description := strings.TrimSpace(body.Description)
+		if !split && description == "" {
+			errJSON(w, http.StatusBadRequest, errTitleRequired)
+			return
 		}
 		// A paid-for lend is part of a bill: its amount is the borrower's
 		// share, and changing it moves the line between their part and the
 		// user's (the bill's total, and so the card, never changes).
-		var origin string
-		tx.QueryRowContext(ctx, `SELECT origin FROM fin_lends WHERE id=$1`, id).Scan(&origin)
 		if origin == "paid_for" && body.Amount != nil && roundMoney(*body.Amount) != roundMoney(principal) {
 			if err := db.SetPaidForShare(ctx, tx, uid, id, *body.Amount); err != nil {
 				lendError(w, r, "set paid-for share", err)
 				return
 			}
-			if err := tx.QueryRowContext(ctx, `SELECT source_transaction_id, principal FROM fin_lends WHERE id=$1`, id).Scan(&txnID, &principal); err != nil {
+			if err := tx.QueryRowContext(ctx, `SELECT l.source_transaction_id, l.principal, t.split_of IS NOT NULL
+				FROM fin_lends l JOIN fin_transactions t ON t.id = l.source_transaction_id WHERE l.id=$1`, id).Scan(&txnID, &principal, &split); err != nil {
 				internalError(w, r, "reload lend", err)
 				return
 			}
 		} else if body.Amount != nil {
 			principal = roundMoney(*body.Amount)
 		}
-		var billID sql.NullInt64
-		tx.QueryRowContext(ctx, `SELECT split_of FROM fin_transactions WHERE id=$1`, txnID).Scan(&billID)
-		if principal < roundMoney(repaid) {
-			errJSON(w, http.StatusBadRequest, fmt.Sprintf("Principal can't be below the ₹%.2f already repaid.", roundMoney(repaid)))
-			return
-		}
-		if requestedLentAt != nil {
-			lentAt = *requestedLentAt
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE fin_lends SET source_account_id=$1, borrower=$2,
-			principal=$3, description=$4, note=$5, lent_at=$6,
-			due_date=NULLIF($7,'')::date, remind=($8 AND $7<>''),
-			last_reminded_due_date=CASE WHEN due_date IS DISTINCT FROM NULLIF($7,'')::date THEN NULL ELSE last_reminded_due_date END,
-			updated_at=NOW() WHERE id=$9 AND user_id=$10`, sourceAccountID,
-			strings.TrimSpace(body.Borrower), principal, strings.TrimSpace(body.Description), strings.TrimSpace(body.Note),
-			lentAt, body.DueDate, body.Remind, id, uid); err != nil {
-			internalError(w, r, "update lend", err)
-			return
-		}
-		description := strings.TrimSpace(body.Description)
-		if description == "" {
-			description = "Lent to " + strings.TrimSpace(body.Borrower)
-		}
-		if billID.Valid {
-			// A split share lives on its bill: account and date move the
-			// bill, and the share follows it.
-			if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET account_id=$1, txn_at=$2, updated_at=NOW()
-				WHERE id=$3 AND user_id=$4`, sourceAccountID, lentAt, billID.Int64, uid); err != nil {
-				internalError(w, r, "update split bill", err)
+		if !strings.EqualFold(oldBorrower, borrower) {
+			if _, err := tx.ExecContext(ctx, `UPDATE fin_lend_settlements SET lend_id = NULL WHERE lend_id = $1 AND user_id = $2`, id, uid); err != nil {
+				internalError(w, r, "unpin payments", err)
 				return
 			}
-			if err := db.SyncSplit(ctx, tx, uid, billID.Int64); err != nil {
-				internalError(w, r, "sync split", err)
+		}
+		if split {
+			// The bill owns title, account, date and note.
+			if _, err := tx.ExecContext(ctx, `UPDATE fin_lends SET borrower=$1, due_date=NULLIF($2,'')::date, remind=($3 AND $2<>''),
+				last_reminded_due_date=CASE WHEN due_date IS DISTINCT FROM NULLIF($2,'')::date THEN NULL ELSE last_reminded_due_date END,
+				updated_at=NOW() WHERE id=$4 AND user_id=$5`, borrower, body.DueDate, body.Remind, id, uid); err != nil {
+				internalError(w, r, "update lend", err)
 				return
 			}
-		} else if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET account_id=$1, amount=$2,
-			description=$3, note=$4, txn_at=$5, updated_at=NOW()
-			WHERE id=$6 AND user_id=$7`, sourceAccountID, principal, description,
-			strings.TrimSpace(body.Note), lentAt, txnID, uid); err != nil {
-			internalError(w, r, "update lend transaction", err)
-			return
+		} else {
+			if body.SourceAccountID != nil {
+				if err := requireOwnedFinanceRef(ctx, tx, "fin_accounts", uid, *body.SourceAccountID); err != nil {
+					errJSON(w, http.StatusNotFound, "That account no longer exists.")
+					return
+				}
+				sourceAccountID = *body.SourceAccountID
+			}
+			if requestedLentAt != nil {
+				lentAt = *requestedLentAt
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE fin_lends SET source_account_id=$1, borrower=$2,
+				principal=$3, description=$4, note=$5, lent_at=$6,
+				due_date=NULLIF($7,'')::date, remind=($8 AND $7<>''),
+				last_reminded_due_date=CASE WHEN due_date IS DISTINCT FROM NULLIF($7,'')::date THEN NULL ELSE last_reminded_due_date END,
+				updated_at=NOW() WHERE id=$9 AND user_id=$10`, sourceAccountID,
+				borrower, principal, description, strings.TrimSpace(body.Note),
+				lentAt, body.DueDate, body.Remind, id, uid); err != nil {
+				internalError(w, r, "update lend", err)
+				return
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET account_id=$1, amount=$2,
+				description=$3, note=$4, txn_at=$5, updated_at=NOW()
+				WHERE id=$6 AND user_id=$7`, sourceAccountID, principal, description,
+				strings.TrimSpace(body.Note), lentAt, txnID, uid); err != nil {
+				internalError(w, r, "update lend transaction", err)
+				return
+			}
 		}
-		for _, b := range []string{oldBorrower, strings.TrimSpace(body.Borrower)} {
+		for _, b := range []string{oldBorrower, borrower} {
 			if err := db.RebalanceLends(ctx, tx, uid, b); err != nil {
 				internalError(w, r, "rebalance lends", err)
 				return
@@ -375,158 +380,9 @@ func updateLend(deps Deps) http.HandlerFunc {
 			internalError(w, r, "commit lend update", err)
 			return
 		}
-		syncTags(deps.DB, uid, "transaction", txnID, body.Note)
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	}
-}
-
-func createLendRepayment(deps Deps) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		uid := userID(r.Context())
-		lendID, err := intParam(r, "id")
-		if err != nil {
-			errJSON(w, http.StatusBadRequest, "invalid id")
-			return
+		if !split {
+			syncTags(deps.DB, uid, "transaction", txnID, body.Note)
 		}
-		var body struct {
-			DestinationAccountID int64   `json:"destination_account_id"`
-			Amount               float64 `json:"amount"`
-			RepaidAt             string  `json:"repaid_at"`
-			Note                 string  `json:"note"`
-		}
-		if err := readJSON(r, &body); err != nil || body.Amount <= 0 {
-			errJSON(w, http.StatusBadRequest, "Enter an amount above zero.")
-			return
-		}
-		ctx := r.Context()
-		tx, err := deps.DB.BeginTx(ctx, nil)
-		if err != nil {
-			internalError(w, r, "begin lend repayment", err)
-			return
-		}
-		defer tx.Rollback()
-
-		var borrower, sourceAccountType string
-		var sourceAccountID, plainID int64
-		var principal, repaid float64
-		if err := tx.QueryRowContext(ctx, `SELECT l.borrower, l.source_account_id, a.type, l.principal,
-			COALESCE((SELECT SUM(amount) FROM fin_lend_repayments WHERE lend_id=l.id),0),
-			(SELECT id FROM fin_slates WHERE user_id=l.user_id AND is_plain)
-			FROM fin_lends l JOIN fin_accounts a ON a.id=l.source_account_id
-			WHERE l.id=$1 AND l.user_id=$2 FOR UPDATE`, lendID, uid,
-		).Scan(&borrower, &sourceAccountID, &sourceAccountType, &principal, &repaid, &plainID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				errJSON(w, http.StatusNotFound, "That lend no longer exists.")
-			} else {
-				internalError(w, r, "find lend", err)
-			}
-			return
-		}
-		if body.DestinationAccountID == 0 {
-			body.DestinationAccountID = sourceAccountID
-			if sourceAccountType == "credit_card" {
-				// Money lent from a card remains payable on that card. The
-				// borrower's return normally lands in cash, so prefer a real
-				// receiving account instead of silently crediting the card.
-				tx.QueryRowContext(ctx, `SELECT id FROM fin_accounts
-					WHERE user_id=$1 AND NOT archived AND type<>'credit_card'
-					ORDER BY CASE type WHEN 'salary' THEN 0 WHEN 'savings' THEN 1 WHEN 'cash' THEN 2 ELSE 3 END, id
-					LIMIT 1`, uid).Scan(&body.DestinationAccountID)
-			}
-		}
-		if err := requireOwnedFinanceRef(ctx, tx, "fin_accounts", uid, body.DestinationAccountID); err != nil {
-			errJSON(w, http.StatusNotFound, "That account no longer exists.")
-			return
-		}
-		outstanding := roundMoney(principal - repaid)
-		amount := roundMoney(body.Amount)
-		if amount > outstanding {
-			errJSON(w, http.StatusBadRequest, fmt.Sprintf("That's more than the ₹%.2f still owed.", outstanding))
-			return
-		}
-		repaidAt := resolveTxnAt(body.RepaidAt, userNow(deps.DB, uid))
-		description := "Repayment from " + borrower
-		var txnID int64
-		if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions
-			(user_id, account_id, type, amount, description, note, txn_at, slate_id)
-			VALUES ($1,$2,'lend_repayment',$3,$4,$5,$6,$7) RETURNING id`, uid,
-			body.DestinationAccountID, amount, description, strings.TrimSpace(body.Note), repaidAt, plainID,
-		).Scan(&txnID); err != nil {
-			internalError(w, r, "create repayment transaction", err)
-			return
-		}
-		var repaymentID int64
-		if err := tx.QueryRowContext(ctx, `INSERT INTO fin_lend_repayments
-			(user_id, lend_id, destination_account_id, transaction_id, amount, repaid_at, note)
-			VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`, uid, lendID,
-			body.DestinationAccountID, txnID, amount, repaidAt, strings.TrimSpace(body.Note),
-		).Scan(&repaymentID); err != nil {
-			internalError(w, r, "create lend repayment", err)
-			return
-		}
-		if err := db.RebalanceLends(ctx, tx, uid, borrower); err != nil {
-			internalError(w, r, "rebalance lends", err)
-			return
-		}
-		if err := tx.Commit(); err != nil {
-			internalError(w, r, "commit lend repayment", err)
-			return
-		}
-		syncTags(deps.DB, uid, "transaction", txnID, body.Note)
-		writeJSON(w, http.StatusCreated, map[string]int64{"id": repaymentID, "transaction_id": txnID})
-	}
-}
-
-func deleteLendRepayment(deps Deps) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		uid := userID(r.Context())
-		lendID, err1 := intParam(r, "id")
-		repaymentID, err2 := intParam(r, "repaymentID")
-		if err1 != nil || err2 != nil {
-			errJSON(w, http.StatusBadRequest, "invalid id")
-			return
-		}
-		ctx := r.Context()
-		tx, err := deps.DB.BeginTx(ctx, nil)
-		if err != nil {
-			internalError(w, r, "begin repayment delete", err)
-			return
-		}
-		defer tx.Rollback()
-		var settlementID int64
-		tx.QueryRowContext(ctx, `SELECT s.id FROM fin_lend_repayments r JOIN fin_lend_settlements s ON s.transaction_id=r.transaction_id
-			WHERE r.id=$1 AND r.lend_id=$2 AND r.user_id=$3`, repaymentID, lendID, uid).Scan(&settlementID)
-		if settlementID != 0 {
-			if err := db.Unsettle(ctx, tx, uid, settlementID); err != nil {
-				lendError(w, r, "unsettle", err)
-				return
-			}
-			if err := tx.Commit(); err != nil {
-				internalError(w, r, "commit unsettle", err)
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-			return
-		}
-		var txnID int64
-		if err := tx.QueryRowContext(ctx, `DELETE FROM fin_lend_repayments
-			WHERE id=$1 AND lend_id=$2 AND user_id=$3 RETURNING transaction_id`, repaymentID, lendID, uid).Scan(&txnID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				errJSON(w, http.StatusNotFound, "That repayment no longer exists.")
-			} else {
-				internalError(w, r, "delete repayment", err)
-			}
-			return
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM fin_transactions WHERE id=$1 AND user_id=$2`, txnID, uid); err != nil {
-			internalError(w, r, "delete repayment transaction", err)
-			return
-		}
-		if err := tx.Commit(); err != nil {
-			internalError(w, r, "commit repayment delete", err)
-			return
-		}
-		deps.DB.ExecContext(ctx, `DELETE FROM tags WHERE user_id=$1 AND entity_type='transaction' AND entity_id=$2`, uid, txnID)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}
 }
@@ -569,29 +425,8 @@ func deleteLend(deps Deps) http.HandlerFunc {
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 			return
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT r.transaction_id FROM fin_lend_repayments r WHERE r.lend_id=$1 AND r.user_id=$2
-			AND NOT EXISTS (SELECT 1 FROM fin_lend_settlements s WHERE s.transaction_id=r.transaction_id)`, lendID, uid)
-		if err != nil {
-			internalError(w, r, "list repayment transactions", err)
-			return
-		}
+		// Payments pinned to it fall back to the person's overall total.
 		txnIDs := []int64{sourceTxnID}
-		for rows.Next() {
-			var txnID int64
-			if rows.Scan(&txnID) == nil {
-				txnIDs = append(txnIDs, txnID)
-			}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			internalError(w, r, "read repayment transactions", err)
-			return
-		}
-		rows.Close()
-		if _, err := tx.ExecContext(ctx, `DELETE FROM fin_lend_repayments WHERE lend_id=$1 AND user_id=$2`, lendID, uid); err != nil {
-			internalError(w, r, "delete lend repayments", err)
-			return
-		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM fin_lends WHERE id=$1 AND user_id=$2`, lendID, uid); err != nil {
 			internalError(w, r, "delete lend", err)
 			return
@@ -618,16 +453,15 @@ func deleteLend(deps Deps) http.HandlerFunc {
 }
 
 func loadOutstandingLends(ctx context.Context, d *db.DB, uid string) (float64, []lendAsset, error) {
-	rows, err := d.QueryContext(ctx, `SELECT l.id, l.borrower, l.description,
-		GREATEST(l.principal - COALESCE(SUM(r.amount),0),0) AS outstanding
-		FROM fin_lends l LEFT JOIN fin_lend_repayments r ON r.lend_id=l.id AND r.user_id=l.user_id
-		WHERE l.user_id=$1 GROUP BY l.id HAVING GREATEST(l.principal - COALESCE(SUM(r.amount),0),0) > 0
+	rows, err := d.QueryContext(ctx, `SELECT l.id, l.borrower, COALESCE(NULLIF(t.description,''), l.description), st.outstanding
+		FROM fin_lends l JOIN fin_lend_state st ON st.lend_id = l.id
+		JOIN fin_transactions t ON t.id = l.source_transaction_id
+		WHERE l.user_id=$1 AND st.outstanding > 0
 		ORDER BY l.lent_at, l.id`, uid)
 	if err != nil {
 		return 0, nil, err
 	}
 	defer rows.Close()
-	total := 0.0
 	assets := []lendAsset{}
 	for rows.Next() {
 		var asset lendAsset
@@ -635,52 +469,17 @@ func loadOutstandingLends(ctx context.Context, d *db.DB, uid string) (float64, [
 			return 0, nil, err
 		}
 		asset.Outstanding = roundMoney(asset.Outstanding)
-		total += asset.Outstanding
 		assets = append(assets, asset)
 	}
 	if err := rows.Err(); err != nil {
 		return 0, nil, err
 	}
-	// Settled beyond what is owed is held for that person: it nets off.
-	var credit float64
-	d.QueryRowContext(ctx, `SELECT COALESCE(SUM(t.amount),0) - COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r
-		JOIN fin_lend_settlements s2 ON s2.transaction_id = r.transaction_id WHERE s2.user_id = $1),0)
-		FROM fin_lend_settlements s JOIN fin_transactions t ON t.id = s.transaction_id WHERE s.user_id = $1`, uid).Scan(&credit)
-	return roundMoney(total - credit), assets, nil
-}
-
-// setLendShare moves the line on a paid-for bill: share is what the borrower
-// owes, the rest stays the user's expense. The bill's total never changes.
-func setLendShare(deps Deps) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		uid := userID(r.Context())
-		id, err := intParam(r, "id")
-		if err != nil {
-			errJSON(w, http.StatusBadRequest, "invalid id")
-			return
-		}
-		var body struct {
-			Share float64 `json:"share"`
-		}
-		if err := readJSON(r, &body); err != nil {
-			errJSON(w, http.StatusBadRequest, "invalid json")
-			return
-		}
-		ctx := r.Context()
-		tx, err := deps.DB.BeginTx(ctx, nil)
-		if err != nil {
-			internalError(w, r, "begin lend share", err)
-			return
-		}
-		defer tx.Rollback()
-		if err := db.SetPaidForShare(ctx, tx, uid, id, body.Share); err != nil {
-			lendError(w, r, "set lend share", err)
-			return
-		}
-		if err := tx.Commit(); err != nil {
-			internalError(w, r, "commit lend share", err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	// Owed overall: every lend minus every payment (money held for someone
+	// beyond what they owe nets off, as before).
+	var total float64
+	if err := d.QueryRowContext(ctx, `SELECT COALESCE((SELECT SUM(principal) FROM fin_lends WHERE user_id = $1),0)
+		- COALESCE((SELECT SUM(t.amount) FROM fin_lend_settlements s JOIN fin_transactions t ON t.id = s.transaction_id WHERE s.user_id = $1),0)`, uid).Scan(&total); err != nil {
+		return 0, nil, err
 	}
+	return roundMoney(total), assets, nil
 }

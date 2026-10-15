@@ -40,8 +40,9 @@ func TestLendPeopleEndpoints(t *testing.T) {
 			VALUES ($1,$2,'expense',$3,'Electricity',NOW() - make_interval(days => $4)) RETURNING id`, uid, card, 100+i, i).Scan(&id)
 		ids = append(ids, id)
 	}
-	var credit int64
+	var credit, cash int64
 	d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_at) VALUES ($1,$2,'income',250,'UPI from Dad',NOW()) RETURNING id`, uid, bank).Scan(&credit)
+	d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_at) VALUES ($1,$2,'income',10,'Cash from Dad',NOW()) RETURNING id`, uid, bank).Scan(&cash)
 
 	mux := http.NewServeMux()
 	registerLendRoutes(mux, Deps{DB: d})
@@ -93,8 +94,8 @@ func TestLendPeopleEndpoints(t *testing.T) {
 	if code := call("POST", "/api/finance/lends/settle", map[string]any{"borrower": "Dad", "transaction_ids": []int64{credit}}, nil); code != 201 {
 		t.Fatalf("settle: %d", code)
 	}
-	if code := call("POST", "/api/finance/lends/settle", map[string]any{"borrower": "Dad", "account_id": bank, "amount": 10}, nil); code != 201 {
-		t.Fatalf("record settlement: %d", code)
+	if code := call("POST", "/api/finance/lends/settle", map[string]any{"borrower": "Dad", "transaction_ids": []int64{cash}}, nil); code != 201 {
+		t.Fatalf("second settle: %d", code)
 	}
 
 	var people []lendPersonResp
@@ -116,8 +117,8 @@ func TestLendPeopleEndpoints(t *testing.T) {
 		t.Fatalf("transactions listed %d, want 37 (%d %s)", len(txns), trec.Code, trec.Body.String()[:min(200, trec.Body.Len())])
 	}
 	for _, x := range txns {
-		if x.ID == credit && (x.LendBorrower == nil || *x.LendBorrower != "Dad") {
-			t.Fatalf("settlement row should carry the person: %+v", x)
+		if x.ID == credit && (x.Settlement == nil || x.Settlement.Borrower != "Dad" || x.Settlement.LendID != nil) {
+			t.Fatalf("settlement row should carry the person, toward overall: %+v", x)
 		}
 	}
 
@@ -131,7 +132,7 @@ func TestLendPeopleEndpoints(t *testing.T) {
 		t.Fatalf("delete paid-for: %d", code)
 	}
 	var typ string
-	d.QueryRow(`SELECT type FROM fin_transactions WHERE id = $1`, lends[0].Repayments[0].TransactionID).Scan(&typ)
+	d.QueryRow(`SELECT type FROM fin_transactions WHERE id = $1`, credit).Scan(&typ)
 	if typ != "lend_repayment" {
 		t.Fatalf("settlement credit should stay a settlement, got %s", typ)
 	}
@@ -139,6 +140,18 @@ func TestLendPeopleEndpoints(t *testing.T) {
 	d.QueryRow(`SELECT COUNT(*) FROM fin_transactions WHERE user_id = $1 AND type = 'expense'`, uid).Scan(&expenses)
 	if expenses != 34 {
 		t.Fatalf("expenses after unmark = %d, want 34", expenses)
+	}
+	// Pin a payment to the remaining lend, then back to overall.
+	sid := strconv.FormatInt(people[0].Settlements[0].ID, 10)
+	if code := call("PUT", "/api/finance/lends/settlements/"+sid, map[string]any{"lend_id": lends[1].ID}, nil); code != 200 {
+		t.Fatalf("pin: %d", code)
+	}
+	call("GET", "/api/finance/lends", nil, &lends)
+	if len(lends) != 1 || lends[0].Repaid == 0 {
+		t.Fatalf("pinned lend: %+v", lends)
+	}
+	if code := call("PUT", "/api/finance/lends/settlements/"+sid, map[string]any{"lend_id": nil}, nil); code != 200 {
+		t.Fatalf("unpin: %d", code)
 	}
 	if code := call("DELETE", "/api/finance/lends/settlements/"+strconv.FormatInt(people[0].Settlements[0].ID, 10), nil, nil); code != 200 {
 		t.Fatalf("unsettle: %d", code)

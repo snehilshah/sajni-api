@@ -10,8 +10,8 @@ import (
 	"sajni/internal/db"
 )
 
-// Paid-for / settle flow: lends are whole transactions picked from the
-// ledger rather than typed in. See db/lends.go for the allocation model.
+// Paid-for / settle flow: lends and payments are transactions marked from the
+// transaction sheet. See db/lends.go for the pinned / overall model.
 
 func lendError(w http.ResponseWriter, r *http.Request, op string, err error) {
 	if errors.Is(err, db.ErrLendInput) {
@@ -27,23 +27,26 @@ type lendSettlementResp struct {
 	AccountID     int64   `json:"account_id"`
 	Account       string  `json:"account"`
 	Amount        float64 `json:"amount"`
-	Applied       float64 `json:"applied"`
+	Applied       float64 `json:"applied"`  // how much of its pinned lend it covers
 	Forgiven      bool    `json:"forgiven"` // a writeoff, not money received
+	LendID        *int64  `json:"lend_id"`  // pinned lend; nil = toward the overall total
+	Toward        *string `json:"toward"`   // the pinned lend's title
 	Description   string  `json:"description"`
+	Note          string  `json:"note"`
 	TxnAt         string  `json:"txn_at"`
 }
 
 type lendPersonResp struct {
 	Borrower    string               `json:"borrower"`
 	Outstanding float64              `json:"outstanding"`
-	Credit      float64              `json:"credit"` // settled beyond what is owed
+	Credit      float64              `json:"credit"` // paid beyond what is owed
 	Open        int                  `json:"open"`
 	LastAt      string               `json:"last_at"`
 	Settlements []lendSettlementResp `json:"settlements"`
 }
 
-// loadLendPeople groups lends per person (case-insensitive name) with their
-// running balance and settlement credits. Bounded by the lend count.
+// loadLendPeople groups lends per person (case-insensitive name): what they
+// owe overall (lends minus every payment), any surplus, and their payments.
 func loadLendPeople(r *http.Request, d *db.DB, uid string) ([]lendPersonResp, error) {
 	ctx := r.Context()
 	loc := userLocation(d, uid)
@@ -51,27 +54,29 @@ func loadLendPeople(r *http.Request, d *db.DB, uid string) ([]lendPersonResp, er
 		WITH owed AS (
 			SELECT LOWER(BTRIM(l.borrower)) AS k,
 			       (ARRAY_AGG(l.borrower ORDER BY l.lent_at DESC))[1] AS name,
-			       SUM(GREATEST(l.principal - COALESCE(p.repaid,0), 0)) AS outstanding,
-			       COUNT(*) FILTER (WHERE l.principal - COALESCE(p.repaid,0) > 0.004) AS open,
+			       SUM(l.principal) AS owed,
+			       COUNT(*) FILTER (WHERE st.outstanding > 0.004) AS open,
 			       MAX(l.lent_at) AS last_at
-			FROM fin_lends l
-			LEFT JOIN (SELECT lend_id, SUM(amount) AS repaid FROM fin_lend_repayments WHERE user_id = $1 GROUP BY lend_id) p ON p.lend_id = l.id
+			FROM fin_lends l JOIN fin_lend_state st ON st.lend_id = l.id
 			WHERE l.user_id = $1 GROUP BY 1
-		), credit AS (
+		), paid AS (
 			SELECT LOWER(BTRIM(s.borrower)) AS k,
 			       (ARRAY_AGG(s.borrower ORDER BY t.txn_at DESC))[1] AS name,
-			       SUM(t.amount) - COALESCE(SUM(a.applied),0) AS credit,
+			       SUM(t.amount) AS paid,
 			       MAX(t.txn_at) AS last_at
 			FROM fin_lend_settlements s
 			JOIN fin_transactions t ON t.id = s.transaction_id
-			LEFT JOIN (SELECT transaction_id, SUM(amount) AS applied FROM fin_lend_repayments WHERE user_id = $1 GROUP BY transaction_id) a ON a.transaction_id = s.transaction_id
 			WHERE s.user_id = $1 GROUP BY 1
+		), c AS (
+			SELECT COALESCE(o.k, p.k) AS k, COALESCE(o.name, p.name) AS name,
+			       COALESCE(o.owed,0) - COALESCE(p.paid,0) AS net,
+			       COALESCE(o.open,0) AS open, GREATEST(o.last_at, p.last_at) AS last_at
+			FROM owed o FULL JOIN paid p ON p.k = o.k
 		)
-		SELECT COALESCE(o.k, c.k), COALESCE(o.name, c.name), COALESCE(o.outstanding,0), COALESCE(c.credit,0),
-		       COALESCE(o.open,0), GREATEST(o.last_at, c.last_at)
-		FROM owed o FULL JOIN credit c ON c.k = o.k
-		WHERE COALESCE(o.k, '') <> '' OR c.credit > 0.004
-		ORDER BY (COALESCE(o.outstanding,0) > 0.004) DESC, 6 DESC`, uid)
+		SELECT c.k, c.name, GREATEST(c.net,0), GREATEST(-c.net,0), c.open, c.last_at
+		FROM c
+		WHERE c.k <> ''
+		ORDER BY (c.net > 0.004) DESC, 6 DESC`, uid)
 	if err != nil {
 		return nil, err
 	}
@@ -97,11 +102,14 @@ func loadLendPeople(r *http.Request, d *db.DB, uid string) ([]lendPersonResp, er
 	}
 
 	srows, err := d.QueryContext(ctx, `
-		SELECT LOWER(BTRIM(s.borrower)), s.id, t.id, t.account_id, a.name, t.amount, t.description, t.txn_at,
-		       COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r WHERE r.transaction_id = t.id),0), t.type = 'writeoff'
+		SELECT LOWER(BTRIM(s.borrower)), s.id, t.id, t.account_id, a.name, t.amount, t.description, t.note, t.txn_at,
+		       COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r WHERE r.transaction_id = t.id),0), t.type = 'writeoff',
+		       s.lend_id, COALESCE(NULLIF(lt.description,''), pl.description)
 		FROM fin_lend_settlements s
 		JOIN fin_transactions t ON t.id = s.transaction_id
 		JOIN fin_accounts a ON a.id = t.account_id
+		LEFT JOIN fin_lends pl ON pl.id = s.lend_id
+		LEFT JOIN fin_transactions lt ON lt.id = pl.source_transaction_id
 		WHERE s.user_id = $1 ORDER BY t.txn_at DESC, t.id DESC`, uid)
 	if err != nil {
 		return nil, err
@@ -111,7 +119,7 @@ func loadLendPeople(r *http.Request, d *db.DB, uid string) ([]lendPersonResp, er
 		var k string
 		var s lendSettlementResp
 		var at time.Time
-		if err := srows.Scan(&k, &s.ID, &s.TransactionID, &s.AccountID, &s.Account, &s.Amount, &s.Description, &at, &s.Applied, &s.Forgiven); err != nil {
+		if err := srows.Scan(&k, &s.ID, &s.TransactionID, &s.AccountID, &s.Account, &s.Amount, &s.Description, &s.Note, &at, &s.Applied, &s.Forgiven, &s.LendID, &s.Toward); err != nil {
 			return nil, err
 		}
 		s.Amount = roundMoney(s.Amount)
@@ -269,19 +277,15 @@ func markPaidFor(deps Deps) http.HandlerFunc {
 	}
 }
 
-// settleLends marks existing credits (transaction_ids) as settlements from a
-// person, or records money received with no transaction yet (account_id +
-// amount) and settles it.
+// settleLends marks existing credits as a person paying the user back,
+// toward one of their lends (lend_id) or their overall total (omitted).
 func settleLends(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
 		var body struct {
 			Borrower       string  `json:"borrower"`
 			TransactionIDs []int64 `json:"transaction_ids"`
-			AccountID      int64   `json:"account_id"`
-			Amount         float64 `json:"amount"`
-			ReceivedAt     string  `json:"received_at"`
-			Note           string  `json:"note"`
+			LendID         *int64  `json:"lend_id"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid json")
@@ -294,14 +298,7 @@ func settleLends(deps Deps) http.HandlerFunc {
 			return
 		}
 		defer tx.Rollback()
-		var newTxnID int64
-		if len(body.TransactionIDs) > 0 {
-			err = db.SettleWith(ctx, tx, uid, body.Borrower, body.TransactionIDs)
-		} else {
-			at := resolveTxnAt(body.ReceivedAt, userNow(deps.DB, uid))
-			newTxnID, err = db.RecordSettlement(ctx, tx, uid, body.Borrower, body.AccountID, body.Amount, at, body.Note)
-		}
-		if err != nil {
+		if err := db.SettleWith(ctx, tx, uid, body.Borrower, body.TransactionIDs, body.LendID); err != nil {
 			lendError(w, r, "settle", err)
 			return
 		}
@@ -309,10 +306,43 @@ func settleLends(deps Deps) http.HandlerFunc {
 			internalError(w, r, "commit settle", err)
 			return
 		}
-		if newTxnID != 0 {
-			syncTags(deps.DB, uid, "transaction", newTxnID, body.Note)
-		}
 		writeJSON(w, http.StatusCreated, map[string]string{"status": "ok"})
+	}
+}
+
+// updateSettlement re-points a payment: toward a lend (lend_id) or, with
+// lend_id null, the person's overall total.
+func updateSettlement(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		var body struct {
+			LendID *int64 `json:"lend_id"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		ctx := r.Context()
+		tx, err := deps.DB.BeginTx(ctx, nil)
+		if err != nil {
+			internalError(w, r, "begin settlement update", err)
+			return
+		}
+		defer tx.Rollback()
+		if err := db.SetSettlementLend(ctx, tx, uid, id, body.LendID); err != nil {
+			lendError(w, r, "update settlement", err)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit settlement update", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}
 }
 
@@ -353,6 +383,7 @@ func forgiveLends(deps Deps) http.HandlerFunc {
 			CategoryID *int64  `json:"category_id"`
 			ForgivenAt string  `json:"forgiven_at"`
 			Note       string  `json:"note"`
+			LendID     *int64  `json:"lend_id"` // toward this lend; omitted = overall
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid json")
@@ -372,7 +403,7 @@ func forgiveLends(deps Deps) http.HandlerFunc {
 		}
 		defer tx.Rollback()
 		at := resolveTxnAt(body.ForgivenAt, userNow(deps.DB, uid))
-		txnID, err := db.Forgive(ctx, tx, uid, body.Borrower, body.Amount, body.CategoryID, at, body.Note)
+		txnID, err := db.Forgive(ctx, tx, uid, body.Borrower, body.Amount, body.CategoryID, at, body.Note, body.LendID)
 		if err != nil {
 			lendError(w, r, "forgive", err)
 			return

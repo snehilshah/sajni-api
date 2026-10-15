@@ -63,3 +63,22 @@ func TestComposeTxnAt(t *testing.T) {
 		t.Errorf("bad date: got %v want now %v", got, now)
 	}
 }
+
+// resolveTxnAt keeps a bare date's day (older clients' "Record received" sent
+// only a date, which used to be dropped for now).
+func TestResolveTxnAtBareDate(t *testing.T) {
+	loc := istLoc(t)
+	now := time.Date(2026, 6, 3, 9, 15, 42, 0, loc)
+	if got, want := resolveTxnAt("2026-06-01", now), time.Date(2026, 6, 1, 9, 15, 42, 0, loc); !got.Equal(want) {
+		t.Errorf("bare date: got %v want %v", got, want)
+	}
+	if got, want := resolveTxnAt("2026-06-01T18:05:00+05:30", now), time.Date(2026, 6, 1, 18, 5, 0, 0, loc); !got.Equal(want) {
+		t.Errorf("rfc3339: got %v want %v", got, want)
+	}
+	if got := resolveTxnAt("", now); !got.Equal(now) {
+		t.Errorf("blank: got %v want now", got)
+	}
+	if got := resolveTxnAt("junk", now); !got.Equal(now) {
+		t.Errorf("junk: got %v want now", got)
+	}
+}

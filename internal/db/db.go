@@ -635,6 +635,8 @@ func (d *DB) ensureSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_fin_lends_user ON fin_lends(user_id, lent_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_fin_lends_due ON fin_lends(user_id, due_date) WHERE remind AND due_date IS NOT NULL;
 
+	-- Derived from pinned settlements by db.RebalanceLends (never written
+	-- directly): how much of a lend its pinned payments cover.
 	CREATE TABLE IF NOT EXISTS fin_lend_repayments (
 		id                     BIGSERIAL     PRIMARY KEY,
 		user_id                UUID          NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -650,17 +652,63 @@ func (d *DB) ensureSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_fin_lend_repayments_lend ON fin_lend_repayments(lend_id, repaid_at);
 	CREATE INDEX IF NOT EXISTS idx_fin_lend_repayments_txn ON fin_lend_repayments(transaction_id);
 
-	-- A credit the user marked as settling a person's lends. Its repayment
-	-- rows are derived (db.RebalanceLends: oldest credit → oldest lend), so
-	-- surplus simply waits for that person's next lend.
+	-- A credit (or a forgive's writeoff) the user marked as a person paying
+	-- them back. Every one reduces the person's total. lend_id pins it to one
+	-- of their lends, which it pays off first; NULL means "toward the overall
+	-- total" and no single lend shows it. A deleted lend drops its pins.
 	CREATE TABLE IF NOT EXISTS fin_lend_settlements (
 		id             BIGSERIAL   PRIMARY KEY,
 		user_id        UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		borrower       TEXT        NOT NULL,
 		transaction_id BIGINT      NOT NULL UNIQUE REFERENCES fin_transactions(id) ON DELETE RESTRICT,
+		lend_id        BIGINT      REFERENCES fin_lends(id) ON DELETE SET NULL,
 		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_lend_settlements_borrower ON fin_lend_settlements(user_id, LOWER(BTRIM(borrower)));
+
+	-- One-time prod patch (2026-10 pinned settlements). Delete once shipped.
+	-- Repayments recorded straight against a lend become settlements pinned
+	-- to it; settlements spread oldest-first become "overall" (their derived
+	-- rows go). Blank titles get one, since a title is now required.
+	ALTER TABLE fin_lend_settlements ADD COLUMN IF NOT EXISTS lend_id BIGINT REFERENCES fin_lends(id) ON DELETE SET NULL;
+	INSERT INTO fin_lend_settlements (user_id, borrower, transaction_id, lend_id)
+		SELECT r.user_id, l.borrower, r.transaction_id, r.lend_id FROM fin_lend_repayments r
+		JOIN fin_lends l ON l.id = r.lend_id
+		WHERE NOT EXISTS (SELECT 1 FROM fin_lend_settlements s WHERE s.transaction_id = r.transaction_id)
+		ON CONFLICT (transaction_id) DO NOTHING;
+	DELETE FROM fin_lend_repayments r USING fin_lend_settlements s
+		WHERE s.transaction_id = r.transaction_id AND s.lend_id IS NULL;
+	UPDATE fin_transactions t SET description = COALESCE(
+		(SELECT 'Lent to ' || l.borrower FROM fin_lends l WHERE l.source_transaction_id = t.id),
+		(SELECT 'From ' || s.borrower FROM fin_lend_settlements s WHERE s.transaction_id = t.id),
+		(SELECT c.name FROM fin_categories c WHERE c.id = t.category_id),
+		CASE t.type WHEN 'income' THEN 'Income' WHEN 'refund' THEN 'Refund'
+			WHEN 'transfer_in' THEN 'Transfer' WHEN 'transfer_out' THEN 'Transfer' ELSE 'Expense' END)
+		WHERE BTRIM(t.description) = '';
+	UPDATE fin_lends l SET description = t.description FROM fin_transactions t
+		WHERE t.id = l.source_transaction_id AND BTRIM(l.description) = '';
+
+	-- Where each lend stands. repaid = what its pinned payments cover;
+	-- outstanding = what's left of it, never more than the person's total
+	-- (lends minus every payment, pinned or not), so once that total is
+	-- ₹0 every lend of theirs is done. Read lend and person balances from
+	-- here, never by summing repayments.
+	CREATE OR REPLACE VIEW fin_lend_state AS
+	WITH owed AS (
+		SELECT user_id, LOWER(BTRIM(borrower)) AS k, SUM(principal) AS owed FROM fin_lends GROUP BY 1, 2
+	), paid AS (
+		SELECT s.user_id, LOWER(BTRIM(s.borrower)) AS k, SUM(t.amount) AS paid
+		FROM fin_lend_settlements s JOIN fin_transactions t ON t.id = s.transaction_id GROUP BY 1, 2
+	), pinned AS (
+		SELECT lend_id, SUM(amount) AS repaid FROM fin_lend_repayments GROUP BY 1
+	)
+	SELECT l.id AS lend_id, l.user_id, o.k AS person,
+		COALESCE(p.repaid, 0) AS repaid,
+		LEAST(GREATEST(l.principal - COALESCE(p.repaid, 0), 0), GREATEST(o.owed - COALESCE(pd.paid, 0), 0)) AS outstanding
+	FROM fin_lends l
+	JOIN owed o ON o.user_id = l.user_id AND o.k = LOWER(BTRIM(l.borrower))
+	LEFT JOIN paid pd ON pd.user_id = l.user_id AND pd.k = o.k
+	LEFT JOIN pinned p ON p.lend_id = l.id;
 
 	CREATE TABLE IF NOT EXISTS fin_budgets (
 		id          BIGSERIAL   PRIMARY KEY,
