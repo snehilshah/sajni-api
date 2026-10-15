@@ -1262,7 +1262,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "update_transaction",
-			Description: "Update an existing finance transaction by id — change its account, category, slate, amount, type, description, or date. On a split bill (has split_share in list_finance_transactions) amount is the user's own part; change the other person's part with set_split_share. To move it to another account pass account_id (balances recompute automatically). To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. To move it between slates pass slate_id (0 = Plain). Use list_finance_transactions to find the id first.",
+			Description: "Update an existing finance transaction by id — change its account, category, slate, amount, type, description, or date. On a split bill (has split_share in list_finance_transactions) amount is the user's own part; change the other person's part with set_split_share. To move it to another account pass account_id (balances recompute automatically). To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. To move it between slates pass slate_id (0 = Plain). A lend_repayment (money someone paid back) only takes a new description. Use list_finance_transactions to find the id first.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"id":            intg("Required. Transaction id to update."),
@@ -3999,7 +3999,19 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	if owned != 1 {
 		return nil, nil, fmt.Errorf("transaction not found")
 	}
-	if storedType == "lend" || storedType == "lend_repayment" || storedType == "writeoff" {
+	if storedType == "lend_repayment" {
+		// A repayment's money is the lends' business; only its title can change.
+		if v, ok := args["description"]; !ok || v == nil {
+			return nil, nil, fmt.Errorf("only a repayment's description can change; manage the money with list_lends")
+		}
+		if _, err := d.ExecContext(ctx, `UPDATE fin_transactions SET description=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`,
+			argStr(args, "description"), id, uid); err != nil {
+			return nil, nil, err
+		}
+		return map[string]any{"id": id, "updated": true},
+			map[string]any{"kind": "transaction_updated", "id": id, "route": "/finance/transactions"}, nil
+	}
+	if storedType == "lend" || storedType == "writeoff" {
 		return nil, nil, fmt.Errorf("manage lending entries with list_lends and record_lend_repayment")
 	}
 	var isSplit bool

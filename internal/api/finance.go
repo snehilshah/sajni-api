@@ -1034,7 +1034,29 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			internalError(w, r, "read transaction type", err)
 			return
 		}
-		if storedType == "lend" || storedType == "lend_repayment" {
+		if storedType == "lend_repayment" {
+			// The money in a repayment belongs to the lends it pays off, but
+			// its words are the user's: title and note can always change.
+			if b.AccountID != nil || b.CategoryID != nil || b.Amount != nil || b.TxnAt != nil || b.SlateID != nil || b.RefundOf != nil || b.Type != nil {
+				errJSON(w, http.StatusConflict, "Only a repayment's title and note can change here. Change the rest from Lends.")
+				return
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET description=COALESCE($1, description), note=COALESCE($2, note), updated_at=NOW()
+				WHERE id=$3 AND user_id=$4`, b.Description, b.Note, id, uid); err != nil {
+				internalError(w, r, "update repayment", err)
+				return
+			}
+			if err := tx.Commit(); err != nil {
+				internalError(w, r, "commit repayment edit", err)
+				return
+			}
+			if b.Note != nil {
+				syncTags(d, uid, "transaction", id, *b.Note)
+			}
+			writeJSON(w, 200, map[string]string{"status": "ok"})
+			return
+		}
+		if storedType == "lend" {
 			errJSON(w, http.StatusConflict, "This is a lending entry. Change it from Lends.")
 			return
 		}
