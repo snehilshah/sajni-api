@@ -3940,17 +3940,29 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	vals = append(vals, id, uid)
 	q := "UPDATE fin_transactions SET " + strings.Join(sets, ", ") +
 		fmt.Sprintf(" WHERE id=$%d AND user_id=$%d", ph, ph+1)
-	if _, err := d.ExecContext(ctx, q, vals...); err != nil {
+	// One transaction: a split bill's new date can be refused by its share's
+	// payments, and then nothing changes.
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, q, vals...); err != nil {
 		return nil, nil, err
 	}
 	// Keep a transfer pair's back-reference in sync when the account moves.
 	if acctID := argInt(args, "account_id", 0); acctID > 0 {
-		d.ExecContext(ctx, "UPDATE fin_transactions SET linked_account=$1, updated_at=NOW() WHERE transfer_pair=$2 AND user_id=$3", acctID, id, uid)
-	}
-	if isSplit {
-		if err := db.SyncSplit(ctx, d, uid, int64(id)); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE fin_transactions SET linked_account=$1, updated_at=NOW() WHERE transfer_pair=$2 AND user_id=$3", acctID, id, uid); err != nil {
 			return nil, nil, err
 		}
+	}
+	if isSplit {
+		if err := db.SyncSplit(ctx, tx, uid, int64(id)); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
 	}
 	return map[string]any{"id": id, "updated": true},
 		map[string]any{"kind": "transaction_updated", "id": id, "route": "/finance/transactions"}, nil

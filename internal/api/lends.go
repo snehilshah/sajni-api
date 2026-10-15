@@ -224,7 +224,7 @@ func createLend(deps Deps) http.HandlerFunc {
 			return
 		}
 		if err := db.RebalanceLends(ctx, tx, uid, borrower); err != nil {
-			internalError(w, r, "rebalance lends", err)
+			lendError(w, r, "rebalance lends", err)
 			return
 		}
 		if err := tx.Commit(); err != nil {
@@ -372,7 +372,7 @@ func updateLend(deps Deps) http.HandlerFunc {
 		}
 		for _, b := range []string{oldBorrower, borrower} {
 			if err := db.RebalanceLends(ctx, tx, uid, b); err != nil {
-				internalError(w, r, "rebalance lends", err)
+				lendError(w, r, "rebalance lends", err)
 				return
 			}
 		}
@@ -438,7 +438,7 @@ func deleteLend(deps Deps) http.HandlerFunc {
 			}
 		}
 		if err := db.RebalanceLends(ctx, tx, uid, borrower); err != nil {
-			internalError(w, r, "rebalance lends", err)
+			lendError(w, r, "rebalance lends", err)
 			return
 		}
 		if err := tx.Commit(); err != nil {

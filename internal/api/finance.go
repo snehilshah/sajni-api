@@ -1259,7 +1259,7 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 		}
 		// A split bill's share follows the bill (no-op for anything else).
 		if err := db.SyncSplit(ctx, tx, uid, id); err != nil {
-			internalError(w, r, "sync split", err)
+			lendError(w, r, "sync split", err)
 			return
 		}
 		if err := tx.Commit(); err != nil {

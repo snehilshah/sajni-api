@@ -3,8 +3,10 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"math"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -391,6 +393,99 @@ func TestPinnedSettlements(t *testing.T) {
 		t.Fatalf("only the forgive should stay pinned, got %d", pinned)
 	}
 	expect("unmarked: first", first, 34, 0)
+}
+
+func TestLendOrder(t *testing.T) {
+	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SAJNI_TEST_DATABASE_URL not set")
+	}
+	d, err := New(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	uid := "01900000-0000-7000-8000-000000000005"
+	d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	must(exec(d, `INSERT INTO users (id, email, name) VALUES ($1, 'order@test', 'T')`, uid))
+	must(exec(d, `INSERT INTO fin_slates (user_id, name, is_plain) VALUES ($1, 'Plain', TRUE)`, uid))
+	defer d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	var bank int64
+	must(d.QueryRow(`INSERT INTO fin_accounts (user_id, name, type) VALUES ($1,'Bank','savings') RETURNING id`, uid).Scan(&bank))
+	txn := func(typ string, amount float64, at string) int64 {
+		var id int64
+		must(d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_at) VALUES ($1,$2,$3,$4,'Coffee',$5) RETURNING id`,
+			uid, bank, typ, amount, at).Scan(&id))
+		return id
+	}
+	inTx := func(f func(tx *sql.Tx) error) error {
+		tx, err := d.BeginTx(ctx, nil)
+		must(err)
+		defer tx.Rollback()
+		if err := f(tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	isOrderErr := func(label string, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrLendInput) || !strings.Contains(err.Error(), "Check the dates") {
+			t.Fatalf("%s: want a date-order error, got %v", label, err)
+		}
+	}
+
+	// A bill on 15 Oct (IST, late evening) split with Siddhi.
+	bill := txn("expense", 1586, "2026-10-15T17:21:00Z")
+	var lendID int64
+	must(inTx(func(tx *sql.Tx) error {
+		ids, err := MarkPaidFor(ctx, tx, uid, "Siddhi", []int64{bill}, nil, false, time.UTC, 793)
+		lendID = ids[0]
+		return err
+	}))
+
+	early := txn("income", 793, "2026-10-03T09:55:00Z")
+	isOrderErr("overall before the first lend", inTx(func(tx *sql.Tx) error { return SettleWith(ctx, tx, uid, "Siddhi", []int64{early}, nil) }))
+	isOrderErr("pinned before its lend", inTx(func(tx *sql.Tx) error { return SettleWith(ctx, tx, uid, "Siddhi", []int64{early}, &lendID) }))
+	var typ string
+	d.QueryRow(`SELECT type FROM fin_transactions WHERE id=$1`, early).Scan(&typ)
+	if typ != "income" {
+		t.Fatalf("a refused settle must leave the credit alone, got %s", typ)
+	}
+	_, err = func() (int64, error) {
+		var id int64
+		return id, inTx(func(tx *sql.Tx) (e error) {
+			id, e = Forgive(ctx, tx, uid, "Siddhi", 100, nil, time.Date(2026, 10, 1, 6, 0, 0, 0, time.UTC), "", nil)
+			return
+		})
+	}()
+	isOrderErr("forgive before the lend", err)
+
+	// Same day, earlier clock: fine (the bill's time is often just "now").
+	sameDay := txn("income", 793, "2026-10-15T04:00:00Z")
+	must(inTx(func(tx *sql.Tx) error { return SettleWith(ctx, tx, uid, "Siddhi", []int64{sameDay}, &lendID) }))
+
+	// Moving the bill (and so its share) after the payment is refused too.
+	isOrderErr("bill moved past its payment", inTx(func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET txn_at='2026-10-17T10:00:00Z' WHERE id=$1`, bill); err != nil {
+			return err
+		}
+		return SyncSplit(ctx, tx, uid, bill)
+	}))
+
+	// A later lend doesn't make an earlier overall payment wrong: it counts
+	// against the first lend's day.
+	later := txn("expense", 300, "2026-10-20T10:00:00Z")
+	must(inTx(func(tx *sql.Tx) error {
+		_, err := MarkPaidFor(ctx, tx, uid, "Siddhi", []int64{later}, nil, false, time.UTC, 0)
+		return err
+	}))
 }
 
 // personNet is every lend minus every payment, across all people.

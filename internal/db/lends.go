@@ -450,12 +450,48 @@ func RebalanceLends(ctx context.Context, tx *sql.Tx, uid, borrower string) error
 		}
 		room[p.lendID] = left - part
 	}
-	return nil
+	return CheckLendOrder(ctx, tx, uid, borrower)
 }
 
 // Execer is the slice of *sql.Tx / *sql.DB that SyncSplit needs.
 type Execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// CheckLendOrder refuses a payment back (or a forgive) dated before what it
+// pays: the lend it is toward or, when it counts overall, the person's first
+// lend. It compares the user's calendar days, so a same-day payment entered
+// with an earlier time still passes. It runs after every lend change
+// (Rebalance, SyncSplit), so a date edit on either side is caught too.
+func CheckLendOrder(ctx context.Context, q Execer, uid, borrower string) error {
+	var kind, who, paidOn, owedOn string
+	var pinned bool
+	err := q.QueryRowContext(ctx, `
+		WITH tz AS (SELECT COALESCE(NULLIF(timezone,''),'Asia/Kolkata') AS z FROM users WHERE id = $1),
+		lends AS (SELECT id, (lent_at AT TIME ZONE (SELECT z FROM tz))::date AS day FROM fin_lends WHERE user_id = $1 AND `+borrowerMatch+`)
+		SELECT t.type, s.borrower, to_char((t.txn_at AT TIME ZONE (SELECT z FROM tz))::date, 'FMDD Mon'),
+		       to_char(COALESCE(p.day, (SELECT MIN(day) FROM lends)), 'FMDD Mon'), p.id IS NOT NULL
+		FROM fin_lend_settlements s
+		JOIN fin_transactions t ON t.id = s.transaction_id
+		LEFT JOIN lends p ON p.id = s.lend_id
+		WHERE s.user_id = $1 AND LOWER(BTRIM(s.borrower)) = LOWER(BTRIM($2))
+		  AND (t.txn_at AT TIME ZONE (SELECT z FROM tz))::date < COALESCE(p.day, (SELECT MIN(day) FROM lends))
+		ORDER BY t.txn_at LIMIT 1`, uid, borrower).Scan(&kind, &who, &paidOn, &owedOn, &pinned)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	what := "payment from " + who
+	if kind == "writeoff" {
+		what = "forgive for " + who
+	}
+	if pinned {
+		return lendErr("The %s on %s would come before the lend it's toward (%s). Check the dates.", what, paidOn, owedOn)
+	}
+	return lendErr("The %s on %s would come before anything they owed (first lend %s). Check the dates.", what, paidOn, owedOn)
 }
 
 // SyncSplit keeps a split bill's share on the bill's account, date and slate
@@ -466,7 +502,16 @@ func SyncSplit(ctx context.Context, q Execer, uid string, billID int64) error {
 		FROM fin_transactions b WHERE s.split_of = b.id AND b.id = $1 AND b.user_id = $2 AND s.user_id = $2`, billID, uid); err != nil {
 		return err
 	}
-	_, err := q.ExecContext(ctx, `UPDATE fin_lends l SET source_account_id = s.account_id, lent_at = s.txn_at, updated_at = NOW()
-		FROM fin_transactions s WHERE l.source_transaction_id = s.id AND s.split_of = $1 AND s.user_id = $2 AND l.user_id = $2`, billID, uid)
-	return err
+	var borrower string
+	err := q.QueryRowContext(ctx, `UPDATE fin_lends l SET source_account_id = s.account_id, lent_at = s.txn_at, updated_at = NOW()
+		FROM fin_transactions s WHERE l.source_transaction_id = s.id AND s.split_of = $1 AND s.user_id = $2 AND l.user_id = $2
+		RETURNING l.borrower`, billID, uid).Scan(&borrower)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// The share's date moved with the bill: its payments must still follow it.
+	return CheckLendOrder(ctx, q, uid, borrower)
 }
