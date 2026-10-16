@@ -64,7 +64,7 @@ func ProcessInvestmentDebits(ctx context.Context, deps Deps) (posted int, err er
 
 	rows, err := d.QueryContext(ctx, `SELECT i.id, i.user_id, i.name, i.account_id, i.monthly_amount, i.frequency, i.next_debit_date::text,
 		COALESCE(i.anchor_day, EXTRACT(DAY FROM i.next_debit_date)::INTEGER),
-		COALESCE(u.timezone,'')
+		COALESCE(u.timezone,''), COALESCE(i.maturity_date::text, '')
 		FROM fin_investments i
 		JOIN users u ON u.id = i.user_id
 		WHERE i.auto_debit = TRUE AND i.account_id IS NOT NULL
@@ -85,11 +85,12 @@ func ProcessInvestmentDebits(ctx context.Context, deps Deps) (posted int, err er
 		debitDate string
 		anchorDay int
 		timezone  string
+		maturity  string // "" = none
 	}
 	var invs []inv
 	for rows.Next() {
 		var i inv
-		if err := rows.Scan(&i.id, &i.userID, &i.name, &i.accountID, &i.amount, &i.freq, &i.debitDate, &i.anchorDay, &i.timezone); err != nil {
+		if err := rows.Scan(&i.id, &i.userID, &i.name, &i.accountID, &i.amount, &i.freq, &i.debitDate, &i.anchorDay, &i.timezone, &i.maturity); err != nil {
 			return 0, fmt.Errorf("scan investment debit: %w", err)
 		}
 		invs = append(invs, i)
@@ -107,8 +108,18 @@ func ProcessInvestmentDebits(ctx context.Context, deps Deps) (posted int, err er
 			jobErrors = append(jobErrors, fmt.Errorf("investment %d has invalid next_debit_date: %w", i.id, perr))
 			continue
 		}
+		// No instalment on or after maturity: an RD maturing on the 12th
+		// took its last one a cycle before. Auto-debit then switches off.
+		var maturity time.Time
+		hasMaturity := false
+		if i.maturity != "" {
+			if m, err := time.Parse("2006-01-02", i.maturity); err == nil {
+				maturity, hasMaturity = m, true
+			}
+		}
+		matured := func(t time.Time) bool { return hasMaturity && !t.Before(maturity) }
 		failed := false
-		for !due.After(todayT) {
+		for !due.After(todayT) && !matured(due) {
 			ok, derr := postInvestmentDebit(ctx, deps, i.userID, i.id, i.accountID, i.name, i.amount, due.Format("2006-01-02"))
 			if derr != nil {
 				log.Warn().Err(derr).Int64("investment", i.id).Msg("investment auto-debit failed")
@@ -124,6 +135,12 @@ func ProcessInvestmentDebits(ctx context.Context, deps Deps) (posted int, err er
 			due = next
 		}
 		if failed {
+			continue
+		}
+		if matured(due) {
+			if _, err := d.ExecContext(ctx, `UPDATE fin_investments SET auto_debit = FALSE, next_debit_date = NULL, last_updated = NOW() WHERE id = $1`, i.id); err != nil {
+				jobErrors = append(jobErrors, fmt.Errorf("end investment %d auto-debit at maturity: %w", i.id, err))
+			}
 			continue
 		}
 		if _, err := d.ExecContext(ctx, `UPDATE fin_investments SET next_debit_date = $1, last_updated = NOW() WHERE id = $2`,
