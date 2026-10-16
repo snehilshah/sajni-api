@@ -16,6 +16,7 @@ import (
 
 	"sajni/internal/ai"
 	"sajni/internal/db"
+	"sajni/internal/finstats"
 )
 
 var errFinanceReferenceNotFound = errors.New("finance reference not found")
@@ -98,6 +99,7 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 
 	// Overview / analytics
 	mux.HandleFunc("GET /api/finance/overview", financeOverview(deps))
+	mux.HandleFunc("GET /api/finance/analytics", financeAnalytics(deps))
 	mux.HandleFunc("GET /api/finance/networth/history", networthHistory(deps))
 	mux.HandleFunc("POST /api/finance/networth/snapshot", networthSnapshot(deps))
 
@@ -2436,6 +2438,29 @@ func deleteStatement(deps Deps) http.HandlerFunc {
 		}
 		d.Exec("DELETE FROM fin_cc_statements WHERE id = $1 AND user_id = $2", id, uid)
 		writeJSON(w, 200, map[string]string{"status": "ok"})
+	}
+}
+
+// --- analytics -------------------------------------------------------------
+
+// financeAnalytics is Finance → Analytics for ?month=YYYY-MM (default: this
+// month): spending against usual, where it went, and what stood out.
+func financeAnalytics(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		now := userNow(d, uid)
+		month, err := finstats.ParseMonth(r.URL.Query().Get("month"), now)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		rows, first, err := finstats.Load(r.Context(), d, uid, month)
+		if err != nil {
+			internalError(w, r, "load finance analytics", err)
+			return
+		}
+		writeJSON(w, 200, finstats.Compute(rows, month, now, first))
 	}
 }
 

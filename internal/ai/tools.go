@@ -17,6 +17,7 @@ import (
 	"google.golang.org/genai"
 
 	"sajni/internal/db"
+	"sajni/internal/finstats"
 	"sajni/internal/habitperiod"
 	mediastatus "sajni/internal/media"
 	sharednote "sajni/internal/note"
@@ -380,6 +381,16 @@ func (s *Service) buildTools() []Tool {
 			Schema:      obj(map[string]*genai.Schema{}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listLendsTool(ctx, d, uid)
+			},
+		},
+		{
+			Name:        "finance_month",
+			Description: "How a month's money went, for 'why is this month so high', 'what did I spend on', savings questions: spent (expenses + forgives − refunds; lends and split shares excluded), income, saved and savings rate; vs_usual (Plain spending to the same day minus the average of up to 3 earlier months); projected month end; categories with change vs usual (positive = driving it up); top merchants by title; the 5 largest spends; unusual ones with a reason; a 12-month trend. Slates count in totals but not in comparisons. Read-only.",
+			Schema: obj(map[string]*genai.Schema{
+				"month": str("YYYY-MM. Defaults to this month."),
+			}),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return financeMonthTool(ctx, d, uid, args)
 			},
 		},
 		{
@@ -3999,6 +4010,23 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	}
 	return map[string]any{"id": id, "updated": true},
 		map[string]any{"kind": "transaction_updated", "id": id, "route": "/finance/transactions"}, nil
+}
+
+// financeMonthTool is Finance → Analytics for the model. The per-day lines
+// are left out: the model needs the findings, not the chart.
+func financeMonthTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	now := time.Now().In(userTZLoc(ctx, d, uid))
+	month, err := finstats.ParseMonth(strings.TrimSpace(argStr(args, "month")), now)
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, first, err := finstats.Load(ctx, d, uid, month)
+	if err != nil {
+		return nil, nil, err
+	}
+	rep := finstats.Compute(rows, month, now, first)
+	rep.Cumulative, rep.Daily = nil, nil
+	return rep, nil, nil
 }
 
 func listCategoriesTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
