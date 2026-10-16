@@ -31,6 +31,7 @@ type lendSettlementResp struct {
 	Forgiven      bool    `json:"forgiven"` // a writeoff, not money received
 	LendID        *int64  `json:"lend_id"`  // pinned lend; nil = toward the overall total
 	Toward        *string `json:"toward"`   // the pinned lend's title
+	CategoryID    *int64  `json:"category_id"`
 	Description   string  `json:"description"`
 	Note          string  `json:"note"`
 	TxnAt         string  `json:"txn_at"`
@@ -104,7 +105,7 @@ func loadLendPeople(r *http.Request, d *db.DB, uid string) ([]lendPersonResp, er
 	srows, err := d.QueryContext(ctx, `
 		SELECT LOWER(BTRIM(s.borrower)), s.id, t.id, t.account_id, a.name, t.amount, t.description, t.note, t.txn_at,
 		       COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r WHERE r.transaction_id = t.id),0), t.type = 'writeoff',
-		       s.lend_id, COALESCE(NULLIF(lt.description,''), pl.description)
+		       s.lend_id, COALESCE(NULLIF(lt.description,''), pl.description), t.category_id
 		FROM fin_lend_settlements s
 		JOIN fin_transactions t ON t.id = s.transaction_id
 		JOIN fin_accounts a ON a.id = t.account_id
@@ -119,7 +120,7 @@ func loadLendPeople(r *http.Request, d *db.DB, uid string) ([]lendPersonResp, er
 		var k string
 		var s lendSettlementResp
 		var at time.Time
-		if err := srows.Scan(&k, &s.ID, &s.TransactionID, &s.AccountID, &s.Account, &s.Amount, &s.Description, &s.Note, &at, &s.Applied, &s.Forgiven, &s.LendID, &s.Toward); err != nil {
+		if err := srows.Scan(&k, &s.ID, &s.TransactionID, &s.AccountID, &s.Account, &s.Amount, &s.Description, &s.Note, &at, &s.Applied, &s.Forgiven, &s.LendID, &s.Toward, &s.CategoryID); err != nil {
 			return nil, err
 		}
 		s.Amount = roundMoney(s.Amount)

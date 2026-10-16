@@ -1099,12 +1099,26 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		if storedType == "lend_repayment" || storedType == "writeoff" {
-			// The money in a payment back (or a forgive) belongs to the lends
-			// it settles, but its words are the user's: title and note can
-			// always change. Unmark it to change the rest.
-			if b.AccountID != nil || b.CategoryID != nil || b.Amount != nil || b.TxnAt != nil || b.SlateID != nil || b.RefundOf != nil || b.Type != nil {
+			// The money in a payment back belongs to the lends it settles,
+			// but its words are the user's: title and note can always change.
+			// Unmark it to change the rest. An adjustment moved no money, so
+			// its amount, category and time can change too (db.EditAdjustment).
+			adjust := storedType == "writeoff"
+			if b.AccountID != nil || b.SlateID != nil || b.RefundOf != nil || b.Type != nil ||
+				(!adjust && (b.CategoryID != nil || b.Amount != nil || b.TxnAt != nil)) {
 				errJSON(w, http.StatusConflict, "Only a repayment's title and note can change. Unmark it to change the rest.")
 				return
+			}
+			if adjust && (b.Amount != nil || b.CategoryID != nil || b.TxnAt != nil) {
+				var at *time.Time
+				if b.TxnAt != nil {
+					v := resolveTxnAt(*b.TxnAt, userNow(d, uid))
+					at = &v
+				}
+				if err := db.EditAdjustment(ctx, tx, uid, id, b.Amount, b.CategoryID, at); err != nil {
+					lendError(w, r, "edit adjustment", err)
+					return
+				}
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET description=COALESCE($1, description), note=COALESCE($2, note), updated_at=NOW()
 				WHERE id=$3 AND user_id=$4`, b.Description, b.Note, id, uid); err != nil {
@@ -1123,10 +1137,6 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 		}
 		if storedType == "lend" {
 			errJSON(w, http.StatusConflict, "This is a lending entry. Change it from Lends.")
-			return
-		}
-		if storedType == "writeoff" {
-			errJSON(w, http.StatusConflict, "This is an adjusted amount. Change it from Lends.")
 			return
 		}
 		if b.Amount != nil && *b.Amount <= 0 {

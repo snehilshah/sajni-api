@@ -265,6 +265,21 @@ func TestSplitAndForgive(t *testing.T) {
 	expect("forgiven: owed", owed(), 0)
 	expect("forgiven: spent", spent(), 377.48+317.48)
 	expect("forgiven: card", cardTotal(), 754.96)
+	// An adjustment's amount can change within what they owe without it.
+	if err := inTx(func(tx *sql.Tx) error { v := 317.49; return EditAdjustment(ctx, tx, uid, writeoff, &v, nil, nil) }); err == nil {
+		t.Fatal("adjusting past what they owe should fail")
+	}
+	must(inTx(func(tx *sql.Tx) error { v := 200.0; return EditAdjustment(ctx, tx, uid, writeoff, &v, nil, nil) }))
+	expect("adjusted down: owed", owed(), 117.48)
+	expect("adjusted down: card", cardTotal(), 754.96)
+	if err := inTx(func(tx *sql.Tx) error {
+		early := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+		return EditAdjustment(ctx, tx, uid, writeoff, nil, nil, &early)
+	}); err == nil || !strings.Contains(err.Error(), "Check the dates") {
+		t.Fatalf("an adjustment before the lend should fail, got %v", err)
+	}
+	must(inTx(func(tx *sql.Tx) error { v := 317.48; return EditAdjustment(ctx, tx, uid, writeoff, &v, nil, nil) }))
+	expect("adjusted back: owed", owed(), 0)
 	var sid int64
 	d.QueryRow(`SELECT id FROM fin_lend_settlements WHERE transaction_id=$1`, writeoff).Scan(&sid)
 	must(inTx(func(tx *sql.Tx) error { return Unsettle(ctx, tx, uid, sid) }))

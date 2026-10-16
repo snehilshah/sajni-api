@@ -245,6 +245,56 @@ func Forgive(ctx context.Context, tx *sql.Tx, uid, borrower string, amount float
 	return txnID, RebalanceLends(ctx, tx, uid, borrower)
 }
 
+// EditAdjustment changes an adjustment's (a writeoff's) amount, category or
+// time; nil leaves one as it is. No money moved, so all three are free to
+// change: the amount stays within what the person owes without it, and the
+// rebalance re-checks that it isn't dated before what it settles.
+func EditAdjustment(ctx context.Context, tx *sql.Tx, uid string, txnID int64, amount *float64, categoryID *int64, at *time.Time) error {
+	var borrower string
+	if err := tx.QueryRowContext(ctx, `SELECT s.borrower FROM fin_lend_settlements s JOIN fin_transactions t ON t.id = s.transaction_id
+		WHERE t.id = $1 AND t.user_id = $2 AND t.type = 'writeoff'`, txnID, uid).Scan(&borrower); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return lendErr("That adjustment no longer exists.")
+		}
+		return err
+	}
+	if amount != nil {
+		a := roundMoney(*amount)
+		if a <= 0 {
+			return lendErr("Enter an amount above zero.")
+		}
+		var room float64
+		if err := tx.QueryRowContext(ctx, `SELECT
+			COALESCE((SELECT SUM(principal) FROM fin_lends WHERE user_id = $1 AND LOWER(BTRIM(borrower)) = LOWER(BTRIM($2))),0)
+			- COALESCE((SELECT SUM(t.amount) FROM fin_lend_settlements s JOIN fin_transactions t ON t.id = s.transaction_id
+				WHERE s.user_id = $1 AND LOWER(BTRIM(s.borrower)) = LOWER(BTRIM($2)) AND t.id <> $3),0)`, uid, borrower, txnID).Scan(&room); err != nil {
+			return err
+		}
+		if room = roundMoney(room); a > room {
+			return lendErr("%s owes ₹%.2f without this, so you can adjust up to that.", borrower, room)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET amount = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`, a, txnID, uid); err != nil {
+			return err
+		}
+	}
+	if categoryID != nil {
+		res, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET category_id = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3
+			AND EXISTS (SELECT 1 FROM fin_categories WHERE id = $1 AND user_id = $3 AND kind = 'expense')`, *categoryID, txnID, uid)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return lendErr("Pick one of your expense categories.")
+		}
+	}
+	if at != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET txn_at = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`, *at, txnID, uid); err != nil {
+			return err
+		}
+	}
+	return RebalanceLends(ctx, tx, uid, borrower)
+}
+
 // checkPin makes sure a pinned lend is one of borrower's. nil = overall.
 func checkPin(ctx context.Context, tx *sql.Tx, uid, borrower string, lendID *int64) error {
 	if lendID == nil {

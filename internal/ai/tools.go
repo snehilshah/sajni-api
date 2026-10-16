@@ -1282,8 +1282,23 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "edit_adjustment",
+			Description: "Change an adjustment (a writeoff: a lend the user let go): its amount, the expense category it counts under, or its date and time. The amount can't exceed what the person owes without it. Get its transaction id from list_finance_transactions (type writeoff).",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"transaction_id": intg("Required. The adjustment's transaction id."),
+				"amount":         num("Optional new amount."),
+				"category_name":  str("Optional expense category it counts under."),
+				"date":           str("Optional ISO date YYYY-MM-DD."),
+				"time":           str("Optional HH:MM (24-hour, the user's time), with date. Defaults to the current time."),
+			}, "transaction_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return editAdjustmentTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "update_transaction",
-			Description: "Update an existing finance transaction by id — change its account, category, slate, amount, type, description, or date. On a split bill (has split_share in list_finance_transactions) amount is the user's own part; change the other person's part with set_split_share. To move it to another account pass account_id (balances recompute automatically). To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. To move it between slates pass slate_id (0 = Plain). A lend_repayment (money someone paid back) only takes a new description. Use list_finance_transactions to find the id first.",
+			Description: "Update an existing finance transaction by id — change its account, category, slate, amount, type, description, or date. On a split bill (has split_share in list_finance_transactions) amount is the user's own part; change the other person's part with set_split_share. To move it to another account pass account_id (balances recompute automatically). To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. To move it between slates pass slate_id (0 = Plain). A lend_repayment (money someone paid back) or writeoff only takes a new description here; change a writeoff's amount, category or date with edit_adjustment. Use list_finance_transactions to find the id first.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"id":            intg("Required. Transaction id to update."),
@@ -3895,7 +3910,7 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	if storedType == "lend_repayment" || storedType == "writeoff" {
 		// A payment's money is the lends' business; only its title can change.
 		if v, ok := args["description"]; !ok || v == nil {
-			return nil, nil, fmt.Errorf("only a repayment's description can change; to re-point it use settle_lends' toward_lend_id when settling")
+			return nil, nil, fmt.Errorf("only a repayment's description can change here; use set_payment_toward to re-point it and edit_adjustment for an adjustment's amount, category or date")
 		}
 		if _, err := d.ExecContext(ctx, `UPDATE fin_transactions SET description=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`,
 			strings.TrimSpace(argStr(args, "description")), id, uid); err != nil {
@@ -4246,6 +4261,44 @@ func optLendID(args map[string]any) *int64 {
 		return &id
 	}
 	return nil
+}
+
+func editAdjustmentTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	id := int64(argInt(args, "transaction_id", 0))
+	var amount *float64
+	if v, ok := args["amount"]; ok && v != nil {
+		a := argFloat(args, "amount")
+		amount = &a
+	}
+	var catID *int64
+	if name := strings.TrimSpace(argStr(args, "category_name")); name != "" {
+		c := resolveCategoryID(ctx, d, uid, name)
+		if c <= 0 {
+			return nil, nil, fmt.Errorf("no category named %q", name)
+		}
+		catID = &c
+	}
+	var at *time.Time
+	if strings.TrimSpace(argStr(args, "date")) != "" {
+		v, err := argTxnAt(ctx, d, uid, args)
+		if err != nil {
+			return nil, nil, err
+		}
+		at = &v
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	if err := db.EditAdjustment(ctx, tx, uid, id, amount, catID, at); err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"id": id, "updated": true},
+		map[string]any{"kind": "lend_updated", "id": id, "route": "/finance/lends"}, nil
 }
 
 func setPaymentTowardTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
