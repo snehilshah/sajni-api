@@ -2,7 +2,10 @@ package ai
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"sajni/internal/db"
@@ -87,4 +90,80 @@ func anchoredMonthDate(year int, month time.Month, day int) time.Time {
 		day = last
 	}
 	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+}
+
+// listInvestmentsTool lists the user's investments for picking one (a
+// transfer into it, auto-debit).
+func listInvestmentsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
+	rows, err := d.QueryContext(ctx, `SELECT i.id, i.name, i.type, i.invested_amount, i.monthly_amount, i.frequency,
+		i.account_id, COALESCE(a.name, ''), i.auto_debit, COALESCE(i.next_debit_date::text, ''), COALESCE(i.maturity_date::text, '')
+		FROM fin_investments i LEFT JOIN fin_accounts a ON a.id = i.account_id
+		WHERE i.user_id = $1 ORDER BY i.name`, uid)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id int64
+		var name, typ, freq, acctName, next, maturity string
+		var invested, cycle float64
+		var acct sql.NullInt64
+		var auto bool
+		if err := rows.Scan(&id, &name, &typ, &invested, &cycle, &freq, &acct, &acctName, &auto, &next, &maturity); err != nil {
+			return nil, nil, err
+		}
+		row := map[string]any{"id": id, "name": name, "type": typ, "invested_amount": invested,
+			"per_cycle": cycle, "frequency": freq, "auto_debit": auto}
+		if acct.Valid {
+			row["account_id"], row["account_name"] = acct.Int64, acctName
+		}
+		if next != "" {
+			row["next_debit_date"] = next
+		}
+		if maturity != "" {
+			row["maturity_date"] = maturity
+		}
+		out = append(out, row)
+	}
+	return out, nil, rows.Err()
+}
+
+// transferToInvestmentTool is create_transaction's type 'transfer' with
+// to_investment_id: money from an account into an investment.
+func transferToInvestmentTool(ctx context.Context, d *db.DB, uid string, acct int64, amount float64, desc string, txnAt time.Time, args map[string]any) (any, map[string]any, error) {
+	invID := argInt(args, "to_investment_id", 0)
+	if invID == 0 {
+		return nil, nil, fmt.Errorf("a transfer here needs to_investment_id (from list_investments)")
+	}
+	var owned bool
+	d.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_accounts WHERE id = $1 AND user_id = $2)`, acct, uid).Scan(&owned)
+	if !owned {
+		return nil, nil, fmt.Errorf("account not found")
+	}
+	slate := argInt(args, "slate_id", 0)
+	if slate > 0 {
+		var okSlate bool
+		d.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_slates WHERE id = $1 AND user_id = $2 AND NOT archived)`, slate, uid).Scan(&okSlate)
+		if !okSlate {
+			return nil, nil, fmt.Errorf("slate not found")
+		}
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	id, err := db.TransferToInvestment(ctx, tx, uid, acct, invID, amount, strings.TrimSpace(desc), strings.TrimSpace(argStr(args, "note")), txnAt, slate)
+	if errors.Is(err, db.ErrInvestmentNotFound) {
+		return nil, nil, fmt.Errorf("investment not found")
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"id": id, "amount": amount, "type": "transfer_out", "investment_id": invID},
+		map[string]any{"kind": "transaction_created", "id": id, "title": fmt.Sprintf("transfer %.2f", amount), "route": "/finance/transactions"}, nil
 }

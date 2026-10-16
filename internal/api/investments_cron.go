@@ -10,12 +10,14 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"sajni/internal/db"
 	"sajni/internal/push"
 )
 
 // Investment auto-debit: for fin_investments rows with auto_debit on, the
-// hourly tick posts the per-cycle contribution as an expense txn from the
-// linked account, bumps invested_amount/current_value, and advances
+// hourly tick posts the per-cycle contribution as a transfer from the linked
+// account into the investment (db.TransferToInvestment: never spending),
+// which bumps invested_amount/current_value, and advances
 // next_debit_date. fin_investment_contributions (uniq on investment_id,
 // due_date) is the idempotency gate, mirroring fin_biller_payments.
 
@@ -54,7 +56,7 @@ func advanceDebitDate(d time.Time, freq string, anchorDay int) time.Time {
 
 // ProcessInvestmentDebits catches up every past-due auto-debit cycle. Each
 // cycle: contribution row first (ON CONFLICT = already posted, skip), then
-// the expense txn, then the investment totals. System txns set no slate, so
+// the transfer into the investment, which moves its totals. System txns set no slate, so
 // they land in Plain — no special case needed any more.
 func ProcessInvestmentDebits(ctx context.Context, deps Deps) (posted int, err error) {
 	d := deps.DB
@@ -159,20 +161,18 @@ func postInvestmentDebit(ctx context.Context, deps Deps, uid string, invID, acco
 		return false, err
 	}
 
-	var txnID int64
-	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_at)
-		 VALUES ($1,$2,'expense',$3,$4,($5::timestamp AT TIME ZONE $6)) RETURNING id`,
-		uid, accountID, amount, name+" (auto)", dueDate, tzName).Scan(&txnID); err != nil {
+	// A transfer into the investment, never an expense: investing isn't
+	// spending. It also raises the invested amount.
+	var at time.Time
+	if err := tx.QueryRowContext(ctx, `SELECT ($1::timestamp AT TIME ZONE $2)`, dueDate, tzName).Scan(&at); err != nil {
+		return false, err
+	}
+	txnID, err := db.TransferToInvestment(ctx, tx, uid, accountID, invID, amount, name+" (auto)", "", at, 0)
+	if err != nil {
 		return false, err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE fin_investment_contributions SET txn_id = $1 WHERE id = $2`, txnID, contribID); err != nil {
-		return false, err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE fin_investments
-		SET invested_amount = invested_amount + $1, current_value = current_value + $1, last_updated = NOW()
-		WHERE id = $2 AND user_id = $3`, amount, invID, uid); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()

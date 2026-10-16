@@ -619,9 +619,13 @@ type txnResp struct {
 	// Split is set on a bill shared with someone. Amount is then the user's
 	// own part; the bill as charged is Amount + Split.Share. The share's own
 	// lend row (split_of) is folded into the bill and never listed alone.
-	Split     *txnSplit `json:"split"`
-	RefundOf  *int64    `json:"refund_of"` // refund: the purchase it came back for
-	CreatedAt string    `json:"created_at"`
+	Split    *txnSplit `json:"split"`
+	RefundOf *int64    `json:"refund_of"` // refund: the purchase it came back for
+	// A transfer into an investment (no transfer_in leg): its name stands
+	// where the destination account's would.
+	InvestmentID   *int64  `json:"investment_id"`
+	InvestmentName *string `json:"investment_name"`
+	CreatedAt      string  `json:"created_at"`
 }
 
 type txnSettlement struct {
@@ -765,8 +769,10 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.slate_id, s.name,
 			  COALESCE(l.id, ls.lend_id), COALESCE(l.borrower, ls.borrower), t.created_at::text,
 			  spl.id, spl.borrower, sp.amount, t.refund_of,
-			  ls.id, COALESCE(NULLIF(pt.description,''), pl.description)
+			  ls.id, COALESCE(NULLIF(pt.description,''), pl.description),
+			  t.investment_id, inv.name
 			  FROM fin_transactions t
+			  LEFT JOIN fin_investments inv ON inv.id = t.investment_id
 			  JOIN fin_accounts a ON a.id = t.account_id
 			  LEFT JOIN fin_categories c ON c.id = t.category_id
 			  JOIN fin_slates s ON s.id = t.slate_id
@@ -798,7 +804,8 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			rows.Scan(&t.ID, &t.AccountID, &t.AccountName, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
 				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount,
 				&t.SlateID, &t.SlateName, &t.LendID, &t.LendBorrower, &t.CreatedAt,
-				&splitLend, &splitBorrower, &splitShare, &t.RefundOf, &settlementID, &toward)
+				&splitLend, &splitBorrower, &splitShare, &t.RefundOf, &settlementID, &toward,
+				&t.InvestmentID, &t.InvestmentName)
 			if settlementID.Valid && t.LendBorrower != nil {
 				t.Settlement = &txnSettlement{ID: settlementID.Int64, Borrower: *t.LendBorrower, LendID: t.LendID, Toward: toward}
 			}
@@ -828,7 +835,10 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			Note          string  `json:"note"`
 			TxnAt         string  `json:"txn_at"` // RFC3339 (IST)
 			LinkedAccount *int64  `json:"linked_account"`
-			SlateID       *int64  `json:"slate_id"` // absent/0 → Plain; N → that slate
+			// transfer only, instead of linked_account: the money goes into
+			// this investment (an RD instalment, a SIP).
+			InvestmentID *int64 `json:"investment_id"`
+			SlateID      *int64 `json:"slate_id"` // absent/0 → Plain; N → that slate
 			// refund only: the purchase it came back for (optional). Its
 			// category and slate are reused when none is sent.
 			RefundOf *int64 `json:"refund_of"`
@@ -934,8 +944,41 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		txnAt := resolveTxnAt(b.TxnAt, userNow(d, uid))
-		if b.Description = strings.TrimSpace(b.Description); b.Description == "" {
+		givenTitle := strings.TrimSpace(b.Description)
+		if b.Description = givenTitle; b.Description == "" {
 			b.Description = fallbackTitle(ctx, d, uid, b.CategoryID, b.Type)
+		}
+
+		if b.InvestmentID != nil && b.Type != "transfer" {
+			errJSON(w, http.StatusBadRequest, "Only a transfer can pay into an investment.")
+			return
+		}
+		// Transfer into an investment: one row out of the account; the
+		// investment's invested amount goes up by the same.
+		if b.Type == "transfer" && b.InvestmentID != nil {
+			tx, err := d.BeginTx(ctx, nil)
+			if err != nil {
+				internalError(w, r, "begin investment transfer", err)
+				return
+			}
+			defer tx.Rollback()
+			// A blank title takes the investment's name.
+			id, err := db.TransferToInvestment(ctx, tx, uid, b.AccountID, *b.InvestmentID, b.Amount, givenTitle, b.Note, txnAt, slateID)
+			if errors.Is(err, db.ErrInvestmentNotFound) {
+				errJSON(w, 404, "not found")
+				return
+			}
+			if err != nil {
+				internalError(w, r, "insert investment transfer", err)
+				return
+			}
+			if err := tx.Commit(); err != nil {
+				internalError(w, r, "commit investment transfer", err)
+				return
+			}
+			syncTags(d, uid, "transaction", id, b.Note)
+			writeJSON(w, 201, map[string]int64{"id": id})
+			return
 		}
 
 		// Transfer: insert a pair (transfer_out from source, transfer_in to dest)
@@ -1139,6 +1182,12 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			errJSON(w, http.StatusConflict, "This is a lending entry. Change it from Lends.")
 			return
 		}
+		// A payment into an investment: its invested amount follows the edit.
+		invID, invOld, toInvestment, err := db.InvestmentTransfer(ctx, tx, uid, id)
+		if err != nil {
+			internalError(w, r, "read investment transfer", err)
+			return
+		}
 		if b.Amount != nil && *b.Amount <= 0 {
 			errJSON(w, http.StatusBadRequest, "Enter an amount above zero.")
 			return
@@ -1269,6 +1318,12 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 				return
 			}
 		}
+		if toInvestment {
+			if err := db.FollowInvestmentTransfer(ctx, tx, uid, id, invID, invOld); err != nil {
+				internalError(w, r, "follow investment transfer", err)
+				return
+			}
+		}
 		// A split bill's share follows the bill (no-op for anything else).
 		if err := db.SyncSplit(ctx, tx, uid, id); err != nil {
 			lendError(w, r, "sync split", err)
@@ -1321,13 +1376,39 @@ func deleteTransaction(deps Deps) http.HandlerFunc {
 			errJSON(w, http.StatusConflict, "This bill is split with "+splitWith+". Remove the split first.")
 			return
 		}
+		ctx := r.Context()
+		tx, err := d.BeginTx(ctx, nil)
+		if err != nil {
+			internalError(w, r, "begin transaction delete", err)
+			return
+		}
+		defer tx.Rollback()
+		// A payment into an investment comes back out of its invested amount.
+		invID, invOld, toInvestment, err := db.InvestmentTransfer(ctx, tx, uid, id)
+		if err != nil {
+			internalError(w, r, "read investment transfer", err)
+			return
+		}
 		// delete pair if any
 		var pair *int64
-		d.QueryRow("SELECT transfer_pair FROM fin_transactions WHERE id = $1 AND user_id = $2", id, uid).Scan(&pair)
-		d.Exec("DELETE FROM fin_transactions WHERE id = $1 AND user_id = $2", id, uid)
-		d.Exec("DELETE FROM tags WHERE user_id = $1 AND entity_type = 'transaction' AND entity_id = $2", uid, id)
+		tx.QueryRowContext(ctx, "SELECT transfer_pair FROM fin_transactions WHERE id = $1 AND user_id = $2", id, uid).Scan(&pair)
+		if _, err := tx.ExecContext(ctx, "DELETE FROM fin_transactions WHERE id = $1 AND user_id = $2", id, uid); err != nil {
+			internalError(w, r, "delete transaction", err)
+			return
+		}
+		tx.ExecContext(ctx, "DELETE FROM tags WHERE user_id = $1 AND entity_type = 'transaction' AND entity_id = $2", uid, id)
 		if pair != nil {
-			d.Exec("DELETE FROM fin_transactions WHERE id = $1 AND user_id = $2", *pair, uid)
+			tx.ExecContext(ctx, "DELETE FROM fin_transactions WHERE id = $1 AND user_id = $2", *pair, uid)
+		}
+		if toInvestment {
+			if err := db.FollowInvestmentTransfer(ctx, tx, uid, id, invID, invOld); err != nil {
+				internalError(w, r, "follow investment transfer", err)
+				return
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit transaction delete", err)
+			return
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}

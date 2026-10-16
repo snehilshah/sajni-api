@@ -910,6 +910,14 @@ func (d *DB) ensureSchema() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_inv_contrib_user ON fin_investment_contributions(user_id);
 
+	-- investment_id: a Transfer into an investment (an RD instalment, a SIP).
+	-- One transfer_out row on the paying account, no transfer_in leg, since
+	-- an investment isn't an account; db.TransferToInvestment adds it to the
+	-- invested amount. Added here, after fin_investments, for the FK; this
+	-- also brings prod's table up to date.
+	ALTER TABLE fin_transactions ADD COLUMN IF NOT EXISTS investment_id BIGINT REFERENCES fin_investments(id) ON DELETE SET NULL;
+	CREATE INDEX IF NOT EXISTS idx_fin_transactions_investment ON fin_transactions(investment_id) WHERE investment_id IS NOT NULL;
+
 	-- ─── Insights / Themes / AI ───────────────────────────────────────
 	CREATE TABLE IF NOT EXISTS insights (
 		id           BIGSERIAL   PRIMARY KEY,
