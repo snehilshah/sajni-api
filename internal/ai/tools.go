@@ -183,6 +183,32 @@ func userTZLoc(ctx context.Context, d *db.DB, uid string) *time.Location {
 	return time.UTC
 }
 
+// argTxnAt reads a money tool's "date" (YYYY-MM-DD) and optional "time"
+// (HH:MM) in the user's zone. No time keeps now's clock, so "yesterday's
+// lunch" lands yesterday at this minute rather than at midnight (the API's
+// resolveTxnAt rule). No date → now.
+func argTxnAt(ctx context.Context, d *db.DB, uid string, args map[string]any) (time.Time, error) {
+	loc := userTZLoc(ctx, d, uid)
+	now := time.Now().In(loc)
+	date := strings.TrimSpace(argStr(args, "date"))
+	if date == "" {
+		return now, nil
+	}
+	day, err := time.ParseInLocation("2006-01-02", date, loc)
+	if err != nil {
+		return now, fmt.Errorf("date must be YYYY-MM-DD")
+	}
+	hh, mm, ss := now.Hour(), now.Minute(), now.Second()
+	if v := strings.TrimSpace(argStr(args, "time")); v != "" {
+		t, err := time.Parse("15:04", v)
+		if err != nil {
+			return now, fmt.Errorf("time must be HH:MM (24-hour)")
+		}
+		hh, mm, ss = t.Hour(), t.Minute(), 0
+	}
+	return time.Date(day.Year(), day.Month(), day.Day(), hh, mm, ss, 0, loc), nil
+}
+
 // userTZNow is time.Now() in the user's timezone. See userTZLoc.
 func userTZNow(ctx context.Context, d *db.DB, uid string) time.Time {
 	return time.Now().In(userTZLoc(ctx, d, uid))
@@ -1160,10 +1186,11 @@ func (s *Service) buildTools() []Tool {
 				"account_id":     intg("Required. The target account ID."),
 				"category_id":    intg("Optional category identifier."),
 				"category_name":  str("Optional category name (e.g. 'Food', 'Groceries', 'Rent') to auto-match on backend. For a refund, the expense category it came back to."),
-				"type":           str("'expense' | 'income' | 'refund'. Default 'expense'."),
+				"type":           str("'expense' | 'income' | 'refund'. Default 'expense'. Card or app cashback is a 'refund' (unlinked) in the Cashback category, not income."),
 				"amount":         num("Positive amount. For a split bill, the whole bill."),
 				"description":    str("Required. A short title for what it was."),
 				"date":           str("ISO date. Defaults to today."),
+				"time":           str("Optional HH:MM (24-hour, the user's time) when the user gave one. Defaults to the current time."),
 				"slate_id":       intg("Omit → Plain (normal life); N → that slate."),
 				"refund_of":      intg("Refund only, optional: the original expense id from list_finance_transactions. Its category and slate are reused when none is given."),
 				"split_with":     str("Expense only, optional: the person who owes part of this bill. Reuse the exact name from list_lends."),
@@ -1210,6 +1237,7 @@ func (s *Service) buildTools() []Tool {
 				"amount":         num("Required. At most what they owe."),
 				"category_name":  str("Optional expense category it counts under, e.g. 'Gifts'. Defaults to Others."),
 				"date":           str("ISO date. Defaults to today."),
+				"time":           str("Optional HH:MM (24-hour, the user's time). Defaults to the current time."),
 				"note":           str("Optional note."),
 				"toward_lend_id": intg("Optional. The lend id (list_lends) being forgiven. Omit for their overall total."),
 			}, "borrower", "amount"),
@@ -3711,7 +3739,10 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	if desc == "" {
 		return nil, nil, fmt.Errorf("description is required: give it a short title")
 	}
-	date := argStr(args, "date")
+	txnAt, err := argTxnAt(ctx, d, uid, args)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// Resolve Category
 	catID := argInt(args, "category_id", 0)
@@ -3719,14 +3750,20 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 
 	if catID == 0 && catName != "" {
 		// 1. Try exact case-insensitive match
-		err := d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1`, uid, catName).Scan(&catID)
+		// A refund nets off spending, so it files under an expense category;
+		// prefer the category of the transaction's own kind when names repeat.
+		kind := "expense"
+		if ttype == "income" {
+			kind = "income"
+		}
+		err := d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND LOWER(name) = LOWER($2) ORDER BY (kind = $3) DESC LIMIT 1`, uid, catName, kind).Scan(&catID)
 		if err != nil || catID == 0 {
 			// 2. Try substring match
-			d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND name ILIKE $2 LIMIT 1`, uid, "%"+catName+"%").Scan(&catID)
+			d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND name ILIKE $2 ORDER BY (kind = $3) DESC LIMIT 1`, uid, "%"+catName+"%", kind).Scan(&catID)
 		}
 		if catID == 0 {
 			// 3. Fallback to default "Other" or "Others"
-			d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND (LOWER(name) = 'other' OR LOWER(name) = 'others') LIMIT 1`, uid).Scan(&catID)
+			d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND (LOWER(name) = 'other' OR LOWER(name) = 'others') ORDER BY (kind = $2) DESC LIMIT 1`, uid, kind).Scan(&catID)
 		}
 	}
 
@@ -3781,14 +3818,10 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		return nil, nil, fmt.Errorf("from_person only applies to income")
 	}
 
-	// txn_at: a model-supplied date is read as IST midnight; absent → now (so a
-	// chat-logged "spent 200 on lunch" gets a real time, not midnight).
-	insArgs := []any{uid, acct, catArg, ttype, amount, desc, slateArg, refundArg}
-	txnCol := "NOW()"
-	if date != "" {
-		txnCol = "($9::timestamp AT TIME ZONE 'Asia/Kolkata')"
-		insArgs = append(insArgs, date)
-	}
+	// txn_at: the model's date (and time, if it gave one), else now; a date
+	// alone keeps now's clock rather than midnight.
+	insArgs := []any{uid, acct, catArg, ttype, amount, desc, slateArg, refundArg, txnAt}
+	txnCol := "$9"
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, nil, err
@@ -4159,13 +4192,9 @@ func forgiveLendTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		id := int64(c)
 		catArg = &id
 	}
-	at := time.Now()
-	if v := argStr(args, "date"); v != "" {
-		parsed, err := time.ParseInLocation("2006-01-02", v, userTZLoc(ctx, d, uid))
-		if err != nil {
-			return nil, nil, fmt.Errorf("date must be YYYY-MM-DD")
-		}
-		at = parsed.Add(12 * time.Hour)
+	at, err := argTxnAt(ctx, d, uid, args)
+	if err != nil {
+		return nil, nil, err
 	}
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
