@@ -366,7 +366,7 @@ func (s *Service) buildTools() []Tool {
 			Description: "List finance transactions with filters. Each transaction includes its category_id/category_name and the slate it sits on. Filter by slate_id to see everything on one slate — that is how you answer 'what did the Goa trip cost'. Types: expense, income, transfer_out/transfer_in, lend (money someone owes), lend_repayment, refund (money back on a purchase; nets off spending, not income) and writeoff (an adjusted lend: the user let it go, so it counts as spending and moves no money; shown as \"Adjusted\").",
 			Schema: obj(map[string]*genai.Schema{
 				"account_id":    intg("Filter by account."),
-				"category_name": str("Filter by category name; several separated by commas match any of them."),
+				"category_name": str("Filter by category name; several separated by commas match any of them. 'Uncategorised' = expenses, income and refunds with no category."),
 				"date_from":     str("ISO date."),
 				"date_to":       str("ISO date."),
 				"slate_id":      intg("Filter to one slate, from list_slates. Plain is a real slate, so pass its id to see normal life only."),
@@ -1846,17 +1846,26 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	}
 	if names := strings.TrimSpace(argStr(args, "category_name")); names != "" {
 		var ids []int64
+		none := false
 		for _, n := range strings.Split(names, ",") {
-			if n = strings.TrimSpace(n); n != "" {
+			switch n = strings.TrimSpace(n); strings.ToLower(n) {
+			case "":
+			case "uncategorised", "uncategorized", "none":
+				none = true
+			default:
 				if c := resolveCategoryID(ctx, d, uid, n); c > 0 {
 					ids = append(ids, c)
 				}
 			}
 		}
-		if len(ids) == 0 {
+		if len(ids) == 0 && !none {
 			return nil, nil, fmt.Errorf("no category named %q", names)
 		}
-		clauses = append(clauses, fmt.Sprintf("t.category_id = ANY($%d)", len(vals)+1))
+		clause := fmt.Sprintf("t.category_id = ANY($%d)", len(vals)+1)
+		if none {
+			clause = "(" + clause + " OR (t.category_id IS NULL AND t.type IN ('expense','income','refund','writeoff')))"
+		}
+		clauses = append(clauses, clause)
 		vals = append(vals, ids)
 	}
 	if df := argStr(args, "date_from"); df != "" {
