@@ -363,7 +363,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_finance_transactions",
-			Description: "List finance transactions with filters. Each transaction includes its category_id/category_name and the slate it sits on. Filter by slate_id to see everything on one slate — that is how you answer 'what did the Goa trip cost'. Types: expense, income, transfer_out/transfer_in, lend (money someone owes), lend_repayment, refund (money back on a purchase; nets off spending, not income) and writeoff (a forgiven lend; counts as spending, moves no money).",
+			Description: "List finance transactions with filters. Each transaction includes its category_id/category_name and the slate it sits on. Filter by slate_id to see everything on one slate — that is how you answer 'what did the Goa trip cost'. Types: expense, income, transfer_out/transfer_in, lend (money someone owes), lend_repayment, refund (money back on a purchase; nets off spending, not income) and writeoff (an adjusted lend: the user let it go, so it counts as spending and moves no money; shown as \"Adjusted\").",
 			Schema: obj(map[string]*genai.Schema{
 				"account_id": intg("Filter by account."),
 				"date_from":  str("ISO date."),
@@ -385,7 +385,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "finance_month",
-			Description: "How a month's money went, for 'why is this month so high', 'what did I spend on', savings questions: spent (expenses + forgives − refunds; lends and split shares excluded), income, saved and savings rate; vs_usual (Plain spending to the same day minus the average of up to 3 earlier months); projected month end; categories with change vs usual (positive = driving it up); top merchants by title; the 5 largest spends; unusual ones with a reason; a 12-month trend. Slates count in totals but not in comparisons. Read-only.",
+			Description: "How a month's money went, for 'why is this month so high', 'what did I spend on', savings questions: spent (expenses + adjusted lends − refunds; lends and split shares excluded), income, saved and savings rate; vs_usual (Plain spending to the same day minus the average of up to 3 earlier months); projected month end; categories with change vs usual (positive = driving it up); top merchants by title; the 5 largest spends; unusual ones with a reason; a 12-month trend. Slates count in totals but not in comparisons. Read-only.",
 			Schema: obj(map[string]*genai.Schema{
 				"month": str("YYYY-MM. Defaults to this month."),
 			}),
@@ -1241,7 +1241,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "forgive_lend",
-			Description: "Forgive part or all of what a person owes. The forgiven amount stops being owed and counts as the user's spending on that day (no money moves). Only when the user clearly says to forgive or write it off.",
+			Description: "Adjust part or all of what a person owes (shown as \"Adjusted\"; the user's word for letting it go). The adjusted amount stops being owed and counts as the user's spending on that day (no money moves). Only when the user clearly says to adjust it, let it go, forgive or write it off. Call it an adjustment in replies, never forgiving.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"borrower":       str("Required. The person, as named in list_lends."),
@@ -1250,7 +1250,7 @@ func (s *Service) buildTools() []Tool {
 				"date":           str("ISO date. Defaults to today."),
 				"time":           str("Optional HH:MM (24-hour, the user's time). Defaults to the current time."),
 				"note":           str("Optional note."),
-				"toward_lend_id": intg("Optional. The lend id (list_lends) being forgiven. Omit for their overall total."),
+				"toward_lend_id": intg("Optional. The lend id (list_lends) being adjusted. Omit for their overall total."),
 			}, "borrower", "amount"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return forgiveLendTool(ctx, d, uid, args)
@@ -1271,7 +1271,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "set_payment_toward",
-			Description: "Change which lend a payment back (or a forgive) counts toward: one of that person's lends, or their overall total. Get the payment's transaction id from list_finance_transactions (type lend_repayment) and lend ids from list_lends.",
+			Description: "Change which lend a payment back (or an adjustment) counts toward: one of that person's lends, or their overall total. Get the payment's transaction id from list_finance_transactions (type lend_repayment) and lend ids from list_lends.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"transaction_id": intg("Required. The payment's transaction id."),

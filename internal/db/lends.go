@@ -227,7 +227,7 @@ func Forgive(ctx context.Context, tx *sql.Tx, uid, borrower string, amount float
 		return 0, lendErr("%s doesn't owe anything right now.", borrower)
 	}
 	if amount > owed {
-		return 0, lendErr("%s owes ₹%.2f, so you can forgive up to that.", borrower, owed)
+		return 0, lendErr("%s owes ₹%.2f, so you can adjust up to that.", borrower, owed)
 	}
 	if err := checkPin(ctx, tx, uid, borrower, lendID); err != nil {
 		return 0, err
@@ -235,7 +235,7 @@ func Forgive(ctx context.Context, tx *sql.Tx, uid, borrower string, amount float
 	var txnID int64
 	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, note, txn_at)
 		VALUES ($1,$2,$3,'writeoff',$4,$5,$6,$7) RETURNING id`,
-		uid, accountID.Int64, categoryID, amount, "Forgave "+borrower, strings.TrimSpace(note), at,
+		uid, accountID.Int64, categoryID, amount, "Adjusted with "+borrower, strings.TrimSpace(note), at,
 	).Scan(&txnID); err != nil {
 		return 0, err
 	}
@@ -486,7 +486,7 @@ func CheckLendOrder(ctx context.Context, q Execer, uid, borrower string) error {
 	}
 	what := "payment from " + who
 	if kind == "writeoff" {
-		what = "forgive for " + who
+		what = "adjustment for " + who
 	}
 	if pinned {
 		return lendErr("The %s on %s would come before the lend it's toward (%s). Check the dates.", what, paidOn, owedOn)

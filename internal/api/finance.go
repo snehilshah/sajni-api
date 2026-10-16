@@ -1126,7 +1126,7 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		if storedType == "writeoff" {
-			errJSON(w, http.StatusConflict, "This is a forgiven amount. Change it from Lends.")
+			errJSON(w, http.StatusConflict, "This is an adjusted amount. Change it from Lends.")
 			return
 		}
 		if b.Amount != nil && *b.Amount <= 0 {
@@ -1301,7 +1301,7 @@ func deleteTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		if storedType == "writeoff" {
-			errJSON(w, http.StatusConflict, "This is a forgiven amount. Undo it from Lends.")
+			errJSON(w, http.StatusConflict, "This is an adjusted amount. Undo it from Lends.")
 			return
 		}
 		var splitWith string
