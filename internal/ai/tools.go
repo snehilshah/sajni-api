@@ -365,11 +365,12 @@ func (s *Service) buildTools() []Tool {
 			Name:        "list_finance_transactions",
 			Description: "List finance transactions with filters. Each transaction includes its category_id/category_name and the slate it sits on. Filter by slate_id to see everything on one slate — that is how you answer 'what did the Goa trip cost'. Types: expense, income, transfer_out/transfer_in, lend (money someone owes), lend_repayment, refund (money back on a purchase; nets off spending, not income) and writeoff (an adjusted lend: the user let it go, so it counts as spending and moves no money; shown as \"Adjusted\").",
 			Schema: obj(map[string]*genai.Schema{
-				"account_id": intg("Filter by account."),
-				"date_from":  str("ISO date."),
-				"date_to":    str("ISO date."),
-				"slate_id":   intg("Filter to one slate, from list_slates. Plain is a real slate, so pass its id to see normal life only."),
-				"limit":      intg("Default 50."),
+				"account_id":    intg("Filter by account."),
+				"category_name": str("Filter by category name; several separated by commas match any of them."),
+				"date_from":     str("ISO date."),
+				"date_to":       str("ISO date."),
+				"slate_id":      intg("Filter to one slate, from list_slates. Plain is a real slate, so pass its id to see normal life only."),
+				"limit":         intg("Default 50."),
 			}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listTxnsTool(ctx, d, uid, args)
@@ -1842,6 +1843,21 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	if a := argInt(args, "account_id", 0); a > 0 {
 		clauses = append(clauses, fmt.Sprintf("t.account_id=$%d", len(vals)+1))
 		vals = append(vals, a)
+	}
+	if names := strings.TrimSpace(argStr(args, "category_name")); names != "" {
+		var ids []int64
+		for _, n := range strings.Split(names, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				if c := resolveCategoryID(ctx, d, uid, n); c > 0 {
+					ids = append(ids, c)
+				}
+			}
+		}
+		if len(ids) == 0 {
+			return nil, nil, fmt.Errorf("no category named %q", names)
+		}
+		clauses = append(clauses, fmt.Sprintf("t.category_id = ANY($%d)", len(vals)+1))
+		vals = append(vals, ids)
 	}
 	if df := argStr(args, "date_from"); df != "" {
 		clauses = append(clauses, fmt.Sprintf("(t.txn_at AT TIME ZONE 'Asia/Kolkata')::date >= $%d", len(vals)+1))
