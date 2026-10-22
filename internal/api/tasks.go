@@ -10,7 +10,8 @@ import (
 	"time"
 
 	"sajni/internal/db"
-	"sajni/internal/routine"
+	"sajni/internal/plan"
+	"sajni/internal/taskrepeat"
 )
 
 // maxNotifyEmails caps the extra reminder recipients per task. Outbound mail
@@ -198,6 +199,7 @@ func registerTaskRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("DELETE /api/tasks/{id}/reminders/{rid}", deleteTaskReminder(deps))
 	registerTaskAttachmentRoutes(mux, deps)
 	mux.HandleFunc("POST /api/tasks/{id}/reschedule", withSync(deps, "tasks", rescheduleTaskDate(deps)))
+	mux.HandleFunc("POST /api/tasks/{id}/skip", withSync(deps, "tasks", skipTask(deps)))
 
 	mux.HandleFunc("GET /api/tasks", listTasks(deps))
 	mux.HandleFunc("POST /api/tasks", withSync(deps, "tasks", createTask(deps)))
@@ -219,7 +221,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			return
 		}
 		var t taskRow
-		var stepsRaw, emailsRaw []byte
+		var stepsRaw, emailsRaw, recurrenceRaw []byte
 		err = d.QueryRow(`
 			SELECT t.id, t.title, t.description, t.status, t.priority, t.color,
 			       t.due_date::text, t.week_of::text, t.month_of::text, t.scheduled_at::text,
@@ -228,7 +230,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			       blocker.title, blocker.status, t.important, t.steps,
 			       COALESCE(t.sort_order, 0),
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
-			       t.created_at, t.updated_at, t.routine_id, routine.name
+			       t.created_at, t.updated_at, t.plan_id, plan.name, t.recurrence
 			FROM tasks t
 			LEFT JOIN (
 				SELECT parent_task_id,
@@ -240,7 +242,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			) c ON c.parent_task_id = t.id
 			LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
 			LEFT JOIN tasks parent ON parent.id=t.parent_task_id AND parent.user_id=t.user_id
-			LEFT JOIN routines routine ON routine.id=t.routine_id AND routine.user_id=t.user_id
+			LEFT JOIN plans plan ON plan.id=t.plan_id AND plan.user_id=t.user_id
 			WHERE t.user_id = $1 AND t.id = $2`, uid, id).Scan(
 			&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority, &t.Color,
 			&t.DueDate, &t.WeekOf, &t.MonthOf, &t.ScheduledAt,
@@ -248,7 +250,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			&t.ListID, &t.ParentTaskID, &t.ParentTaskTitle, &t.BlockedByTaskID,
 			&t.BlockedByTaskTitle, &t.BlockedByTaskStatus, &t.Important, &stepsRaw,
 			&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
-			&t.CreatedAt, &t.UpdatedAt, &t.RoutineID, &t.RoutineName,
+			&t.CreatedAt, &t.UpdatedAt, &t.PlanID, &t.PlanName, &recurrenceRaw,
 		)
 		if err != nil {
 			errJSON(w, 404, "not found")
@@ -256,6 +258,7 @@ func getTask(deps Deps) http.HandlerFunc {
 		}
 		t.Steps = decodeSteps(stepsRaw)
 		t.NotifyEmails = decodeEmails(emailsRaw)
+		t.Recurrence = taskrepeat.Decode(recurrenceRaw)
 		tagRows, err := d.Query("SELECT tag FROM tags WHERE user_id = $1 AND entity_type = 'task' AND entity_id = $2", uid, t.ID)
 		if err == nil {
 			for tagRows.Next() {
@@ -309,10 +312,12 @@ type taskRow struct {
 	Subtasks  []subtaskBrief `json:"subtasks"`
 	CreatedAt string         `json:"created_at"`
 	UpdatedAt string         `json:"updated_at"`
-	// RoutineID makes the task an agenda item of that Journal routine's
-	// occurrence on due_date; RoutineName labels it in task lists.
-	RoutineID   *int64  `json:"routine_id"`
-	RoutineName *string `json:"routine_name"`
+	// PlanID puts the task in that Journal plan's occurrence on due_date;
+	// PlanName labels it in task lists.
+	PlanID   *int64  `json:"plan_id"`
+	PlanName *string `json:"plan_name"`
+	// Recurrence is the repeat rule ({} when the task doesn't repeat).
+	Recurrence taskrepeat.Rule `json:"recurrence"`
 }
 
 // subtaskBrief is the lightweight child shape embedded in a task list row
@@ -470,7 +475,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 			       blocker.title, blocker.status, t.important, t.steps,
 			       COALESCE(t.sort_order, 0),
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
-			       t.created_at, t.updated_at, t.routine_id, routine.name
+			       t.created_at, t.updated_at, t.plan_id, plan.name, t.recurrence
 			FROM tasks t
 			LEFT JOIN (
 				SELECT parent_task_id,
@@ -482,7 +487,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 			) c ON c.parent_task_id = t.id
 			LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
 			LEFT JOIN tasks parent ON parent.id=t.parent_task_id AND parent.user_id=t.user_id
-			LEFT JOIN routines routine ON routine.id=t.routine_id AND routine.user_id=t.user_id
+			LEFT JOIN plans plan ON plan.id=t.plan_id AND plan.user_id=t.user_id
 			WHERE ` + strings.Join(clauses, " AND ") + `
 			` + orderBy
 
@@ -496,7 +501,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 		var tasks []taskRow
 		for rows.Next() {
 			var t taskRow
-			var stepsRaw, emailsRaw []byte
+			var stepsRaw, emailsRaw, recurrenceRaw []byte
 			if err := rows.Scan(
 				&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority, &t.Color,
 				&t.DueDate, &t.WeekOf, &t.MonthOf, &t.ScheduledAt,
@@ -504,13 +509,14 @@ func listTasks(deps Deps) http.HandlerFunc {
 				&t.ListID, &t.ParentTaskID, &t.ParentTaskTitle, &t.BlockedByTaskID,
 				&t.BlockedByTaskTitle, &t.BlockedByTaskStatus, &t.Important, &stepsRaw,
 				&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
-				&t.CreatedAt, &t.UpdatedAt, &t.RoutineID, &t.RoutineName,
+				&t.CreatedAt, &t.UpdatedAt, &t.PlanID, &t.PlanName, &recurrenceRaw,
 			); err != nil {
 				errJSON(w, 500, err.Error())
 				return
 			}
 			t.Steps = decodeSteps(stepsRaw)
 			t.NotifyEmails = decodeEmails(emailsRaw)
+			t.Recurrence = taskrepeat.Decode(recurrenceRaw)
 			tagRows, err := d.Query("SELECT tag FROM tags WHERE user_id = $1 AND entity_type = 'task' AND entity_id = $2", uid, t.ID)
 			if err == nil {
 				for tagRows.Next() {
@@ -619,45 +625,42 @@ func createTask(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid := userID(r.Context())
 		var body struct {
-			Title           string   `json:"title"`
-			Description     string   `json:"description"`
-			Priority        string   `json:"priority"`
-			Color           *string  `json:"color"`
-			Status          string   `json:"status"`
-			DueDate         *string  `json:"due_date"`
-			WeekOf          *string  `json:"week_of"`
-			MonthOf         *string  `json:"month_of"`
-			ScheduledAt     *string  `json:"scheduled_at"`
-			Remind          bool     `json:"remind"`
-			NotifyEmails    []string `json:"notify_emails"`
-			ListID          *int64   `json:"list_id"`
-			ParentTaskID    *int64   `json:"parent_task_id"`
-			BlockedByTaskID *int64   `json:"blocked_by_task_id"`
-			Important       bool     `json:"important"`
-			Steps           []Step   `json:"steps"`
-			RoutineID       *int64   `json:"routine_id"`
+			Title           string           `json:"title"`
+			Description     string           `json:"description"`
+			Priority        string           `json:"priority"`
+			Color           *string          `json:"color"`
+			Status          string           `json:"status"`
+			DueDate         *string          `json:"due_date"`
+			WeekOf          *string          `json:"week_of"`
+			MonthOf         *string          `json:"month_of"`
+			ScheduledAt     *string          `json:"scheduled_at"`
+			Remind          bool             `json:"remind"`
+			NotifyEmails    []string         `json:"notify_emails"`
+			ListID          *int64           `json:"list_id"`
+			ParentTaskID    *int64           `json:"parent_task_id"`
+			BlockedByTaskID *int64           `json:"blocked_by_task_id"`
+			Important       bool             `json:"important"`
+			Steps           []Step           `json:"steps"`
+			PlanID          *int64           `json:"plan_id"`
+			Recurrence      *taskrepeat.Rule `json:"recurrence"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
 			return
 		}
-		// An agenda task lands on a routine occurrence: the given due_date
-		// (a day the routine runs) or its next one, timed at the start.
-		if body.RoutineID != nil {
+		// A plan task lands on a plan occurrence: the given due_date (a day
+		// the plan runs) or its next one.
+		if body.PlanID != nil {
 			due := ""
 			if body.DueDate != nil {
 				due = strings.TrimSpace(*body.DueDate)
 			}
-			date, at, err := routine.Occurrence(r.Context(), d, uid, *body.RoutineID, due)
+			date, _, err := plan.Occurrence(r.Context(), d, uid, *body.PlanID, due)
 			if err != nil {
-				writeRoutineError(w, r, err)
+				writePlanError(w, r, err)
 				return
 			}
 			body.DueDate, body.WeekOf, body.MonthOf = &date, nil, nil
-			if body.ScheduledAt == nil || strings.TrimSpace(*body.ScheduledAt) == "" {
-				s := at.Format(time.RFC3339)
-				body.ScheduledAt = &s
-			}
 		}
 		if body.Priority == "" {
 			body.Priority = "medium"
@@ -744,6 +747,17 @@ func createTask(deps Deps) http.HandlerFunc {
 			}
 		}
 
+		recurrence := taskrepeat.Rule{}
+		if body.Recurrence != nil {
+			str := func(v any) string { s, _ := v.(string); return s }
+			rule, err := taskrepeat.Normalize(*body.Recurrence, taskrepeat.Scope{Due: str(dueArg), Week: str(weekArg), Month: str(monthArg)})
+			if err != nil {
+				errJSON(w, 400, strings.TrimPrefix(err.Error(), taskrepeat.ErrInvalid.Error()+": "))
+				return
+			}
+			recurrence = rule
+		}
+
 		// Compute the next sort_order in a separate query. Inlining it
 		// inside the INSERT made Postgres unable to infer the type of the
 		// nullable bigint placeholders, throwing 500 on empty payloads.
@@ -767,11 +781,12 @@ func createTask(deps Deps) http.HandlerFunc {
 		var id int64
 		err := d.QueryRow(`
 			INSERT INTO tasks (user_id, title, description, priority, color, status, due_date, week_of, month_of, scheduled_at, remind,
-			                   notify_emails, list_id, parent_task_id, blocked_by_task_id, important, steps, sort_order, routine_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15, $16, $17::jsonb, $18, $19)
+			                   notify_emails, list_id, parent_task_id, blocked_by_task_id, important, steps, sort_order, plan_id, recurrence)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15, $16, $17::jsonb, $18, $19, $20::jsonb)
 			RETURNING id`,
 			uid, body.Title, body.Description, body.Priority, body.Color, body.Status, dueArg, weekArg, monthArg, schedArg, body.Remind,
-			string(notifyJSON), body.ListID, body.ParentTaskID, body.BlockedByTaskID, body.Important, stepsJSON, nextSort, body.RoutineID,
+			string(notifyJSON), body.ListID, body.ParentTaskID, body.BlockedByTaskID, body.Important, stepsJSON, nextSort, body.PlanID,
+			taskrepeat.Encode(recurrence),
 		).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -804,33 +819,33 @@ func updateTask(deps Deps) http.HandlerFunc {
 		// any field with a non-nil pointer is updated. due_date/list_id/parent
 		// also accept the JSON literal null to clear the column.
 		var body struct {
-			Title           *string   `json:"title"`
-			Description     *string   `json:"description"`
-			Status          *string   `json:"status"`
-			Priority        *string   `json:"priority"`
-			Color           *string   `json:"color"`
-			DueDate         *string   `json:"due_date"`
-			WeekOf          *string   `json:"week_of"`
-			MonthOf         *string   `json:"month_of"`
-			ScheduledAt     *string   `json:"scheduled_at"`
-			Remind          *bool     `json:"remind"`
-			NotifyEmails    *[]string `json:"notify_emails"`
-			ListID          *int64    `json:"list_id"`
-			ParentTaskID    *int64    `json:"parent_task_id"`
-			BlockedByTaskID *int64    `json:"blocked_by_task_id"`
-			Important       *bool     `json:"important"`
-			Steps           *[]Step   `json:"steps"`
-			SortOrder       *int      `json:"sort_order"`
-			RoutineID       *int64    `json:"routine_id"`
-			ClearRoutine    bool      `json:"clear_routine"`
-			ClearList       bool      `json:"clear_list"`
-			ClearParent     bool      `json:"clear_parent"`
-			ClearBlockedBy  bool      `json:"clear_blocked_by"`
-			ClearScheduled  bool      `json:"clear_scheduled"`
-			ClearDue        bool      `json:"clear_due"`
-			ClearWeek       bool      `json:"clear_week"`
-			ClearMonth      bool      `json:"clear_month"`
-			ClearColor      bool      `json:"clear_color"`
+			Title           *string          `json:"title"`
+			Description     *string          `json:"description"`
+			Status          *string          `json:"status"`
+			Priority        *string          `json:"priority"`
+			Color           *string          `json:"color"`
+			DueDate         *string          `json:"due_date"`
+			WeekOf          *string          `json:"week_of"`
+			MonthOf         *string          `json:"month_of"`
+			ScheduledAt     *string          `json:"scheduled_at"`
+			Remind          *bool            `json:"remind"`
+			NotifyEmails    *[]string        `json:"notify_emails"`
+			ListID          *int64           `json:"list_id"`
+			ParentTaskID    *int64           `json:"parent_task_id"`
+			BlockedByTaskID *int64           `json:"blocked_by_task_id"`
+			Important       *bool            `json:"important"`
+			Steps           *[]Step          `json:"steps"`
+			SortOrder       *int             `json:"sort_order"`
+			Recurrence      *taskrepeat.Rule `json:"recurrence"`
+			ClearPlan       bool             `json:"clear_plan"`
+			ClearList       bool             `json:"clear_list"`
+			ClearParent     bool             `json:"clear_parent"`
+			ClearBlockedBy  bool             `json:"clear_blocked_by"`
+			ClearScheduled  bool             `json:"clear_scheduled"`
+			ClearDue        bool             `json:"clear_due"`
+			ClearWeek       bool             `json:"clear_week"`
+			ClearMonth      bool             `json:"clear_month"`
+			ClearColor      bool             `json:"clear_color"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -1083,26 +1098,17 @@ func updateTask(deps Deps) http.HandlerFunc {
 		if body.SortOrder != nil {
 			q.Exec("UPDATE tasks SET sort_order=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.SortOrder, id, uid)
 		}
-		if body.ClearRoutine {
-			q.Exec("UPDATE tasks SET routine_id=NULL, updated_at=NOW() WHERE id=$1 AND user_id=$2", id, uid)
-		} else if body.RoutineID != nil {
-			// Joining a routine keeps the task's day when the routine runs then;
-			// an undated (or week/month) task moves to the next occurrence.
-			var due string
-			q.QueryRow("SELECT COALESCE(due_date::text,'') FROM tasks WHERE id=$1 AND user_id=$2", id, uid).Scan(&due)
-			date, at, err := routine.Occurrence(r.Context(), d, uid, *body.RoutineID, due)
-			if err != nil && due != "" && errors.Is(err, routine.ErrInvalid) {
-				date, at, err = routine.Occurrence(r.Context(), d, uid, *body.RoutineID, "")
+		if body.ClearPlan {
+			q.Exec("UPDATE tasks SET plan_id=NULL, updated_at=NOW() WHERE id=$1 AND user_id=$2", id, uid)
+		}
+		// The repeat rule must fit the task's (possibly new) scope.
+		if err := taskrepeat.Fit(r.Context(), tx, uid, id, body.Recurrence); err != nil {
+			if errors.Is(err, taskrepeat.ErrInvalid) {
+				errJSON(w, 400, strings.TrimPrefix(err.Error(), taskrepeat.ErrInvalid.Error()+": "))
+			} else {
+				internalError(w, r, "task repeat", err)
 			}
-			if err != nil {
-				writeRoutineError(w, r, err)
-				return
-			}
-			if date != due {
-				q.Exec(`UPDATE tasks SET due_date=$1, scheduled_at=$2, week_of=NULL, month_of=NULL, reminded_at=NULL
-					WHERE id=$3 AND user_id=$4`, date, at, id, uid)
-			}
-			q.Exec("UPDATE tasks SET routine_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.RoutineID, id, uid)
+			return
 		}
 		if err := tx.Commit(); err != nil {
 			internalError(w, r, "commit task patch", err)
@@ -1374,4 +1380,26 @@ func normalizeSteps(in []Step) []Step {
 		out = append(out, s)
 	}
 	return out
+}
+
+// skipTask moves a repeating task past its current date without a miss.
+func skipTask(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		m, err := taskrepeat.Skip(r.Context(), deps.DB, deps.ReminderQueue, userID(r.Context()), id)
+		switch {
+		case errors.Is(err, taskrepeat.ErrNotFound):
+			errJSON(w, 404, "task not found")
+		case errors.Is(err, taskrepeat.ErrInvalid):
+			errJSON(w, 400, strings.TrimPrefix(err.Error(), taskrepeat.ErrInvalid.Error()+": "))
+		case err != nil:
+			internalError(w, r, "skip task", err)
+		default:
+			writeJSON(w, 200, map[string]any{"id": id, "from": m.From, "to": m.To})
+		}
+	}
 }

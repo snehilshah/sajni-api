@@ -146,15 +146,14 @@ func (d *DB) ensureSchema() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_task_lists_user ON task_lists(user_id);
 
-	-- ─── Routines (Journal) ───────────────────────────────────────────
-	-- A named time slot that repeats on chosen weekdays ("Office start",
-	-- Mon–Fri 09:00 in the user's timezone). items = the standing checklist
-	-- [{id,text}], ticked per day in routine_runs.done (item ids) and fresh
-	-- each occurrence. One-off agenda items are tasks with routine_id, dated
-	-- to an occurrence. weekdays: 0=Sunday … 6=Saturday. next_alert_at = the
-	-- next start alert (NULL with notify off); the fire claims it with
-	-- alert_claimed_until, sends once, then advances it (internal/routine).
-	CREATE TABLE IF NOT EXISTS routines (
+	-- ─── Plans (Journal) ──────────────────────────────────────────────
+	-- A named moment that repeats on chosen weekdays ("Office start",
+	-- Mon–Fri 09:00 in the user's timezone) to plan what that day is about.
+	-- A plan's tasks are ordinary tasks with plan_id, dated to an
+	-- occurrence. weekdays: 0=Sunday … 6=Saturday. next_alert_at = the next
+	-- start alert (NULL with notify off); the fire claims it with
+	-- alert_claimed_until, sends once, then advances it (internal/plan).
+	CREATE TABLE IF NOT EXISTS plans (
 		id                  BIGSERIAL   PRIMARY KEY,
 		user_id             UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name                TEXT        NOT NULL,
@@ -162,24 +161,13 @@ func (d *DB) ensureSchema() error {
 		weekdays            JSONB       NOT NULL DEFAULT '[1,2,3,4,5]'::jsonb,
 		start_time          TEXT        NOT NULL DEFAULT '09:00',
 		notify              BOOLEAN     NOT NULL DEFAULT TRUE,
-		items               JSONB       NOT NULL DEFAULT '[]'::jsonb,
 		next_alert_at       TIMESTAMPTZ,
 		alert_claimed_until TIMESTAMPTZ,
 		created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
-	CREATE INDEX IF NOT EXISTS idx_routines_user ON routines(user_id);
-	CREATE INDEX IF NOT EXISTS idx_routines_alert ON routines(next_alert_at) WHERE next_alert_at IS NOT NULL;
-
-	CREATE TABLE IF NOT EXISTS routine_runs (
-		routine_id BIGINT      NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
-		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		run_date   DATE        NOT NULL,
-		done       JSONB       NOT NULL DEFAULT '[]'::jsonb,
-		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-		PRIMARY KEY (routine_id, run_date)
-	);
-	CREATE INDEX IF NOT EXISTS idx_routine_runs_user_date ON routine_runs(user_id, run_date);
+	CREATE INDEX IF NOT EXISTS idx_plans_user ON plans(user_id);
+	CREATE INDEX IF NOT EXISTS idx_plans_alert ON plans(next_alert_at) WHERE next_alert_at IS NOT NULL;
 
 	-- Reminders ride on tasks rather than a separate model: scheduled_at is
 	-- the event instant, remind gates the nudge, reminded_at is the
@@ -188,8 +176,9 @@ func (d *DB) ensureSchema() error {
 	-- a "month goal" — the three scopes (day/week/month) stay mutually
 	-- exclusive. notify_emails = extra email-only reminder recipients
 	-- (JSONB array, API caps + validates). digested_at stamps the last
-	-- weekly/monthly digest nudge for week/month tasks. routine_id makes the
-	-- task an agenda item of that routine's occurrence on due_date.
+	-- weekly/monthly digest nudge for week/month tasks. plan_id puts the task
+	-- in that plan's occurrence on due_date. recurrence = the repeat rule
+	-- ({} = one-off; internal/taskrepeat moves it to its next date).
 	CREATE TABLE IF NOT EXISTS tasks (
 		id               BIGSERIAL   PRIMARY KEY,
 		user_id          UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -211,7 +200,8 @@ func (d *DB) ensureSchema() error {
 		list_id          BIGINT      REFERENCES task_lists(id) ON DELETE SET NULL,
 		parent_task_id   BIGINT      REFERENCES tasks(id) ON DELETE CASCADE,
 		blocked_by_task_id BIGINT    REFERENCES tasks(id) ON DELETE SET NULL,
-		routine_id       BIGINT      REFERENCES routines(id) ON DELETE SET NULL,
+		plan_id          BIGINT      REFERENCES plans(id) ON DELETE SET NULL,
+		recurrence       JSONB       NOT NULL DEFAULT '{}'::jsonb,
 		steps            JSONB       NOT NULL DEFAULT '[]'::jsonb,
 		important        BOOLEAN     NOT NULL DEFAULT FALSE,
 		sort_order       INTEGER     NOT NULL DEFAULT 0,
@@ -228,9 +218,8 @@ func (d *DB) ensureSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_tasks_week_of ON tasks(user_id, week_of) WHERE week_of IS NOT NULL;
 	CREATE INDEX IF NOT EXISTS idx_tasks_month_of ON tasks(user_id, month_of) WHERE month_of IS NOT NULL;
 	CREATE INDEX IF NOT EXISTS idx_tasks_user_due_date ON tasks(user_id, due_date) WHERE due_date IS NOT NULL;
-	-- One-time prod patch (2026-10 routines). Delete once shipped.
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS routine_id BIGINT REFERENCES routines(id) ON DELETE SET NULL;
-	CREATE INDEX IF NOT EXISTS idx_tasks_routine ON tasks(routine_id, due_date) WHERE routine_id IS NOT NULL;
+	CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id, due_date) WHERE plan_id IS NOT NULL;
+	CREATE INDEX IF NOT EXISTS idx_tasks_repeat ON tasks(id) WHERE recurrence <> '{}'::jsonb;
 
 	-- Standalone reminders deliberately do not ride on tasks. A reminder is a
 	-- lightweight message + schedule; occurrence rows carry delivery state so

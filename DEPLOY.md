@@ -264,7 +264,8 @@ Date-driven notifications share one idempotent sweep:
 - movie release email at **10:00 in the owner's timezone**, one day before;
 - weekly task digest at local 10:00 on Friday;
 - monthly task digest at local 10:00 on the last day of the month;
-- biller and investment processing against each owner's local calendar.
+- biller and investment processing against each owner's local calendar;
+- repeating tasks moving to their next date once their day, week or month has ended.
 
 Cloud Scheduler calls `/internal/notifications/run` every 15 minutes. The
 quarter-hour cadence is required for IANA zones with `:30` or `:45` UTC

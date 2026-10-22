@@ -21,7 +21,7 @@ const (
 	KindTask       = "task"
 	KindMulti      = "multi"
 	KindStandalone = "standalone"
-	KindRoutine    = "routine"
+	KindPlan       = "plan"
 
 	enqueueTimeout = 10 * time.Second
 )
@@ -70,7 +70,7 @@ func (c Queue) fireURL() string {
 // edits enqueue a new Cloud Task, and stale older tasks no-op after the fire
 // endpoint re-checks Postgres.
 func (c Queue) Enqueue(ctx context.Context, kind string, id int64, at time.Time) error {
-	if kind != KindTask && kind != KindMulti && kind != KindStandalone && kind != KindRoutine {
+	if kind != KindTask && kind != KindMulti && kind != KindStandalone && kind != KindPlan {
 		return fmt.Errorf("unknown reminder kind %q", kind)
 	}
 	if id <= 0 || at.IsZero() {
@@ -128,6 +128,6 @@ func (c Queue) EnqueueStandalone(ctx context.Context, id int64, fireAt time.Time
 	return c.Enqueue(ctx, KindStandalone, id, fireAt)
 }
 
-func (c Queue) EnqueueRoutine(ctx context.Context, id int64, at time.Time) error {
-	return c.Enqueue(ctx, KindRoutine, id, at)
+func (c Queue) EnqueuePlan(ctx context.Context, id int64, at time.Time) error {
+	return c.Enqueue(ctx, KindPlan, id, at)
 }

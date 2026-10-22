@@ -50,8 +50,7 @@ func takeoutExport(deps Deps) http.HandlerFunc {
 			exportTaskLists,
 			exportHabits,
 			exportHabitLogs,
-			exportRoutines,
-			exportRoutineRuns,
+			exportPlans,
 			exportEvents,
 			exportEventVariables,
 			exportEventEntries,
@@ -96,8 +95,7 @@ Layout:
   task_lists.csv          - your custom task lists
   habits.csv              - habits and their colours
   habit_logs.csv          - every day you ticked a habit
-  routines.csv            - Journal routines, their days, time and checklist
-  routine_runs.csv        - checklist items ticked on each routine day
+  plans.csv               - Journal plans, their days and time
   events.csv              - tracked life events
   event_variables.csv     - numeric fields configured for events
   event_entries.csv       - timestamped event occurrences
@@ -144,7 +142,8 @@ func exportMemos(ctx context.Context, zw *zip.Writer, deps Deps, uid string) err
 func exportTasks(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx, `
 		SELECT id, title, COALESCE(description,''), status, priority, due_date,
-		       COALESCE(list_id,0), important, created_at, updated_at
+		       COALESCE(list_id,0), important, created_at, updated_at,
+		       COALESCE(plan_id,0), recurrence::text
 		FROM tasks WHERE user_id = $1 ORDER BY created_at`, uid)
 	if err != nil {
 		return err
@@ -155,14 +154,14 @@ func exportTasks(ctx context.Context, zw *zip.Writer, deps Deps, uid string) err
 		return err
 	}
 	cw := csv.NewWriter(f)
-	cw.Write([]string{"id", "title", "description", "status", "priority", "due_date", "list_id", "important", "created_at", "updated_at"})
+	cw.Write([]string{"id", "title", "description", "status", "priority", "due_date", "list_id", "important", "created_at", "updated_at", "plan_id", "repeat"})
 	for rows.Next() {
-		var id, listID int64
-		var title, desc, status, prio string
+		var id, listID, planID int64
+		var title, desc, status, prio, repeat string
 		var due sql.NullTime
 		var important bool
 		var created, updated time.Time
-		if err := rows.Scan(&id, &title, &desc, &status, &prio, &due, &listID, &important, &created, &updated); err != nil {
+		if err := rows.Scan(&id, &title, &desc, &status, &prio, &due, &listID, &important, &created, &updated, &planID, &repeat); err != nil {
 			continue
 		}
 		cw.Write([]string{
@@ -170,6 +169,7 @@ func exportTasks(ctx context.Context, zw *zip.Writer, deps Deps, uid string) err
 			nullDateStr(due), strconv.FormatInt(listID, 10),
 			strconv.FormatBool(important),
 			created.Format(time.RFC3339), updated.Format(time.RFC3339),
+			strconv.FormatInt(planID, 10), repeat,
 		})
 	}
 	cw.Flush()
@@ -272,46 +272,27 @@ func exportHabitLogs(ctx context.Context, zw *zip.Writer, deps Deps, uid string)
 	})
 }
 
-func exportRoutines(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
+func exportPlans(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
 	rows, err := deps.DB.QueryContext(ctx, `
-		SELECT id, name, color, weekdays::text, start_time, notify, items::text, created_at
-		  FROM routines WHERE user_id = $1 ORDER BY start_time, id`, uid)
+		SELECT id, name, color, weekdays::text, start_time, notify, created_at
+		  FROM plans WHERE user_id = $1 ORDER BY start_time, id`, uid)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	return writeCSV(zw, "routines.csv",
-		[]string{"id", "name", "color", "weekdays", "start_time", "notify", "items", "created_at"},
+	return writeCSV(zw, "plans.csv",
+		[]string{"id", "name", "color", "weekdays", "start_time", "notify", "created_at"},
 		func(emit func([]string)) {
 			for rows.Next() {
 				var id int64
-				var name, color, days, start, items string
+				var name, color, days, start string
 				var notify bool
 				var created time.Time
-				if err := rows.Scan(&id, &name, &color, &days, &start, &notify, &items, &created); err == nil {
-					emit([]string{strconv.FormatInt(id, 10), name, color, days, start, strconv.FormatBool(notify), items, created.Format(time.RFC3339)})
+				if err := rows.Scan(&id, &name, &color, &days, &start, &notify, &created); err == nil {
+					emit([]string{strconv.FormatInt(id, 10), name, color, days, start, strconv.FormatBool(notify), created.Format(time.RFC3339)})
 				}
 			}
 		})
-}
-
-func exportRoutineRuns(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
-	rows, err := deps.DB.QueryContext(ctx, `
-		SELECT routine_id, run_date, done::text FROM routine_runs WHERE user_id = $1 ORDER BY run_date, routine_id`, uid)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	return writeCSV(zw, "routine_runs.csv", []string{"routine_id", "date", "done"}, func(emit func([]string)) {
-		for rows.Next() {
-			var rid int64
-			var d time.Time
-			var done string
-			if err := rows.Scan(&rid, &d, &done); err == nil {
-				emit([]string{strconv.FormatInt(rid, 10), d.Format("2006-01-02"), done})
-			}
-		}
-	})
 }
 
 func exportEvents(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {

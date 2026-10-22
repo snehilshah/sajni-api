@@ -135,8 +135,8 @@ func ProcessReminderFire(ctx context.Context, deps Deps, kind string, id int64) 
 			return 1, nil
 		}
 		return 0, nil
-	case reminderqueue.KindRoutine:
-		sent, err := sendRoutineAlert(ctx, deps, id)
+	case reminderqueue.KindPlan:
+		sent, err := sendPlanAlert(ctx, deps, id)
 		if err != nil {
 			return 0, err
 		}
@@ -304,11 +304,11 @@ func ProcessReminderCron(ctx context.Context, deps Deps) (int, error) {
 	if err != nil {
 		return sent + multiSent, err
 	}
-	routineSent, err := processRoutineAlertCron(ctx, deps)
+	planSent, err := processPlanAlertCron(ctx, deps)
 	if err != nil {
 		return sent + multiSent + standaloneSent, err
 	}
-	return sent + multiSent + standaloneSent + routineSent, nil
+	return sent + multiSent + standaloneSent + planSent, nil
 }
 
 func sendSingleTaskReminder(ctx context.Context, deps Deps, id int64) (bool, error) {

@@ -1,4 +1,4 @@
-package routine
+package plan
 
 import (
 	"errors"
@@ -7,8 +7,7 @@ import (
 )
 
 func TestNormalizeDefaults(t *testing.T) {
-	in, err := Normalize(SaveInput{Name: "  Office start ", StartTime: "9:30", Weekdays: []int{5, 1, 1},
-		Items: []Item{{Text: " Check calendar "}, {Text: "  "}, {ID: "x", Text: "Standup"}, {ID: "x", Text: "Inbox"}}})
+	in, err := Normalize(SaveInput{Name: "  Office start ", StartTime: "9:30", Weekdays: []int{5, 1, 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -17,12 +16,6 @@ func TestNormalizeDefaults(t *testing.T) {
 	}
 	if len(in.Weekdays) != 2 || in.Weekdays[0] != 1 || in.Weekdays[1] != 5 {
 		t.Fatalf("weekdays = %v", in.Weekdays)
-	}
-	if len(in.Items) != 3 || in.Items[0].Text != "Check calendar" || in.Items[0].ID == "" {
-		t.Fatalf("items = %+v", in.Items)
-	}
-	if in.Items[1].ID != "x" || in.Items[2].ID == "x" {
-		t.Fatalf("duplicate id kept: %+v", in.Items)
 	}
 
 	def, _ := Normalize(SaveInput{Name: "Closing"})

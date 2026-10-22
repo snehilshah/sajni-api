@@ -21,9 +21,10 @@ import (
 	"sajni/internal/habitperiod"
 	mediastatus "sajni/internal/media"
 	sharednote "sajni/internal/note"
+	"sajni/internal/plan"
 	"sajni/internal/reminderqueue"
-	"sajni/internal/routine"
 	"sajni/internal/storage"
+	"sajni/internal/taskrepeat"
 )
 
 // Tool wraps a function declaration with its server-side handler. The
@@ -542,7 +543,8 @@ func (s *Service) buildTools() []Tool {
 				"important":        boolean("Optional. Star the task (Important smart list)."),
 				"steps":            arrayOf(str(""), "Optional inline checklist (array of step text strings)."),
 				"tags":             arrayOf(str(""), "Optional tag list."),
-				"routine_id":       intg("Optional. Adds the task to a Journal routine's agenda (from list_routines): it lands on due_date when the routine runs that day, else on the routine's next occurrence, timed at its start. The routine's own alert covers it, so leave remind off."),
+				"plan_id":          intg("Optional. Puts the task in a Journal plan (from list_plans): it lands on due_date when the plan runs that day, else on the plan's next occurrence. The plan's own alert covers it, so leave remind off."),
+				"recurrence":       taskRepeatSchema(),
 			}, "title"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createTaskTool(ctx, d, queue, uid, args)
@@ -563,7 +565,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "update_task",
-			Description: "Edit an existing task in place: title, description, priority, due_date, and/or move it between lists. This is the only way to move or promote a task to a different list — pass list_id (resolve names via list_task_lists), or to_inbox=true to clear its list. Only the fields you pass change. For reminder/scheduled-time edits use reschedule_task instead.",
+			Description: "Edit an existing task in place: title, description, priority, due_date, repeat, and/or move it between lists. This is the only way to move or promote a task to a different list — pass list_id (resolve names via list_task_lists), or to_inbox=true to clear its list. Only the fields you pass change. For reminder/scheduled-time edits use reschedule_task instead.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"id":             intg("Required. Task id (use list_tasks to find it)."),
@@ -575,6 +577,8 @@ func (s *Service) buildTools() []Tool {
 				"list_id":        intg("Optional. Move the task into this list."),
 				"parent_task_id": intg("Optional. Re-parent as a subtask of this task id."),
 				"to_inbox":       boolean("Optional. true clears the task's list (promote to Inbox). Ignored when list_id is set."),
+				"recurrence":     taskRepeatSchema(),
+				"stop_repeating": boolean("Optional. true makes a repeating task one-off."),
 			}, "id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return updateTaskTool(ctx, d, uid, args)
@@ -1341,7 +1345,7 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 	}
-	tools = append(tools, routineTools(d, queue)...)
+	tools = append(tools, planTools(d, queue)...)
 	return append(tools, standaloneReminderTools(d, queue)...)
 }
 
@@ -1451,7 +1455,8 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	             COALESCE(duration_minutes,30),
 	             list_id,parent_task_id,blocked_by_task_id,important,
 	             (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id = tasks.id),
-	             COALESCE((SELECT p.title FROM tasks p WHERE p.id = tasks.parent_task_id), '')
+	             COALESCE((SELECT p.title FROM tasks p WHERE p.id = tasks.parent_task_id), ''),
+	             recurrence, COALESCE(week_of::text,''), COALESCE(month_of::text,''), plan_id
 	      FROM tasks WHERE ` + strings.Join(clauses, " AND ") +
 		fmt.Sprintf(` ORDER BY (status='done') ASC, important DESC NULLS LAST, due_date NULLS LAST, created_at DESC LIMIT %d`, limit)
 	rows, err := d.QueryContext(ctx, q, vals...)
@@ -1467,9 +1472,12 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		var listID, parentID, blockedByID sql.NullInt64
 		var important bool
 		var subCount int
-		var parentTitle string
+		var parentTitle, weekOf, monthOf string
+		var recurrenceRaw []byte
+		var planID sql.NullInt64
 		rows.Scan(&id, &title, &desc, &status, &priority, &color, &due, &sched, &dur,
-			&listID, &parentID, &blockedByID, &important, &subCount, &parentTitle)
+			&listID, &parentID, &blockedByID, &important, &subCount, &parentTitle,
+			&recurrenceRaw, &weekOf, &monthOf, &planID)
 		row := map[string]any{
 			"id": id, "title": title, "description": desc,
 			"status": status, "priority": priority,
@@ -1486,6 +1494,18 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		}
 		if blockedByID.Valid {
 			row["blocked_by_task_id"] = blockedByID.Int64
+		}
+		if rule := taskrepeat.Decode(recurrenceRaw); rule.Recurring() {
+			row["recurrence"] = rule
+		}
+		if weekOf != "" {
+			row["week_of"] = weekOf
+		}
+		if monthOf != "" {
+			row["month_of"] = monthOf
+		}
+		if planID.Valid {
+			row["plan_id"] = planID.Int64
 		}
 		out = append(out, row)
 	}
@@ -2390,28 +2410,34 @@ func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, ui
 		}
 	}
 
-	// A routine agenda item lands on an occurrence, timed at its start.
-	var routineArg any
+	// A plan task lands on a plan occurrence.
+	var planArg any
 	route := "/tasks"
-	if rid := argInt(args, "routine_id", 0); rid != 0 {
-		date, at, err := routine.Occurrence(ctx, d, uid, rid, dueDate)
+	if pid := argInt(args, "plan_id", 0); pid != 0 {
+		date, _, err := plan.Occurrence(ctx, d, uid, pid, dueDate)
 		if err != nil {
 			return nil, nil, err
 		}
-		routineArg, dueArg, weekArg, monthArg = rid, date, nil, nil
-		if scheduled == "" {
-			schArg = at
-		}
+		planArg, dueArg, weekArg, monthArg = pid, date, nil, nil
 		route = "/journal?date=" + date
+	}
+	recurrence := "{}"
+	if raw, ok := args["recurrence"]; ok && raw != nil {
+		str := func(v any) string { s, _ := v.(string); return s }
+		rule, err := taskrepeat.Normalize(reminderRuleFromAny(raw), taskrepeat.Scope{Due: str(dueArg), Week: str(weekArg), Month: str(monthArg)})
+		if err != nil {
+			return nil, nil, err
+		}
+		recurrence = taskrepeat.Encode(rule)
 	}
 
 	var scheduledAt sql.NullTime
 	err := d.QueryRowContext(ctx, `
 		INSERT INTO tasks (user_id, title, description, priority, color, status, due_date, week_of, month_of, scheduled_at, remind,
-		                   notify_emails, duration_minutes, list_id, parent_task_id, important, steps, routine_id)
-		VALUES ($1,$2,$3,$4,$5,'todo',$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16::jsonb,$17)
+		                   notify_emails, duration_minutes, list_id, parent_task_id, important, steps, plan_id, recurrence)
+		VALUES ($1,$2,$3,$4,$5,'todo',$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16::jsonb,$17,$18::jsonb)
 		RETURNING id, scheduled_at`,
-		uid, title, desc, priority, colorArg, dueArg, weekArg, monthArg, schArg, remind, notifyJSON, dur, listArg, parentArg, important, stepsJSON, routineArg,
+		uid, title, desc, priority, colorArg, dueArg, weekArg, monthArg, schArg, remind, notifyJSON, dur, listArg, parentArg, important, stepsJSON, planArg, recurrence,
 	).Scan(&id, &scheduledAt)
 	if err != nil {
 		return nil, nil, err
@@ -2737,14 +2763,35 @@ func updateTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 		add("parent_task_id", pid)
 	}
 
-	if len(sets) == 0 {
-		return nil, nil, fmt.Errorf("nothing to update: pass at least one of title, description, priority, color, due_date, list_id, parent_task_id, to_inbox")
+	var rule *taskrepeat.Rule
+	if raw, ok := args["recurrence"]; ok && raw != nil {
+		r := reminderRuleFromAny(raw)
+		rule = &r
+	}
+	if argBool(args, "stop_repeating", false) {
+		rule = &taskrepeat.Rule{}
+	}
+	if len(sets) == 0 && rule == nil {
+		return nil, nil, fmt.Errorf("nothing to update: pass at least one of title, description, priority, color, due_date, list_id, parent_task_id, to_inbox, recurrence, stop_repeating")
 	}
 
-	vals = append(vals, id, uid)
-	q := fmt.Sprintf(`UPDATE tasks SET %s, updated_at=NOW() WHERE id=$%d AND user_id=$%d`,
-		strings.Join(sets, ", "), len(vals)-1, len(vals))
-	if _, err := d.ExecContext(ctx, q, vals...); err != nil {
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	if len(sets) > 0 {
+		vals = append(vals, id, uid)
+		q := fmt.Sprintf(`UPDATE tasks SET %s, updated_at=NOW() WHERE id=$%d AND user_id=$%d`,
+			strings.Join(sets, ", "), len(vals)-1, len(vals))
+		if _, err := tx.ExecContext(ctx, q, vals...); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := taskrepeat.Fit(ctx, tx, uid, int64(id), rule); err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, nil, err
 	}
 	if titleUpdated || descUpdated {
