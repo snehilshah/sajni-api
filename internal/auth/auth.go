@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,6 +34,12 @@ const (
 	refreshTokenTTL  = 7 * 24 * time.Hour
 	oauthExchangeTTL = 5 * time.Minute
 	refreshCookie    = "sajni_refresh"
+	// mediaCookie lets a plain <img> load the user's uploads: the access
+	// token lives in memory and an image request can't carry a header.
+	// It is scoped to mediaPath and only ever accepted there (GET/HEAD).
+	mediaCookie   = "sajni_media"
+	mediaPath     = "/api/uploads"
+	mediaAudience = "media"
 )
 
 // Service holds the dependencies the auth handlers need.
@@ -131,7 +138,30 @@ func (s *Service) issueAccessToken(userID string) (string, error) {
 	return tok.SignedString(s.JWTSecret)
 }
 
-func (s *Service) parseAccessToken(raw string) (string, error) {
+// issueMediaToken mints the image-only token for the media cookie. It
+// lives as long as the refresh token and is re-issued with every session.
+func (s *Service) issueMediaToken(userID string) (string, error) {
+	now := time.Now()
+	claims := accessClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   userID,
+			Audience:  jwt.ClaimStrings{mediaAudience},
+			ExpiresAt: jwt.NewNumericDate(now.Add(refreshTokenTTL)),
+			IssuedAt:  jwt.NewNumericDate(now),
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.JWTSecret)
+}
+
+// parseAccessToken accepts only API access tokens (no audience), never a
+// media token sent as a Bearer.
+func (s *Service) parseAccessToken(raw string) (string, error) { return s.parseToken(raw, "") }
+
+func (s *Service) parseMediaToken(raw string) (string, error) {
+	return s.parseToken(raw, mediaAudience)
+}
+
+func (s *Service) parseToken(raw, audience string) (string, error) {
 	tok, err := jwt.ParseWithClaims(raw, &accessClaims{}, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
@@ -144,6 +174,9 @@ func (s *Service) parseAccessToken(raw string) (string, error) {
 	c, ok := tok.Claims.(*accessClaims)
 	if !ok || !tok.Valid {
 		return "", errors.New("invalid token")
+	}
+	if (audience == "" && len(c.Audience) > 0) || (audience != "" && !slices.Contains(c.Audience, audience)) {
+		return "", errors.New("wrong token audience")
 	}
 	if _, err := uuid.Parse(c.Subject); err != nil {
 		return "", fmt.Errorf("bad subject: %w", err)
@@ -240,17 +273,19 @@ func (s *Service) consumeOAuthExchangeCode(raw string) (string, error) {
 }
 
 // Middleware wraps an HTTP handler and rejects requests that don't carry
-// a valid Bearer access token.
+// a valid Bearer access token. Reading an upload also accepts the media
+// cookie, so images render from a plain <img>.
 func (s *Service) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		header := r.Header.Get("Authorization")
-		if !strings.HasPrefix(header, "Bearer ") {
-			w.Header().Set("Content-Type", "application/json")
-			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-			return
+		var userID string
+		err := errors.New("no credentials")
+		if header := r.Header.Get("Authorization"); strings.HasPrefix(header, "Bearer ") {
+			userID, err = s.parseAccessToken(strings.TrimPrefix(header, "Bearer "))
+		} else if isMediaRead(r) {
+			if c, cerr := r.Cookie(mediaCookie); cerr == nil {
+				userID, err = s.parseMediaToken(c.Value)
+			}
 		}
-		token := strings.TrimPrefix(header, "Bearer ")
-		userID, err := s.parseAccessToken(token)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
@@ -261,34 +296,35 @@ func (s *Service) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+func isMediaRead(r *http.Request) bool {
+	return (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+		strings.HasPrefix(r.URL.Path, mediaPath+"/")
+}
+
 // setRefreshCookie writes the refresh token cookie with the right flags
 // for the current environment.
 func (s *Service) setRefreshCookie(w http.ResponseWriter, raw string) {
-	cookie := &http.Cookie{
-		Name:     refreshCookie,
-		Value:    raw,
-		Path:     "/api/auth",
-		HttpOnly: true,
-		Expires:  time.Now().Add(refreshTokenTTL),
-	}
-	if s.CookieInsecure {
-		cookie.SameSite = http.SameSiteLaxMode
-		cookie.Secure = false
-	} else {
-		cookie.SameSite = http.SameSiteNoneMode
-		cookie.Secure = true
-	}
-	http.SetCookie(w, cookie)
+	s.setCookie(w, refreshCookie, "/api/auth", raw, time.Now().Add(refreshTokenTTL))
 }
 
 func (s *Service) clearRefreshCookie(w http.ResponseWriter) {
-	cookie := &http.Cookie{
-		Name:     refreshCookie,
-		Value:    "",
-		Path:     "/api/auth",
-		HttpOnly: true,
-		Expires:  time.Unix(0, 0),
-		MaxAge:   -1,
+	s.setCookie(w, refreshCookie, "/api/auth", "", time.Time{})
+}
+
+func (s *Service) setMediaCookie(w http.ResponseWriter, raw string) {
+	s.setCookie(w, mediaCookie, mediaPath, raw, time.Now().Add(refreshTokenTTL))
+}
+
+func (s *Service) clearMediaCookie(w http.ResponseWriter) {
+	s.setCookie(w, mediaCookie, mediaPath, "", time.Time{})
+}
+
+// setCookie writes an httpOnly cookie; a zero expiry deletes it.
+func (s *Service) setCookie(w http.ResponseWriter, name, path, value string, expires time.Time) {
+	cookie := &http.Cookie{Name: name, Value: value, Path: path, HttpOnly: true, Expires: expires}
+	if expires.IsZero() {
+		cookie.Expires = time.Unix(0, 0)
+		cookie.MaxAge = -1
 	}
 	if s.CookieInsecure {
 		cookie.SameSite = http.SameSiteLaxMode

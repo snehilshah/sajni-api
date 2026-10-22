@@ -349,7 +349,12 @@ After a successful sign-in (any of the three paths), `issueSession`:
 2. Mints a random 32-byte refresh token, stores `SHA-256(it)` in
    `refresh_tokens` with a 7-day TTL, and sets it as `httpOnly` cookie
    `sajni_refresh` scoped to `/api/auth`.
-3. Returns `{ access_token, user }` JSON (or, for OAuth, redirects with
+3. Sets `sajni_media`, an `httpOnly` cookie scoped to `/api/uploads`
+   holding a 7-day JWT with audience `media`. The access token lives in
+   memory and an `<img>` can't send a header, so this is how note and
+   task images load on web. The middleware accepts it only for GET/HEAD
+   under `/api/uploads/`, and a media token is never valid as a Bearer.
+4. Returns `{ access_token, user }` JSON (or, for OAuth, redirects with
    the access token in the URL fragment).
 
 When the access JWT expires the frontend's `authFetch` sees a 401 and
@@ -360,8 +365,9 @@ calls `/api/auth/refresh` automatically. The handler:
    user_id`. One indexed lookup, one row mutation. No bcrypt sweep.
 2. If found, mints a fresh access token AND a fresh refresh token,
    rotates the cookie, and returns the new pair.
-3. If not found (token reused, expired, or unknown) → 401 + clears the
-   cookie. The frontend bounces to `/signin`.
+3. If not found (token reused, expired, or unknown) → 401. The cookie
+   is left alone (a benign race, e.g. two tabs, would otherwise log the
+   user out); only logout clears it. The frontend bounces to `/signin`.
 
 **Rotation** is important: every refresh invalidates the previous
 refresh token. If an attacker steals the cookie and uses it, the next
@@ -372,7 +378,7 @@ data is there to add it later.)
 Logout (`POST /api/auth/logout`):
 
 1. Best-effort `DELETE FROM refresh_tokens WHERE token_hash=$1`.
-2. Clears the cookie.
+2. Clears both cookies.
 3. Returns 200.
 
 ---

@@ -176,7 +176,7 @@ func (s *Service) loadUser(ctx context.Context, id string) (*userResponse, error
 	return resp, nil
 }
 
-// issueSession mints access + refresh tokens, sets the cookie, and
+// issueSession mints access + refresh tokens, sets the cookies, and
 // returns the auth response body.
 func (s *Service) issueSession(ctx context.Context, w http.ResponseWriter, userID string) (*authResponse, error) {
 	access, err := s.issueAccessToken(userID)
@@ -188,6 +188,11 @@ func (s *Service) issueSession(ctx context.Context, w http.ResponseWriter, userI
 		return nil, fmt.Errorf("issue refresh token: %w", err)
 	}
 	s.setRefreshCookie(w, refresh)
+	media, err := s.issueMediaToken(userID)
+	if err != nil {
+		return nil, fmt.Errorf("issue media token: %w", err)
+	}
+	s.setMediaCookie(w, media)
 	u, err := s.loadUser(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("load user: %w", err)
@@ -552,6 +557,7 @@ func (s *Service) handleLogout(w http.ResponseWriter, r *http.Request) {
 		_, _ = s.consumeRefreshToken(cookie.Value)
 	}
 	s.clearRefreshCookie(w)
+	s.clearMediaCookie(w)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
