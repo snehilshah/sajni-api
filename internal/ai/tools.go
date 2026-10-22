@@ -684,6 +684,7 @@ func (s *Service) buildTools() []Tool {
 					return nil, nil, fmt.Errorf("missing id")
 				}
 				unblockAITaskTreeDependents(ctx, d, uid, id)
+				d.DeleteTaskFiles(ctx, store, uid, int64(id))
 				_, err := d.Exec(`DELETE FROM tasks WHERE id=$1 AND user_id=$2`, id, uid)
 				if err != nil {
 					return nil, nil, err

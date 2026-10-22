@@ -196,6 +196,7 @@ func registerTaskRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/tasks/{id}/reminders", listTaskReminders(deps))
 	mux.HandleFunc("POST /api/tasks/{id}/reminders", addTaskReminder(deps))
 	mux.HandleFunc("DELETE /api/tasks/{id}/reminders/{rid}", deleteTaskReminder(deps))
+	registerTaskAttachmentRoutes(mux, deps)
 	mux.HandleFunc("POST /api/tasks/{id}/reschedule", withSync(deps, "tasks", rescheduleTaskDate(deps)))
 
 	mux.HandleFunc("GET /api/tasks", listTasks(deps))
@@ -1147,6 +1148,7 @@ func deleteTask(deps Deps) http.HandlerFunc {
 			d.Exec("DELETE FROM tags WHERE user_id=$1 AND entity_type='task' AND entity_id=$2", uid, x)
 			d.Exec("DELETE FROM backlinks WHERE user_id=$1 AND source_type='task' AND source_id=$2", uid, x)
 		}
+		d.DeleteTaskFiles(r.Context(), deps.Storage, uid, id)
 		d.Exec("DELETE FROM tasks WHERE id = $1 AND user_id = $2", id, uid)
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}

@@ -1043,6 +1043,19 @@ func (d *DB) ensureSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_task_reminders_task ON task_reminders(task_id);
 	CREATE INDEX IF NOT EXISTS idx_task_reminders_due  ON task_reminders(remind_at) WHERE sent_at IS NULL;
 
+	-- ─── Tasks: attached images ───────────────────────────────────────
+	-- filename is the object under the user's uploads/ in storage, served
+	-- by GET /api/uploads/{filename}. Deleting the task deletes the files.
+	CREATE TABLE IF NOT EXISTS task_attachments (
+		id           BIGSERIAL   PRIMARY KEY,
+		user_id      UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		task_id      BIGINT      NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+		filename     TEXT        NOT NULL,
+		content_type TEXT        NOT NULL DEFAULT '',
+		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_task_attachments_task ON task_attachments(task_id, id);
+
 	-- ─── Finance: learned merchant → category ─────────────────────────
 	-- Remember the category the user files a given merchant under, so the
 	-- next shared SMS for that merchant pre-fills the category without an AI

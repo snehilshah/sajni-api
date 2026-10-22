@@ -46,6 +46,7 @@ func takeoutExport(deps Deps) http.HandlerFunc {
 			exportReadme,
 			exportMemos,
 			exportTasks,
+			exportTaskAttachments,
 			exportTaskLists,
 			exportHabits,
 			exportHabitLogs,
@@ -91,6 +92,7 @@ This archive contains all your Sajni data.
 Layout:
   memos.md                - every memo, separated by '---'
   tasks.csv               - your tasks, including completed ones
+  task_attachments/       - images attached to tasks, one folder per task id
   task_lists.csv          - your custom task lists
   habits.csv              - habits and their colours
   habit_logs.csv          - every day you ticked a habit
@@ -172,6 +174,42 @@ func exportTasks(ctx context.Context, zw *zip.Writer, deps Deps, uid string) err
 	}
 	cw.Flush()
 	return cw.Error()
+}
+
+// exportTaskAttachments writes each task's images as
+// task_attachments/<task id>/<filename>.
+func exportTaskAttachments(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {
+	rows, err := deps.DB.QueryContext(ctx,
+		`SELECT task_id, filename FROM task_attachments WHERE user_id = $1 ORDER BY id`, uid)
+	if err != nil {
+		return err
+	}
+	type file struct {
+		taskID int64
+		name   string
+	}
+	var files []file
+	for rows.Next() {
+		var f file
+		if rows.Scan(&f.taskID, &f.name) == nil {
+			files = append(files, f)
+		}
+	}
+	rows.Close()
+	for _, f := range files {
+		data, _, err := deps.Storage.Get(ctx, storage.UserKey(uid, "uploads", f.name))
+		if err != nil {
+			continue
+		}
+		w, err := zw.Create(fmt.Sprintf("task_attachments/%d/%s", f.taskID, f.name))
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(data); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func exportTaskLists(ctx context.Context, zw *zip.Writer, deps Deps, uid string) error {

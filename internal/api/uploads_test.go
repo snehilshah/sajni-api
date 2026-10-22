@@ -14,11 +14,14 @@ import (
 )
 
 type uploadStore struct {
-	data []byte
+	data    []byte
+	key     string
+	deleted bool
 }
 
-func (s *uploadStore) Put(_ context.Context, _ string, data []byte, _ string) error {
+func (s *uploadStore) Put(_ context.Context, key string, data []byte, _ string) error {
 	s.data = append([]byte(nil), data...)
+	s.key = key
 	return nil
 }
 
@@ -26,7 +29,8 @@ func (s *uploadStore) Get(context.Context, string) ([]byte, string, error) {
 	return nil, "", storage.ErrNotFound
 }
 
-func (s *uploadStore) Delete(context.Context, string) error {
+func (s *uploadStore) Delete(_ context.Context, key string) error {
+	s.deleted = s.deleted || key == s.key
 	return nil
 }
 
