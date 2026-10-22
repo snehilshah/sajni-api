@@ -117,7 +117,7 @@ func TestPlansAndRepeats(t *testing.T) {
 	}
 
 	// Moving a daily task to a week clears the rule that no longer fits.
-	monday := today.AddDate(0, 0, -((int(today.Weekday())+6)%7)).Format("2006-01-02")
+	monday := today.AddDate(0, 0, -((int(today.Weekday()) + 6) % 7)).Format("2006-01-02")
 	call("PUT", "/api/tasks/"+strconv.FormatInt(open, 10), map[string]any{"week_of": monday, "clear_due": true})
 	if tr := task(open); tr.Recurrence.Recurring() {
 		t.Fatalf("week task kept a daily rule: %+v", tr.Recurrence)
