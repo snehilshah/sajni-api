@@ -16,7 +16,7 @@ COPY cmd/ cmd/
 COPY internal/ internal/
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/sajni ./cmd
 
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates tzdata
 COPY --from=build /out/sajni /usr/local/bin/sajni
 EXPOSE 8080
