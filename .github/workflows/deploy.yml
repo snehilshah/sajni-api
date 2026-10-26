@@ -20,6 +20,10 @@ env:
   SERVICE_NAME: sajni-api
   REGISTRY: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/sajni-api
 
+# Read-only token; a job that needs more says so itself.
+permissions:
+  contents: read
+
 jobs:
   verify:
     name: Lint, vet, build, test
