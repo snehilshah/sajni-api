@@ -779,12 +779,11 @@ func updateMedia(deps Deps) http.HandlerFunc {
 			}
 		}
 
-		// Episode/season advance — only log forward jumps (not edits
-		// that walk back). Skip when the only change was status, to
-		// avoid logging "started" + "progress" for the same row.
-		if newStatus == prevStatus && (newEpsWatched > prevEpsWatched || newSeasWatch > prevSeasWatch) {
-			logMediaEvent(d, uid, id, "progress",
-				progressMeta(newSeasWatch, newEpsWatched, newEpsTotal, seasonEps))
+		// Episode/season change: merges into the open progress run (see
+		// logMediaProgress). Skip when the status changed too, to avoid
+		// logging "started" + "progress" for the same row.
+		if newStatus == prevStatus && (newEpsWatched != prevEpsWatched || newSeasWatch != prevSeasWatch) {
+			logMediaProgress(d, uid, id, prevEpsWatched, prevSeasWatch, newEpsWatched, newSeasWatch, newEpsTotal, seasonEps)
 		}
 
 		// Rating set / changed.
