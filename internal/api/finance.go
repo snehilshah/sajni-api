@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -616,11 +617,14 @@ type txnResp struct {
 	// Settlement is set on a payment back (or a forgive): who it is from and
 	// the lend it counts toward (LendID nil = their overall total).
 	Settlement *txnSettlement `json:"settlement"`
-	// Split is set on a bill shared with someone. Amount is then the user's
-	// own part; the bill as charged is Amount + Split.Share. The share's own
-	// lend row (split_of) is folded into the bill and never listed alone.
-	Split    *txnSplit `json:"split"`
-	RefundOf *int64    `json:"refund_of"` // refund: the purchase it came back for
+	// Splits are the people a bill is shared with, one share each. Amount is
+	// then the user's own part (₹0 when they share all of it); the bill as
+	// charged is Amount + the shares. Each share's lend row (split_of) is
+	// folded into the bill and never listed alone. Split is the first of
+	// them, kept for clients that know one person only.
+	Split    *txnSplit  `json:"split"`
+	Splits   []txnSplit `json:"splits"`
+	RefundOf *int64     `json:"refund_of"` // refund: the purchase it came back for
 	// A transfer into an investment (no transfer_in leg): its name stands
 	// where the destination account's would.
 	InvestmentID   *int64  `json:"investment_id"`
@@ -768,7 +772,9 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		q := `SELECT t.id, t.account_id, a.name, t.category_id, c.name, c.color, t.type, t.amount,
 			  t.description, t.note, t.txn_at, t.transfer_pair, t.linked_account, t.slate_id, s.name,
 			  COALESCE(l.id, ls.lend_id), COALESCE(l.borrower, ls.borrower), t.created_at::text,
-			  spl.id, spl.borrower, sp.amount, t.refund_of,
+			  (SELECT json_agg(json_build_object('lend_id', spl.id, 'borrower', spl.borrower, 'share', sp.amount) ORDER BY sp.id)
+			     FROM fin_transactions sp JOIN fin_lends spl ON spl.source_transaction_id = sp.id AND spl.user_id = sp.user_id
+			    WHERE sp.split_of = t.id AND sp.user_id = t.user_id), t.refund_of,
 			  ls.id, COALESCE(NULLIF(pt.description,''), pl.description),
 			  t.investment_id, inv.name
 			  FROM fin_transactions t
@@ -780,8 +786,6 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			  LEFT JOIN fin_lend_settlements ls ON ls.transaction_id=t.id AND ls.user_id=t.user_id
 			  LEFT JOIN fin_lends pl ON pl.id = ls.lend_id
 			  LEFT JOIN fin_transactions pt ON pt.id = pl.source_transaction_id
-			  LEFT JOIN fin_transactions sp ON sp.split_of=t.id AND sp.user_id=t.user_id
-			  LEFT JOIN fin_lends spl ON spl.source_transaction_id=sp.id AND spl.user_id=t.user_id
 			  WHERE ` + strings.Join(clauses, " AND ") +
 			` ORDER BY t.txn_at DESC, t.id DESC LIMIT ` + itoa(limit)
 
@@ -796,21 +800,26 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		for rows.Next() {
 			var t txnResp
 			var at time.Time
-			var splitLend sql.NullInt64
-			var splitBorrower sql.NullString
-			var splitShare sql.NullFloat64
+			var splitsJSON []byte
 			var settlementID sql.NullInt64
 			var toward *string
 			rows.Scan(&t.ID, &t.AccountID, &t.AccountName, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
 				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount,
 				&t.SlateID, &t.SlateName, &t.LendID, &t.LendBorrower, &t.CreatedAt,
-				&splitLend, &splitBorrower, &splitShare, &t.RefundOf, &settlementID, &toward,
+				&splitsJSON, &t.RefundOf, &settlementID, &toward,
 				&t.InvestmentID, &t.InvestmentName)
 			if settlementID.Valid && t.LendBorrower != nil {
 				t.Settlement = &txnSettlement{ID: settlementID.Int64, Borrower: *t.LendBorrower, LendID: t.LendID, Toward: toward}
 			}
-			if splitLend.Valid {
-				t.Split = &txnSplit{LendID: splitLend.Int64, Borrower: splitBorrower.String, Share: roundMoney(splitShare.Float64)}
+			t.Splits = []txnSplit{}
+			if len(splitsJSON) > 0 {
+				_ = json.Unmarshal(splitsJSON, &t.Splits)
+				for i := range t.Splits {
+					t.Splits[i].Share = roundMoney(t.Splits[i].Share)
+				}
+				if len(t.Splits) > 0 {
+					t.Split = &t.Splits[0]
+				}
 			}
 			t.TxnAt = at.In(loc).Format(time.RFC3339)
 			out = append(out, t)
@@ -849,6 +858,14 @@ func createTransaction(deps Deps) http.HandlerFunc {
 				DueDate  *string `json:"due_date"` // absent → card cycle; "" → none
 				Remind   bool    `json:"remind"`
 			} `json:"split"`
+			// expense only, instead of split: several people, each owing
+			// their share. split_due_date / split_remind apply to all.
+			Splits []struct {
+				Borrower string  `json:"borrower"`
+				Share    float64 `json:"share"`
+			} `json:"splits"`
+			SplitDueDate *string `json:"split_due_date"`
+			SplitRemind  bool    `json:"split_remind"`
 			// income only: this is that person paying the user back, toward
 			// one of their lends (settle_lend_id) or their overall total.
 			SettleWith   string `json:"settle_with"`
@@ -903,6 +920,10 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		}
 		if b.Split != nil && (b.Type != "expense" || strings.TrimSpace(b.Split.Borrower) == "" || b.Split.Share <= 0 || roundMoney(b.Split.Share) > roundMoney(b.Amount)) {
 			errJSON(w, http.StatusBadRequest, "A split needs a person and a share between zero and the bill.")
+			return
+		}
+		if len(b.Splits) > 0 && (b.Type != "expense" || b.Split != nil) {
+			errJSON(w, http.StatusBadRequest, "Only an expense can be split.")
 			return
 		}
 		if b.SettleWith = strings.TrimSpace(b.SettleWith); b.SettleWith != "" && b.Type != "income" {
@@ -1070,6 +1091,16 @@ func createTransaction(deps Deps) http.HandlerFunc {
 				return
 			}
 		}
+		if len(b.Splits) > 0 {
+			shares := make([]db.SplitShare, len(b.Splits))
+			for i, sp := range b.Splits {
+				shares[i] = db.SplitShare{Borrower: sp.Borrower, Share: sp.Share}
+			}
+			if _, err := db.SplitBill(ctx, tx, uid, id, shares, b.SplitDueDate, b.SplitRemind, userLocation(d, uid)); err != nil {
+				lendError(w, r, "split transaction", err)
+				return
+			}
+		}
 		if b.SettleWith != "" {
 			if err := db.SettleWith(ctx, tx, uid, b.SettleWith, []int64{id}, b.SettleLendID); err != nil {
 				lendError(w, r, "settle transaction", err)
@@ -1189,8 +1220,13 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		if b.Amount != nil && *b.Amount <= 0 {
-			errJSON(w, http.StatusBadRequest, "Enter an amount above zero.")
-			return
+			// A bill others share entirely holds ₹0 of the user's own.
+			var shared bool
+			tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_transactions WHERE split_of = $1 AND user_id = $2)`, id, uid).Scan(&shared)
+			if !shared || *b.Amount < 0 {
+				errJSON(w, http.StatusBadRequest, "Enter an amount above zero.")
+				return
+			}
 		}
 		retype := b.Type != nil && *b.Type != storedType
 		if retype {
@@ -1370,7 +1406,7 @@ func deleteTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		var splitWith string
-		d.QueryRow(`SELECT l.borrower FROM fin_transactions sp JOIN fin_lends l ON l.source_transaction_id = sp.id
+		d.QueryRow(`SELECT COALESCE(string_agg(l.borrower, ', ' ORDER BY sp.id), '') FROM fin_transactions sp JOIN fin_lends l ON l.source_transaction_id = sp.id
 			WHERE sp.split_of = $1 AND sp.user_id = $2`, id, uid).Scan(&splitWith)
 		if splitWith != "" {
 			errJSON(w, http.StatusConflict, "This bill is split with "+splitWith+". Remove the split first.")

@@ -566,9 +566,10 @@ func (d *DB) ensureSchema() error {
 	--   writeoff = the part of a lend the user forgave. Counts as spending on
 	--              the day it was forgiven but moves no money (the lend already
 	--              did), so balances and card statements ignore it.
-	-- split_of: set on the lend row cut from a bill the user shared ("Split").
-	-- The bill keeps its id and holds the user's share; bill + split rows sum
-	-- to the original charge, so balances and statements stay whole.
+	-- split_of: set on a lend row cut from a bill the user shared ("Split"),
+	-- one per person. The bill keeps its id and holds the user's part (₹0 when
+	-- the others share all of it); bill + split rows sum to the original
+	-- charge, so balances and statements stay whole.
 	CREATE TABLE IF NOT EXISTS fin_transactions (
 		id              BIGSERIAL   PRIMARY KEY,
 		user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -595,8 +596,10 @@ func (d *DB) ensureSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_account ON fin_transactions(account_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_at ON fin_transactions(user_id, txn_at);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_slate ON fin_transactions(user_id, slate_id);
-	-- A bill has at most one split row.
-	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_transactions_split_of ON fin_transactions(split_of) WHERE split_of IS NOT NULL;
+	-- A bill has one split row per person it's shared with. The unique index
+	-- from the one-person days is dropped in place; remove the DROP once shipped.
+	DROP INDEX IF EXISTS uniq_fin_transactions_split_of;
+	CREATE INDEX IF NOT EXISTS idx_fin_transactions_split_of ON fin_transactions(split_of) WHERE split_of IS NOT NULL;
 
 	-- A lend is a receivable, not spending. source_transaction_id is the
 	-- account outflow; repayments each own an account inflow. Keeping those

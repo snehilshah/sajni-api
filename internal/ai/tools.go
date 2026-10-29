@@ -82,7 +82,37 @@ func arrayOf(item *genai.Schema, d string) *genai.Schema {
 	return &genai.Schema{Type: genai.TypeArray, Items: item, Description: d}
 }
 
+// splitsSchema is the people sharing a bill, each with their share.
+func splitsSchema(d string) *genai.Schema {
+	return arrayOf(obj(map[string]*genai.Schema{
+		"person": str("Required. Who owes this share. Reuse the exact name from list_lends."),
+		"share":  num("Required. Their part of the bill."),
+	}, "person", "share"), d)
+}
+
 // ----- argument helpers -----
+
+// argSplits reads a splits array ([{person, share}]); absent → nil.
+func argSplits(args map[string]any, k string) ([]db.SplitShare, error) {
+	raw, ok := args[k].([]any)
+	if !ok || len(raw) == 0 {
+		return nil, nil
+	}
+	out := make([]db.SplitShare, 0, len(raw))
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%s: each entry needs person and share", k)
+		}
+		person := strings.TrimSpace(argStr(m, "person"))
+		share := argFloat(m, "share")
+		if person == "" || share <= 0 {
+			return nil, fmt.Errorf("%s: each entry needs a person and a share above zero", k)
+		}
+		out = append(out, db.SplitShare{Borrower: person, Share: share})
+	}
+	return out, nil
+}
 
 func argStr(args map[string]any, k string) string {
 	if v, ok := args[k]; ok && v != nil {
@@ -1205,7 +1235,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "create_transaction",
-			Description: "Record a finance transaction against an existing account and assign a category. Paying into an investment (an RD instalment, a SIP) is type 'transfer' with to_investment_id from list_investments: it leaves the account, adds to the invested amount and is never spending; no category. Use list_finance_accounts to get account_id. Specify either category_id or category_name; if category_name is specified, the backend will auto-match it to the closest existing category. Slates: omit slate_id and it files under Plain (normal life); pass a slate id from list_slates for an outlier like a trip. A refund (money back on a purchase) is type 'refund' with the purchase's expense category: it lowers that spending and is not income. A bill shared with someone is an expense with split_with + split_share (their part). Lending money is an expense with split_with and split_share equal to amount. Money received from someone who owes the user is income with from_person; add toward_lend_id only when it was clearly for one of their lends (from list_lends), otherwise it counts toward their overall total.",
+			Description: "Record a finance transaction against an existing account and assign a category. Paying into an investment (an RD instalment, a SIP) is type 'transfer' with to_investment_id from list_investments: it leaves the account, adds to the invested amount and is never spending; no category. Use list_finance_accounts to get account_id. Specify either category_id or category_name; if category_name is specified, the backend will auto-match it to the closest existing category. Slates: omit slate_id and it files under Plain (normal life); pass a slate id from list_slates for an outlier like a trip. A refund (money back on a purchase) is type 'refund' with the purchase's expense category: it lowers that spending and is not income. A bill shared with someone is an expense with split_with + split_share (their part); shared with several people, use splits instead (one entry per person, the rest is the user's part). Lending money is an expense with split_with and split_share equal to amount. Money received from someone who owes the user is income with from_person; add toward_lend_id only when it was clearly for one of their lends (from list_lends), otherwise it counts toward their overall total.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"account_id":       intg("Required. The target account ID."),
@@ -1221,6 +1251,7 @@ func (s *Service) buildTools() []Tool {
 				"refund_of":        intg("Refund only, optional: the original expense id from list_finance_transactions. Its category and slate are reused when none is given."),
 				"split_with":       str("Expense only, optional: the person who owes part of this bill. Reuse the exact name from list_lends."),
 				"split_share":      num("With split_with: their part of the bill. Equal to amount when all of it is theirs."),
+				"splits":           splitsSchema("Expense only, optional, instead of split_with: everyone who owes part of this bill, with their share. Shares may add up to the whole amount (the user paid for them all)."),
 				"from_person":      str("Income only, optional: the person paying the user back (as named in list_lends)."),
 				"toward_lend_id":   intg("With from_person, optional: the lend id (list_lends) this payment was for. Omit for their overall total."),
 			}, "account_id", "amount", "description"),
@@ -1230,14 +1261,15 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "mark_paid_for",
-			Description: "Mark existing expenses as paid on someone's behalf (e.g. Dad's electricity bill on the user's card, a friend's purchase on the user's discount card). Each whole transaction becomes money that person owes; it leaves spending. Card charges default their due date to that card cycle's bill due date. Get ids from list_finance_transactions.",
+			Description: "Mark existing expenses as paid on someone's behalf (e.g. Dad's electricity bill on the user's card, a friend's purchase on the user's discount card). Each whole transaction becomes money that person owes; it leaves spending. To split one bill between several people, pass that one id with splits instead of borrower. Card charges default their due date to that card cycle's bill due date. Get ids from list_finance_transactions.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"borrower":        str("Required. The person, e.g. 'Dad'. Reuse the exact name from list_lends when they already owe."),
+				"borrower":        str("The person, e.g. 'Dad'. Reuse the exact name from list_lends when they already owe. Required unless splits is given."),
 				"transaction_ids": arrayOf(intg(""), "Required. Expense ids from list_finance_transactions."),
 				"due_date":        str("Optional ISO due date. Omit for the card-cycle default."),
 				"share":           num("Optional, one transaction only: the person's part of a shared bill (e.g. half). The rest stays the user's spending. Omit for the whole bill."),
-			}, "borrower", "transaction_ids"),
+				"splits":          splitsSchema("Optional, one transaction only, instead of borrower: several people sharing the bill, each with their share. The rest stays the user's spending. Also adds people to a bill that is already split."),
+			}, "transaction_ids"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return markPaidForTool(ctx, d, uid, args)
 			},
@@ -1913,7 +1945,9 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	}
 	limit := argInt(args, "limit", 50)
 	q := `SELECT t.id, t.account_id, t.type, t.amount, t.description, (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date::text, t.category_id, COALESCE(c.name, ''), t.slate_id, s.name,
-	      t.split_of, t.refund_of, (SELECT sp.amount FROM fin_transactions sp WHERE sp.split_of = t.id),
+	      t.split_of, t.refund_of,
+	      (SELECT json_agg(json_build_object('person', l.borrower, 'share', sp.amount, 'lend_id', l.id) ORDER BY sp.id)
+	         FROM fin_transactions sp JOIN fin_lends l ON l.source_transaction_id = sp.id WHERE sp.split_of = t.id),
 	      t.investment_id, COALESCE((SELECT i.name FROM fin_investments i WHERE i.id = t.investment_id), '')
 	      FROM fin_transactions t
 	      LEFT JOIN fin_categories c ON c.id = t.category_id
@@ -1934,18 +1968,30 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		var slateID int64
 		var catName, slateName string
 		var splitOf, refundOf sql.NullInt64
-		var splitShare sql.NullFloat64
+		var splitWith []byte
 		var investmentID sql.NullInt64
 		var investmentName string
-		rows.Scan(&id, &acct, &ttype, &amount, &desc, &date, &catID, &catName, &slateID, &slateName, &splitOf, &refundOf, &splitShare, &investmentID, &investmentName)
+		rows.Scan(&id, &acct, &ttype, &amount, &desc, &date, &catID, &catName, &slateID, &slateName, &splitOf, &refundOf, &splitWith, &investmentID, &investmentName)
 		row := map[string]any{
 			"id": id, "account_id": acct, "type": ttype, "amount": amount,
 			"description": desc, "date": date, "category_name": catName,
 		}
-		// A split bill: amount is the user's part, split_share the other
-		// person's; the split_of row is that share as a lend.
-		if splitShare.Valid {
-			row["split_share"] = splitShare.Float64
+		// A split bill: amount is the user's part, split_with each other
+		// person's share (split_share their total); each split_of row is one
+		// share as a lend.
+		if len(splitWith) > 0 {
+			var with []struct {
+				Person string  `json:"person"`
+				Share  float64 `json:"share"`
+				LendID int64   `json:"lend_id"`
+			}
+			if json.Unmarshal(splitWith, &with) == nil && len(with) > 0 {
+				var total float64
+				for _, w := range with {
+					total += w.Share
+				}
+				row["split_with"], row["split_share"] = with, math.Round(total*100)/100
+			}
 		}
 		if splitOf.Valid {
 			row["split_of"] = splitOf.Int64
@@ -3925,9 +3971,16 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 
 	splitWith := strings.TrimSpace(argStr(args, "split_with"))
 	splitShare := argFloat(args, "split_share")
+	splits, err := argSplits(args, "splits")
+	if err != nil {
+		return nil, nil, err
+	}
 	fromPerson := strings.TrimSpace(argStr(args, "from_person"))
-	if splitWith != "" && ttype != "expense" {
-		return nil, nil, fmt.Errorf("split_with only applies to an expense")
+	if (splitWith != "" || len(splits) > 0) && ttype != "expense" {
+		return nil, nil, fmt.Errorf("split_with and splits only apply to an expense")
+	}
+	if splitWith != "" && len(splits) > 0 {
+		return nil, nil, fmt.Errorf("use split_with for one person or splits for several, not both")
 	}
 	if splitWith != "" && (splitShare <= 0 || splitShare > amount) {
 		return nil, nil, fmt.Errorf("split_share must be above zero and at most the amount")
@@ -3955,6 +4008,10 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	switch {
 	case splitWith != "":
 		if _, err := db.MarkPaidFor(ctx, tx, uid, splitWith, []int64{id}, nil, false, userTZLoc(ctx, d, uid), splitShare); err != nil {
+			return nil, nil, err
+		}
+	case len(splits) > 0:
+		if _, err := db.SplitBill(ctx, tx, uid, id, splits, nil, false, userTZLoc(ctx, d, uid)); err != nil {
 			return nil, nil, err
 		}
 	case fromPerson != "":
@@ -4294,12 +4351,26 @@ func markPaidForTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		}
 		due = &v
 	}
+	splits, err := argSplits(args, "splits")
+	if err != nil {
+		return nil, nil, err
+	}
+	txnIDs := argInt64Slice(args, "transaction_ids")
+	if len(splits) > 0 && len(txnIDs) != 1 {
+		return nil, nil, fmt.Errorf("splits apply to one transaction at a time")
+	}
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer tx.Rollback()
-	ids, err := db.MarkPaidFor(ctx, tx, uid, borrower, argInt64Slice(args, "transaction_ids"), due, false, userTZLoc(ctx, d, uid), argFloat(args, "share"))
+	var ids []int64
+	if len(splits) > 0 {
+		ids, err = db.SplitBill(ctx, tx, uid, txnIDs[0], splits, due, false, userTZLoc(ctx, d, uid))
+		borrower = splits[0].Borrower
+	} else {
+		ids, err = db.MarkPaidFor(ctx, tx, uid, borrower, txnIDs, due, false, userTZLoc(ctx, d, uid), argFloat(args, "share"))
+	}
 	if err != nil {
 		return nil, nil, err
 	}

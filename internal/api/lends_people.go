@@ -247,6 +247,12 @@ func markPaidFor(deps Deps) http.HandlerFunc {
 			DueDate        *string `json:"due_date"` // absent → card cycle due date; "" → none
 			Remind         bool    `json:"remind"`
 			Share          float64 `json:"share"` // > 0, one transaction: their part of the bill
+			// One transaction shared with several people (borrower unused):
+			// each owes their share, the rest stays the user's.
+			Shares []struct {
+				Borrower string  `json:"borrower"`
+				Share    float64 `json:"share"`
+			} `json:"shares"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid json")
@@ -265,7 +271,20 @@ func markPaidFor(deps Deps) http.HandlerFunc {
 			return
 		}
 		defer tx.Rollback()
-		ids, err := db.MarkPaidFor(ctx, tx, uid, body.Borrower, body.TransactionIDs, body.DueDate, body.Remind, userLocation(deps.DB, uid), body.Share)
+		var ids []int64
+		if len(body.Shares) > 0 {
+			if len(body.TransactionIDs) != 1 {
+				errJSON(w, http.StatusBadRequest, "Split one bill at a time.")
+				return
+			}
+			shares := make([]db.SplitShare, len(body.Shares))
+			for i, sp := range body.Shares {
+				shares[i] = db.SplitShare{Borrower: sp.Borrower, Share: sp.Share}
+			}
+			ids, err = db.SplitBill(ctx, tx, uid, body.TransactionIDs[0], shares, body.DueDate, body.Remind, userLocation(deps.DB, uid))
+		} else {
+			ids, err = db.MarkPaidFor(ctx, tx, uid, body.Borrower, body.TransactionIDs, body.DueDate, body.Remind, userLocation(deps.DB, uid), body.Share)
+		}
 		if err != nil {
 			lendError(w, r, "mark paid for", err)
 			return

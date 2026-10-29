@@ -13,7 +13,8 @@ import (
 // "Paid for" turns an existing expense into a lend (origin 'paid_for'). With a
 // share below the bill it is a split: the bill keeps the user's part and the
 // share is cut into its own lend row (split_of = bill), so the two still sum
-// to the charge. "Settle" turns an existing credit into a settlement for a
+// to the charge. A bill split with several people has one such row and lend
+// per person (SplitBill). "Settle" turns an existing credit into a settlement for a
 // person; "forgive" books a writeoff that settles like a credit. Every
 // settlement reduces the person's total. One pinned to a lend (lend_id) also
 // pays that lend off (Rebalance derives fin_lend_repayments from the pins);
@@ -84,13 +85,7 @@ func MarkPaidFor(ctx context.Context, tx *sql.Tx, uid, borrower string, txnIDs [
 		if typ != "expense" || transferPair.Valid || invested {
 			return nil, lendErr("Only plain expenses can be marked paid for (#%d is already a lend, a split bill, a transfer or income).", txnID)
 		}
-		var due any
-		switch {
-		case dueDate != nil && *dueDate != "":
-			due = *dueDate
-		case dueDate == nil && accountType == "credit_card" && statementDay.Valid:
-			due = CardCycleDue(at.In(loc), int(statementDay.Int64), int(dueDay.Int64)).Format("2006-01-02")
-		}
+		due := lendDue(dueDate, accountType, statementDay, dueDay, at, loc)
 		if description == "" {
 			description = "Paid for " + borrower
 		}
@@ -116,6 +111,147 @@ func MarkPaidFor(ctx context.Context, tx *sql.Tx, uid, borrower string, txnIDs [
 }
 
 func roundMoney(v float64) float64 { return math.Round(v*100) / 100 }
+
+// lendDue is a new paid-for lend's due date: the one asked for, none for "",
+// else (nil) the card cycle's due date on a card.
+func lendDue(dueDate *string, accountType string, statementDay, dueDay sql.NullInt64, at time.Time, loc *time.Location) any {
+	switch {
+	case dueDate != nil && *dueDate != "":
+		return *dueDate
+	case dueDate == nil && accountType == "credit_card" && statementDay.Valid:
+		return CardCycleDue(at.In(loc), int(statementDay.Int64), int(dueDay.Int64)).Format("2006-01-02")
+	}
+	return nil
+}
+
+// SplitShare is one person's part of a bill.
+type SplitShare struct {
+	Borrower string
+	Share    float64
+}
+
+// SplitBill shares an expense with one or more people. One person on an
+// unsplit bill takes the MarkPaidFor path (All turns the bill into their
+// lend). Otherwise the bill keeps the user's part, which may reach zero, and
+// each person gets a share row (split_of = bill) and a paid-for lend of their
+// own, so each settles on its own and bill + shares still equal the charge.
+// People added to a bill that is already split take from the user's part.
+func SplitBill(ctx context.Context, tx *sql.Tx, uid string, billID int64, shares []SplitShare, dueDate *string, remind bool, loc *time.Location) ([]int64, error) {
+	if len(shares) == 0 {
+		return nil, lendErr("Pick at least one person.")
+	}
+	seen := map[string]bool{}
+	var sum float64
+	for i := range shares {
+		shares[i].Borrower = strings.TrimSpace(shares[i].Borrower)
+		shares[i].Share = roundMoney(shares[i].Share)
+		key := strings.ToLower(shares[i].Borrower)
+		if key == "" {
+			return nil, lendErr("Each share needs a person.")
+		}
+		if seen[key] {
+			return nil, lendErr("%s is in the split twice.", shares[i].Borrower)
+		}
+		seen[key] = true
+		if shares[i].Share <= 0 {
+			return nil, lendErr("%s's share has to be above zero.", shares[i].Borrower)
+		}
+		sum += shares[i].Share
+	}
+	sum = roundMoney(sum)
+
+	var typ, accountType, description, note string
+	var amount float64
+	var accountID int64
+	var at time.Time
+	var transferPair, splitOf, statementDay, dueDay sql.NullInt64
+	var invested bool
+	err := tx.QueryRowContext(ctx, `SELECT t.type, t.amount, t.account_id, t.description, t.note, t.txn_at, t.transfer_pair, t.split_of,
+		a.type, a.statement_day, a.due_day,
+		EXISTS (SELECT 1 FROM fin_investment_contributions c WHERE c.txn_id = t.id)
+		FROM fin_transactions t JOIN fin_accounts a ON a.id = t.account_id
+		WHERE t.id = $1 AND t.user_id = $2 FOR UPDATE OF t`, billID, uid,
+	).Scan(&typ, &amount, &accountID, &description, &note, &at, &transferPair, &splitOf, &accountType, &statementDay, &dueDay, &invested)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, lendErr("That transaction no longer exists.")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if typ != "expense" || transferPair.Valid || splitOf.Valid || invested {
+		return nil, lendErr("Only a plain expense can be split.")
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT l.borrower FROM fin_transactions sp
+		JOIN fin_lends l ON l.source_transaction_id = sp.id AND l.user_id = sp.user_id
+		WHERE sp.split_of = $1 AND sp.user_id = $2`, billID, uid)
+	if err != nil {
+		return nil, err
+	}
+	var already []string
+	for rows.Next() {
+		var b string
+		if err := rows.Scan(&b); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		already = append(already, b)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, b := range already {
+		if seen[strings.ToLower(strings.TrimSpace(b))] {
+			return nil, lendErr("%s already has a share of this bill. Change it from Edit lend.", b)
+		}
+	}
+
+	if len(shares) == 1 && len(already) == 0 {
+		return MarkPaidFor(ctx, tx, uid, shares[0].Borrower, []int64{billID}, dueDate, remind, loc, shares[0].Share)
+	}
+	if sum > roundMoney(amount) {
+		if len(already) > 0 {
+			return nil, lendErr("The shares add up to ₹%.2f, more than your part of ₹%.2f.", sum, amount)
+		}
+		return nil, lendErr("The shares add up to ₹%.2f, more than the bill's ₹%.2f.", sum, amount)
+	}
+
+	due := lendDue(dueDate, accountType, statementDay, dueDay, at, loc)
+	var ids []int64
+	for _, sh := range shares {
+		var cut int64
+		if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions
+			(user_id, account_id, category_id, type, amount, description, txn_at, slate_id, split_of)
+			SELECT user_id, account_id, category_id, 'lend', $1, description, txn_at, slate_id, id
+			FROM fin_transactions WHERE id = $2 AND user_id = $3 RETURNING id`, sh.Share, billID, uid).Scan(&cut); err != nil {
+			return nil, err
+		}
+		title := description
+		if title == "" {
+			title = "Paid for " + sh.Borrower
+		}
+		var lendID int64
+		if err := tx.QueryRowContext(ctx, `INSERT INTO fin_lends
+			(user_id, source_account_id, source_transaction_id, borrower, principal, description, note, lent_at, due_date, remind, origin)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'paid_for') RETURNING id`,
+			uid, accountID, cut, sh.Borrower, sh.Share, title, note, at, due, remind && due != nil,
+		).Scan(&lendID); err != nil {
+			return nil, err
+		}
+		ids = append(ids, lendID)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET amount = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`,
+		roundMoney(amount-sum), billID, uid); err != nil {
+		return nil, err
+	}
+	for _, sh := range shares {
+		if err := RebalanceLends(ctx, tx, uid, sh.Borrower); err != nil {
+			return nil, err
+		}
+	}
+	return ids, nil
+}
 
 // SetPaidForShare moves the line between the user's part of a paid-for bill
 // and the borrower's. The bill's total never changes, so the account and its
@@ -152,12 +288,24 @@ func SetPaidForShare(ctx context.Context, tx *sql.Tx, uid string, lendID int64, 
 		total += billAmount
 	}
 	total = roundMoney(total)
+	// Others sharing the bill: the line only moves between this person and
+	// the user, and the bill row stays (at ₹0 when this share takes it all).
+	var others bool
+	if splitOf.Valid {
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_transactions WHERE split_of = $1 AND id <> $2 AND user_id = $3)`,
+			splitOf.Int64, lendTxn, uid).Scan(&others); err != nil {
+			return err
+		}
+	}
 	if share <= 0 || share > total {
+		if others {
+			return lendErr("Their share has to be above zero and at most ₹%.2f (the bill less the others' shares).", total)
+		}
 		return lendErr("Their share has to be above zero and at most the bill's ₹%.2f.", total)
 	}
 
 	switch {
-	case share == total && splitOf.Valid:
+	case share == total && splitOf.Valid && !others:
 		// Whole again: the bill row becomes the lend, the split row goes.
 		bill := splitOf.Int64
 		if _, err := tx.ExecContext(ctx, `UPDATE fin_lends SET source_transaction_id = $1, principal = $2, updated_at = NOW() WHERE id = $3`, bill, total, lendID); err != nil {
@@ -169,7 +317,7 @@ func SetPaidForShare(ctx context.Context, tx *sql.Tx, uid string, lendID int64, 
 		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET type = 'lend', amount = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`, total, bill, uid); err != nil {
 			return err
 		}
-	case share == total:
+	case share == total && !splitOf.Valid:
 		// Already whole.
 	case !splitOf.Valid:
 		// Whole → split: the original row keeps its id (and any capture ref)
@@ -506,6 +654,7 @@ func RebalanceLends(ctx context.Context, tx *sql.Tx, uid, borrower string) error
 // Execer is the slice of *sql.Tx / *sql.DB that SyncSplit needs.
 type Execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
@@ -552,16 +701,30 @@ func SyncSplit(ctx context.Context, q Execer, uid string, billID int64) error {
 		FROM fin_transactions b WHERE s.split_of = b.id AND b.id = $1 AND b.user_id = $2 AND s.user_id = $2`, billID, uid); err != nil {
 		return err
 	}
-	var borrower string
-	err := q.QueryRowContext(ctx, `UPDATE fin_lends l SET source_account_id = s.account_id, lent_at = s.txn_at, updated_at = NOW()
+	rows, err := q.QueryContext(ctx, `UPDATE fin_lends l SET source_account_id = s.account_id, lent_at = s.txn_at, updated_at = NOW()
 		FROM fin_transactions s WHERE l.source_transaction_id = s.id AND s.split_of = $1 AND s.user_id = $2 AND l.user_id = $2
-		RETURNING l.borrower`, billID, uid).Scan(&borrower)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
+		RETURNING l.borrower`, billID, uid)
 	if err != nil {
 		return err
 	}
-	// The share's date moved with the bill: its payments must still follow it.
-	return CheckLendOrder(ctx, q, uid, borrower)
+	var borrowers []string
+	for rows.Next() {
+		var b string
+		if err := rows.Scan(&b); err != nil {
+			rows.Close()
+			return err
+		}
+		borrowers = append(borrowers, b)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// Each share's date moved with the bill: its payments must still follow it.
+	for _, b := range borrowers {
+		if err := CheckLendOrder(ctx, q, uid, b); err != nil {
+			return err
+		}
+	}
+	return nil
 }
