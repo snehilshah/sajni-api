@@ -14,6 +14,7 @@ import (
 	"iter"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	"google.golang.org/genai"
@@ -177,7 +178,7 @@ func (s *Service) QuickGenerate(ctx context.Context, system, user string) (strin
 		MaxOutputTokens:   maxOut,
 		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow},
 	}
-	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
+	resp, err := s.generate(ctx, "quick", []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: user}}},
 	}, cfg)
 	if err != nil {
@@ -225,7 +226,7 @@ func (s *Service) GenerateThemePalette(ctx context.Context, system, user string)
 			PropertyOrdering: []string{"name", "primary", "secondary", "tertiary", "neutral"},
 		},
 	}
-	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
+	resp, err := s.generate(ctx, "theme", []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: user}}},
 	}, cfg)
 	if err != nil {
@@ -276,13 +277,51 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		}
 	}
 
+	// Gemini sees the message after a <now> block; the saved history keeps
+	// the message alone (see saved), so the chat never shows the block.
 	contents := append([]*genai.Content(nil), req.History...)
+	msgAt := len(contents)
 	contents = append(contents, &genai.Content{
 		Role:  "user",
-		Parts: []*genai.Part{{Text: req.Message}},
+		Parts: []*genai.Part{{Text: s.liveContext(ctx, req.UserID)}, {Text: req.Message}},
 	})
+	saved := func() []*genai.Content {
+		h := append([]*genai.Content(nil), contents...)
+		h[msgAt] = &genai.Content{Role: "user", Parts: []*genai.Part{{Text: req.Message}}}
+		return h
+	}
 
-	sysPrompt := s.buildSystemInstruction(ctx, req.UserID)
+	// One log line per question: rounds, tools used, tokens and cost.
+	started := time.Now()
+	var (
+		total     usage
+		roundsRun int
+		toolsUsed []string
+		outcome   = "error"
+	)
+	defer func() {
+		ev := log.Info()
+		if outcome == "error" {
+			ev = log.Warn()
+		}
+		total.fields(ev.Str("uid", req.UserID).Str("mode", req.Mode).Str("model", s.model).
+			Str("outcome", outcome).Int("rounds", roundsRun).Strs("tools", toolsUsed).
+			Int("msg_chars", len(req.Message)).Int64("ms", time.Since(started).Milliseconds())).
+			Msg("ai turn")
+	}()
+	// round logs one model call of this question.
+	round := func(n int, u usage, ms int64, calls []string, err error) {
+		roundsRun++
+		total.add(u)
+		ev := log.Info()
+		if err != nil {
+			ev = log.Warn().Err(err)
+		}
+		u.fields(ev.Str("uid", req.UserID).Str("mode", req.Mode).Int("round", n).
+			Strs("calls", calls).Int64("ms", ms)).Msg("ai round")
+	}
+
+	sysPrompt := systemPrompt
 
 	decls := make([]*genai.FunctionDeclaration, len(s.tools))
 	for i, t := range s.tools {
@@ -331,6 +370,8 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			// be returned exactly as received on the next tool round.
 			callParts []*genai.Part
 			streamErr error
+			used      usage
+			roundAt   = time.Now()
 		)
 
 		// Dedupe identical FunctionCall parts. Gemini sometimes emits the
@@ -341,6 +382,10 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			if err != nil {
 				streamErr = err
 				break
+			}
+			// Each chunk carries the running count; the last one is the total.
+			if resp != nil && resp.UsageMetadata != nil {
+				used = usageOf(resp.UsageMetadata)
 			}
 			if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
 				continue
@@ -370,12 +415,12 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 				}
 			}
 		}
+		names := make([]string, len(calls))
+		for i, c := range calls {
+			names[i] = c.Name
+		}
+		round(r+1, used, time.Since(roundAt).Milliseconds(), names, streamErr)
 		if streamErr != nil {
-			log.Warn().Err(streamErr).
-				Str("model", s.model).
-				Str("mode", req.Mode).
-				Int("round", r+1).
-				Msg("gemini chat stream failed")
 			send("error", map[string]string{"message": friendlyAIError(streamErr)})
 			return
 		}
@@ -392,9 +437,10 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		}
 
 		if len(calls) == 0 {
+			outcome = "done"
 			send("done", map[string]any{
 				"text":    finalText.String(),
-				"history": contents,
+				"history": saved(),
 			})
 			return
 		}
@@ -402,14 +448,10 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		respParts := make([]*genai.Part, 0, len(calls))
 		for _, fc := range calls {
 			send("tool_call", map[string]any{"name": fc.Name, "args": fc.Args})
+			toolAt := time.Now()
 			data, meta, err := s.dispatch(ctx, req.UserID, fc.Name, fc.Args)
-			if err != nil {
-				log.Warn().Err(err).
-					Str("tool", fc.Name).
-					Str("uid", req.UserID).
-					Interface("args", fc.Args).
-					Msg("ai tool dispatch failed")
-			}
+			toolsUsed = append(toolsUsed, fc.Name)
+			logTool(req.UserID, r+1, fc, data, err, time.Since(toolAt))
 			res := map[string]any{"name": fc.Name, "ok": err == nil}
 			if err != nil {
 				res["error"] = err.Error()
@@ -445,15 +487,19 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 	synthesisCfg.ToolConfig = &genai.ToolConfig{
 		FunctionCallingConfig: &genai.FunctionCallingConfig{Mode: genai.FunctionCallingConfigModeNone},
 	}
-	var synthesisText strings.Builder
+	var (
+		synthesisText strings.Builder
+		synthUsed     usage
+		synthAt       = time.Now()
+	)
 	for resp, err := range s.client.GenerateContentStream(ctx, s.model, contents, &synthesisCfg) {
 		if err != nil {
-			log.Warn().Err(err).
-				Str("model", s.model).
-				Str("mode", req.Mode).
-				Msg("gemini chat synthesis failed")
+			round(rounds+1, synthUsed, time.Since(synthAt).Milliseconds(), nil, err)
 			send("error", map[string]string{"message": friendlyAIError(err)})
 			return
+		}
+		if resp != nil && resp.UsageMetadata != nil {
+			synthUsed = usageOf(resp.UsageMetadata)
 		}
 		if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
 			continue
@@ -467,6 +513,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			send("delta", map[string]string{"text": part.Text})
 		}
 	}
+	round(rounds+1, synthUsed, time.Since(synthAt).Milliseconds(), nil, nil)
 	if synthesisText.Len() > 0 {
 		contents = append(contents, &genai.Content{
 			Role:  "model",
@@ -477,7 +524,27 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		send("error", map[string]string{"message": "I couldn't finish that one in time."})
 		return
 	}
-	send("done", map[string]any{"text": finalText.String(), "history": contents})
+	// Out of tool rounds: the answer came from the no-tools wrap-up call.
+	outcome = "round_limit"
+	send("done", map[string]any{"text": finalText.String(), "history": saved()})
+}
+
+// logTool logs one tool call: how long it took, whether it worked, and how
+// big its result is (that size goes back to Gemini as input tokens).
+func logTool(uid string, round int, fc *genai.FunctionCall, data any, err error, took time.Duration) {
+	size := 0
+	if data != nil {
+		if b, mErr := json.Marshal(data); mErr == nil {
+			size = len(b)
+		}
+	}
+	ev := log.Info()
+	if err != nil {
+		ev = log.Warn().Err(err).Interface("args", fc.Args)
+	}
+	ev.Str("uid", uid).Int("round", round).Str("tool", fc.Name).Bool("ok", err == nil).
+		Int("result_bytes", size).Int("result_tokens_est", size/4).
+		Int64("ms", took.Milliseconds()).Msg("ai tool")
 }
 
 // CategorizeExpense maps a short user-provided expense title to one of
@@ -544,7 +611,7 @@ Strict rules:
 		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow},
 	}
 
-	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
+	resp, err := s.generate(ctx, "categorize", []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: prompt}}},
 	}, cfg)
 	if err != nil {
@@ -676,7 +743,7 @@ Rules:
 		MaxOutputTokens:   maxOut,
 		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow},
 	}
-	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
+	resp, err := s.generate(ctx, "parse_text", []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: prompt}}},
 	}, cfg)
 	if err != nil {
@@ -752,7 +819,7 @@ Rules:
 		MaxOutputTokens:   maxOut,
 		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow},
 	}
-	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
+	resp, err := s.generate(ctx, "parse_image", []*genai.Content{
 		{
 			Role: "user",
 			Parts: []*genai.Part{

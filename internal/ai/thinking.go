@@ -97,7 +97,7 @@ Reply with ONLY a single JSON object. No prose. No markdown fences.`
 		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelMedium},
 		ResponseMIMEType:  "application/json",
 	}
-	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
+	resp, err := s.generate(ctx, "project_enrich", []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: prompt}}},
 	}, cfg)
 	if err != nil {
@@ -176,7 +176,7 @@ Reply with ONLY a single JSON object. The thesis VALUE must be a single markdown
 		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelMedium},
 		ResponseMIMEType:  "application/json",
 	}
-	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
+	resp, err := s.generate(ctx, "project_synthesis", []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: prompt}}},
 	}, cfg)
 	if err != nil {

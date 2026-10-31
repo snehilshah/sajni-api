@@ -69,7 +69,7 @@ Strict rules:
 		MaxOutputTokens:   maxOut,
 		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow},
 	}
-	resp, err := s.client.GenerateContent(ctx, s.model, []*genai.Content{
+	resp, err := s.generate(ctx, "classify", []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: prompt}}},
 	}, cfg)
 	if err != nil {

@@ -323,6 +323,28 @@ gcloud run services update-traffic sajni-api --region asia-south1 \
 
 ---
 
+## AI usage logs
+
+Every Gemini call logs its tokens and an estimated cost (`internal/ai/usage.go`,
+list prices in USD, cached input at a tenth):
+
+| Line | One per | Fields |
+| --- | --- | --- |
+| `ai turn` | question asked in chat or the palette | `mode`, `outcome` (done, round_limit, error), `rounds`, `tools`, tokens, `cost_usd`, `ms` |
+| `ai round` | model call inside a question | `round`, `calls` (tools it asked for), tokens, `cache_pct`, `ms` |
+| `ai tool` | tool run | `tool`, `ok`, `ms`, `result_tokens_est` (what it adds to the next round) |
+| `ai call` | one-off call (categorize, parse_text, theme, …) | `kind`, tokens, `cost_usd`, `ms` |
+
+Tokens are `in_tokens` (cached included), `cached_tokens`, `out_tokens`, `thinking_tokens`.
+
+```sh
+# Questions over the last day, newest first.
+gcloud logging read 'resource.labels.service_name="sajni-api" AND jsonPayload.message="ai turn"' \
+  --freshness=1d --format='table(timestamp, jsonPayload.mode, jsonPayload.rounds, jsonPayload.tools, jsonPayload.in_tokens, jsonPayload.cache_pct, jsonPayload.cost_usd)'
+```
+
+---
+
 ## Local dev
 
 ```sh

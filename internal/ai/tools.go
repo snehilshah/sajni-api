@@ -257,7 +257,7 @@ func (s *Service) buildTools() []Tool {
 		// ---------------- READ ----------------
 		{
 			Name:        "get_current_context",
-			Description: "Returns today's date in ISO format, the current weekday, and a quick summary of the user's day (open task count, habits done/pending, recent memo count). Call this first when the user asks about 'today', 'tomorrow', 'this week', etc.",
+			Description: "Returns today's date, weekday and time, and a quick summary of the user's day (open task count, habits done/pending, recent memo count). The <now> block in the user's message already has the dates; use this only for fresh counts later in a long chat.",
 			Schema:      obj(map[string]*genai.Schema{}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return getCurrentContextTool(ctx, d, uid)
@@ -265,17 +265,17 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_tasks",
-			Description: "List the user's tasks with optional filters. Use this before suggesting actions on tasks. Smart filters: 'my_day' (due today), 'important' (starred), 'planned' (has due date), 'week' (week-scoped tasks for the current week), 'month' (month goals for the current month), 'missed' (overdue and still open — past due_date, not done/scratched; a month goal's child sessions are rolled up to the goal, not listed individually), 'inbox' (no list). Scratched (abandoned) tasks are excluded from every smart filter; pass status='scratched' to see them.",
+			Description: "List the user's tasks with optional filters. Use this before suggesting actions on tasks. Smart filters: 'my_day' (due today), 'important' (starred), 'planned' (has due date), 'week' (week-scoped tasks for the current week), 'month' (month goals for the current month), 'missed' (overdue and still open — past due_date, not done/scratched; a month goal's child sessions are rolled up to the goal, not listed individually), 'blocked', 'inbox' (no list). Scratched (abandoned) tasks are excluded from every smart filter; pass status='scratched' to see them. due_from/due_to match each task's deadline: its due_date, else the Sunday of its week (week tasks), else the last day of its month (month goals); due_by shows it when it isn't due_date. Sorted by starred, priority, then deadline. Each row has open_days (days since created, open tasks only), missed_count (times it went past its date unfinished) and list_name.",
 			Schema: obj(map[string]*genai.Schema{
-				"smart":     str("Smart-list shortcut: 'my_day' | 'important' | 'planned' | 'week' | 'month' | 'missed' | 'inbox' | 'all'."),
+				"smart":     str("Smart-list shortcut: 'my_day' | 'important' | 'planned' | 'week' | 'month' | 'missed' | 'blocked' | 'inbox' | 'all'."),
 				"list_id":   intg("Filter to a specific user list."),
 				"parent_id": intg("Set to non-zero to fetch children of a parent task. Default returns top-level only."),
-				"status":    str("Filter by status: 'todo', 'in_progress', 'done', 'scratched'."),
-				"due_from":  str("Lower bound (inclusive) ISO date YYYY-MM-DD."),
-				"due_to":    str("Upper bound (inclusive) ISO date YYYY-MM-DD."),
+				"status":    str("Filter by status: 'open' (todo, in progress or blocked: anything still to do), 'todo', 'in_progress', 'blocked', 'done', 'scratched'."),
+				"due_from":  str("Deadline on or after, ISO date YYYY-MM-DD."),
+				"due_to":    str("Deadline on or before, ISO date YYYY-MM-DD."),
 				"priority":  str("Filter by priority: 'high', 'medium', 'low'."),
 				"important": boolean("Restrict to starred tasks."),
-				"limit":     intg("Maximum tasks to return (default 50)."),
+				"limit":     intg("Maximum tasks to return (default 50, at most 200)."),
 			}),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return listTasksTool(ctx, d, uid, args)
@@ -1413,7 +1413,8 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	// "active" excludes scratched (abandoned) and done. Dates are the user's
 	// local day, not the server's UTC CURRENT_DATE.
 	const active = "status NOT IN ('done','scratched')"
-	today := userTZNow(ctx, d, uid).Format("2006-01-02")
+	nowLocal := userTZNow(ctx, d, uid)
+	today := nowLocal.Format("2006-01-02")
 	switch argStr(args, "smart") {
 	case "my_day":
 		clauses = append(clauses, fmt.Sprintf("due_date = $%d", len(vals)+1), active)
@@ -1462,7 +1463,9 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		clauses = append(clauses, "parent_task_id IS NULL")
 	}
 
-	if s := argStr(args, "status"); s != "" {
+	if s := argStr(args, "status"); s == "open" {
+		clauses = append(clauses, active)
+	} else if s != "" {
 		clauses = append(clauses, fmt.Sprintf("status=$%d", len(vals)+1))
 		vals = append(vals, s)
 	}
@@ -1473,24 +1476,32 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	if argBool(args, "important", false) {
 		clauses = append(clauses, "important=TRUE")
 	}
+	// A task's deadline: its day, else the end of its week or month.
+	const deadline = `COALESCE(tasks.due_date, tasks.week_of + 6, (tasks.month_of + INTERVAL '1 month' - INTERVAL '1 day')::date)`
 	if df := argStr(args, "due_from"); df != "" {
-		clauses = append(clauses, fmt.Sprintf("due_date >= $%d", len(vals)+1))
+		clauses = append(clauses, fmt.Sprintf("%s >= $%d", deadline, len(vals)+1))
 		vals = append(vals, df)
 	}
 	if dt := argStr(args, "due_to"); dt != "" {
-		clauses = append(clauses, fmt.Sprintf("due_date <= $%d", len(vals)+1))
+		clauses = append(clauses, fmt.Sprintf("%s <= $%d", deadline, len(vals)+1))
 		vals = append(vals, dt)
 	}
-	limit := argInt(args, "limit", 50)
-	q := `SELECT id,title,COALESCE(description,''),status,priority,COALESCE(color,''),
+	limit := min(max(argInt(args, "limit", 50), 1), 200)
+	q := `SELECT id,title,COALESCE(description,''),status,priority,
 	             COALESCE(due_date::text,''),COALESCE(scheduled_at::text,''),
 	             COALESCE(duration_minutes,30),
 	             list_id,parent_task_id,blocked_by_task_id,important,
 	             (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id = tasks.id),
 	             COALESCE((SELECT p.title FROM tasks p WHERE p.id = tasks.parent_task_id), ''),
-	             recurrence, COALESCE(week_of::text,''), COALESCE(month_of::text,''), plan_id
+	             recurrence, COALESCE(week_of::text,''), COALESCE(month_of::text,''), plan_id,
+	             COALESCE(` + deadline + `::text, ''),
+	             COALESCE((SELECT l.name FROM task_lists l WHERE l.id = tasks.list_id), ''),
+	             (SELECT COUNT(*) FROM task_due_history h WHERE h.task_id = tasks.id AND h.outcome = 'missed'),
+	             created_at
 	      FROM tasks WHERE ` + strings.Join(clauses, " AND ") +
-		fmt.Sprintf(` ORDER BY (status='done') ASC, important DESC NULLS LAST, due_date NULLS LAST, created_at DESC LIMIT %d`, limit)
+		fmt.Sprintf(` ORDER BY (status='done') ASC, important DESC NULLS LAST,
+		              CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END,
+		              %s NULLS LAST, created_at DESC LIMIT %d`, deadline, limit)
 	rows, err := d.QueryContext(ctx, q, vals...)
 	if err != nil {
 		return nil, nil, err
@@ -1499,7 +1510,7 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	out := []map[string]any{}
 	for rows.Next() {
 		var id int64
-		var title, desc, status, priority, color, due, sched string
+		var title, desc, status, priority, due, sched string
 		var dur int
 		var listID, parentID, blockedByID sql.NullInt64
 		var important bool
@@ -1507,15 +1518,36 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		var parentTitle, weekOf, monthOf string
 		var recurrenceRaw []byte
 		var planID sql.NullInt64
-		rows.Scan(&id, &title, &desc, &status, &priority, &color, &due, &sched, &dur,
+		var dueBy, listName string
+		var missedCount int
+		var created time.Time
+		rows.Scan(&id, &title, &desc, &status, &priority, &due, &sched, &dur,
 			&listID, &parentID, &blockedByID, &important, &subCount, &parentTitle,
-			&recurrenceRaw, &weekOf, &monthOf, &planID)
+			&recurrenceRaw, &weekOf, &monthOf, &planID, &dueBy, &listName, &missedCount, &created)
 		row := map[string]any{
-			"id": id, "title": title, "description": desc,
+			"id": id, "title": title,
 			"status": status, "priority": priority,
-			"color":    color,
-			"due_date": due, "scheduled_at": sched, "duration_minutes": dur,
+			"due_date": due, "duration_minutes": dur,
 			"important": important, "subtask_count": subCount,
+		}
+		// Empty fields are left out: every byte is input tokens.
+		if desc != "" {
+			row["description"] = desc
+		}
+		if sched != "" {
+			row["scheduled_at"] = sched
+		}
+		if dueBy != "" && dueBy != due {
+			row["due_by"] = dueBy
+		}
+		if listName != "" {
+			row["list_name"] = listName
+		}
+		if missedCount > 0 {
+			row["missed_count"] = missedCount
+		}
+		if status != "done" && status != "scratched" {
+			row["open_days"] = daysBetween(created.In(nowLocal.Location()), nowLocal)
 		}
 		if listID.Valid {
 			row["list_id"] = listID.Int64
@@ -1542,6 +1574,13 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		out = append(out, row)
 	}
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
+}
+
+// daysBetween counts calendar days from a to b in their own zone.
+func daysBetween(a, b time.Time) int {
+	da := time.Date(a.Year(), a.Month(), a.Day(), 0, 0, 0, 0, time.UTC)
+	db := time.Date(b.Year(), b.Month(), b.Day(), 0, 0, 0, 0, time.UTC)
+	return int(db.Sub(da).Hours() / 24)
 }
 
 func listTaskListsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
