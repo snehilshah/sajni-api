@@ -479,3 +479,34 @@ These are worth knowing because they show up as opaque
   expired `refresh_tokens`, and `users` past their soft-delete grace
   are not garbage collected by a background job. They accumulate.
   Adding a daily prune is a small follow-up.
+
+---
+
+## 10. Connected apps (MCP OAuth)
+
+Outside assistants (ChatGPT, Gemini, Claude) sign in to `/mcp` through a
+separate OAuth 2.1 server in `internal/mcp/oauth.go`. Its tokens never work
+on `/api/*`, and Sajni's own JWTs never work on `/mcp`.
+
+- **Discovery:** `/.well-known/oauth-protected-resource[/mcp]` names the
+  issuer (`APP_URL`); `/.well-known/oauth-authorization-server` (also served
+  as `openid-configuration`) lists the endpoints. A 401 from `/mcp` carries
+  `WWW-Authenticate: Bearer resource_metadata=…`.
+- **Clients:** dynamic registration (`POST /api/oauth/register`, id `dcr_…`,
+  public or with a hashed secret; unapproved ones pruned after a day, 60
+  registrations an hour) or a client metadata document (the client id is an
+  https URL, fetched with private addresses blocked, re-read daily; any
+  https redirect on the document's own origin is allowed, since ChatGPT's
+  document doesn't list its callback).
+- **Consent:** `authorization_endpoint` is the web page `/oauth/authorize`
+  (behind sign-in; the return path survives the Google round trip via
+  `sessionStorage`). It calls `GET /api/oauth/request` to check the request
+  and `POST /api/oauth/approve` to answer. A bad client or redirect URI is
+  shown on the page, never redirected to. Responses carry `iss` (RFC 9207).
+- **Tokens:** code 10 min, single use, PKCE S256 required; access 1 h;
+  refresh 90 days, replaced on each use but still accepted for 2 minutes
+  so a retried refresh doesn't sign the app out. All stored as SHA-256 in
+  `mcp_tokens` under one `mcp_grants` row per user and app. Scope `read`
+  or `read write` lives on the grant; removing the grant in Settings →
+  Connected apps deletes every token at once.
+

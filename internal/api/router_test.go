@@ -4,8 +4,10 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"sajni/internal/auth"
 	"sajni/internal/config"
 )
 
@@ -85,4 +87,25 @@ func TestFinanceRoutesRegisterWithoutConflict(t *testing.T) {
 		}
 	}()
 	registerFinanceRoutes(http.NewServeMux(), Deps{})
+}
+
+// The whole router, so a pattern clash anywhere (connected apps share the
+// root mux with /api/) fails here instead of at boot.
+func TestRouterBuilds(t *testing.T) {
+	h := Router(Deps{Auth: &auth.Service{AppURL: "https://www.ohmysajni.com"}})
+	// The MCP endpoint answers any origin, and a missing token gets the
+	// sign-in challenge rather than the app's own 401.
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	req.Header.Set("Origin", "https://chatgpt.com")
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != http.StatusUnauthorized || res.Header().Get("Access-Control-Allow-Origin") != "*" ||
+		!strings.Contains(res.Header().Get("WWW-Authenticate"), "resource_metadata=") {
+		t.Fatalf("POST /mcp = %d %v", res.Code, res.Header())
+	}
+	res = httptest.NewRecorder()
+	h.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil))
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"issuer":"https://www.ohmysajni.com"`) {
+		t.Fatalf("AS metadata = %d %s", res.Code, res.Body)
+	}
 }

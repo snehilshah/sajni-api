@@ -40,19 +40,24 @@ Tool use:
 - For mutations, confirm only if ambiguous — otherwise just do it and state what was created. Multiple required actions in one request? Call all the tools in parallel in the same round.
 - If a tool errors, fix args and retry once. No retry loops.
 
-Agendas & priorities ("what's pending this week", "what should I do tomorrow", "my top priority"):
-- Gather widely in one round of parallel calls, then rank it yourself. list_tasks with status='open' and due_from/due_to for the range (it includes week tasks and month goals whose deadline falls in it), list_tasks smart='missed', smart='week' and smart='month' while the range is in this week/month, and list_plans with date= for a single day.
-- Rank: overdue and often-missed first, then starred, then high priority, then the nearest deadline or time, then the longest open. Blocked tasks aren't doable: say what blocks them instead of ranking them.
-- Reply with a short ranked list, one line of reason each. Asked for the top priority? Name one first, then the next two or three.
+` + agendaRules + `
 
-Finance & Budget Analysis:
-- When asked to analyze budgets/spending, do not just list category totals; automatically fetch recent transactions ('list_finance_transactions') to inspect descriptions in your very first response.
-- Distinguish essentials (groceries, rent, utilities, bills) from discretionary/non-essential items (cafes, dining out, gifts, entertainment, subscriptions) and call out specific transactions to cut to stay under budget.
+` + financeRules + `
 
 Boundaries:
 - Read: memos, tasks, habits, journal, plans, notes, media, finance.
 - Write: tasks, habits, memos, journal, plans, media, transactions.
 - Can't: delete habits, archive accounts, change settings other than themes, or send anything outside the app. State this only if asked.`
+
+// agendaRules and financeRules are shared with the MCP instructions.
+const agendaRules = `Agendas & priorities ("what's pending this week", "what should I do tomorrow", "my top priority"):
+- Gather widely in one round of parallel calls, then rank it yourself. list_tasks with status='open' and due_from/due_to for the range (it includes week tasks and month goals whose deadline falls in it), list_tasks smart='missed', smart='week' and smart='month' while the range is in this week/month, and list_plans with date= for a single day.
+- Rank: overdue and often-missed first, then starred, then high priority, then the nearest deadline or time, then the longest open. Blocked tasks aren't doable: say what blocks them instead of ranking them.
+- Reply with a short ranked list, one line of reason each. Asked for the top priority? Name one first, then the next two or three.`
+
+const financeRules = `Finance & Budget Analysis:
+- When asked to analyze budgets/spending, do not just list category totals; automatically fetch recent transactions ('list_finance_transactions') to inspect descriptions in your very first response.
+- Distinguish essentials (groceries, rent, utilities, bills) from discretionary/non-essential items (cafes, dining out, gifts, entertainment, subscriptions) and call out specific transactions to cut to stay under budget.`
 
 // liveContext is the <now> block put in front of the user's message: the
 // dates the model needs to resolve "tomorrow" or "this week", and a few live

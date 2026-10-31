@@ -343,6 +343,26 @@ gcloud logging read 'resource.labels.service_name="sajni-api" AND jsonPayload.me
   --freshness=1d --format='table(timestamp, jsonPayload.mode, jsonPayload.rounds, jsonPayload.tools, jsonPayload.in_tokens, jsonPayload.cache_pct, jsonPayload.cost_usd)'
 ```
 
+## Connected apps (MCP)
+
+ChatGPT, Gemini and Claude connect to `https://www.ohmysajni.com/mcp`.
+Vercel rewrites `/mcp` and `/.well-known/oauth-*` (and `openid-configuration`)
+to this service (`sajni-web/vercel.json`), so the issuer and resource stay on
+`APP_URL`. Nothing else to configure: no new secrets. The Cloud Run URL
+in those rewrites must change if the service URL does. Auth flow: `AUTH.md` §10.
+
+| Line | When | Fields |
+| --- | --- | --- |
+| `mcp call` | an outside app ran a tool | `client` (app name), `tool`, `ok`, `ms`, `result_bytes` |
+| `mcp client registered` / `mcp app approved` / `mcp app disconnected` | sign-in steps | `client`, `scope` |
+
+These calls run on the other app's model, so they cost no Gemini tokens.
+
+```sh
+gcloud logging read 'resource.labels.service_name="sajni-api" AND jsonPayload.message="mcp call"' \
+  --freshness=1d --format='table(timestamp, jsonPayload.client, jsonPayload.tool, jsonPayload.ok, jsonPayload.ms)'
+```
+
 ---
 
 ## Local dev

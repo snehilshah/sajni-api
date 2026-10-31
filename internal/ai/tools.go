@@ -1390,6 +1390,9 @@ func getCurrentContextTool(ctx context.Context, d *db.DB, uid string) (any, map[
 		"today":     today,
 		"weekday":   now.Weekday().String(),
 		"timestamp": now.Format(time.RFC3339),
+		"timezone":  now.Location().String(),
+		// Tomorrow, this week (Mon–Sun), next week and this month.
+		"dates": nowDates(now),
 	}
 	// "open" excludes scratched (abandoned) as well as done.
 	var openTasks, dueToday, missed, memos7d int

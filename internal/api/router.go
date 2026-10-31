@@ -12,6 +12,7 @@ import (
 	"sajni/internal/auth"
 	"sajni/internal/config"
 	"sajni/internal/db"
+	"sajni/internal/mcp"
 	"sajni/internal/push"
 	"sajni/internal/reminderqueue"
 	"sajni/internal/storage"
@@ -79,6 +80,9 @@ func Router(deps Deps) http.Handler {
 	registerLinkRoutes(apiMux, deps)
 	registerBookmarkRoutes(apiMux, deps)
 	registerPushRoutes(apiMux, deps)
+	// Connected apps: outside assistants over MCP (internal/mcp).
+	connected := mcp.New(deps.DB, deps.AI, deps.Auth.AppURL)
+	connected.RegisterUser(apiMux)
 
 	protected := deps.Auth.Middleware(withIdempotency(deps.DB, apiMux))
 
@@ -96,6 +100,7 @@ func Router(deps Deps) http.Handler {
 	root.Handle("/api/auth/refresh", authMux)
 	root.Handle("/api/auth/logout", authMux)
 	root.Handle("/api/", protected)
+	connected.RegisterPublic(root)
 
 	// Liveness/readiness probes — unauthenticated, ping the DB so deploys
 	// can fail fast if Postgres is unreachable.
@@ -173,6 +178,20 @@ func (sw *statusWriter) Flush() {
 func withCORS(h http.Handler, cfg config.HTTP) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
+		if mcp.IsPublicPath(r.URL.Path) {
+			// MCP and OAuth endpoints use bearer tokens, never cookies, so
+			// any origin may call them (browser-based MCP clients).
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Protocol-Version, Mcp-Session-Id, Last-Event-ID")
+			w.Header().Set("Access-Control-Expose-Headers", "WWW-Authenticate, Mcp-Session-Id")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			h.ServeHTTP(w, r)
+			return
+		}
 		if cfg.CORSOrigin != "" && origin == cfg.CORSOrigin {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")

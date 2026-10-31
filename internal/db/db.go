@@ -123,6 +123,43 @@ func (d *DB) ensureSchema() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_oauth_exchange_codes_expiry ON oauth_exchange_codes(expires_at);
 
+	-- ─── Connected apps: outside assistants (ChatGPT, Gemini) using the
+	-- MCP server at /mcp through OAuth (internal/mcp). ─────────────────
+	-- A client registered itself (DCR, id "dcr_…") or is a client metadata
+	-- document URL (CIMD, id = the URL, re-read daily). DCR clients nobody
+	-- approved are pruned after a day.
+	CREATE TABLE IF NOT EXISTS mcp_clients (
+		id            TEXT         PRIMARY KEY,
+		name          TEXT         NOT NULL DEFAULT '',
+		redirect_uris JSONB        NOT NULL DEFAULT '[]',
+		secret_hash   BYTEA,                    -- NULL: public client, PKCE only
+		fetched_at    TIMESTAMPTZ,              -- CIMD: when the document was read
+		created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+	);
+	-- One per user and client they approved; scope is 'read' or 'read write'.
+	CREATE TABLE IF NOT EXISTS mcp_grants (
+		id           UUID         PRIMARY KEY,
+		user_id      UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		client_id    TEXT         NOT NULL REFERENCES mcp_clients(id) ON DELETE CASCADE,
+		scope        TEXT         NOT NULL,
+		created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+		last_used_at TIMESTAMPTZ,
+		UNIQUE (user_id, client_id)
+	);
+	-- Authorization codes (10 min, single use), access tokens (1 h) and
+	-- refresh tokens (90 days, replaced on each use), stored as SHA-256.
+	-- Deleting the grant signs the app out at once.
+	CREATE TABLE IF NOT EXISTS mcp_tokens (
+		token_hash     BYTEA        PRIMARY KEY,
+		grant_id       UUID         NOT NULL REFERENCES mcp_grants(id) ON DELETE CASCADE,
+		kind           TEXT         NOT NULL,   -- code | access | refresh
+		redirect_uri   TEXT         NOT NULL DEFAULT '',  -- codes only
+		code_challenge TEXT         NOT NULL DEFAULT '',  -- codes only (PKCE S256)
+		expires_at     TIMESTAMPTZ  NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_mcp_tokens_grant ON mcp_tokens(grant_id);
+	CREATE INDEX IF NOT EXISTS idx_mcp_tokens_expiry ON mcp_tokens(expires_at);
+
 	-- ─── Content (BIGSERIAL row PK; user_id is UUID) ──────────────────
 	CREATE TABLE IF NOT EXISTS memos (
 		id         BIGSERIAL   PRIMARY KEY,
