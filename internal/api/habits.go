@@ -201,7 +201,7 @@ func toggleHabitLog(deps Deps) http.HandlerFunc {
 			return
 		}
 		today := userNow(d, uid).Format("2006-01-02")
-		toggleLog(d, uid, id, today, w)
+		toggleLog(d, uid, id, today, wantLogged(r), w)
 	}
 }
 
@@ -228,8 +228,22 @@ func toggleHabitLogForDate(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "You can't log a future day.")
 			return
 		}
-		toggleLog(d, uid, id, date, w)
+		toggleLog(d, uid, id, date, wantLogged(r), w)
 	}
+}
+
+// wantLogged reads ?logged=true|false: set that state instead of flipping it.
+// The Android offline outbox sends it, so a resend can't undo a check-in.
+func wantLogged(r *http.Request) *bool {
+	switch r.URL.Query().Get("logged") {
+	case "true":
+		v := true
+		return &v
+	case "false":
+		v := false
+		return &v
+	}
+	return nil
 }
 
 func toggleHabitPeriodForDate(deps Deps) http.HandlerFunc {
@@ -270,6 +284,14 @@ func toggleHabitPeriodForDate(deps Deps) http.HandlerFunc {
 			return
 		}
 
+		want := wantLogged(r)
+		if want != nil && *want == (count > 0) {
+			writeJSON(w, 200, map[string]any{
+				"logged": *want, "period_start": period.Start.Format("2006-01-02"),
+				"period_end": period.End.Format("2006-01-02"),
+			})
+			return
+		}
 		if count > 0 {
 			if _, err := d.Exec(
 				`DELETE FROM habit_logs
@@ -301,8 +323,9 @@ func toggleHabitPeriodForDate(deps Deps) http.HandlerFunc {
 	}
 }
 
-// toggleLog flips today's log row for habit/user; returns logged: bool.
-func toggleLog(d *db.DB, uid string, habitID int64, date string, w http.ResponseWriter) {
+// toggleLog flips the day's log row for habit/user (or sets it, with want);
+// returns logged: bool.
+func toggleLog(d *db.DB, uid string, habitID int64, date string, want *bool, w http.ResponseWriter) {
 	// Verify the habit belongs to the user.
 	var owns int
 	d.QueryRow("SELECT COUNT(*) FROM habits WHERE id = $1 AND user_id = $2", habitID, uid).Scan(&owns)
@@ -312,6 +335,10 @@ func toggleLog(d *db.DB, uid string, habitID int64, date string, w http.Response
 	}
 	var exists int
 	d.QueryRow("SELECT COUNT(*) FROM habit_logs WHERE user_id = $1 AND habit_id = $2 AND logged_date = $3", uid, habitID, date).Scan(&exists)
+	if want != nil && *want == (exists > 0) {
+		writeJSON(w, 200, map[string]bool{"logged": *want})
+		return
+	}
 	if exists > 0 {
 		d.Exec("DELETE FROM habit_logs WHERE user_id = $1 AND habit_id = $2 AND logged_date = $3", uid, habitID, date)
 		writeJSON(w, 200, map[string]bool{"logged": false})
