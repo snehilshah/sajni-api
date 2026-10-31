@@ -596,9 +596,7 @@ func (d *DB) ensureSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_account ON fin_transactions(account_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_at ON fin_transactions(user_id, txn_at);
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_slate ON fin_transactions(user_id, slate_id);
-	-- A bill has one split row per person it's shared with. The unique index
-	-- from the one-person days is dropped in place; remove the DROP once shipped.
-	DROP INDEX IF EXISTS uniq_fin_transactions_split_of;
+	-- A bill has one split row per person it's shared with.
 	CREATE INDEX IF NOT EXISTS idx_fin_transactions_split_of ON fin_transactions(split_of) WHERE split_of IS NOT NULL;
 
 	-- A lend is a receivable, not spending. source_transaction_id is the
@@ -1075,6 +1073,18 @@ func (d *DB) ensureSchema() error {
 		last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id);
+
+	-- A change sent with an Idempotency-Key (the Android offline outbox) runs
+	-- once: a retry replays the stored reply. status 0 = still running.
+	-- Rows older than a month are pruned as new ones arrive (api/idempotency.go).
+	CREATE TABLE IF NOT EXISTS idempotency_keys (
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		key        TEXT        NOT NULL,
+		status     INTEGER     NOT NULL DEFAULT 0,
+		body       BYTEA       NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (user_id, key)
+	);
 
 	-- Category names are case-insensitive within each kind.
 	CREATE UNIQUE INDEX IF NOT EXISTS uq_fin_categories_user_kind_name

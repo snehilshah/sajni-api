@@ -80,7 +80,7 @@ func Router(deps Deps) http.Handler {
 	registerBookmarkRoutes(apiMux, deps)
 	registerPushRoutes(apiMux, deps)
 
-	protected := deps.Auth.Middleware(apiMux)
+	protected := deps.Auth.Middleware(withIdempotency(deps.DB, apiMux))
 
 	// Top-level dispatcher: route the unauthenticated auth endpoints
 	// directly to authMux, fall through to the protected mux for
@@ -184,7 +184,7 @@ func withCORS(h http.Handler, cfg config.HTTP) http.Handler {
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
