@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -84,7 +85,7 @@ func handleTelemetry(deps Deps) http.HandlerFunc {
 				continue
 			}
 			evt := log.Info()
-			if h.Kind == "fetch_stuck" || h.Kind == "query_stuck" || h.Kind == "user_report" ||
+			if strings.HasSuffix(h.Kind, "_stuck") || h.Kind == "user_report" ||
 				h.Kind == "stall" || h.Kind == "error" || h.Kind == "chunk_slow" {
 				evt = log.Warn()
 			}
