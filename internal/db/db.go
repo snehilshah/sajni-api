@@ -3,8 +3,11 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/rs/zerolog/log"
 )
 
 // DB wraps the sql.DB connection to Postgres.
@@ -20,20 +23,29 @@ func New(dsn string) (*DB, error) {
 		return nil, fmt.Errorf("empty DATABASE_URL")
 	}
 
-	conn, err := sql.Open("pgx", dsn)
+	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open db: %w", err)
+		return nil, fmt.Errorf("parse db url: %w", err)
 	}
+	cfg.Tracer = tracer{}
+	conn := stdlib.OpenDB(*cfg)
+
+	start := time.Now()
 	if err := conn.Ping(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
+	pinged := time.Since(start)
 
 	d := &DB{DB: conn}
 	if err := d.ensureSchema(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("initialize schema: %w", err)
 	}
+	log.Info().
+		Int64("ping_ms", pinged.Milliseconds()).
+		Int64("schema_ms", (time.Since(start) - pinged).Milliseconds()).
+		Msg("db ready")
 	return d, nil
 }
 

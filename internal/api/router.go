@@ -100,6 +100,8 @@ func Router(deps Deps) http.Handler {
 	root.Handle("/api/auth/refresh", authMux)
 	root.Handle("/api/auth/logout", authMux)
 	root.Handle("/api/", protected)
+	// Client diagnostics: open so a broken session can still report.
+	root.Handle("POST /api/telemetry", handleTelemetry(deps))
 	connected.RegisterPublic(root)
 
 	// Liveness/readiness probes — unauthenticated, ping the DB so deploys
@@ -124,53 +126,7 @@ func Router(deps Deps) http.Handler {
 	RegisterDigestCronHandler(root, deps)
 	RegisterScheduledNotificationHandler(root, deps)
 
-	return withCORS(withLogging(root), deps.HTTP)
-}
-
-// withLogging logs all requests at debug, errors (5xx) at error, slow (>2s) at warn.
-// Health probes are skipped entirely.
-func withLogging(h http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
-			h.ServeHTTP(w, r)
-			return
-		}
-		rw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-		start := time.Now()
-		h.ServeHTTP(rw, r)
-		dur := time.Since(start)
-
-		evt := log.Debug()
-		switch {
-		case rw.status >= 500:
-			evt = log.Error()
-		case dur > 2*time.Second:
-			evt = log.Warn()
-		}
-		evt.Str("method", r.Method).
-			Str("path", r.URL.Path).
-			Int("status", rw.status).
-			Int64("ms", dur.Milliseconds()).
-			Send()
-	})
-}
-
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (sw *statusWriter) WriteHeader(code int) {
-	sw.status = code
-	sw.ResponseWriter.WriteHeader(code)
-}
-
-// Flush delegates to the underlying ResponseWriter so SSE and chunked
-// transfers work through the logging middleware.
-func (sw *statusWriter) Flush() {
-	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
+	return withCORS(withLogging(root, deps.DB, deps.Reminders.CloudTasksProject), deps.HTTP)
 }
 
 // withCORS reflects the configured allowed origin and enables credentials

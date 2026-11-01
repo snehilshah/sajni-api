@@ -157,6 +157,20 @@ func (s *Service) issueMediaToken(userID string) (string, error) {
 // media token sent as a Bearer.
 func (s *Service) parseAccessToken(raw string) (string, error) { return s.parseToken(raw, "") }
 
+// BearerUserID returns the user behind a valid access token on r, or "".
+// For endpoints that serve anyone but want to tag signed-in callers.
+func (s *Service) BearerUserID(r *http.Request) string {
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, "Bearer ") {
+		return ""
+	}
+	uid, err := s.parseAccessToken(strings.TrimPrefix(header, "Bearer "))
+	if err != nil {
+		return ""
+	}
+	return uid
+}
+
 func (s *Service) parseMediaToken(raw string) (string, error) {
 	return s.parseToken(raw, mediaAudience)
 }

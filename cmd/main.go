@@ -26,6 +26,7 @@ import (
 )
 
 func main() {
+	bootStart := time.Now()
 	ctx := context.Background()
 
 	port := flag.Int("port", 8080, "HTTP server port")
@@ -84,7 +85,8 @@ func main() {
 	evt = evt.
 		Bool("tmdb", cfg.Media.TMDBAPIKey != "").
 		Bool("cloud_tasks", cloudTasksEnabled).
-		Bool("push", pushSvc != nil)
+		Bool("push", pushSvc != nil).
+		Int64("boot_ms", time.Since(bootStart).Milliseconds())
 	evt.Msg("sajni started")
 
 	deps := api.Deps{
