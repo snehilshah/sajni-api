@@ -1,8 +1,10 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -28,7 +30,9 @@ func New(dsn string) (*DB, error) {
 		return nil, fmt.Errorf("parse db url: %w", err)
 	}
 	cfg.Tracer = tracer{}
+	limitConn(cfg)
 	conn := stdlib.OpenDB(*cfg)
+	limitPool(conn)
 
 	start := time.Now()
 	if err := conn.Ping(); err != nil {
@@ -47,6 +51,52 @@ func New(dsn string) (*DB, error) {
 		Int64("schema_ms", (time.Since(start) - pinged).Milliseconds()).
 		Msg("db ready")
 	return d, nil
+}
+
+// Limits so a bad database connection fails a request instead of hanging it.
+//
+// A connection can die silently (Cloud Run pauses the CPU between requests,
+// a NAT drops an idle flow). Without limits a query on it waits for the
+// kernel's TCP retry timeout, about 15 minutes. With them:
+//   - unacknowledged data for 20 s closes the connection (TCP_USER_TIMEOUT),
+//     and keepalives find a dead idle one;
+//   - no statement runs past 30 s, no transaction sits idle past 60 s;
+//   - idle connections are replaced after 5 minutes, all after 30.
+const (
+	stmtTimeout   = "30s"
+	idleTxTimeout = "60s"
+	tcpUserMs     = 20_000
+	keepAlive     = 15 * time.Second
+	dialTimeout   = 10 * time.Second
+	maxOpen       = 20
+	maxIdle       = 4
+	idleLife      = 5 * time.Minute
+	maxLife       = 30 * time.Minute
+)
+
+func limitConn(cfg *pgx.ConnConfig) {
+	if cfg.RuntimeParams == nil {
+		cfg.RuntimeParams = map[string]string{}
+	}
+	cfg.RuntimeParams["statement_timeout"] = stmtTimeout
+	cfg.RuntimeParams["idle_in_transaction_session_timeout"] = idleTxTimeout
+	if cfg.ConnectTimeout == 0 {
+		cfg.ConnectTimeout = dialTimeout
+	}
+	d := &net.Dialer{
+		KeepAliveConfig: net.KeepAliveConfig{Enable: true, Idle: keepAlive, Interval: keepAlive, Count: 3},
+		Control:         tcpUserTimeout,
+	}
+	cfg.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return d.DialContext(ctx, network, addr)
+	}
+}
+
+func limitPool(conn *sql.DB) {
+	conn.SetMaxOpenConns(maxOpen)
+	conn.SetMaxIdleConns(maxIdle)
+	conn.SetConnMaxIdleTime(idleLife)
+	conn.SetConnMaxLifetime(maxLife)
 }
 
 func (d *DB) ensureSchema() error {

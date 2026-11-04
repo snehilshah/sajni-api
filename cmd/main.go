@@ -158,7 +158,10 @@ func main() {
 	}()
 
 	addr := fmt.Sprintf(":%d", *port)
-	if err := http.ListenAndServe(addr, handler); err != nil {
+	// A client that never finishes sending its headers can't hold a
+	// connection open; replies (AI streams) aren't time-limited.
+	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal().Err(err).Msg("server error")
 	}
 }
