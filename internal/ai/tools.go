@@ -1241,8 +1241,10 @@ func (s *Service) buildTools() []Tool {
 				"account_id":       intg("Required. The target account ID."),
 				"category_id":      intg("Optional category identifier."),
 				"category_name":    str("Optional category name (e.g. 'Food', 'Groceries', 'Rent') to auto-match on backend. For a refund, the expense category it came back to."),
-				"type":             str("'expense' | 'income' | 'refund' | 'transfer'. Default 'expense'. Card or app cashback is a 'refund' (unlinked) in the Cashback category, not income. 'transfer' only into an investment, with to_investment_id."),
+				"type":             str("'expense' | 'income' | 'refund' | 'transfer'. Default 'expense'. Card or app cashback is a 'refund' (unlinked) in the Cashback category, not income. 'transfer' moves money from account_id to another account (to_account_id: paying a credit card bill, moving savings) or into an investment (to_investment_id); it is never spending and takes no category."),
 				"to_investment_id": intg("Transfer only: the investment (list_investments) the money goes into."),
+				"to_account_id":    intg("Transfer only: the account (list_finance_accounts) the money goes to, e.g. the credit card a bill payment went to."),
+				"note":             str("Optional longer note (a reference number, who it was with). #tags in it are picked up."),
 				"amount":           num("Positive amount. For a split bill, the whole bill."),
 				"description":      str("Required. A short title for what it was."),
 				"date":             str("ISO date. Defaults to today."),
@@ -1355,6 +1357,7 @@ func (s *Service) buildTools() []Tool {
 				"type":          str("Optional 'expense' | 'income' | 'refund'. A credit that was money back on a purchase is 'refund' (pass its expense category too)."),
 				"amount":        num("Optional positive amount."),
 				"description":   str("Optional new description."),
+				"note":          str("Optional new note; an empty string clears it. #tags in it are picked up."),
 				"date":          str("Optional ISO date YYYY-MM-DD."),
 				"slate_id":      intg("Optional. Move to this slate; 0 = Plain. Omitted = untouched."),
 			}, "id"),
@@ -1377,6 +1380,7 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 	}
+	tools = append(tools, financeSetupTools(d)...)
 	tools = append(tools, planTools(d, queue)...)
 	return append(tools, standaloneReminderTools(d, queue)...)
 }
@@ -3947,6 +3951,9 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		return nil, nil, err
 	}
 	if ttype == "transfer" {
+		if argInt(args, "to_account_id", 0) > 0 {
+			return transferBetweenAccountsTool(ctx, d, uid, acct, amount, desc, txnAt, args)
+		}
 		return transferToInvestmentTool(ctx, d, uid, acct, amount, desc, txnAt, args)
 	}
 
@@ -4033,7 +4040,8 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 
 	// txn_at: the model's date (and time, if it gave one), else now; a date
 	// alone keeps now's clock rather than midnight.
-	insArgs := []any{uid, acct, catArg, ttype, amount, desc, slateArg, refundArg, txnAt}
+	note := strings.TrimSpace(argStr(args, "note"))
+	insArgs := []any{uid, acct, catArg, ttype, amount, desc, slateArg, refundArg, txnAt, note}
 	txnCol := "$9"
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
@@ -4042,8 +4050,8 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	defer tx.Rollback()
 	var id int64
 	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, slate_id, refund_of, txn_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,`+txnCol+`) RETURNING id`,
+		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, slate_id, refund_of, txn_at, note)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,`+txnCol+`,$10) RETURNING id`,
 		insArgs...).Scan(&id); err != nil {
 		return nil, nil, err
 	}
@@ -4060,6 +4068,9 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		if err := db.SettleWith(ctx, tx, uid, fromPerson, []int64{id}, optLendID(args)); err != nil {
 			return nil, nil, err
 		}
+	}
+	if err := db.SyncTags(ctx, tx, uid, "transaction", id, note); err != nil {
+		return nil, nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, nil, err
@@ -4163,6 +4174,10 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	if v, ok := args["description"]; ok && v != nil {
 		add("description", argStr(args, "description"))
 	}
+	_, noteGiven := args["note"]
+	if noteGiven {
+		add("note", strings.TrimSpace(argStr(args, "note")))
+	}
 	if dt := argStr(args, "date"); dt != "" {
 		sets = append(sets, fmt.Sprintf("txn_at = ($%d::timestamp AT TIME ZONE 'Asia/Kolkata')", ph))
 		vals = append(vals, dt)
@@ -4220,6 +4235,11 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	}
 	if isSplit {
 		if err := db.SyncSplit(ctx, tx, uid, int64(id)); err != nil {
+			return nil, nil, err
+		}
+	}
+	if noteGiven {
+		if err := db.SyncTags(ctx, tx, uid, "transaction", int64(id), strings.TrimSpace(argStr(args, "note"))); err != nil {
 			return nil, nil, err
 		}
 	}

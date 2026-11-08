@@ -1392,26 +1392,6 @@ func deleteTransaction(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid id")
 			return
 		}
-		var storedType string
-		if err := d.QueryRow("SELECT type FROM fin_transactions WHERE id = $1 AND user_id = $2", id, uid).Scan(&storedType); err != nil {
-			errJSON(w, http.StatusNotFound, "not found")
-			return
-		}
-		if storedType == "lend" || storedType == "lend_repayment" {
-			errJSON(w, http.StatusConflict, "This is a lending entry. Change it from Lends.")
-			return
-		}
-		if storedType == "writeoff" {
-			errJSON(w, http.StatusConflict, "This is an adjusted amount. Undo it from Lends.")
-			return
-		}
-		var splitWith string
-		d.QueryRow(`SELECT COALESCE(string_agg(l.borrower, ', ' ORDER BY sp.id), '') FROM fin_transactions sp JOIN fin_lends l ON l.source_transaction_id = sp.id
-			WHERE sp.split_of = $1 AND sp.user_id = $2`, id, uid).Scan(&splitWith)
-		if splitWith != "" {
-			errJSON(w, http.StatusConflict, "This bill is split with "+splitWith+". Remove the split first.")
-			return
-		}
 		ctx := r.Context()
 		tx, err := d.BeginTx(ctx, nil)
 		if err != nil {
@@ -1419,28 +1399,17 @@ func deleteTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		defer tx.Rollback()
-		// A payment into an investment comes back out of its invested amount.
-		invID, invOld, toInvestment, err := db.InvestmentTransfer(ctx, tx, uid, id)
-		if err != nil {
-			internalError(w, r, "read investment transfer", err)
+		var conflict *db.TxnConflict
+		switch err := db.DeleteTransaction(ctx, tx, uid, id); {
+		case errors.Is(err, db.ErrTxnNotFound):
+			errJSON(w, http.StatusNotFound, "not found")
 			return
-		}
-		// delete pair if any
-		var pair *int64
-		tx.QueryRowContext(ctx, "SELECT transfer_pair FROM fin_transactions WHERE id = $1 AND user_id = $2", id, uid).Scan(&pair)
-		if _, err := tx.ExecContext(ctx, "DELETE FROM fin_transactions WHERE id = $1 AND user_id = $2", id, uid); err != nil {
+		case errors.As(err, &conflict):
+			errJSON(w, http.StatusConflict, conflict.Msg)
+			return
+		case err != nil:
 			internalError(w, r, "delete transaction", err)
 			return
-		}
-		tx.ExecContext(ctx, "DELETE FROM tags WHERE user_id = $1 AND entity_type = 'transaction' AND entity_id = $2", uid, id)
-		if pair != nil {
-			tx.ExecContext(ctx, "DELETE FROM fin_transactions WHERE id = $1 AND user_id = $2", *pair, uid)
-		}
-		if toInvestment {
-			if err := db.FollowInvestmentTransfer(ctx, tx, uid, id, invID, invOld); err != nil {
-				internalError(w, r, "follow investment transfer", err)
-				return
-			}
 		}
 		if err := tx.Commit(); err != nil {
 			internalError(w, r, "commit transaction delete", err)
