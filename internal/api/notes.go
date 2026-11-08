@@ -8,6 +8,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"sajni/internal/db"
 	sharednote "sajni/internal/note"
 	"sajni/internal/storage"
 )
@@ -89,25 +90,33 @@ func listNotes(deps Deps) http.HandlerFunc {
 			UpdatedAt   string   `json:"updated_at"`
 		}
 		var notes []Note
+		index := map[int64]int{}
 		for rows.Next() {
 			var n Note
 			if err := rows.Scan(&n.ID, &n.Title, &n.Folder, &n.Description, &n.Pinned, &n.CreatedAt, &n.UpdatedAt); err != nil {
 				errJSON(w, 500, err.Error())
 				return
 			}
-			tagRows, err := d.Query("SELECT tag FROM tags WHERE user_id = $1 AND entity_type = 'note' AND entity_id = $2", uid, n.ID)
+			n.Tags = []string{}
+			index[n.ID] = len(notes)
+			notes = append(notes, n)
+		}
+		rows.Close()
+		// One query for every note's tags (was one per note).
+		if len(notes) > 0 {
+			tagRows, err := d.Query("SELECT entity_id, tag FROM tags WHERE user_id = $1 AND entity_type = 'note' ORDER BY tag", uid)
 			if err == nil {
 				for tagRows.Next() {
+					var id int64
 					var t string
-					tagRows.Scan(&t)
-					n.Tags = append(n.Tags, t)
+					if tagRows.Scan(&id, &t) == nil {
+						if i, ok := index[id]; ok {
+							notes[i].Tags = append(notes[i].Tags, t)
+						}
+					}
 				}
 				tagRows.Close()
 			}
-			if n.Tags == nil {
-				n.Tags = []string{}
-			}
-			notes = append(notes, n)
 		}
 		if notes == nil {
 			notes = []Note{}
@@ -154,18 +163,7 @@ func getNote(deps Deps) http.HandlerFunc {
 			}
 		}
 
-		tagRows, _ := d.Query("SELECT tag FROM tags WHERE user_id = $1 AND entity_type = 'note' AND entity_id = $2", uid, n.ID)
-		if tagRows != nil {
-			for tagRows.Next() {
-				var t string
-				tagRows.Scan(&t)
-				n.Tags = append(n.Tags, t)
-			}
-			tagRows.Close()
-		}
-		if n.Tags == nil {
-			n.Tags = []string{}
-		}
+		n.Tags = noteTags(d, uid, n.ID)
 
 		n.Backlinks = getIncomingBacklinks(d, uid, "note", n.ID)
 		writeJSON(w, 200, n)
@@ -198,7 +196,12 @@ func createNote(deps Deps) http.HandlerFunc {
 		id := created.ID
 		syncTags(d, uid, "note", id, body.Content)
 		syncBacklinks(d, uid, "note", id, body.Content)
-		writeJSON(w, 201, map[string]any{"id": id, "folder": folder})
+		var createdAt, updatedAt string
+		d.QueryRow("SELECT created_at, updated_at FROM notes WHERE id = $1 AND user_id = $2", id, uid).Scan(&createdAt, &updatedAt)
+		writeJSON(w, 201, map[string]any{
+			"id": id, "folder": folder, "title": body.Title,
+			"tags": noteTags(d, uid, id), "created_at": createdAt, "updated_at": updatedAt,
+		})
 	}
 }
 
@@ -275,7 +278,16 @@ func updateNote(deps Deps) http.HandlerFunc {
 			d.Exec("UPDATE notes SET pinned = $1 WHERE id = $2 AND user_id = $3", *body.Pinned, id, uid)
 		}
 
-		writeJSON(w, 200, map[string]any{"status": "ok", "folder": nextFolder, "title": nextTitle})
+		resp := map[string]any{"status": "ok", "folder": nextFolder, "title": nextTitle}
+		var updatedAt string
+		if d.QueryRow("SELECT updated_at FROM notes WHERE id = $1 AND user_id = $2", id, uid).Scan(&updatedAt) == nil {
+			resp["updated_at"] = updatedAt
+		}
+		// Tags only change with the content; clients patch them in place.
+		if body.Content != nil {
+			resp["tags"] = noteTags(d, uid, id)
+		}
+		writeJSON(w, 200, resp)
 	}
 }
 
@@ -564,4 +576,21 @@ func renameFolder(deps Deps) http.HandlerFunc {
 
 		writeJSON(w, 200, map[string]string{"from": from, "to": to})
 	}
+}
+
+// noteTags lists a note's tags, alphabetically (never nil).
+func noteTags(d *db.DB, uid string, id int64) []string {
+	tags := []string{}
+	rows, err := d.Query("SELECT tag FROM tags WHERE user_id = $1 AND entity_type = 'note' AND entity_id = $2 ORDER BY tag", uid, id)
+	if err != nil {
+		return tags
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var t string
+		if rows.Scan(&t) == nil {
+			tags = append(tags, t)
+		}
+	}
+	return tags
 }
