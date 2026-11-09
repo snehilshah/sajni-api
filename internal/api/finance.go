@@ -425,7 +425,7 @@ func deleteAccount(deps Deps) http.HandlerFunc {
 			return
 		}
 		if usedByLend {
-			errJSON(w, http.StatusConflict, "This account has lending activity on it. Undo its lends, repayments and settlements in Lends first.")
+			errJSON(w, http.StatusConflict, "This account has lending activity on it. Undo its lends, repayments and settlements in People first.")
 			return
 		}
 		if _, err := d.Exec("DELETE FROM fin_accounts WHERE id = $1 AND user_id = $2", id, uid); err != nil {
@@ -915,7 +915,7 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		if b.Type != "expense" && b.Type != "income" && b.Type != "transfer" && b.Type != "refund" {
-			errJSON(w, http.StatusBadRequest, "Pick expense, income, refund or transfer. Lending is managed from Lends.")
+			errJSON(w, http.StatusBadRequest, "Pick expense, income, refund or transfer. Lending is managed from People.")
 			return
 		}
 		if b.Split != nil && (b.Type != "expense" || strings.TrimSpace(b.Split.Borrower) == "" || b.Split.Share <= 0 || roundMoney(b.Split.Share) > roundMoney(b.Amount)) {
@@ -1210,7 +1210,7 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		if storedType == "lend" {
-			errJSON(w, http.StatusConflict, "This is a lending entry. Change it from Lends.")
+			errJSON(w, http.StatusConflict, "This is a lending entry. Change it from People.")
 			return
 		}
 		// A payment into an investment: its invested amount follows the edit.

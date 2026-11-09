@@ -17,7 +17,7 @@ func (e *TxnConflict) Error() string { return e.Msg }
 
 // DeleteTransaction deletes one of the user's transactions with its tags and,
 // for a transfer, its other leg. A payment into an investment comes back out
-// of the invested amount. Lending rows are refused: they change from Lends.
+// of the invested amount. Lending rows are refused: they change from People.
 // The API and the AI tools both go through here.
 func DeleteTransaction(ctx context.Context, tx *sql.Tx, uid string, id int64) error {
 	var storedType string
@@ -32,9 +32,9 @@ func DeleteTransaction(ctx context.Context, tx *sql.Tx, uid string, id int64) er
 	}
 	switch storedType {
 	case "lend", "lend_repayment":
-		return &TxnConflict{"This is a lending entry. Change it from Lends."}
+		return &TxnConflict{"This is a lending entry. Change it from People."}
 	case "writeoff":
-		return &TxnConflict{"This is an adjusted amount. Undo it from Lends."}
+		return &TxnConflict{"This is an adjusted amount. Undo it from People."}
 	}
 	var splitWith string
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(string_agg(l.borrower, ', ' ORDER BY sp.id), '') FROM fin_transactions sp
