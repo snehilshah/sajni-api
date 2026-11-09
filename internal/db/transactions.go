@@ -35,7 +35,21 @@ func DeleteTransaction(ctx context.Context, tx *sql.Tx, uid string, id int64) er
 		return &TxnConflict{"This is a lending entry. Change it from People."}
 	case "writeoff":
 		return &TxnConflict{"This is an adjusted amount. Undo it from People."}
+	case "netoff":
+		return &TxnConflict{"This was netted off. Undo it from People."}
+	case "owed":
+		var lend bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_lends WHERE source_transaction_id = $1)`, id).Scan(&lend); err != nil {
+			return err
+		}
+		if lend {
+			return &TxnConflict{"This is a lending entry. Change it from People."}
+		}
 	}
+	// Money the user owes someone: deleting a debt can't leave them paid back
+	// more than they owed.
+	var owedTo string
+	tx.QueryRowContext(ctx, `SELECT person FROM fin_owed WHERE transaction_id = $1 AND user_id = $2`, id, uid).Scan(&owedTo)
 	var splitWith string
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(string_agg(l.borrower, ', ' ORDER BY sp.id), '') FROM fin_transactions sp
 		JOIN fin_lends l ON l.source_transaction_id = sp.id
@@ -59,6 +73,11 @@ func DeleteTransaction(ctx context.Context, tx *sql.Tx, uid string, id int64) er
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM tags WHERE user_id = $1 AND entity_type = 'transaction' AND entity_id = $2`, uid, del); err != nil {
 			return err
+		}
+	}
+	if owedTo != "" {
+		if err := CheckOwed(ctx, tx, uid, owedTo); err != nil {
+			return &TxnConflict{"You've already paid " + owedTo + " back more than that would leave. Delete a payment first."}
 		}
 	}
 	if toInvestment {

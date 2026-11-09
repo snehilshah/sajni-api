@@ -15,3 +15,20 @@ func Spend(alias string) string {
 	}
 	return fmt.Sprintf("(CASE WHEN %[1]stype = 'refund' THEN -%[1]samount ELSE %[1]samount END)", alias)
 }
+
+// MoneyInTypes and MoneyOutTypes move an account's balance up and down.
+// Writeoffs, owed rows and net-offs move no money, so they're in neither.
+const (
+	MoneyInTypes  = "('income','refund','transfer_in','lend_repayment','borrow')"
+	MoneyOutTypes = "('expense','transfer_out','lend','borrow_repayment')"
+)
+
+// BalanceDelta is a fin_transactions row's signed effect on its account's
+// balance (alias "" for an unaliased table).
+func BalanceDelta(alias string) string {
+	if alias != "" {
+		alias += "."
+	}
+	return fmt.Sprintf("(CASE WHEN %[1]stype IN %[2]s THEN %[1]samount WHEN %[1]stype IN %[3]s THEN -%[1]samount ELSE 0 END)",
+		alias, MoneyInTypes, MoneyOutTypes)
+}

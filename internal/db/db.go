@@ -658,7 +658,17 @@ func (d *DB) ensureSchema() error {
 	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_slates_user_id ON fin_slates(user_id, id);
 
 	-- type: expense | income | transfer_out | transfer_in | lend |
-	-- lend_repayment | refund | writeoff.
+	-- lend_repayment | refund | writeoff | borrow | borrow_repayment | owed |
+	-- netoff.
+	--   borrow           = money in that the user owes back (fin_owed debt);
+	--                      raises the balance, never income.
+	--   borrow_repayment = paying it back (fin_owed payment); lowers the
+	--                      balance, never spending.
+	--   owed             = a debt, either way, from before Sajni: no money
+	--                      moves (a lend's source row or a fin_owed debt).
+	--   netoff           = two debts closed against each other: a pair (via
+	--                      transfer_pair), one a lend settlement, one a fin_owed
+	--                      payment. Moves no money, never spending.
 	--   refund   = money back on a purchase. A credit to the account that
 	--              carries an expense category and nets off spending (never
 	--              income). refund_of optionally points at the original charge.
@@ -798,6 +808,22 @@ func (d *DB) ensureSchema() error {
 	JOIN owed o ON o.user_id = l.user_id AND o.k = LOWER(BTRIM(l.borrower))
 	LEFT JOIN paid pd ON pd.user_id = l.user_id AND pd.k = o.k
 	LEFT JOIN pinned p ON p.lend_id = l.id;
+
+	-- Money the user owes someone: the mirror of a lend, kept simple. Each row
+	-- tags one transaction with a person. kind 'debt' (a borrow, or an owed row
+	-- when no money moved) raises what the user owes them; kind 'payment' (a
+	-- borrow_repayment, or the netoff half) lowers it. Totals are per person
+	-- (case-insensitive name, as with lends), never per debt.
+	CREATE TABLE IF NOT EXISTS fin_owed (
+		id             BIGSERIAL   PRIMARY KEY,
+		user_id        UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		person         TEXT        NOT NULL,
+		transaction_id BIGINT      NOT NULL UNIQUE REFERENCES fin_transactions(id) ON DELETE CASCADE,
+		kind           TEXT        NOT NULL CHECK (kind IN ('debt','payment')),
+		due_date       DATE,       -- when the user means to pay a debt back
+		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_owed_person ON fin_owed(user_id, LOWER(BTRIM(person)));
 
 	CREATE TABLE IF NOT EXISTS fin_budgets (
 		id          BIGSERIAL   PRIMARY KEY,

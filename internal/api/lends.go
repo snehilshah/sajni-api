@@ -23,6 +23,7 @@ func registerLendRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("PUT /api/finance/lends/settlements/{id}", updateSettlement(deps))
 	mux.HandleFunc("DELETE /api/finance/lends/settlements/{id}", deleteSettlement(deps))
 	mux.HandleFunc("POST /api/finance/lends/forgive", forgiveLends(deps))
+	registerOwedRoutes(mux, deps)
 }
 
 type lendRepaymentResp struct {
@@ -161,6 +162,8 @@ func createLend(deps Deps) http.HandlerFunc {
 			LentAt          string  `json:"lent_at"`
 			DueDate         *string `json:"due_date"`
 			Remind          bool    `json:"remind"`
+			// Owed from before Sajni: the lend's row moves no money ('owed').
+			NoMoneyMoved bool `json:"no_money_moved"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid json")
@@ -199,11 +202,15 @@ func createLend(deps Deps) http.HandlerFunc {
 			return
 		}
 		lentAt := resolveTxnAt(body.LentAt, userNow(deps.DB, uid))
+		typ := "lend"
+		if body.NoMoneyMoved {
+			typ = "owed"
+		}
 		var txnID int64
 		if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions
 			(user_id, account_id, type, amount, description, note, txn_at, slate_id)
-			VALUES ($1,$2,'lend',$3,$4,$5,$6,$7) RETURNING id`,
-			uid, body.SourceAccountID, roundMoney(body.Amount), description, strings.TrimSpace(body.Note), lentAt, plainID,
+			VALUES ($1,$2,$8,$3,$4,$5,$6,$7) RETURNING id`,
+			uid, body.SourceAccountID, roundMoney(body.Amount), description, strings.TrimSpace(body.Note), lentAt, plainID, typ,
 		).Scan(&txnID); err != nil {
 			internalError(w, r, "create lend transaction", err)
 			return

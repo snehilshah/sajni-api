@@ -29,6 +29,7 @@ type lendSettlementResp struct {
 	Amount        float64 `json:"amount"`
 	Applied       float64 `json:"applied"`  // how much of its pinned lend it covers
 	Forgiven      bool    `json:"forgiven"` // a writeoff, not money received
+	Netted        bool    `json:"netted"`   // closed against what the user owes them; no money moved
 	LendID        *int64  `json:"lend_id"`  // pinned lend; nil = toward the overall total
 	Toward        *string `json:"toward"`   // the pinned lend's title
 	CategoryID    *int64  `json:"category_id"`
@@ -44,6 +45,10 @@ type lendPersonResp struct {
 	Open        int                  `json:"open"`
 	LastAt      string               `json:"last_at"`
 	Settlements []lendSettlementResp `json:"settlements"`
+	// What the user owes this person (debts minus payments back), and those
+	// rows oldest first. See owed.go.
+	YouOwe float64         `json:"you_owe"`
+	Owed   []owedEntryResp `json:"owed"`
 }
 
 // loadLendPeople groups lends per person (case-insensitive name): what they
@@ -104,7 +109,7 @@ func loadLendPeople(r *http.Request, d *db.DB, uid string) ([]lendPersonResp, er
 
 	srows, err := d.QueryContext(ctx, `
 		SELECT LOWER(BTRIM(s.borrower)), s.id, t.id, t.account_id, a.name, t.amount, t.description, t.note, t.txn_at,
-		       COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r WHERE r.transaction_id = t.id),0), t.type = 'writeoff',
+		       COALESCE((SELECT SUM(r.amount) FROM fin_lend_repayments r WHERE r.transaction_id = t.id),0), t.type = 'writeoff', t.type = 'netoff',
 		       s.lend_id, COALESCE(NULLIF(lt.description,''), pl.description), t.category_id
 		FROM fin_lend_settlements s
 		JOIN fin_transactions t ON t.id = s.transaction_id
@@ -120,7 +125,7 @@ func loadLendPeople(r *http.Request, d *db.DB, uid string) ([]lendPersonResp, er
 		var k string
 		var s lendSettlementResp
 		var at time.Time
-		if err := srows.Scan(&k, &s.ID, &s.TransactionID, &s.AccountID, &s.Account, &s.Amount, &s.Description, &s.Note, &at, &s.Applied, &s.Forgiven, &s.LendID, &s.Toward, &s.CategoryID); err != nil {
+		if err := srows.Scan(&k, &s.ID, &s.TransactionID, &s.AccountID, &s.Account, &s.Amount, &s.Description, &s.Note, &at, &s.Applied, &s.Forgiven, &s.Netted, &s.LendID, &s.Toward, &s.CategoryID); err != nil {
 			return nil, err
 		}
 		s.Amount = roundMoney(s.Amount)
@@ -135,7 +140,11 @@ func loadLendPeople(r *http.Request, d *db.DB, uid string) ([]lendPersonResp, er
 
 func listLendPeople(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		people, err := loadLendPeople(r, deps.DB, userID(r.Context()))
+		uid := userID(r.Context())
+		people, err := loadLendPeople(r, deps.DB, uid)
+		if err == nil {
+			people, err = addOwedToPeople(r.Context(), deps.DB, uid, userLocation(deps.DB, uid), people)
+		}
 		if err != nil {
 			internalError(w, r, "list lend people", err)
 			return

@@ -1381,6 +1381,7 @@ func (s *Service) buildTools() []Tool {
 		},
 	}
 	tools = append(tools, financeSetupTools(d)...)
+	tools = append(tools, owedTools(d)...)
 	tools = append(tools, planTools(d, queue)...)
 	return append(tools, standaloneReminderTools(d, queue)...)
 }
@@ -1924,10 +1925,7 @@ func listMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 func listAccountsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
 	rows, err := d.QueryContext(ctx, `
 		SELECT a.id, a.name, a.type, a.institution, a.currency,
-		       a.opening_balance + COALESCE((SELECT SUM(CASE
-		                                     WHEN t.type IN ('income','refund','transfer_in','lend_repayment') THEN t.amount
-		                                     WHEN t.type IN ('expense','transfer_out','lend') THEN -t.amount
-		                                     ELSE 0 END)
+		       a.opening_balance + COALESCE((SELECT SUM(`+db.BalanceDelta("t")+`)
 		                                     FROM fin_transactions t WHERE t.account_id=a.id AND t.user_id=a.user_id),0) AS balance
 		FROM fin_accounts a WHERE a.user_id=$1 AND a.archived=FALSE ORDER BY a.id`, uid)
 	if err != nil {

@@ -530,6 +530,17 @@ func Unsettle(ctx context.Context, tx *sql.Tx, uid string, settlementID int64) e
 	if err != nil {
 		return err
 	}
+	// A net-off goes on both sides at once (the debt's half too).
+	var typ string
+	if err := tx.QueryRowContext(ctx, `SELECT type FROM fin_transactions WHERE id = $1 AND user_id = $2`, txnID, uid).Scan(&typ); err != nil {
+		return err
+	}
+	if typ == "netoff" {
+		if err := undoNetOff(ctx, tx, uid, txnID); err != nil {
+			return err
+		}
+		return RebalanceLends(ctx, tx, uid, borrower)
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM fin_lend_repayments WHERE user_id = $1 AND transaction_id = $2`, uid, txnID); err != nil {
 		return err
 	}

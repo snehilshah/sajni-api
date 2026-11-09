@@ -191,24 +191,16 @@ func categoryNameExists(d *db.DB, uid, kind, name string, excludeID int64) bool 
 	return exists
 }
 
-// computeBalance returns the current signed balance of an account based on
-// opening_balance + income + refunds - expense + transfer_in - transfer_out
-// - lends + repayments. Writeoffs move no money, so they never count.
-// For credit cards this comes out negative when money is owed.
+// computeBalance returns the current signed balance of an account: the
+// opening balance plus every row's db.BalanceDelta (money in minus money out;
+// writeoffs, owed rows and net-offs move nothing). For credit cards this
+// comes out negative when money is owed.
 func computeBalance(deps Deps, uid string, accountID int64) float64 {
-	d := deps.DB
-	var opening float64
-	d.QueryRow("SELECT opening_balance FROM fin_accounts WHERE id = $1 AND user_id = $2", accountID, uid).Scan(&opening)
-
-	var income, expense, transferIn, transferOut, lent, repaid float64
-	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type IN ('income','refund')", uid, accountID).Scan(&income)
-	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'expense'", uid, accountID).Scan(&expense)
-	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_in'", uid, accountID).Scan(&transferIn)
-	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'transfer_out'", uid, accountID).Scan(&transferOut)
-	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'lend'", uid, accountID).Scan(&lent)
-	d.QueryRow("SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND account_id = $2 AND type = 'lend_repayment'", uid, accountID).Scan(&repaid)
-
-	return opening + income - expense + transferIn - transferOut - lent + repaid
+	var bal float64
+	deps.DB.QueryRow(`SELECT a.opening_balance + COALESCE((SELECT SUM(`+db.BalanceDelta("t")+`) FROM fin_transactions t
+		WHERE t.user_id = a.user_id AND t.account_id = a.id), 0)
+		FROM fin_accounts a WHERE a.id = $1 AND a.user_id = $2`, accountID, uid).Scan(&bal)
+	return bal
 }
 
 // --- accounts --------------------------------------------------------------
@@ -629,7 +621,17 @@ type txnResp struct {
 	// where the destination account's would.
 	InvestmentID   *int64  `json:"investment_id"`
 	InvestmentName *string `json:"investment_name"`
-	CreatedAt      string  `json:"created_at"`
+	// Owed is set on money the user owes someone (a borrow or an owed row,
+	// kind debt) or pays them back (kind payment).
+	Owed      *txnOwed `json:"owed"`
+	CreatedAt string   `json:"created_at"`
+}
+
+type txnOwed struct {
+	ID      int64   `json:"id"`
+	Person  string  `json:"person"`
+	Kind    string  `json:"kind"` // debt | payment
+	DueDate *string `json:"due_date"`
 }
 
 type txnSettlement struct {
@@ -712,7 +714,9 @@ func listTransactions(deps Deps) http.HandlerFunc {
 		uid := userID(r.Context())
 
 		args := []any{uid}
-		clauses := []string{"t.user_id = $1", "t.split_of IS NULL"}
+		// A net-off is a pair: the list shows its lend half only.
+		clauses := []string{"t.user_id = $1", "t.split_of IS NULL",
+			"NOT (t.type = 'netoff' AND EXISTS (SELECT 1 FROM fin_owed o WHERE o.transaction_id = t.id))"}
 		ph := 2
 		// account_id=1,4,7: any of these accounts.
 		if v := queryParam(r, "account_id"); v != "" {
@@ -776,8 +780,10 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			     FROM fin_transactions sp JOIN fin_lends spl ON spl.source_transaction_id = sp.id AND spl.user_id = sp.user_id
 			    WHERE sp.split_of = t.id AND sp.user_id = t.user_id), t.refund_of,
 			  ls.id, COALESCE(NULLIF(pt.description,''), pl.description),
-			  t.investment_id, inv.name
+			  t.investment_id, inv.name,
+			  ow.id, ow.person, ow.kind, ow.due_date::text
 			  FROM fin_transactions t
+			  LEFT JOIN fin_owed ow ON ow.transaction_id = t.id AND ow.user_id = t.user_id
 			  LEFT JOIN fin_investments inv ON inv.id = t.investment_id
 			  JOIN fin_accounts a ON a.id = t.account_id
 			  LEFT JOIN fin_categories c ON c.id = t.category_id
@@ -801,13 +807,17 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			var t txnResp
 			var at time.Time
 			var splitsJSON []byte
-			var settlementID sql.NullInt64
-			var toward *string
+			var settlementID, owedID sql.NullInt64
+			var toward, owedPerson, owedKind, owedDue *string
 			rows.Scan(&t.ID, &t.AccountID, &t.AccountName, &t.CategoryID, &t.CategoryName, &t.CategoryColor,
 				&t.Type, &t.Amount, &t.Description, &t.Note, &at, &t.TransferPair, &t.LinkedAccount,
 				&t.SlateID, &t.SlateName, &t.LendID, &t.LendBorrower, &t.CreatedAt,
 				&splitsJSON, &t.RefundOf, &settlementID, &toward,
-				&t.InvestmentID, &t.InvestmentName)
+				&t.InvestmentID, &t.InvestmentName,
+				&owedID, &owedPerson, &owedKind, &owedDue)
+			if owedID.Valid && owedPerson != nil && owedKind != nil {
+				t.Owed = &txnOwed{ID: owedID.Int64, Person: *owedPerson, Kind: *owedKind, DueDate: owedDue}
+			}
 			if settlementID.Valid && t.LendBorrower != nil {
 				t.Settlement = &txnSettlement{ID: settlementID.Int64, Borrower: *t.LendBorrower, LendID: t.LendID, Toward: toward}
 			}
@@ -870,6 +880,12 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			// one of their lends (settle_lend_id) or their overall total.
 			SettleWith   string `json:"settle_with"`
 			SettleLendID *int64 `json:"settle_lend_id"`
+			// income only: money the user owes this person back (not income),
+			// optionally by owe_due_date.
+			OweTo      string  `json:"owe_to"`
+			OweDueDate *string `json:"owe_due_date"`
+			// expense only: paying this person back (not spending).
+			PayBackTo string `json:"pay_back_to"`
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -928,6 +944,11 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		}
 		if b.SettleWith = strings.TrimSpace(b.SettleWith); b.SettleWith != "" && b.Type != "income" {
 			errJSON(w, http.StatusBadRequest, "Only money received can pay someone's lends back.")
+			return
+		}
+		b.OweTo, b.PayBackTo = strings.TrimSpace(b.OweTo), strings.TrimSpace(b.PayBackTo)
+		if (b.OweTo != "" && (b.Type != "income" || b.SettleWith != "")) || (b.PayBackTo != "" && (b.Type != "expense" || b.Split != nil || len(b.Splits) > 0)) {
+			errJSON(w, http.StatusBadRequest, "Money you owe back is received money; paying it back is a plain expense.")
 			return
 		}
 		if b.Type == "refund" {
@@ -1107,6 +1128,18 @@ func createTransaction(deps Deps) http.HandlerFunc {
 				return
 			}
 		}
+		if b.OweTo != "" {
+			if err := db.Borrow(ctx, tx, uid, b.OweTo, id, b.OweDueDate); err != nil {
+				lendError(w, r, "borrow", err)
+				return
+			}
+		}
+		if b.PayBackTo != "" {
+			if err := db.PayBack(ctx, tx, uid, b.PayBackTo, id); err != nil {
+				lendError(w, r, "pay back", err)
+				return
+			}
+		}
 		if err := tx.Commit(); err != nil {
 			internalError(w, r, "commit transaction", err)
 			return
@@ -1170,6 +1203,22 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 		var storedType string
 		if err := tx.QueryRowContext(ctx, `SELECT type FROM fin_transactions WHERE id=$1 AND user_id=$2`, id, uid).Scan(&storedType); err != nil {
 			internalError(w, r, "read transaction type", err)
+			return
+		}
+		// Money the user owes someone: a borrow, a payment back, or a debt
+		// that moved no money keeps its kind (undo it from People to change
+		// that); everything else about it can change. A net-off can't.
+		var owedTo string
+		tx.QueryRowContext(ctx, `SELECT person FROM fin_owed WHERE transaction_id = $1 AND user_id = $2`, id, uid).Scan(&owedTo)
+		switch {
+		case storedType == "netoff":
+			errJSON(w, http.StatusConflict, "This was netted off. Undo it from People.")
+			return
+		case storedType == "owed" && owedTo == "":
+			errJSON(w, http.StatusConflict, "This is a lending entry. Change it from People.")
+			return
+		case owedTo != "" && ((b.Type != nil && *b.Type != storedType) || b.CategoryID != nil || b.RefundOf != nil):
+			errJSON(w, http.StatusConflict, "This is money you owe "+owedTo+" (or paid back). Undo it from People to change its kind.")
 			return
 		}
 		if storedType == "lend_repayment" || storedType == "writeoff" {
@@ -1364,6 +1413,12 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 		if err := db.SyncSplit(ctx, tx, uid, id); err != nil {
 			lendError(w, r, "sync split", err)
 			return
+		}
+		if owedTo != "" {
+			if err := db.CheckOwed(ctx, tx, uid, owedTo); err != nil {
+				lendError(w, r, "check owed", err)
+				return
+			}
 		}
 		if err := tx.Commit(); err != nil {
 			internalError(w, r, "commit transaction edit", err)
@@ -2301,10 +2356,10 @@ func computeStatementTotals(d *db.DB, uid string, acctID int64, in statementCalc
 	} else {
 		var personalSpend, refund float64
 		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND account_id = $2 AND type = 'expense' AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
+			WHERE user_id = $1 AND account_id = $2 AND type IN ('expense','borrow_repayment') AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
 			uid, acctID, from, in.StatementDate).Scan(&personalSpend)
 		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions
-			WHERE user_id = $1 AND account_id = $2 AND type IN ('income','refund','lend_repayment') AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
+			WHERE user_id = $1 AND account_id = $2 AND type IN ('income','refund','lend_repayment','borrow') AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date > $3 AND (txn_at AT TIME ZONE 'Asia/Kolkata')::date <= $4`,
 			uid, acctID, from, in.StatementDate).Scan(&refund)
 		newCharges = personalSpend + lendCharges - refund
 	}
@@ -2634,6 +2689,12 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			return
 		}
 		totalAssets += moneyLentTotal
+		moneyOwedTotal, owedBreakdown, err := loadOwedPeople(r.Context(), d, uid)
+		if err != nil {
+			internalError(w, r, "load money owed", err)
+			return
+		}
+		totalLiabilities += moneyOwedTotal
 
 		// Unpaid CC due adds to liabilities (already counted via account balance)
 
@@ -2764,6 +2825,7 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			"total_liabilities":      totalLiabilities,
 			"investments_total":      invTotal,
 			"money_lent_total":       moneyLentTotal,
+			"money_owed_total":       moneyOwedTotal,
 			"month_income":           monthIncome,
 			"month_expense":          monthExpense,
 			"month_savings":          monthIncome - monthExpense,
@@ -2776,6 +2838,7 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			"investments_breakdown":  invBreak,
 			"investment_assets":      investmentAssets,
 			"lends_breakdown":        lendAssets,
+			"owed_breakdown":         owedBreakdown,
 		})
 	}
 }
@@ -2851,6 +2914,12 @@ func networthSnapshot(deps Deps) http.HandlerFunc {
 			return
 		}
 		assets += moneyLentTotal
+		moneyOwedTotal, _, err := loadOwedPeople(r.Context(), d, uid)
+		if err != nil {
+			internalError(w, r, "load money owed", err)
+			return
+		}
+		liabilities += moneyOwedTotal
 
 		netWorth := assets - liabilities
 		today := userNow(d, uid).Format("2006-01-02")
