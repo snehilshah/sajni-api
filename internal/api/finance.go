@@ -3256,6 +3256,9 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 
 		var body struct {
 			Text string `json:"text"`
+			// Auto: captured by the phone without the user (SMS, a notification),
+			// so only money that has already moved counts as a transaction.
+			Auto bool `json:"auto"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -3286,7 +3289,7 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
 		defer cancel()
 
-		parsed, tokens, err := deps.AI.ParseTransactionMessage(ctx, text, today)
+		parsed, tokens, err := deps.AI.ParseTransactionMessage(ctx, text, today, body.Auto)
 		if tokens <= 0 {
 			tokens = 80 // conservative floor for cap accounting
 		}
