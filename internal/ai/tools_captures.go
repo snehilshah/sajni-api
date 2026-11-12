@@ -23,7 +23,7 @@ func listCapturesTool(ctx context.Context, d *db.DB, uid string, args map[string
 	if limit < 1 || limit > 100 {
 		limit = 100
 	}
-	q := `SELECT id, received_at, source, sender_label, COALESCE(text, ''), amount, type, description, outcome, reason, txn_id
+	q := `SELECT id, received_at, source, sender_label, COALESCE(text, ''), amount, type, description, outcome, reason, txn_id, suggestion, suggestion_taken IS NOT NULL
 		FROM fin_captures WHERE user_id = $1 AND created_at > now() - ($2 || ' days')::interval`
 	params := []any{uid, strconv.FormatInt(days, 10)}
 	if o := strings.ToLower(strings.TrimSpace(argStr(args, "outcome"))); o != "" {
@@ -45,13 +45,14 @@ func listCapturesTool(ctx context.Context, d *db.DB, uid string, args map[string
 	out := []map[string]any{}
 	for rows.Next() {
 		var (
-			id                                               int64
-			at                                               time.Time
-			source, sender, text, typ, desc, outcome, reason string
-			amount                                           float64
-			txn                                              *int64
+			id                                                           int64
+			at                                                           time.Time
+			source, sender, text, typ, desc, outcome, reason, suggestion string
+			amount                                                       float64
+			txn                                                          *int64
+			taken                                                        bool
 		)
-		if err := rows.Scan(&id, &at, &source, &sender, &text, &amount, &typ, &desc, &outcome, &reason, &txn); err != nil {
+		if err := rows.Scan(&id, &at, &source, &sender, &text, &amount, &typ, &desc, &outcome, &reason, &txn, &suggestion, &taken); err != nil {
 			return nil, nil, err
 		}
 		row := map[string]any{"at": at.Format(time.RFC3339), "via": sender, "source": source, "outcome": outcome}
@@ -63,6 +64,9 @@ func listCapturesTool(ctx context.Context, d *db.DB, uid string, args map[string
 		}
 		if txn != nil {
 			row["txn_id"] = *txn
+		}
+		if suggestion != "" {
+			row["offered"], row["offer_taken"] = suggestion, taken
 		}
 		if text != "" {
 			if len([]rune(text)) > 300 {

@@ -1196,6 +1196,8 @@ func (d *DB) ensureSchema() error {
 		outcome      TEXT        NOT NULL DEFAULT '',
 		reason       TEXT        NOT NULL DEFAULT '',
 		txn_id       BIGINT      REFERENCES fin_transactions(id) ON DELETE SET NULL,
+		suggestion   TEXT        NOT NULL DEFAULT '',      -- one-tap offered, e.g. "settle:Papa"
+		suggestion_taken TIMESTAMPTZ,                      -- when the owner tapped it
 		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_captures_user ON fin_captures(user_id, created_at DESC);
@@ -1215,6 +1217,18 @@ func (d *DB) ensureSchema() error {
 		category_id BIGINT      NOT NULL REFERENCES fin_categories(id) ON DELETE CASCADE,
 		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		PRIMARY KEY (user_id, merchant)
+	);
+
+	-- ─── Finance: payee → a person in People ──────────────────────────
+	-- The bank's name for someone the owner lends to ("Ronak Arvind Shah" is
+	-- Papa). Learned when a captured credit is marked as paid back by them;
+	-- a later credit from that name offers "Paid back · Papa" in one tap.
+	CREATE TABLE IF NOT EXISTS fin_payee_people (
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		payee      TEXT        NOT NULL,
+		person     TEXT        NOT NULL,
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (user_id, payee)
 	);
 
 	-- ─── Finance: payee → the owner's name for it ─────────────────────

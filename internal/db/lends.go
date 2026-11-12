@@ -496,6 +496,19 @@ func SettleWith(ctx context.Context, tx *sql.Tx, uid, borrower string, txnIDs []
 			return err
 		}
 	}
+	// A captured credit: the bank's name for this person is now known, and
+	// a one-tap suggestion that offered them counts as taken.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO fin_payee_people (user_id, payee, person)
+		SELECT DISTINCT ON (LOWER(BTRIM(description))) user_id, LOWER(BTRIM(description)), $3
+		FROM fin_captures WHERE user_id = $1 AND txn_id = ANY($2) AND outcome = 'created' AND BTRIM(description) <> ''
+		ON CONFLICT (user_id, payee) DO UPDATE SET person = EXCLUDED.person, updated_at = NOW()`, uid, txnIDs, borrower); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE fin_captures SET suggestion_taken = NOW()
+		WHERE user_id = $1 AND txn_id = ANY($2) AND suggestion <> '' AND suggestion_taken IS NULL`, uid, txnIDs); err != nil {
+		return err
+	}
 	return RebalanceLends(ctx, tx, uid, borrower)
 }
 

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"sajni/internal/ai"
 	"sajni/internal/auth"
@@ -252,5 +253,83 @@ func TestPayeeNames(t *testing.T) {
 	rename(f, "Chai with Ronak", food)
 	if _, title, _ := capture("30"); title != "Office Smoke" {
 		t.Fatalf("₹30 after a one-off: %q", title)
+	}
+}
+
+// Papa owes the card bill; his NEFT credit arrives as "Ronak Arvind Shah".
+func TestSettleSuggestion(t *testing.T) {
+	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SAJNI_TEST_DATABASE_URL not set")
+	}
+	d, err := db.New(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+	uid := "01900000-0000-7000-8000-0000000000cc"
+	d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	d.Exec(`INSERT INTO users (id, email, name) VALUES ($1, 'suggest@test', 'T')`, uid)
+	d.Exec(`INSERT INTO fin_slates (user_id, name, is_plain) VALUES ($1, 'Plain', TRUE)`, uid)
+	defer d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	var kotak, bill, bill2 int64
+	d.QueryRow(`INSERT INTO fin_accounts (user_id, name, type, match_hints) VALUES ($1,'Kotak','savings','2851') RETURNING id`, uid).Scan(&kotak)
+	for _, p := range []*int64{&bill, &bill2} {
+		d.QueryRow(`INSERT INTO fin_transactions (user_id, account_id, type, amount, description, txn_at) VALUES ($1,$2,'expense',4911,'Card bill','2026-11-01T10:00:00+05:30') RETURNING id`, uid, kotak).Scan(p)
+	}
+	tx, _ := d.BeginTx(ctx, nil)
+	if _, err := db.MarkPaidFor(ctx, tx, uid, "Papa", []int64{bill, bill2}, nil, false, time.UTC, 0); err != nil {
+		t.Fatal(err)
+	}
+	tx.Commit()
+
+	captureParserSwapped = true
+	old := captureParser
+	captureParser = func(_ context.Context, _ Deps, text, _ string) (ai.ParsedTxn, int, error) {
+		return ai.ParsedTxn{Amount: 4911, Type: "income", Description: "Ronak Arvind Shah", Date: "2026-11-12", Time: "12:0" + text[len(text)-1:], AccountHint: "2851"}, 1, nil
+	}
+	defer func() { captureParser, captureParserSwapped = old, false }()
+	mux := http.NewServeMux()
+	registerFinanceRoutes(mux, Deps{DB: d, AILimiter: newAILimiter()})
+	call := func(method, path string, body any) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		json.NewEncoder(&buf).Encode(body)
+		req := httptest.NewRequest(method, path, &buf)
+		req = req.WithContext(context.WithValue(req.Context(), auth.ContextKey{}, uid))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code >= 300 {
+			t.Fatalf("%s %s: %d %s", method, path, rec.Code, rec.Body.String())
+		}
+		return rec.Body.Bytes()
+	}
+	capture := func(n string) captureResp {
+		var out captureResp
+		json.Unmarshal(call("POST", "/api/finance/captures", map[string]any{"text": "NEFT credit from RONAK ARVIND SHAH " + n, "source": "sms"}), &out)
+		return out
+	}
+
+	// Nothing ties "Ronak Arvind Shah" to Papa yet.
+	first := capture("1")
+	if first.Outcome != "created" || first.Suggest != nil {
+		t.Fatalf("first: %+v", first)
+	}
+	// The owner marks it paid back by hand; the name is learned.
+	call("POST", "/api/finance/lends/settle", map[string]any{"borrower": "Papa", "transaction_ids": []int64{first.TxnID}})
+	second := capture("2")
+	if second.Suggest == nil || second.Suggest.Person != "Papa" || second.Suggest.Owes != 4911 {
+		t.Fatalf("second: %+v", second.Suggest)
+	}
+	call("POST", "/api/finance/lends/settle", map[string]any{"borrower": "Papa", "transaction_ids": []int64{second.TxnID}})
+	var taken bool
+	d.QueryRow(`SELECT suggestion_taken IS NOT NULL FROM fin_captures WHERE txn_id = $1`, second.TxnID).Scan(&taken)
+	if !taken {
+		t.Fatal("the tap wasn't counted")
+	}
+	// Papa owes nothing now: no offer.
+	if third := capture("3"); third.Suggest != nil {
+		t.Fatalf("third: %+v", third.Suggest)
 	}
 }

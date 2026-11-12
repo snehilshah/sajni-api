@@ -71,6 +71,15 @@ type captureResp struct {
 	Parsed   map[string]any `json:"parsed,omitempty"`
 	Matured  string         `json:"matured,omitempty"`
 	Interest float64        `json:"interest,omitempty"`
+	// Suggest is a one-tap link offered with a new row: a credit from
+	// someone who owes the owner → "Paid back · Papa".
+	Suggest *captureSuggest `json:"suggest,omitempty"`
+}
+
+type captureSuggest struct {
+	Kind   string  `json:"kind"`   // settle
+	Person string  `json:"person"` // as on their lends
+	Owes   float64 `json:"owes"`   // their total before this
 }
 
 var captureSpaces = regexp.MustCompile(`\s+`)
@@ -283,9 +292,9 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 		finish := func(c captureResp) {
 			c.Parsed = fields
 			if _, err := tx.ExecContext(ctx, `INSERT INTO fin_captures
-				(user_id, source, channel, sender_label, text, text_hash, received_at, ref, amount, type, description, account_id, outcome, reason, txn_id)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULLIF($15,0))`,
-				uid, b.Source, channel, b.SenderLabel, b.Text, hash, receivedAt, ref, parsed.Amount, typ, parsed.Description, acct, c.Outcome, c.Reason, c.TxnID); err != nil {
+				(user_id, source, channel, sender_label, text, text_hash, received_at, ref, amount, type, description, account_id, outcome, reason, txn_id, suggestion)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULLIF($15,0),$16)`,
+				uid, b.Source, channel, b.SenderLabel, b.Text, hash, receivedAt, ref, parsed.Amount, typ, parsed.Description, acct, c.Outcome, c.Reason, c.TxnID, suggestionKey(c.Suggest)); err != nil {
 				internalError(w, r, "record capture", err)
 				return
 			}
@@ -400,8 +409,65 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 		if b.Force {
 			resp.Reason = "Added anyway."
 		}
+		if typ == "income" {
+			resp.Suggest = suggestSettle(ctx, tx, uid, parsed.Description)
+		}
 		finish(resp)
 	}
+}
+
+func suggestionKey(s *captureSuggest) string {
+	if s == nil {
+		return ""
+	}
+	return s.Kind + ":" + s.Person
+}
+
+// suggestSettle offers "Paid back · <person>" for a credit from someone who
+// owes the owner: the bank's name as learned from an earlier settle
+// (fin_payee_people), else a person whose name is the payee's name or its
+// first word ("Alefiya" for "Alefiya Abbas Rampur"), when exactly one fits.
+// An experiment: fin_captures records each offer and whether it was taken.
+func suggestSettle(ctx context.Context, tx *sql.Tx, uid, payee string) *captureSuggest {
+	p := strings.ToLower(strings.TrimSpace(payee))
+	if p == "" {
+		return nil
+	}
+	var alias string
+	tx.QueryRowContext(ctx, `SELECT LOWER(BTRIM(person)) FROM fin_payee_people
+		WHERE user_id = $1 AND (payee = $2 OR (length($2) >= $3 AND (starts_with(payee, $2)
+		      OR (length(payee) >= $3 AND starts_with($2, payee)))))
+		ORDER BY (payee = $2) DESC, length(payee) DESC LIMIT 1`, uid, p, merchantPrefixMin).Scan(&alias)
+	rows, err := tx.QueryContext(ctx, `
+		WITH owed AS (
+			SELECT LOWER(BTRIM(borrower)) AS k, MAX(borrower) AS person, SUM(principal) AS owed
+			FROM fin_lends WHERE user_id = $1 GROUP BY 1
+		), paid AS (
+			SELECT LOWER(BTRIM(s.borrower)) AS k, SUM(t.amount) AS paid
+			FROM fin_lend_settlements s JOIN fin_transactions t ON t.id = s.transaction_id
+			WHERE s.user_id = $1 GROUP BY 1
+		)
+		SELECT o.person, o.owed - COALESCE(p.paid, 0)
+		FROM owed o LEFT JOIN paid p ON p.k = o.k
+		WHERE o.owed - COALESCE(p.paid, 0) > 0.005
+		  AND (CASE WHEN $2 <> '' THEN o.k = $2 ELSE o.k = $3 OR o.k = split_part($3, ' ', 1) END)
+		LIMIT 2`, uid, alias, p)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []captureSuggest
+	for rows.Next() {
+		var s captureSuggest
+		if rows.Scan(&s.Person, &s.Owes) == nil {
+			s.Kind = "settle"
+			out = append(out, s)
+		}
+	}
+	if len(out) != 1 {
+		return nil
+	}
+	return &out[0]
 }
 
 // copyFromOtherChannel finds the row this message is another channel's copy
@@ -488,10 +554,12 @@ type captureRow struct {
 	Outcome     string  `json:"outcome"`
 	Reason      string  `json:"reason"`
 	TxnID       *int64  `json:"txn_id"`
+	Suggestion  string  `json:"suggestion,omitempty"`
+	Taken       bool    `json:"suggestion_taken,omitempty"`
 }
 
 func recentCaptures(ctx context.Context, d *db.DB, uid string, limit int) ([]captureRow, error) {
-	rows, err := d.QueryContext(ctx, `SELECT id, created_at, source, sender_label, text, amount, type, description, outcome, reason, txn_id
+	rows, err := d.QueryContext(ctx, `SELECT id, created_at, source, sender_label, text, amount, type, description, outcome, reason, txn_id, suggestion, suggestion_taken IS NOT NULL
 		FROM fin_captures WHERE user_id = $1 ORDER BY id DESC LIMIT $2`, uid, limit)
 	if err != nil {
 		return nil, err
@@ -501,7 +569,7 @@ func recentCaptures(ctx context.Context, d *db.DB, uid string, limit int) ([]cap
 	for rows.Next() {
 		var c captureRow
 		var at time.Time
-		if err := rows.Scan(&c.ID, &at, &c.Source, &c.SenderLabel, &c.Text, &c.Amount, &c.Type, &c.Description, &c.Outcome, &c.Reason, &c.TxnID); err != nil {
+		if err := rows.Scan(&c.ID, &at, &c.Source, &c.SenderLabel, &c.Text, &c.Amount, &c.Type, &c.Description, &c.Outcome, &c.Reason, &c.TxnID, &c.Suggestion, &c.Taken); err != nil {
 			return nil, err
 		}
 		c.At = at.Format(time.RFC3339)
