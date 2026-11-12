@@ -1171,6 +1171,38 @@ func (d *DB) ensureSchema() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_task_attachments_task ON task_attachments(task_id, id);
 
+	-- Every message the phone captured (bank SMS, an app's notification) and
+	-- what Sajni did with it. It is the memory behind "one real payment, one
+	-- row": the reference and which channel reported which transaction, kept
+	-- past any time window. text is the raw message, cleared after 30 days
+	-- (the parsed fields stay); rows go after a year.
+	-- outcome: created | absorbed (another copy of txn_id) | confirmed (an
+	-- instalment Sajni posted) | asked | review (no account) | ignored (not
+	-- money moving) | failed.
+	CREATE TABLE IF NOT EXISTS fin_captures (
+		id           BIGSERIAL   PRIMARY KEY,
+		user_id      UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		source       TEXT        NOT NULL DEFAULT 'sms',   -- sms | notification
+		channel      TEXT        NOT NULL DEFAULT '',      -- 'sms', an app's package, or a mail app's package/from/subject
+		sender_label TEXT        NOT NULL DEFAULT '',      -- shown: "bank SMS", "GPay", "Gmail"
+		text         TEXT,
+		text_hash    TEXT        NOT NULL DEFAULT '',
+		received_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		ref          TEXT        NOT NULL DEFAULT '',
+		amount       NUMERIC(14,2) NOT NULL DEFAULT 0,
+		type         TEXT        NOT NULL DEFAULT '',
+		description  TEXT        NOT NULL DEFAULT '',
+		account_id   BIGINT      REFERENCES fin_accounts(id) ON DELETE SET NULL,
+		outcome      TEXT        NOT NULL DEFAULT '',
+		reason       TEXT        NOT NULL DEFAULT '',
+		txn_id       BIGINT      REFERENCES fin_transactions(id) ON DELETE SET NULL,
+		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_fin_captures_user ON fin_captures(user_id, created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_fin_captures_ref ON fin_captures(user_id, ref) WHERE ref <> '';
+	CREATE INDEX IF NOT EXISTS idx_fin_captures_hash ON fin_captures(user_id, text_hash);
+	CREATE INDEX IF NOT EXISTS idx_fin_captures_txn ON fin_captures(txn_id) WHERE txn_id IS NOT NULL;
+
 	-- ─── Finance: learned merchant → category ─────────────────────────
 	-- Remember the category the user files a given merchant under, so the
 	-- next shared SMS for that merchant pre-fills the category without an AI

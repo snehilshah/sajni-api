@@ -115,6 +115,8 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /api/finance/categorize", categorizeTransaction(deps))
 	// AI parse of a shared bank/UPI message into transaction fields (PWA share target).
 	mux.HandleFunc("POST /api/finance/parse-message", parseTransactionMessage(deps))
+	mux.HandleFunc("POST /api/finance/captures", captureTransaction(deps))
+	mux.HandleFunc("GET /api/finance/captures", listCaptures(deps))
 	// AI parse of a shared transaction screenshot / receipt image.
 	mux.HandleFunc("POST /api/finance/parse-image", parseTransactionImage(deps))
 }
@@ -627,6 +629,8 @@ type txnResp struct {
 	// kind debt) or pays them back (kind payment).
 	Owed      *txnOwed `json:"owed"`
 	CreatedAt string   `json:"created_at"`
+	// SeenVia names where auto-capture heard of it ("bank SMS · GPay").
+	SeenVia string `json:"seen_via"`
 }
 
 type txnOwed struct {
@@ -783,7 +787,8 @@ func listTransactions(deps Deps) http.HandlerFunc {
 			    WHERE sp.split_of = t.id AND sp.user_id = t.user_id), t.refund_of,
 			  ls.id, COALESCE(NULLIF(pt.description,''), pl.description),
 			  t.investment_id, inv.name,
-			  ow.id, ow.person, ow.kind, ow.due_date::text
+			  ow.id, ow.person, ow.kind, ow.due_date::text,
+			  COALESCE((SELECT string_agg(DISTINCT cp.sender_label, ' · ') FROM fin_captures cp WHERE cp.txn_id = t.id AND cp.sender_label <> ''), '')
 			  FROM fin_transactions t
 			  LEFT JOIN fin_owed ow ON ow.transaction_id = t.id AND ow.user_id = t.user_id
 			  LEFT JOIN fin_investments inv ON inv.id = t.investment_id
@@ -816,7 +821,7 @@ func listTransactions(deps Deps) http.HandlerFunc {
 				&t.SlateID, &t.SlateName, &t.LendID, &t.LendBorrower, &t.CreatedAt,
 				&splitsJSON, &t.RefundOf, &settlementID, &toward,
 				&t.InvestmentID, &t.InvestmentName,
-				&owedID, &owedPerson, &owedKind, &owedDue)
+				&owedID, &owedPerson, &owedKind, &owedDue, &t.SeenVia)
 			if owedID.Valid && owedPerson != nil && owedKind != nil {
 				t.Owed = &txnOwed{ID: owedID.Int64, Person: *owedPerson, Kind: *owedKind, DueDate: owedDue}
 			}
@@ -3525,7 +3530,7 @@ func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed
 		}
 		if id, name := lookupMerchantCategory(deps.DB, uid, parsed.Description, kind); id != nil {
 			catID, catName = id, name
-		} else {
+		} else if deps.AI != nil {
 			type cat struct {
 				id   int64
 				name string

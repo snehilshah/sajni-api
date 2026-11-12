@@ -416,6 +416,19 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "list_captures",
+			Description: "What the phone's automatic money capture heard lately (bank SMS, payment-app and bank-mail notifications) and what Sajni did with each: created (logged as a transaction, txn_id), absorbed (another copy of a payment already logged, e.g. the bank's email after its SMS; reason names it), confirmed (an RD/SIP instalment Sajni had already posted), asked (same reference, different amount; the user was asked), review (no account matched; the user was asked to file it), ignored (not money that moved, e.g. cashback promos), failed (could not be read). For 'why wasn't X captured', 'why is this a duplicate', 'what did my bank send'. Message text is kept 30 days. Read-only.",
+			Schema: obj(map[string]*genai.Schema{
+				"outcome": str("Only this outcome (created, absorbed, confirmed, asked, review, ignored, failed)."),
+				"search":  str("Words to find in the message, sender or title, e.g. a merchant or an amount like 2724."),
+				"days":    intg("How far back, default 7, at most 365."),
+				"limit":   intg("Default 30, at most 100."),
+			}),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return listCapturesTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "list_lends",
 			Description: "List money the user has lent, including borrower, source account, principal, repaid (payments pinned to this lend), outstanding (what is left of it, never more than the person's overall total), optional due date, and status. A lend is a receivable asset, not an expense.",
 			Schema:      obj(map[string]*genai.Schema{}),

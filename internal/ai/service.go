@@ -740,7 +740,8 @@ Rules:
 	if auto {
 		sys += `
 - This text was captured automatically from an SMS or a phone notification (often an email's subject and first lines). Log only money that has ALREADY moved into or out of one of the user's accounts, cards or wallets. Set amount to 0 for anything else: failed or declined attempts; money requests and collect requests; future or scheduled debits and credits ("will be debited", "will be credited by", standing instructions, mandates, autopay notices); bill, statement or due-date reminders; balance-only updates; offers, cashback promises and promotions; OTPs; "payable to you" notices from a broker.
-- If the amount isn't stated in the text, set amount to 0. Never guess an amount.`
+- If the amount isn't stated in the text, set amount to 0. Never guess an amount.
+- A merchant's receipt that splits the total across ways of paying (e.g. "Uber Cash ₹5.54 + Amazon Pay ₹82.13"): amount is only the part that left the user's account, card or wallet (82.13), and account_hint names it ("Amazon Pay"). Store credit, coins and the merchant's own cash are not money that moved.`
 	}
 
 	msg = cleanTxnMessage(msg)
