@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog/log"
+
 	"sajni/internal/ai"
 	"sajni/internal/db"
 	"sajni/internal/finstats"
@@ -1073,6 +1075,8 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		// The per-user lock (held until commit) makes check + insert atomic: one SMS reaching
 		// the phone twice at once used to slip both copies past a plain SELECT.
 		force := r.URL.Query().Get("force") == "true" || r.Header.Get("X-Force") == "true"
+		// Filed by the phone's auto-capture, without the owner looking.
+		direct := r.Header.Get("X-Sajni-Direct") == "1"
 		if !force && b.Type != "transfer" {
 			if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('fin_txn_create:' || $1::text, 0))`, uid); err != nil {
 				internalError(w, r, "lock transaction create", err)
@@ -1095,6 +1099,23 @@ func createTransaction(deps Deps) http.HandlerFunc {
 				}
 				writeJSON(w, 200, map[string]any{"id": dupID, "duplicate": true})
 				return
+			}
+			// The bank confirming an instalment Sajni already posted (an RD
+			// or SIP auto-debit): the SMS or email is a receipt for that
+			// transfer, not a second payment.
+			if direct && b.Type == "expense" {
+				var invTxn int64
+				var invName string
+				err := tx.QueryRowContext(ctx, `
+					SELECT t.id, i.name FROM fin_transactions t JOIN fin_investments i ON i.id = t.investment_id
+					WHERE t.user_id = $1 AND t.account_id = $2 AND t.type = 'transfer_out'
+					  AND ABS(t.amount - $3) < 0.001
+					  AND ABS(EXTRACT(EPOCH FROM (t.txn_at - $4))) < 36*3600
+					ORDER BY ABS(EXTRACT(EPOCH FROM (t.txn_at - $4))) LIMIT 1`, uid, b.AccountID, b.Amount, txnAt).Scan(&invTxn, &invName)
+				if err == nil && invTxn > 0 {
+					writeJSON(w, 200, map[string]any{"id": invTxn, "duplicate": true, "expected": invName})
+					return
+				}
 			}
 		}
 
@@ -1146,9 +1167,12 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		}
 		// Index #hashtags from the note into the shared tag system.
 		syncTags(d, uid, "transaction", id, b.Note)
-		// Learn merchant → category so the next shared SMS for the same
-		// merchant pre-fills without an AI call.
-		learnMerchantCategory(d, uid, b.Description, b.CategoryID)
+		// Learn merchant → category so the next message from the same
+		// merchant files itself, but only from the owner's own choices: a
+		// row the phone filed on its own carries the AI's guess.
+		if !direct {
+			learnMerchantCategory(d, uid, b.Description, b.CategoryID)
+		}
 		writeJSON(w, 201, map[string]int64{"id": id})
 	}
 }
@@ -1200,8 +1224,8 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 			}
 			return
 		}
-		var storedType string
-		if err := tx.QueryRowContext(ctx, `SELECT type FROM fin_transactions WHERE id=$1 AND user_id=$2`, id, uid).Scan(&storedType); err != nil {
+		var storedType, oldDesc string
+		if err := tx.QueryRowContext(ctx, `SELECT type, description FROM fin_transactions WHERE id=$1 AND user_id=$2`, id, uid).Scan(&storedType, &oldDesc); err != nil {
 			internalError(w, r, "read transaction type", err)
 			return
 		}
@@ -1426,6 +1450,22 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 		}
 		if b.Note != nil {
 			syncTags(d, uid, "transaction", id, *b.Note)
+		}
+		// The owner sorting a row is the strongest signal there is: the
+		// next message from this merchant files itself the same way.
+		if b.CategoryID != nil || b.Description != nil {
+			var desc string
+			var cat sql.NullInt64
+			var typ string
+			if d.QueryRowContext(ctx, `SELECT description, category_id, type FROM fin_transactions WHERE id = $1 AND user_id = $2`, id, uid).Scan(&desc, &cat, &typ) == nil &&
+				cat.Valid && (typ == "expense" || typ == "income") {
+				learnMerchantCategory(d, uid, desc, &cat.Int64)
+				// Renamed from the bank's name ("Bhola Khan" → "Sewri"): the
+				// bank keeps sending the old name, so it learns too.
+				if !strings.EqualFold(strings.TrimSpace(oldDesc), strings.TrimSpace(desc)) {
+					learnMerchantCategory(d, uid, oldDesc, &cat.Int64)
+				}
+			}
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
@@ -3174,13 +3214,10 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 	}
 }
 
-// parseTransactionMessage reads a shared bank / UPI message (SMS or
-// notification text) and returns structured transaction fields for the
-// share-target confirm sheet to pre-fill. Best-effort and behind the shared
-// AI limiter — a parse failure still returns 200 with empty fields so the
-// sheet opens for manual entry.
-// learnMerchantCategory remembers (or refreshes) the category a merchant is
-// filed under. No-op when merchant or category is empty. merchant is keyed
+// learnMerchantCategory remembers (or refreshes) the category the owner
+// filed a merchant under. Only the owner's own choices teach: callers skip
+// rows the phone filed by itself, and "Others" is never learned (it would
+// stop the AI from ever looking at that merchant again). merchant is keyed
 // lowercase so casing doesn't fork the rule.
 func learnMerchantCategory(d *db.DB, uid, merchant string, categoryID *int64) {
 	m := strings.ToLower(strings.TrimSpace(merchant))
@@ -3188,15 +3225,23 @@ func learnMerchantCategory(d *db.DB, uid, merchant string, categoryID *int64) {
 		return
 	}
 	d.Exec(`INSERT INTO fin_merchant_categories (user_id, merchant, category_id)
-	        VALUES ($1, $2, $3)
+	        SELECT $1, $2, c.id FROM fin_categories c
+	        WHERE c.id = $3 AND c.user_id = $1 AND LOWER(BTRIM(c.name)) <> 'others'
 	        ON CONFLICT (user_id, merchant)
 	        DO UPDATE SET category_id = EXCLUDED.category_id, updated_at = NOW()`,
 		uid, m, *categoryID)
 }
 
+// merchantPrefixMin is the shortest name matched by prefix: banks cut payee
+// names (Kotak SMS keeps 20 characters), so "salman mohammad isma" must find
+// the rule "salman mohammad ismail shaikh". Shorter names only match exactly.
+const merchantPrefixMin = 12
+
 // lookupMerchantCategory returns the learned (category_id, name) for a
-// merchant, or (nil,"") when no rule exists (or its category was deleted).
-func lookupMerchantCategory(d *db.DB, uid, merchant string) (*int64, string) {
+// merchant among categories of kind ("expense" or "income"), or (nil,"")
+// when no rule fits. An exact name wins; otherwise a long name matches a
+// rule it is the start of, or that is the start of it (longest rule first).
+func lookupMerchantCategory(d *db.DB, uid, merchant, kind string) (*int64, string) {
 	m := strings.ToLower(strings.TrimSpace(merchant))
 	if m == "" {
 		return nil, ""
@@ -3206,7 +3251,12 @@ func lookupMerchantCategory(d *db.DB, uid, merchant string) (*int64, string) {
 	err := d.QueryRow(`SELECT mc.category_id, c.name
 	                   FROM fin_merchant_categories mc
 	                   JOIN fin_categories c ON c.id = mc.category_id AND c.user_id = mc.user_id
-	                   WHERE mc.user_id = $1 AND mc.merchant = $2`, uid, m).Scan(&id, &name)
+	                   WHERE mc.user_id = $1 AND c.kind = $3 AND LOWER(BTRIM(c.name)) <> 'others'
+	                     AND (mc.merchant = $2
+	                       OR (length($2) >= $4 AND (starts_with(mc.merchant, $2)
+	                           OR (length(mc.merchant) >= $4 AND starts_with($2, mc.merchant)))))
+	                   ORDER BY (mc.merchant = $2) DESC, length(mc.merchant) DESC
+	                   LIMIT 1`, uid, m, kind, merchantPrefixMin).Scan(&id, &name)
 	if err != nil {
 		return nil, ""
 	}
@@ -3229,7 +3279,7 @@ func matchAccountByHint(d *db.DB, uid, hint string) *int64 {
 	}
 	runs := hintDigitRuns(h)
 
-	rows, err := d.Query(`SELECT id, COALESCE(match_hints,'') FROM fin_accounts WHERE user_id=$1 AND archived=false`, uid)
+	rows, err := d.Query(`SELECT id, COALESCE(match_hints,'') FROM fin_accounts WHERE user_id=$1 AND archived=false ORDER BY id`, uid)
 	if err != nil {
 		return nil
 	}
@@ -3315,6 +3365,12 @@ func hintDigitRuns(s string) []string {
 	return runs
 }
 
+// parseTransactionMessage reads a shared bank / UPI message (SMS or
+// notification text) and returns structured transaction fields. Behind the
+// shared AI limiter. For a message the user shared, a parse failure still
+// returns 200 with empty fields so the sheet opens for manual entry; for an
+// automatic capture it is a 503, so the phone retries and, failing that,
+// tells the user it couldn't read the message instead of dropping it.
 func parseTransactionMessage(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if deps.AI == nil {
@@ -3355,14 +3411,20 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 		loc := userLocation(deps.DB, uid)
 		now := userNow(deps.DB, uid)
 		today := now.Format("2006-01-02")
-		ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
-		defer cancel()
-
-		parsed, tokens, err := deps.AI.ParseTransactionMessage(ctx, text, today, body.Auto)
+		pctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		parsed, tokens, err := deps.AI.ParseTransactionMessage(pctx, text, today, body.Auto)
+		cancel()
 		if tokens <= 0 {
 			tokens = 80 // conservative floor for cap accounting
 		}
 		deps.AILimiter.record(uid, tokens)
+		if err != nil && body.Auto {
+			// Not "this isn't a transaction": the phone retries and then
+			// tells the user, instead of dropping a real payment unseen.
+			log.Warn().Err(err).Msg("parse-message failed (auto)")
+			errJSON(w, http.StatusServiceUnavailable, "Couldn't read the message right now.")
+			return
+		}
 		if err != nil {
 			// Best-effort: empty fields → sheet opens for manual entry.
 			writeJSON(w, 200, map[string]any{
@@ -3372,22 +3434,27 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		out := resolveParsedTransaction(ctx, deps, uid, parsed, loc, now)
+		cctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
+		defer cancel()
+		out := resolveParsedTransaction(cctx, deps, uid, parsed, loc, now, body.Auto)
 		writeJSON(w, 200, out)
 	}
 }
 
-func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed ai.ParsedTxn, loc *time.Location, now time.Time) map[string]any {
+// resolveParsedTransaction adds the account and category to a parse. For an
+// automatic capture an AI guess of "Others" is left blank, so the row shows
+// up as uncategorised for the owner to sort rather than looking filed.
+func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed ai.ParsedTxn, loc *time.Location, now time.Time, auto bool) map[string]any {
 	var catID *int64
 	var catName string
 	if parsed.Amount > 0 && strings.TrimSpace(parsed.Description) != "" {
-		if id, name := lookupMerchantCategory(deps.DB, uid, parsed.Description); id != nil {
+		kind := parsed.Type
+		if kind != "income" {
+			kind = "expense"
+		}
+		if id, name := lookupMerchantCategory(deps.DB, uid, parsed.Description, kind); id != nil {
 			catID, catName = id, name
 		} else {
-			kind := parsed.Type
-			if kind != "income" {
-				kind = "expense"
-			}
 			type cat struct {
 				id   int64
 				name string
@@ -3409,7 +3476,7 @@ func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed
 				ctoks = 30
 			}
 			deps.AILimiter.record(uid, ctoks)
-			if cerr == nil {
+			if cerr == nil && !(auto && strings.EqualFold(strings.TrimSpace(picked), "others")) {
 				for _, c := range cats {
 					if strings.EqualFold(c.name, picked) {
 						id := c.id
@@ -3546,7 +3613,7 @@ func parseTransactionImage(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		out := resolveParsedTransaction(ctx, deps, uid, parsed, loc, now)
+		out := resolveParsedTransaction(ctx, deps, uid, parsed, loc, now, false)
 		writeJSON(w, 200, out)
 	}
 }
