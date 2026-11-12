@@ -377,6 +377,14 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		desc := strings.TrimSpace(parsed.Description)
+		// The owner's own name for this payee ("Bhola Khan" → "Sewri";
+		// Salman by amount: Office Smoke or Salman's shop).
+		if title, cat, ok := lookupPayeeName(ctx, tx, uid, desc, typ, parsed.Amount); ok {
+			desc = title
+			if cat != nil {
+				catID = cat
+			}
+		}
 		if desc == "" {
 			desc = fallbackTitle(ctx, d, uid, catID, typ)
 		}

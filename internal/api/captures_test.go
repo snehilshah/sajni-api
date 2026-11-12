@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 
 	"sajni/internal/ai"
@@ -160,5 +162,95 @@ func TestCaptureMemory(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("Alefiya's credit missing from the list")
+	}
+}
+
+// Salman: the owner calls his ₹22 smokes "Office Smoke" and his ₹60 Coke
+// "Salman's shop". Kotak cuts his name to 20 characters.
+func TestPayeeNames(t *testing.T) {
+	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SAJNI_TEST_DATABASE_URL not set")
+	}
+	d, err := db.New(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	uid := "01900000-0000-7000-8000-0000000000cb"
+	d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	d.Exec(`INSERT INTO users (id, email, name) VALUES ($1, 'payees@test', 'T')`, uid)
+	d.Exec(`INSERT INTO fin_slates (user_id, name, is_plain) VALUES ($1, 'Plain', TRUE)`, uid)
+	defer d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	var smoke, food int64
+	d.Exec(`INSERT INTO fin_accounts (user_id, name, type, match_hints) VALUES ($1,'Kotak','savings','2851')`, uid)
+	d.QueryRow(`INSERT INTO fin_categories (user_id, name, kind) VALUES ($1,'Smoke','expense') RETURNING id`, uid).Scan(&smoke)
+	d.QueryRow(`INSERT INTO fin_categories (user_id, name, kind) VALUES ($1,'Food & Dining','expense') RETURNING id`, uid).Scan(&food)
+
+	captureParserSwapped = true
+	old := captureParser
+	captureParser = func(_ context.Context, _ Deps, text, _ string) (ai.ParsedTxn, int, error) {
+		var amt float64
+		json.Unmarshal([]byte(text[:strings.Index(text, " ")]), &amt)
+		return ai.ParsedTxn{Amount: amt, Type: "expense", Description: "Salman Mohammad Isma", Date: "2026-11-13", Time: "13:" + text[len(text)-2:], AccountHint: "2851"}, 1, nil
+	}
+	defer func() { captureParser, captureParserSwapped = old, false }()
+	mux := http.NewServeMux()
+	registerFinanceRoutes(mux, Deps{DB: d, AILimiter: newAILimiter()})
+	call := func(method, path string, body any) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		json.NewEncoder(&buf).Encode(body)
+		req := httptest.NewRequest(method, path, &buf)
+		req = req.WithContext(context.WithValue(req.Context(), auth.ContextKey{}, uid))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code >= 300 {
+			t.Fatalf("%s %s: %d %s", method, path, rec.Code, rec.Body.String())
+		}
+		return rec.Body.Bytes()
+	}
+	n := 0
+	capture := func(amount string) (int64, string, *int64) {
+		t.Helper()
+		n++
+		var out captureResp
+		json.Unmarshal(call("POST", "/api/finance/captures", map[string]any{"text": amount + " to Salman ref-less " + strconv.Itoa(10+n), "source": "sms"}), &out)
+		var title string
+		var cat *int64
+		d.QueryRow(`SELECT description, category_id FROM fin_transactions WHERE id = $1`, out.TxnID).Scan(&title, &cat)
+		return out.TxnID, title, cat
+	}
+	rename := func(id int64, title string, cat int64) {
+		call("PUT", "/api/finance/transactions/"+strconv.FormatInt(id, 10), map[string]any{"description": title, "category_id": cat})
+	}
+
+	a, title, _ := capture("22")
+	if title != "Salman Mohammad Isma" {
+		t.Fatalf("before any rule: %q", title)
+	}
+	rename(a, "Office Smoke", smoke)
+	rename(a, "Office Smoke", smoke) // the same payment again doesn't count twice
+	if _, title, _ = capture("25"); title != "Salman Mohammad Isma" {
+		t.Fatalf("one rename is not yet a rule: %q", title)
+	}
+	b, _, _ := capture("22")
+	rename(b, "Office Smoke", smoke)
+	c, _, _ := capture("60")
+	rename(c, "Salman's shop", food)
+	e, _, _ := capture("65")
+	rename(e, "Salman's shop", food)
+
+	if _, title, cat := capture("22"); title != "Office Smoke" || cat == nil || *cat != smoke {
+		t.Fatalf("₹22: %q %v", title, cat)
+	}
+	if _, title, cat := capture("58"); title != "Salman's shop" || cat == nil || *cat != food {
+		t.Fatalf("₹58: %q %v", title, cat)
+	}
+	// A one-off title never renames the payee.
+	f, _, _ := capture("30")
+	rename(f, "Chai with Ronak", food)
+	if _, title, _ := capture("30"); title != "Office Smoke" {
+		t.Fatalf("₹30 after a one-off: %q", title)
 	}
 }

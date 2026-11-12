@@ -1217,6 +1217,29 @@ func (d *DB) ensureSchema() error {
 		PRIMARY KEY (user_id, merchant)
 	);
 
+	-- ─── Finance: payee → the owner's name for it ─────────────────────
+	-- The owner names payees by place: Kotak says "Bhola Khan", the owner
+	-- says "Sewri". Learned when the owner renames a captured row (payee =
+	-- the name the capture read, lowercased). One payee can be several
+	-- things by amount: Salman is "Office Smoke" at ₹22 and "Salman's shop"
+	-- at ₹60, so each title keeps the amount it was last used at and a new
+	-- capture takes the title whose amount is nearest. category_id comes
+	-- along (NULL keeps the usual category guess). A title applies once the
+	-- owner has given it on two different payments (uses ≥ 2), so a one-off
+	-- title ("Dinner with Rahul") never renames the restaurant's next bill.
+	CREATE TABLE IF NOT EXISTS fin_payee_names (
+		user_id     UUID          NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		payee       TEXT          NOT NULL,
+		kind        TEXT          NOT NULL,  -- expense | income
+		title       TEXT          NOT NULL,
+		amount      NUMERIC(14,2) NOT NULL,
+		category_id BIGINT        REFERENCES fin_categories(id) ON DELETE SET NULL,
+		uses        INT           NOT NULL DEFAULT 1,  -- different payments it was given on
+		last_txn_id BIGINT,
+		updated_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (user_id, payee, kind, title)
+	);
+
 	-- ─── Push devices (FCM) ───────────────────────────────────────────
 	-- One row per registered native device token. Notifications go to BOTH
 	-- channels: every live token gets push, email goes out regardless.

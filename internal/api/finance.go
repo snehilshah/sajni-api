@@ -1534,6 +1534,9 @@ func updateTransaction(deps Deps) http.HandlerFunc {
 					learnMerchantCategory(d, uid, oldDesc, &cat.Int64)
 				}
 			}
+			if typ == "expense" || typ == "income" {
+				learnPayeeName(ctx, d, uid, id, typ)
+			}
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
@@ -3306,6 +3309,58 @@ func learnMerchantCategory(d *db.DB, uid, merchant string, categoryID *int64) {
 	        ON CONFLICT (user_id, merchant)
 	        DO UPDATE SET category_id = EXCLUDED.category_id, updated_at = NOW()`,
 		uid, m, *categoryID)
+}
+
+// learnPayeeName remembers the owner's name for a captured row's payee
+// (fin_payee_names): the name the capture read, when the row now carries
+// another title. Typed rows have no bank name and teach nothing.
+func learnPayeeName(ctx context.Context, d *db.DB, uid string, txnID int64, kind string) {
+	if _, err := d.ExecContext(ctx, `
+		INSERT INTO fin_payee_names (user_id, payee, kind, title, amount, category_id, last_txn_id)
+		SELECT t.user_id, LOWER(BTRIM(c.description)), $3, BTRIM(t.description), t.amount, t.category_id, t.id
+		FROM fin_transactions t
+		JOIN LATERAL (SELECT description FROM fin_captures
+		              WHERE txn_id = t.id AND user_id = t.user_id AND outcome = 'created' AND description <> ''
+		              ORDER BY id LIMIT 1) c ON TRUE
+		WHERE t.id = $1 AND t.user_id = $2 AND BTRIM(t.description) <> ''
+		  AND LOWER(BTRIM(t.description)) <> LOWER(BTRIM(c.description))
+		ON CONFLICT (user_id, payee, kind, title)
+		DO UPDATE SET amount = EXCLUDED.amount, category_id = EXCLUDED.category_id, updated_at = NOW(),
+			uses = fin_payee_names.uses + CASE WHEN fin_payee_names.last_txn_id = EXCLUDED.last_txn_id THEN 0 ELSE 1 END,
+			last_txn_id = EXCLUDED.last_txn_id`,
+		txnID, uid, kind); err != nil {
+		log.Warn().Err(err).Msg("learn payee name")
+	}
+}
+
+// lookupPayeeName returns the owner's title (and its category, if any) for
+// a payee as a capture read it: an exact name or a prefix of at least
+// merchantPrefixMin, then the title last used at the nearest amount. Only
+// titles given on two or more payments count.
+func lookupPayeeName(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, uid, payee, kind string, amount float64) (string, *int64, bool) {
+	p := strings.ToLower(strings.TrimSpace(payee))
+	if p == "" || amount <= 0 {
+		return "", nil, false
+	}
+	var title string
+	var cat sql.NullInt64
+	err := q.QueryRowContext(ctx, `
+		SELECT n.title, c.id FROM fin_payee_names n
+		LEFT JOIN fin_categories c ON c.id = n.category_id AND c.user_id = n.user_id AND c.kind = n.kind
+		WHERE n.user_id = $1 AND n.kind = $3 AND n.uses >= 2
+		  AND (n.payee = $2 OR (length($2) >= $5 AND (starts_with(n.payee, $2)
+		      OR (length(n.payee) >= $5 AND starts_with($2, n.payee)))))
+		ORDER BY (n.payee = $2) DESC, ABS(LN($4 / GREATEST(n.amount, 0.01))), n.updated_at DESC
+		LIMIT 1`, uid, p, kind, amount, merchantPrefixMin).Scan(&title, &cat)
+	if err != nil {
+		return "", nil, false
+	}
+	if cat.Valid {
+		return title, &cat.Int64, true
+	}
+	return title, nil, true
 }
 
 // merchantPrefixMin is the shortest name matched by prefix: banks cut payee
