@@ -111,4 +111,3 @@ func TestCaptureRules(t *testing.T) {
 		t.Fatal("a manual ₹10,000 expense was taken for the RD")
 	}
 }
-
