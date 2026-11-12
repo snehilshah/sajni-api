@@ -96,7 +96,8 @@ func anchoredMonthDate(year int, month time.Month, day int) time.Time {
 // transfer into it, auto-debit).
 func listInvestmentsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
 	rows, err := d.QueryContext(ctx, `SELECT i.id, i.name, i.type, i.invested_amount, i.monthly_amount, i.frequency,
-		i.account_id, COALESCE(a.name, ''), i.auto_debit, COALESCE(i.next_debit_date::text, ''), COALESCE(i.maturity_date::text, '')
+		i.account_id, COALESCE(a.name, ''), i.auto_debit, COALESCE(i.next_debit_date::text, ''), COALESCE(i.maturity_date::text, ''),
+		COALESCE((SELECT SUM(t.amount) FROM fin_transactions t WHERE t.investment_id = i.id AND t.type IN ('transfer_in','income')), 0)
 		FROM fin_investments i LEFT JOIN fin_accounts a ON a.id = i.account_id
 		WHERE i.user_id = $1 ORDER BY i.name`, uid)
 	if err != nil {
@@ -107,10 +108,10 @@ func listInvestmentsTool(ctx context.Context, d *db.DB, uid string) (any, map[st
 	for rows.Next() {
 		var id int64
 		var name, typ, freq, acctName, next, maturity string
-		var invested, cycle float64
+		var invested, cycle, returned float64
 		var acct sql.NullInt64
 		var auto bool
-		if err := rows.Scan(&id, &name, &typ, &invested, &cycle, &freq, &acct, &acctName, &auto, &next, &maturity); err != nil {
+		if err := rows.Scan(&id, &name, &typ, &invested, &cycle, &freq, &acct, &acctName, &auto, &next, &maturity, &returned); err != nil {
 			return nil, nil, err
 		}
 		row := map[string]any{"id": id, "name": name, "type": typ, "invested_amount": invested,
@@ -123,6 +124,10 @@ func listInvestmentsTool(ctx context.Context, d *db.DB, uid string) (any, map[st
 		}
 		if maturity != "" {
 			row["maturity_date"] = maturity
+		}
+		if returned > 0 {
+			row["returned_amount"] = returned
+			row["closed"] = invested <= 0.005
 		}
 		out = append(out, row)
 	}
@@ -166,4 +171,46 @@ func transferToInvestmentTool(ctx context.Context, d *db.DB, uid string, acct in
 	}
 	return map[string]any{"id": id, "amount": amount, "type": "transfer_out", "investment_id": invID},
 		map[string]any{"kind": "transaction_created", "id": id, "title": fmt.Sprintf("transfer %.2f", amount), "route": "/finance/transactions"}, nil
+}
+
+// transferFromInvestmentTool is create_transaction's type 'transfer' with
+// from_investment_id: money coming back from an investment into an account.
+func transferFromInvestmentTool(ctx context.Context, d *db.DB, uid string, acct int64, amount float64, desc string, txnAt time.Time, args map[string]any) (any, map[string]any, error) {
+	invID := argInt(args, "from_investment_id", 0)
+	var owned bool
+	d.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_accounts WHERE id = $1 AND user_id = $2)`, acct, uid).Scan(&owned)
+	if !owned {
+		return nil, nil, fmt.Errorf("account not found")
+	}
+	slate := argInt(args, "slate_id", 0)
+	if slate > 0 {
+		var okSlate bool
+		d.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_slates WHERE id = $1 AND user_id = $2 AND NOT archived)`, slate, uid).Scan(&okSlate)
+		if !okSlate {
+			return nil, nil, fmt.Errorf("slate not found")
+		}
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	id, gainID, err := db.TransferFromInvestment(ctx, tx, uid, acct, invID, amount, strings.TrimSpace(desc), strings.TrimSpace(argStr(args, "note")), txnAt, slate)
+	if errors.Is(err, db.ErrInvestmentNotFound) {
+		return nil, nil, fmt.Errorf("investment not found")
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	var principal, gain float64
+	tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT amount FROM fin_transactions WHERE id = $1), 0), COALESCE((SELECT amount FROM fin_transactions WHERE id = $2), 0)`, id, gainID).Scan(&principal, &gain)
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	ref := id
+	if ref == 0 {
+		ref = gainID
+	}
+	return map[string]any{"id": id, "amount": amount, "type": "transfer_in", "from_investment_id": invID, "own_money_back": principal, "interest": gain, "interest_id": gainID},
+		map[string]any{"kind": "transaction_created", "id": ref, "title": fmt.Sprintf("back from investment %.2f", amount), "route": "/finance/transactions"}, nil
 }

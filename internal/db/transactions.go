@@ -67,6 +67,23 @@ func DeleteTransaction(ctx context.Context, tx *sql.Tx, uid string, id int64) er
 	if pair.Valid {
 		ids = append(ids, pair.Int64)
 	}
+	// Money back from an investment takes its gain (the Interest row filed
+	// with it) along.
+	if toInvestment && storedType == "transfer_in" {
+		rows, err := tx.QueryContext(ctx, `SELECT g.id FROM fin_transactions g JOIN fin_transactions t ON t.id = $1
+			WHERE g.user_id = $2 AND g.type = 'income' AND g.investment_id = t.investment_id
+			  AND g.account_id = t.account_id AND g.txn_at = t.txn_at`, id, uid)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var g int64
+			if rows.Scan(&g) == nil {
+				ids = append(ids, g)
+			}
+		}
+		rows.Close()
+	}
 	for _, del := range ids {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM fin_transactions WHERE id = $1 AND user_id = $2`, del, uid); err != nil {
 			return err

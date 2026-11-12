@@ -111,3 +111,86 @@ func TestCaptureRules(t *testing.T) {
 		t.Fatal("a manual ₹10,000 expense was taken for the RD")
 	}
 }
+
+// Needs a scratch Postgres. An RD maturing: own money back is a transfer,
+// the rest Interest; the investment closes; deleting the transfer undoes both.
+func TestInvestmentMaturity(t *testing.T) {
+	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SAJNI_TEST_DATABASE_URL not set")
+	}
+	d, err := db.New(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	uid := "01900000-0000-7000-8000-0000000000c8"
+	d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	d.Exec(`INSERT INTO users (id, email, name) VALUES ($1, 'maturity@test', 'T')`, uid)
+	d.Exec(`INSERT INTO fin_slates (user_id, name, is_plain) VALUES ($1, 'Plain', TRUE)`, uid)
+	defer d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	d.Exec(`INSERT INTO fin_categories (user_id, name, kind) VALUES ($1,'Interest','income')`, uid)
+	var bank, rd int64
+	d.QueryRow(`INSERT INTO fin_accounts (user_id, name, type) VALUES ($1,'Kotak','savings') RETURNING id`, uid).Scan(&bank)
+	d.QueryRow(`INSERT INTO fin_investments (user_id, name, type, account_id, invested_amount, current_value, maturity_date)
+		VALUES ($1,'Savings RD','rd',$2,150000,150000,'2026-12-12') RETURNING id`, uid, bank).Scan(&rd)
+
+	mux := http.NewServeMux()
+	registerFinanceRoutes(mux, Deps{DB: d})
+	call := func(method, path string, body any, direct bool) map[string]any {
+		t.Helper()
+		var buf bytes.Buffer
+		json.NewEncoder(&buf).Encode(body)
+		req := httptest.NewRequest(method, path, &buf)
+		req = req.WithContext(context.WithValue(req.Context(), auth.ContextKey{}, uid))
+		if direct {
+			req.Header.Set("X-Sajni-Direct", "1")
+		}
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		var out map[string]any
+		json.Unmarshal(rec.Body.Bytes(), &out)
+		if rec.Code >= 300 {
+			t.Fatalf("%s %s: %d %s", method, path, rec.Code, rec.Body.String())
+		}
+		return out
+	}
+	state := func() (invested, balance, income float64) {
+		d.QueryRow(`SELECT invested_amount FROM fin_investments WHERE id = $1`, rd).Scan(&invested)
+		d.QueryRow(`SELECT COALESCE(SUM(`+db.BalanceDelta("t")+`),0) FROM fin_transactions t WHERE t.account_id = $1`, bank).Scan(&balance)
+		d.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM fin_transactions WHERE user_id = $1 AND type = 'income'`, uid).Scan(&income)
+		return
+	}
+
+	// The bank's SMS on the day, captured by the phone as income.
+	out := call("POST", "/api/finance/transactions", map[string]any{"account_id": bank, "type": "income", "amount": 157420, "description": "Kotak RD", "txn_at": "2026-12-12T10:05:00+05:30"}, true)
+	if out["matured"] != "Savings RD" || out["interest"] != 7420.0 {
+		t.Fatalf("maturity not recognised: %v", out)
+	}
+	if inv, bal, inc := state(); inv != 0 || bal != 157420 || inc != 7420 {
+		t.Fatalf("after maturity: invested %v balance %v income %v", inv, bal, inc)
+	}
+	var auto bool
+	var value float64
+	d.QueryRow(`SELECT auto_debit, current_value FROM fin_investments WHERE id = $1`, rd).Scan(&auto, &value)
+	if auto || value != 0 {
+		t.Fatalf("not closed: auto %v value %v", auto, value)
+	}
+
+	// Deleting the transfer brings the money back into the RD and drops the interest.
+	call("DELETE", "/api/finance/transactions/"+strconv.FormatInt(int64(out["id"].(float64)), 10), nil, false)
+	if inv, bal, inc := state(); inv != 150000 || bal != 0 || inc != 0 {
+		t.Fatalf("after undo: invested %v balance %v income %v", inv, bal, inc)
+	}
+
+	// Breaking it early for less than was put in: all own money, nothing earned.
+	call("POST", "/api/finance/transactions", map[string]any{"account_id": bank, "type": "transfer", "from_investment_id": rd, "amount": 60000, "description": "Broke the RD", "txn_at": "2026-11-20T10:00:00+05:30"}, false)
+	if inv, bal, inc := state(); inv != 90000 || bal != 60000 || inc != 0 {
+		t.Fatalf("partial: invested %v balance %v income %v", inv, bal, inc)
+	}
+	// An ordinary credit far from maturity stays income.
+	out = call("POST", "/api/finance/transactions", map[string]any{"account_id": bank, "type": "income", "amount": 90000, "description": "Bonus", "txn_at": "2026-11-25T10:00:00+05:30"}, true)
+	if out["matured"] != nil {
+		t.Fatalf("a bonus was taken for the RD: %v", out)
+	}
+}

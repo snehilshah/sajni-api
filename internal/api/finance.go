@@ -859,7 +859,11 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			// transfer only, instead of linked_account: the money goes into
 			// this investment (an RD instalment, a SIP).
 			InvestmentID *int64 `json:"investment_id"`
-			SlateID      *int64 `json:"slate_id"` // absent/0 → Plain; N → that slate
+			// transfer only: money coming back from this investment into
+			// account_id (an RD maturing). Up to what's invested is a
+			// transfer; anything above is Interest income.
+			FromInvestmentID *int64 `json:"from_investment_id"`
+			SlateID          *int64 `json:"slate_id"` // absent/0 → Plain; N → that slate
 			// refund only: the purchase it came back for (optional). Its
 			// category and slate are reused when none is sent.
 			RefundOf *int64 `json:"refund_of"`
@@ -993,8 +997,37 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			b.Description = fallbackTitle(ctx, d, uid, b.CategoryID, b.Type)
 		}
 
-		if b.InvestmentID != nil && b.Type != "transfer" {
-			errJSON(w, http.StatusBadRequest, "Only a transfer can pay into an investment.")
+		if (b.InvestmentID != nil || b.FromInvestmentID != nil) && b.Type != "transfer" {
+			errJSON(w, http.StatusBadRequest, "Only a transfer can move money into or out of an investment.")
+			return
+		}
+		// Money back from an investment: the user's own money up to what's
+		// invested, the rest as Interest.
+		if b.Type == "transfer" && b.FromInvestmentID != nil {
+			tx, err := d.BeginTx(ctx, nil)
+			if err != nil {
+				internalError(w, r, "begin investment return", err)
+				return
+			}
+			defer tx.Rollback()
+			id, gain, err := db.TransferFromInvestment(ctx, tx, uid, b.AccountID, *b.FromInvestmentID, b.Amount, givenTitle, b.Note, txnAt, slateID)
+			if errors.Is(err, db.ErrInvestmentNotFound) {
+				errJSON(w, 404, "not found")
+				return
+			}
+			if err != nil {
+				internalError(w, r, "insert investment return", err)
+				return
+			}
+			if err := tx.Commit(); err != nil {
+				internalError(w, r, "commit investment return", err)
+				return
+			}
+			if id == 0 {
+				id = gain
+			}
+			syncTags(d, uid, "transaction", id, b.Note)
+			writeJSON(w, 201, map[string]int64{"id": id, "interest_id": gain})
 			return
 		}
 		// Transfer into an investment: one row out of the account; the
@@ -1114,6 +1147,36 @@ func createTransaction(deps Deps) http.HandlerFunc {
 					ORDER BY ABS(EXTRACT(EPOCH FROM (t.txn_at - $4))) LIMIT 1`, uid, b.AccountID, b.Amount, txnAt).Scan(&invTxn, &invName)
 				if err == nil && invTxn > 0 {
 					writeJSON(w, 200, map[string]any{"id": invTxn, "duplicate": true, "expected": invName})
+					return
+				}
+			}
+			// An investment maturing into this account: a credit of at least
+			// what's invested, two days either side of its maturity date, is
+			// that money coming back (a transfer plus Interest), not income.
+			if direct && b.Type == "income" {
+				var invID int64
+				var invName string
+				err := tx.QueryRowContext(ctx, `
+					SELECT id, name FROM fin_investments
+					WHERE user_id = $1 AND account_id = $2 AND maturity_date IS NOT NULL
+					  AND invested_amount > 0 AND $3 >= invested_amount - 0.5
+					  AND ABS(EXTRACT(EPOCH FROM (maturity_date - $4::timestamptz))) <= 2*86400 + 43200
+					ORDER BY ABS(EXTRACT(EPOCH FROM (maturity_date - $4::timestamptz))) LIMIT 1`, uid, b.AccountID, b.Amount, txnAt).Scan(&invID, &invName)
+				if err == nil && invID > 0 {
+					id, gain, err := db.TransferFromInvestment(ctx, tx, uid, b.AccountID, invID, b.Amount, invName+" matured", b.Note, txnAt, slateID)
+					if err != nil {
+						internalError(w, r, "file investment maturity", err)
+						return
+					}
+					if err := tx.Commit(); err != nil {
+						internalError(w, r, "commit investment maturity", err)
+						return
+					}
+					var interest float64
+					if gain > 0 {
+						d.QueryRowContext(ctx, `SELECT amount FROM fin_transactions WHERE id = $1`, gain).Scan(&interest)
+					}
+					writeJSON(w, 201, map[string]any{"id": id, "matured": invName, "interest": interest})
 					return
 				}
 			}
@@ -1829,8 +1892,11 @@ func listInvestments(deps Deps) http.HandlerFunc {
 		uid := userID(r.Context())
 		rows, err := d.Query(`SELECT id, name, type, account_id, invested_amount, current_value, monthly_amount,
 			frequency, start_date::text, maturity_date::text, expected_return, notes, last_updated::text,
-			auto_debit, next_debit_date::text
-			FROM fin_investments WHERE user_id = $1 ORDER BY created_at ASC`, uid)
+			auto_debit, next_debit_date::text,
+			COALESCE((SELECT SUM(t.amount) FROM fin_transactions t WHERE t.investment_id = i.id AND t.type IN ('transfer_in','income')), 0),
+			COALESCE((SELECT SUM(t.amount) FROM fin_transactions t WHERE t.investment_id = i.id AND t.type = 'income'), 0),
+			CASE WHEN i.invested_amount <= 0.005 THEN (SELECT MAX(t.txn_at)::date::text FROM fin_transactions t WHERE t.investment_id = i.id AND t.type = 'transfer_in') END
+			FROM fin_investments i WHERE user_id = $1 ORDER BY created_at ASC`, uid)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
@@ -1852,13 +1918,18 @@ func listInvestments(deps Deps) http.HandlerFunc {
 			LastUpdated    string  `json:"last_updated"`
 			AutoDebit      bool    `json:"auto_debit"`
 			NextDebitDate  *string `json:"next_debit_date"`
+			// Money back from it so far (own money + gain), and the day the
+			// last of it came back once nothing is left invested.
+			ReturnedAmount float64 `json:"returned_amount"`
+			EarnedAmount   float64 `json:"earned_amount"` // the part of it above what was put in
+			ClosedOn       *string `json:"closed_on"`
 		}
 		var out []Inv
 		for rows.Next() {
 			var i Inv
 			rows.Scan(&i.ID, &i.Name, &i.Type, &i.AccountID, &i.InvestedAmount, &i.CurrentValue, &i.MonthlyAmount,
 				&i.Frequency, &i.StartDate, &i.MaturityDate, &i.ExpectedReturn, &i.Notes, &i.LastUpdated,
-				&i.AutoDebit, &i.NextDebitDate)
+				&i.AutoDebit, &i.NextDebitDate, &i.ReturnedAmount, &i.EarnedAmount, &i.ClosedOn)
 			i.CurrentValue = effectiveInvestmentValue(investmentValuation{
 				ID: i.ID, Name: i.Name, Type: i.Type, InvestedAmount: i.InvestedAmount,
 				CurrentValue: i.CurrentValue, CycleAmount: i.MonthlyAmount, Frequency: i.Frequency,

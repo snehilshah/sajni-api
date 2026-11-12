@@ -1235,27 +1235,28 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "create_transaction",
-			Description: "Record a finance transaction against an existing account and assign a category. Paying into an investment (an RD instalment, a SIP) is type 'transfer' with to_investment_id from list_investments: it leaves the account, adds to the invested amount and is never spending; no category. Use list_finance_accounts to get account_id. Specify either category_id or category_name; if category_name is specified, the backend will auto-match it to the closest existing category. Slates: omit slate_id and it files under Plain (normal life); pass a slate id from list_slates for an outlier like a trip. A refund (money back on a purchase) is type 'refund' with the purchase's expense category: it lowers that spending and is not income. A bill shared with someone is an expense with split_with + split_share (their part); shared with several people, use splits instead (one entry per person, the rest is the user's part). Lending money is an expense with split_with and split_share equal to amount. Money received from someone who owes the user is income with from_person; add toward_lend_id only when it was clearly for one of their lends (from list_lends), otherwise it counts toward their overall total.",
+			Description: "Record a finance transaction against an existing account and assign a category. Paying into an investment (an RD instalment, a SIP) is type 'transfer' with to_investment_id from list_investments: it leaves the account, adds to the invested amount and is never spending; no category. Money back from one (an RD maturing) is type 'transfer' with from_investment_id: never income except the part above what was invested. Use list_finance_accounts to get account_id. Specify either category_id or category_name; if category_name is specified, the backend will auto-match it to the closest existing category. Slates: omit slate_id and it files under Plain (normal life); pass a slate id from list_slates for an outlier like a trip. A refund (money back on a purchase) is type 'refund' with the purchase's expense category: it lowers that spending and is not income. A bill shared with someone is an expense with split_with + split_share (their part); shared with several people, use splits instead (one entry per person, the rest is the user's part). Lending money is an expense with split_with and split_share equal to amount. Money received from someone who owes the user is income with from_person; add toward_lend_id only when it was clearly for one of their lends (from list_lends), otherwise it counts toward their overall total.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"account_id":       intg("Required. The target account ID."),
-				"category_id":      intg("Optional category identifier."),
-				"category_name":    str("Optional category name (e.g. 'Food', 'Groceries', 'Rent') to auto-match on backend. For a refund, the expense category it came back to."),
-				"type":             str("'expense' | 'income' | 'refund' | 'transfer'. Default 'expense'. Card or app cashback is a 'refund' (unlinked) in the Cashback category, not income. 'transfer' moves money from account_id to another account (to_account_id: paying a credit card bill, moving savings) or into an investment (to_investment_id); it is never spending and takes no category."),
-				"to_investment_id": intg("Transfer only: the investment (list_investments) the money goes into."),
-				"to_account_id":    intg("Transfer only: the account (list_finance_accounts) the money goes to, e.g. the credit card a bill payment went to."),
-				"note":             str("Optional longer note (a reference number, who it was with). #tags in it are picked up."),
-				"amount":           num("Positive amount. For a split bill, the whole bill."),
-				"description":      str("Required. A short title for what it was."),
-				"date":             str("ISO date. Defaults to today."),
-				"time":             str("Optional HH:MM (24-hour, the user's time) when the user gave one. Defaults to the current time."),
-				"slate_id":         intg("Omit → Plain (normal life); N → that slate."),
-				"refund_of":        intg("Refund only, optional: the original expense id from list_finance_transactions. Its category and slate are reused when none is given."),
-				"split_with":       str("Expense only, optional: the person who owes part of this bill. Reuse the exact name from list_lends."),
-				"split_share":      num("With split_with: their part of the bill. Equal to amount when all of it is theirs."),
-				"splits":           splitsSchema("Expense only, optional, instead of split_with: everyone who owes part of this bill, with their share. Shares may add up to the whole amount (the user paid for them all)."),
-				"from_person":      str("Income only, optional: the person paying the user back (as named in list_lends)."),
-				"toward_lend_id":   intg("With from_person, optional: the lend id (list_lends) this payment was for. Omit for their overall total."),
+				"account_id":         intg("Required. The target account ID."),
+				"category_id":        intg("Optional category identifier."),
+				"category_name":      str("Optional category name (e.g. 'Food', 'Groceries', 'Rent') to auto-match on backend. For a refund, the expense category it came back to."),
+				"type":               str("'expense' | 'income' | 'refund' | 'transfer'. Default 'expense'. Card or app cashback is a 'refund' (unlinked) in the Cashback category, not income. 'transfer' moves money from account_id to another account (to_account_id: paying a credit card bill, moving savings) or into an investment (to_investment_id); it is never spending and takes no category."),
+				"to_investment_id":   intg("Transfer only: the investment (list_investments) the money goes into."),
+				"from_investment_id": intg("Transfer only: money coming back from this investment (list_investments) into account_id, e.g. an RD maturing or a SIP redeemed. amount is everything received; up to what's still invested comes back as a transfer (not income), the rest is filed as Interest income. Once nothing is left invested the investment is closed."),
+				"to_account_id":      intg("Transfer only: the account (list_finance_accounts) the money goes to, e.g. the credit card a bill payment went to."),
+				"note":               str("Optional longer note (a reference number, who it was with). #tags in it are picked up."),
+				"amount":             num("Positive amount. For a split bill, the whole bill."),
+				"description":        str("Required. A short title for what it was."),
+				"date":               str("ISO date. Defaults to today."),
+				"time":               str("Optional HH:MM (24-hour, the user's time) when the user gave one. Defaults to the current time."),
+				"slate_id":           intg("Omit → Plain (normal life); N → that slate."),
+				"refund_of":          intg("Refund only, optional: the original expense id from list_finance_transactions. Its category and slate are reused when none is given."),
+				"split_with":         str("Expense only, optional: the person who owes part of this bill. Reuse the exact name from list_lends."),
+				"split_share":        num("With split_with: their part of the bill. Equal to amount when all of it is theirs."),
+				"splits":             splitsSchema("Expense only, optional, instead of split_with: everyone who owes part of this bill, with their share. Shares may add up to the whole amount (the user paid for them all)."),
+				"from_person":        str("Income only, optional: the person paying the user back (as named in list_lends)."),
+				"toward_lend_id":     intg("With from_person, optional: the lend id (list_lends) this payment was for. Omit for their overall total."),
 			}, "account_id", "amount", "description"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createTxnTool(ctx, d, uid, args)
@@ -2040,9 +2041,16 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		if splitOf.Valid {
 			row["split_of"] = splitOf.Int64
 		}
-		// A transfer into an investment (no other leg).
+		// Money into an investment, back out of it, or the gain it paid.
 		if investmentID.Valid {
-			row["to_investment_id"], row["to_investment"] = investmentID.Int64, investmentName
+			switch row["type"] {
+			case "transfer_in":
+				row["from_investment_id"], row["from_investment"] = investmentID.Int64, investmentName
+			case "income":
+				row["earned_on_investment"] = investmentName
+			default:
+				row["to_investment_id"], row["to_investment"] = investmentID.Int64, investmentName
+			}
 		}
 		if refundOf.Valid {
 			row["refund_of"] = refundOf.Int64
@@ -3951,6 +3959,9 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	if ttype == "transfer" {
 		if argInt(args, "to_account_id", 0) > 0 {
 			return transferBetweenAccountsTool(ctx, d, uid, acct, amount, desc, txnAt, args)
+		}
+		if argInt(args, "from_investment_id", 0) > 0 {
+			return transferFromInvestmentTool(ctx, d, uid, acct, amount, desc, txnAt, args)
 		}
 		return transferToInvestmentTool(ctx, d, uid, acct, amount, desc, txnAt, args)
 	}
