@@ -429,6 +429,19 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
+			Name:        "set_capture_tracking",
+			Description: "Stop or resume automatic capture for an account the user doesn't keep in Sajni (a Zomato Money wallet, a meal card): messages naming it are ignored instead of asking the user to file them. hint is the account as the messages name it (list_captures shows it as account_hint), e.g. 'Zomato Money' or '7287'. list_captures returns the current list as not_tracked.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"hint":  str("Required. The account as messages name it."),
+				"track": boolean("Required. false = stop asking about it, true = ask again."),
+				"label": str("Optional display name, e.g. 'Zomato Money'."),
+			}, "hint", "track"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return setCaptureTrackingTool(ctx, d, uid, args)
+			},
+		},
+		{
 			Name:        "list_lends",
 			Description: "List money the user has lent, including borrower, source account, principal, repaid (payments pinned to this lend), outstanding (what is left of it, never more than the person's overall total), optional due date, and status. A lend is a receivable asset, not an expense.",
 			Schema:      obj(map[string]*genai.Schema{}),
@@ -1364,16 +1377,17 @@ func (s *Service) buildTools() []Tool {
 			Description: "Update an existing finance transaction by id — change its account, category, slate, amount, type, description, or date. On a split bill (has split_share in list_finance_transactions) amount is the user's own part; change the other person's part with set_split_share. To move it to another account pass account_id (balances recompute automatically). To recategorize, pass category_name (auto-matched against existing categories, same as create) or category_id. To move it between slates pass slate_id (0 = Plain). A lend_repayment (money someone paid back) or writeoff only takes a new description here; change a writeoff's amount, category or date with edit_adjustment. Use list_finance_transactions to find the id first.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"id":            intg("Required. Transaction id to update."),
-				"account_id":    intg("Optional. Move the transaction to this account id."),
-				"category_id":   intg("Optional category id."),
-				"category_name": str("Optional category name to auto-match (e.g. 'Groceries', 'Rent')."),
-				"type":          str("Optional 'expense' | 'income' | 'refund'. A credit that was money back on a purchase is 'refund' (pass its expense category too)."),
-				"amount":        num("Optional positive amount."),
-				"description":   str("Optional new description."),
-				"note":          str("Optional new note; an empty string clears it. #tags in it are picked up."),
-				"date":          str("Optional ISO date YYYY-MM-DD."),
-				"slate_id":      intg("Optional. Move to this slate; 0 = Plain. Omitted = untouched."),
+				"id":                       intg("Required. Transaction id to update."),
+				"account_id":               intg("Optional. Move the transaction to this account id."),
+				"category_id":              intg("Optional category id."),
+				"category_name":            str("Optional category name to auto-match (e.g. 'Groceries', 'Rent')."),
+				"type":                     str("Optional 'expense' | 'income' | 'refund'. A credit that was money back on a purchase is 'refund' (pass its expense category too)."),
+				"amount":                   num("Optional positive amount."),
+				"description":              str("Optional new description."),
+				"note":                     str("Optional new note; an empty string clears it. #tags in it are picked up."),
+				"date":                     str("Optional ISO date YYYY-MM-DD."),
+				"slate_id":                 intg("Optional. Move to this slate; 0 = Plain. Omitted = untouched."),
+				"transfer_with_account_id": intg("Optional. Turn this expense or income into a transfer with that account (money that only moved between the user's own accounts: a wallet top-up, a UPI Lite load, cash a friend sent back by UPI). An expense becomes money out to that account, an income money in from it; the category goes. Only description may be passed with it. Never delete and re-create for this."),
 			}, "id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return updateTxnTool(ctx, d, uid, args)
@@ -4117,6 +4131,32 @@ func resolveCategoryID(ctx context.Context, d *db.DB, uid, name string) int64 {
 
 // updateTxnTool mutates an existing transaction. Only the fields the model
 // passes are touched; category_name is resolved to an id server-side.
+// makeTransferTool: update_transaction's transfer_with_account_id.
+func makeTransferTool(ctx context.Context, d *db.DB, uid string, id, other int64, title string) (any, map[string]any, error) {
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	pair, err := db.MakeTransfer(ctx, tx, uid, id, other)
+	if err != nil {
+		return nil, nil, err
+	}
+	if title != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET description = $1, updated_at = NOW() WHERE id IN ($2,$3) AND user_id = $4`, title, id, pair, uid); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := db.LearnPayeeTransfer(ctx, tx, uid, id, other); err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"id": id, "pair_id": pair, "transfer": true},
+		map[string]any{"kind": "transaction_updated", "id": id, "route": "/finance/transactions"}, nil
+}
+
 func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
 	id := argInt(args, "id", 0)
 	if id == 0 {
@@ -4130,6 +4170,9 @@ func updateTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	}
 	if v, ok := args["description"]; ok && v != nil && strings.TrimSpace(argStr(args, "description")) == "" {
 		return nil, nil, fmt.Errorf("description can't be blank")
+	}
+	if other := argInt(args, "transfer_with_account_id", 0); other > 0 {
+		return makeTransferTool(ctx, d, uid, int64(id), int64(other), strings.TrimSpace(argStr(args, "description")))
 	}
 	if storedType == "lend_repayment" || storedType == "writeoff" {
 		// A payment's money is the lends' business; only its title can change.

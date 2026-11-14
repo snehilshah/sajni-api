@@ -1198,6 +1198,8 @@ func (d *DB) ensureSchema() error {
 		txn_id       BIGINT      REFERENCES fin_transactions(id) ON DELETE SET NULL,
 		suggestion   TEXT        NOT NULL DEFAULT '',      -- one-tap offered, e.g. "settle:Papa"
 		suggestion_taken TIMESTAMPTZ,                      -- when the owner tapped it
+		own_money    BOOLEAN     NOT NULL DEFAULT FALSE,   -- the message says it moved between the owner's own accounts
+		account_hint TEXT        NOT NULL DEFAULT '',      -- the account as the message names it ("Zomato Money", "7287")
 		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_fin_captures_user ON fin_captures(user_id, created_at DESC);
@@ -1252,6 +1254,36 @@ func (d *DB) ensureSchema() error {
 		last_txn_id BIGINT,
 		updated_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
 		PRIMARY KEY (user_id, payee, kind, title)
+	);
+
+	-- ─── Finance: payee → a transfer with one of the owner's accounts ──
+	-- "SNEHIL RONAK SHAH" on a Kotak debit is the owner loading UPI Lite.
+	-- Learned when the owner turns a captured row into a transfer
+	-- (db.MakeTransfer); kind is the captured direction. A later capture
+	-- from that payee is filed as the same transfer once it was made on two
+	-- payments, or on one when the message said it was the owner's own money.
+	CREATE TABLE IF NOT EXISTS fin_payee_transfers (
+		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		payee       TEXT        NOT NULL,
+		kind        TEXT        NOT NULL,  -- expense (money out) | income (money in)
+		account_id  BIGINT      NOT NULL REFERENCES fin_accounts(id) ON DELETE CASCADE,
+		own         BOOLEAN     NOT NULL DEFAULT FALSE,
+		uses        INT         NOT NULL DEFAULT 1,
+		last_txn_id BIGINT,
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (user_id, payee, kind)
+	);
+
+	-- ─── Finance: accounts the owner doesn't track ────────────────────
+	-- "Don't track" on a capture's review prompt: messages naming this
+	-- account (Zomato Money, a Pluxee card) are ignored instead of asked.
+	-- hint is the account as messages name it, lowercased.
+	CREATE TABLE IF NOT EXISTS fin_capture_ignores (
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		hint       TEXT        NOT NULL,
+		label      TEXT        NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (user_id, hint)
 	);
 
 	-- ─── Push devices (FCM) ───────────────────────────────────────────

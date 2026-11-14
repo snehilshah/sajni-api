@@ -668,6 +668,10 @@ type ParsedTxn struct {
 	// phone as both a bank SMS and a UPI-app notification carrying the same
 	// ref, while amount alone cannot tell an echo from a second chai.
 	RefID string `json:"ref_id"`
+	// OwnMoney: the message says the money went to or came from the
+	// user's own account or wallet (a wallet top-up, "added to your
+	// balance", a transfer to their own name). Auto captures only.
+	OwnMoney bool `json:"own_money,omitempty"`
 }
 
 var (
@@ -724,7 +728,7 @@ func (s *Service) ParseTransactionMessage(ctx context.Context, msg, today string
 	sys := `You read a single bank / UPI transaction message and extract its fields as JSON.
 
 Reply with ONLY a JSON object — no markdown, no prose:
-{"amount": number, "type": "expense"|"income", "description": string, "note": string, "date": "YYYY-MM-DD", "time": "HH:MM", "account_hint": string, "ref_id": string}
+{"amount": number, "type": "expense"|"income", "description": string, "note": string, "date": "YYYY-MM-DD", "time": "HH:MM", "account_hint": string, "ref_id": string, "own_money": boolean}
 
 Rules:
 - amount: the transaction amount as a positive number (no currency symbol, no commas).
@@ -741,7 +745,9 @@ Rules:
 		sys += `
 - This text was captured automatically from an SMS or a phone notification (often an email's subject and first lines). Log only money that has ALREADY moved into or out of one of the user's accounts, cards or wallets. Set amount to 0 for anything else: failed or declined attempts; money requests and collect requests; future or scheduled debits and credits ("will be debited", "will be credited by", standing instructions, mandates, autopay notices); bill, statement or due-date reminders; balance-only updates; offers, cashback promises and promotions; OTPs; "payable to you" notices from a broker.
 - If the amount isn't stated in the text, set amount to 0. Never guess an amount.
-- A merchant's receipt that splits the total across ways of paying (e.g. "Uber Cash ₹5.54 + Amazon Pay ₹82.13"): amount is only the part that left the user's account, card or wallet (82.13), and account_hint names it ("Amazon Pay"). Store credit, coins and the merchant's own cash are not money that moved.`
+- A merchant's receipt that splits the total across ways of paying (e.g. "Uber Cash ₹5.54 + Amazon Pay ₹82.13"): amount is only the part that left the user's account, card or wallet (82.13), and account_hint names it ("Amazon Pay"). Store credit, coins and the merchant's own cash are not money that moved.
+- An order confirmation or delivery receipt ("Thank you for ordering", "Your order from X was delivered") that doesn't say which card, account or wallet paid is not a payment report: set amount to 0. The payment itself arrives as its own message.
+- Also return "own_money": true when the money moved between the user's own accounts or wallets: a wallet or balance top-up ("added to your Amazon Pay balance", "Amazon Pay Bala credited"), a UPI Lite load, or money sent to or received from an account in the user's own name. Otherwise false.`
 	}
 
 	msg = cleanTxnMessage(msg)

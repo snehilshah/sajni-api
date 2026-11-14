@@ -102,3 +102,106 @@ func DeleteTransaction(ctx context.Context, tx *sql.Tx, uid string, id int64) er
 	}
 	return nil
 }
+
+// MakeTransfer turns one of the user's plain expenses or incomes into a
+// transfer with another of their accounts: money that only moved between
+// their own accounts (an Amazon Pay top-up, a UPI Lite load, cash a friend
+// handed back by UPI). An expense becomes the transfer's "out" leg and the
+// other account gets the "in" leg; an income becomes the "in" leg and the
+// other account the "out" one. Title, note, time and slate carry over; the
+// category goes (a transfer has none). Rows tied to something else (a
+// split, a lend, a refund, a biller, an investment, money owed) are
+// refused. Returns the new leg's id. The API, the capture endpoint and the
+// AI tools all go through here.
+func MakeTransfer(ctx context.Context, tx *sql.Tx, uid string, id, otherAccountID int64) (int64, error) {
+	var (
+		typ                 string
+		acct, slate         sql.NullInt64
+		amount              float64
+		desc, note          string
+		txnAt               any
+		splitOf, investment sql.NullInt64
+	)
+	err := tx.QueryRowContext(ctx, `SELECT type, account_id, amount, description, note, txn_at, slate_id, split_of, investment_id
+		FROM fin_transactions WHERE id = $1 AND user_id = $2 FOR UPDATE`, id, uid).
+		Scan(&typ, &acct, &amount, &desc, &note, &txnAt, &slate, &splitOf, &investment)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrTxnNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	if typ != "expense" && typ != "income" {
+		return 0, &TxnConflict{"Only an expense or an income can become a transfer."}
+	}
+	if splitOf.Valid || investment.Valid {
+		return 0, &TxnConflict{"This row belongs to a split or an investment, so it can't become a transfer."}
+	}
+	if !acct.Valid || acct.Int64 == otherAccountID {
+		return 0, &TxnConflict{"Pick a different account for the other side."}
+	}
+	var ok bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_accounts WHERE id = $1 AND user_id = $2)`, otherAccountID, uid).Scan(&ok); err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, &TxnConflict{"That account doesn't exist."}
+	}
+	var tied bool
+	if err := tx.QueryRowContext(ctx, `SELECT
+		EXISTS (SELECT 1 FROM fin_transactions WHERE (split_of = $1 OR refund_of = $1) AND user_id = $2)
+		OR EXISTS (SELECT 1 FROM fin_lends WHERE source_transaction_id = $1)
+		OR EXISTS (SELECT 1 FROM fin_lend_repayments WHERE transaction_id = $1)
+		OR EXISTS (SELECT 1 FROM fin_lend_settlements WHERE transaction_id = $1)
+		OR EXISTS (SELECT 1 FROM fin_owed WHERE transaction_id = $1)
+		OR EXISTS (SELECT 1 FROM fin_biller_payment_txns WHERE txn_id = $1)`, id, uid).Scan(&tied); err != nil {
+		return 0, err
+	}
+	if tied {
+		return 0, &TxnConflict{"This row is tied to a split, refund, lend, bill or money owed, so it can't become a transfer."}
+	}
+	thisLeg, otherLeg := "transfer_out", "transfer_in"
+	if typ == "income" {
+		thisLeg, otherLeg = "transfer_in", "transfer_out"
+	}
+	var newID int64
+	if err := tx.QueryRowContext(ctx, `INSERT INTO fin_transactions
+		(user_id, account_id, type, amount, description, note, txn_at, slate_id, transfer_pair, linked_account)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+		uid, otherAccountID, otherLeg, amount, desc, note, txnAt, slate, id, acct.Int64).Scan(&newID); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET type = $1, category_id = NULL, refund_of = NULL,
+		transfer_pair = $2, linked_account = $3, updated_at = NOW() WHERE id = $4 AND user_id = $5`,
+		thisLeg, newID, otherAccountID, id, uid); err != nil {
+		return 0, err
+	}
+	if err := SyncTags(ctx, tx, uid, "transaction", newID, note); err != nil {
+		return 0, err
+	}
+	return newID, nil
+}
+
+// LearnPayeeTransfer remembers that the owner turned a captured row into a
+// transfer with otherAccount (MakeTransfer), keyed on the payee the capture
+// read. Changing the account starts the count again. The API and AI tools
+// call it; the capture endpoint's own pairing doesn't (an "Amazon Pay"
+// top-up pair mustn't turn every Amazon Pay purchase into a transfer).
+func LearnPayeeTransfer(ctx context.Context, tx *sql.Tx, uid string, txnID, otherAccount int64) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO fin_payee_transfers (user_id, payee, kind, account_id, own, last_txn_id)
+		SELECT c.user_id, LOWER(BTRIM(c.description)), c.type, $3, c.own_money, $1
+		FROM fin_captures c
+		WHERE c.txn_id = $1 AND c.user_id = $2 AND c.outcome = 'created' AND c.description <> '' AND c.type IN ('expense','income')
+		ORDER BY c.id LIMIT 1
+		ON CONFLICT (user_id, payee, kind) DO UPDATE SET
+			uses = CASE WHEN fin_payee_transfers.account_id <> EXCLUDED.account_id THEN 1
+			            WHEN fin_payee_transfers.last_txn_id = EXCLUDED.last_txn_id THEN fin_payee_transfers.uses
+			            ELSE fin_payee_transfers.uses + 1 END,
+			own = EXCLUDED.own OR (fin_payee_transfers.own AND fin_payee_transfers.account_id = EXCLUDED.account_id),
+			account_id = EXCLUDED.account_id, last_txn_id = EXCLUDED.last_txn_id, updated_at = NOW()`,
+		txnID, uid, otherAccount); err != nil {
+		return err
+	}
+	return nil
+}

@@ -70,6 +70,7 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /api/finance/transactions", createTransaction(deps))
 	mux.HandleFunc("PUT /api/finance/transactions/{id}", updateTransaction(deps))
 	mux.HandleFunc("DELETE /api/finance/transactions/{id}", deleteTransaction(deps))
+	mux.HandleFunc("POST /api/finance/transactions/{id}/transfer", makeTransfer(deps))
 	registerLendRoutes(mux, deps)
 
 	// Slates (normal life vs outliers)
@@ -117,6 +118,9 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("POST /api/finance/parse-message", parseTransactionMessage(deps))
 	mux.HandleFunc("POST /api/finance/captures", captureTransaction(deps))
 	mux.HandleFunc("GET /api/finance/captures", listCaptures(deps))
+	mux.HandleFunc("GET /api/finance/captures/ignores", listCaptureIgnores(deps))
+	mux.HandleFunc("POST /api/finance/captures/ignores", addCaptureIgnore(deps))
+	mux.HandleFunc("DELETE /api/finance/captures/ignores", removeCaptureIgnore(deps))
 	// AI parse of a shared transaction screenshot / receipt image.
 	mux.HandleFunc("POST /api/finance/parse-image", parseTransactionImage(deps))
 }
@@ -1582,6 +1586,65 @@ func deleteTransaction(deps Deps) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
+	}
+}
+
+// makeTransfer turns an expense or income into a transfer with another of
+// the owner's accounts (db.MakeTransfer). Body: {account_id, description?}.
+// A captured row teaches its payee (fin_payee_transfers), so the next
+// capture from them is filed as the same transfer.
+func makeTransfer(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		id, err := intParam(r, "id")
+		if err != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		var b struct {
+			AccountID   int64   `json:"account_id"`
+			Description *string `json:"description"`
+		}
+		if err := readJSON(r, &b); err != nil || b.AccountID <= 0 {
+			errJSON(w, 400, "account_id is required")
+			return
+		}
+		ctx := r.Context()
+		tx, err := d.BeginTx(ctx, nil)
+		if err != nil {
+			internalError(w, r, "begin make transfer", err)
+			return
+		}
+		defer tx.Rollback()
+		other, err := db.MakeTransfer(ctx, tx, uid, id, b.AccountID)
+		var conflict *db.TxnConflict
+		switch {
+		case errors.Is(err, db.ErrTxnNotFound):
+			errJSON(w, http.StatusNotFound, "not found")
+			return
+		case errors.As(err, &conflict):
+			errJSON(w, http.StatusConflict, conflict.Msg)
+			return
+		case err != nil:
+			internalError(w, r, "make transfer", err)
+			return
+		}
+		if b.Description != nil && strings.TrimSpace(*b.Description) != "" {
+			if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET description = $1, updated_at = NOW() WHERE id IN ($2,$3) AND user_id = $4`,
+				strings.TrimSpace(*b.Description), id, other, uid); err != nil {
+				internalError(w, r, "title transfer", err)
+				return
+			}
+		}
+		if err := db.LearnPayeeTransfer(ctx, tx, uid, id, b.AccountID); err != nil {
+			log.Warn().Err(err).Msg("learn payee transfer")
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit make transfer", err)
+			return
+		}
+		writeJSON(w, 200, map[string]int64{"id": id, "pair_id": other})
 	}
 }
 
