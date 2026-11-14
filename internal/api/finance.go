@@ -71,6 +71,7 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("PUT /api/finance/transactions/{id}", updateTransaction(deps))
 	mux.HandleFunc("DELETE /api/finance/transactions/{id}", deleteTransaction(deps))
 	mux.HandleFunc("POST /api/finance/transactions/{id}/transfer", makeTransfer(deps))
+	mux.HandleFunc("GET /api/finance/titles", suggestTitles(deps))
 	registerLendRoutes(mux, deps)
 
 	// Slates (normal life vs outliers)
@@ -1645,6 +1646,67 @@ func makeTransfer(deps Deps) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, 200, map[string]int64{"id": id, "pair_id": other})
+	}
+}
+
+// titleSuggestion is a title the owner used before, with the account and
+// category of its latest use, for the sheet's title autocomplete.
+type titleSuggestion struct {
+	Title      string  `json:"title"`
+	AccountID  *int64  `json:"account_id"`
+	CategoryID *int64  `json:"category_id"`
+	Amount     float64 `json:"amount"`
+	Uses       int     `json:"uses"`
+}
+
+// suggestTitles: GET /finance/titles?q=sew&type=expense. Titles of the last
+// 180 days that start with q (or have a word that does), most used first;
+// each carries its latest account, category and amount. Up to 6.
+func suggestTitles(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		typ := r.URL.Query().Get("type")
+		if typ != "income" {
+			typ = "expense"
+		}
+		out := []titleSuggestion{}
+		if q == "" {
+			writeJSON(w, 200, out)
+			return
+		}
+		like := strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(strings.ToLower(q))
+		rows, err := d.QueryContext(r.Context(), `
+			WITH m AS (
+				SELECT LOWER(BTRIM(t.description)) AS k, BTRIM(t.description) AS title, t.account_id,
+				       CASE WHEN c.kind = $3 THEN t.category_id END AS category_id, t.amount, t.txn_at
+				FROM fin_transactions t
+				LEFT JOIN fin_categories c ON c.id = t.category_id
+				WHERE t.user_id = $1 AND t.type = $3 AND t.split_of IS NULL AND BTRIM(t.description) <> ''
+				  AND t.txn_at > NOW() - INTERVAL '180 days'
+				  AND (LOWER(t.description) LIKE $2 || '%' OR LOWER(t.description) LIKE '% ' || $2 || '%')
+			), latest AS (
+				SELECT DISTINCT ON (k) k, title, account_id, category_id, amount, txn_at FROM m ORDER BY k, txn_at DESC
+			)
+			SELECT l.title, l.account_id, l.category_id, l.amount, (SELECT COUNT(*) FROM m WHERE m.k = l.k)
+			FROM latest l
+			ORDER BY (LOWER(l.title) LIKE $2 || '%') DESC, 5 DESC, l.txn_at DESC
+			LIMIT 6`, uid, like, typ)
+		if err != nil {
+			internalError(w, r, "suggest titles", err)
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var s titleSuggestion
+			if err := rows.Scan(&s.Title, &s.AccountID, &s.CategoryID, &s.Amount, &s.Uses); err != nil {
+				internalError(w, r, "scan title", err)
+				return
+			}
+			out = append(out, s)
+		}
+		writeJSON(w, 200, out)
 	}
 }
 
