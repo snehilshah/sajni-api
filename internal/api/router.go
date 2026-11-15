@@ -126,7 +126,18 @@ func Router(deps Deps) http.Handler {
 	RegisterDigestCronHandler(root, deps)
 	RegisterScheduledNotificationHandler(root, deps)
 
-	return withCORS(withLogging(root, deps.DB, deps.Reminders.CloudTasksProject), deps.HTTP)
+	return withCORS(withNoStore(withLogging(root, deps.DB, deps.Reminders.CloudTasksProject)), deps.HTTP)
+}
+
+// withNoStore marks every answer private and uncacheable unless its handler
+// says otherwise (uploads keep "private, max-age=3600"). Without it Vercel's
+// rewrite fills in "public, max-age=0, must-revalidate", which invites shared
+// caches (Vercel, Cloudflare) and browser-TTL overrides to keep personal data.
+func withNoStore(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "private, no-store")
+		h.ServeHTTP(w, r)
+	})
 }
 
 // withCORS reflects the configured allowed origin and enables credentials
