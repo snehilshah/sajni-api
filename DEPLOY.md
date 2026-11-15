@@ -32,7 +32,6 @@ to the Cloud Run default URL.
 | Secret Manager            | 4 secrets, ≤6 free                      | $0          |
 | GCS (`sajni-blobs`)       | Standard, single region, <1GB           | <$0.05/mo |
 | Cloud Tasks               | First 1M ops/month free                 | $0          |
-| Cloud Run domain mapping  | `api.ohmysajni.com`                     | $0          |
 | **Postgres**              | **Use Supabase / Neon free tier**       | $0          |
 |                           | (Cloud SQL min ≈ ₹830/mo — avoid)      |              |
 | Egress to Vercel          | First 1GB/mo free                       | $0          |

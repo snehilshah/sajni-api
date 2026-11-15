@@ -175,7 +175,8 @@ Why these shapes:
      also don't get a real display name, so we fall back to the email
      local-part (`alice` from `alice@x.com`).
 4. User approves on Google. Google 302s back to
-   `https://api.ohmysajni.com/api/auth/google/callback?code=...&state=...`.
+   `$API_BASE_URL/api/auth/google/callback?code=...&state=...` (the
+   Cloud Run `run.app` URL; there is no `api.ohmysajni.com`).
 5. Server `oauthCallback("google")`:
    - Verifies the signed `state` HMAC + expiry → reject if invalid
      ("state mismatch").
