@@ -188,6 +188,7 @@ func registerAIRoutes(mux *http.ServeMux, deps Deps, svc *ai.Service) {
 		}
 
 		var finalHistory []*genai.Content
+		gone := false
 		for ev := range svc.Chat(ctx, req) {
 			// A failed turn carries its history too, so the question is kept.
 			if ev.Type == "done" || ev.Type == "error" {
@@ -197,8 +198,14 @@ func registerAIRoutes(mux *http.ServeMux, deps Deps, svc *ai.Service) {
 				_ = json.Unmarshal(ev.Data, &raw)
 				finalHistory = raw.History
 			}
+			// A client that left stops getting events, but the turn is still
+			// drained so whatever it changed is saved in the session.
+			if gone {
+				continue
+			}
 			if err := writeSSE(w, ev.Type, ev.Data); err != nil {
-				return
+				gone = true
+				continue
 			}
 			flusher.Flush()
 		}

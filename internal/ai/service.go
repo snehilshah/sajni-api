@@ -52,8 +52,9 @@ const (
 	paletteRounds = 6
 	// roundIdle is how long a round may go without a streamed chunk before
 	// it's cut (and tried once more if nothing was shown yet).
-	roundIdleChat    = 30 * time.Second
-	roundIdlePalette = 20 * time.Second
+	// Healthy rounds finish in under 10 s; the whole turn has 50 s.
+	roundIdleChat    = 15 * time.Second
+	roundIdlePalette = 12 * time.Second
 	// GenerateContent caps include reasoning tokens as well as visible output.
 	// Leave headroom for Gemini 3.8, which cannot disable thinking.
 	maxOutputTokens      = 8192
@@ -327,9 +328,24 @@ func (s *Service) Chat(ctx context.Context, req ChatRequest) <-chan Event {
 
 func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 	send := func(t string, v any) {
+		ev := newEvent(t, v)
+		// Try first: once ctx has expired a select picks at random, and the
+		// final error (with the history to save) must not be the one dropped.
 		select {
-		case out <- newEvent(t, v):
+		case out <- ev:
+			return
+		default:
+		}
+		select {
+		case out <- ev:
 		case <-ctx.Done():
+			if t == "error" || t == "done" {
+				// The reader drains until close; wait briefly for room.
+				select {
+				case out <- ev:
+				case <-time.After(2 * time.Second):
+				}
+			}
 		}
 	}
 
@@ -353,13 +369,19 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 	}
 	// fail ends the turn with a message, and keeps the question (and any
 	// tool work so far) in the history so the chat isn't lost.
-	fail := func(msg string) {
+	fail := func(err error, msg string) {
 		if strings.Contains(msg, "Start a new chat") {
 			// The history itself is the problem; don't save it again.
 			send("error", map[string]any{"message": msg})
 			return
 		}
-		h := append(saved(), &genai.Content{Role: "model", Parts: []*genai.Part{{Text: msg}}})
+		h := saved()
+		if err != nil && strings.Contains(strings.ToLower(err.Error()), "invalid_argument") {
+			// This turn's tool results may be what the model refused: keep
+			// only the question, so the session isn't poisoned.
+			h = append(append([]*genai.Content(nil), req.History...), h[msgAt])
+		}
+		h = append(h, &genai.Content{Role: "model", Parts: []*genai.Part{{Text: "(" + msg + ")"}}})
 		send("error", map[string]any{"message": msg, "history": h})
 	}
 
@@ -385,6 +407,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			Msg("ai turn")
 	}()
 	// round logs one model call of this question.
+	finish := ""
 	round := func(n int, u usage, ms int64, calls []string, err error) {
 		roundsRun++
 		total.add(u)
@@ -394,7 +417,8 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			ev = log.Warn().Err(err)
 		}
 		u.fields(ev.Str("uid", req.UserID).Str("mode", req.Mode).Int("round", n).
-			Strs("calls", calls).Int64("ms", ms)).Msg("ai round")
+			Strs("calls", calls).Str("finish", finish).Int64("ms", ms)).Msg("ai round")
+		finish = ""
 	}
 
 	sysPrompt := systemPrompt
@@ -463,6 +487,9 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 				if resp != nil && resp.UsageMetadata != nil {
 					used = usageOf(resp.UsageMetadata)
 				}
+				if resp != nil && len(resp.Candidates) > 0 && resp.Candidates[0].FinishReason != "" {
+					finish = string(resp.Candidates[0].FinishReason)
+				}
 				if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
 					continue
 				}
@@ -491,11 +518,23 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 					}
 				}
 			}
-			// A stalled or failed round that showed nothing is tried once more.
-			if streamErr == nil || turnText.Len() > 0 || len(calls) > 0 || ctx.Err() != nil {
+			// A round that showed nothing is tried once more when it stalled or
+			// the server failed, or when it came back empty (often a call to a
+			// tool that wasn't loaded: then load them all).
+			if turnText.Len() > 0 || len(calls) > 0 || ctx.Err() != nil {
 				break
 			}
-			log.Warn().Err(streamErr).Str("uid", req.UserID).Int("round", r+1).Msg("ai round retry")
+			empty := streamErr == nil
+			if !empty && !retryable(streamErr) {
+				break
+			}
+			if empty {
+				for _, g := range groups {
+					active[g.name] = true
+				}
+				cfg.Tools = []*genai.Tool{{FunctionDeclarations: s.declsFor(active)}}
+			}
+			log.Warn().Err(streamErr).Bool("empty", empty).Str("finish", finish).Str("uid", req.UserID).Int("round", r+1).Msg("ai round retry")
 		}
 		names := make([]string, len(calls))
 		for i, c := range calls {
@@ -503,7 +542,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		}
 		round(r+1, used, time.Since(roundAt).Milliseconds(), names, streamErr)
 		if streamErr != nil {
-			fail(friendlyAIError(streamErr))
+			fail(streamErr, friendlyAIError(streamErr))
 			return
 		}
 
@@ -518,6 +557,10 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			contents = append(contents, &genai.Content{Role: "model", Parts: turnParts})
 		}
 
+		if len(calls) == 0 && finalText.Len() == 0 {
+			fail(nil, "I couldn't answer that one. Try putting it another way.")
+			return
+		}
 		if len(calls) == 0 {
 			outcome = "done"
 			send("done", map[string]any{
@@ -587,7 +630,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 	for resp, err := range s.stream(ctx, contents, &synthesisCfg, idle) {
 		if err != nil {
 			round(rounds+1, synthUsed, time.Since(synthAt).Milliseconds(), nil, err)
-			fail(friendlyAIError(err))
+			fail(err, friendlyAIError(err))
 			return
 		}
 		if resp != nil && resp.UsageMetadata != nil {
@@ -613,7 +656,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		})
 	}
 	if finalText.Len() == 0 {
-		fail("I couldn't finish that one in time.")
+		fail(nil, "I couldn't finish that one in time.")
 		return
 	}
 	// Out of tool rounds: the answer came from the no-tools wrap-up call.
@@ -646,6 +689,21 @@ func (s *Service) stream(ctx context.Context, contents []*genai.Content, cfg *ge
 }
 
 var errRoundStalled = errors.New("model stopped responding")
+
+// retryable: a stall or a server-side failure, worth one more try. Limits
+// (429) and bad requests (400) would fail the same way again.
+func retryable(err error) bool {
+	if errors.Is(err, errRoundStalled) {
+		return true
+	}
+	low := strings.ToLower(err.Error())
+	for _, code := range []string{"error 500", "error 502", "error 503", "error 504", "internal", "unavailable", "deadline_exceeded"} {
+		if strings.Contains(low, code) {
+			return true
+		}
+	}
+	return false
+}
 
 // logTool logs one tool call: how long it took, whether it worked, and how
 // big its result is (that size goes back to Gemini as input tokens).
@@ -736,6 +794,13 @@ Strict rules:
 	resp, err := s.generate(ctx, "categorize", []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: prompt}}},
 	}, cfg)
+	if err != nil && badRequest(err) {
+		// Enum refused (an odd category name?): ask for plain text instead.
+		cfg.ResponseMIMEType, cfg.ResponseSchema = "", nil
+		resp, err = s.generate(ctx, "categorize", []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: prompt}}},
+		}, cfg)
+	}
 	if err != nil {
 		return "Others", 0, fmt.Errorf("categorize: %w", err)
 	}
@@ -897,6 +962,23 @@ func cleanTxnMessage(s string) string {
 // (anything mentioning an amount and an account or a movement), so the model
 // is the one that turns away money that hasn't moved.
 func (s *Service) ParseTransactionMessage(ctx context.Context, msg, today string, auto bool, cats *TxnCategories) (ParsedTxn, int, error) {
+	p, cost, err := s.parseMessage(ctx, msg, today, auto, cats, true)
+	if err != nil && badRequest(err) {
+		// The schema (it carries the user's category names) was refused:
+		// read the message the old way rather than lose the capture.
+		log.Warn().Err(err).Msg("parse schema refused; retrying without it")
+		return s.parseMessage(ctx, msg, today, auto, nil, false)
+	}
+	return p, cost, err
+}
+
+// badRequest reports a request Gemini refused as malformed (400).
+func badRequest(err error) bool {
+	low := strings.ToLower(err.Error())
+	return strings.Contains(low, "invalid_argument") || strings.Contains(low, "error 400")
+}
+
+func (s *Service) parseMessage(ctx context.Context, msg, today string, auto bool, cats *TxnCategories, schema bool) (ParsedTxn, int, error) {
 	var zero ParsedTxn
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
@@ -945,8 +1027,10 @@ Income categories: ` + strings.Join(cats.Income, ", ")
 		SystemInstruction: &genai.Content{Parts: []*genai.Part{{Text: sys}}},
 		MaxOutputTokens:   maxOut,
 		ThinkingConfig:    &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow},
-		ResponseMIMEType:  "application/json",
-		ResponseSchema:    txnSchema(cats, auto),
+	}
+	if schema {
+		cfg.ResponseMIMEType = "application/json"
+		cfg.ResponseSchema = txnSchema(cats, auto)
 	}
 	resp, err := s.generate(ctx, "parse_text", []*genai.Content{
 		{Role: "user", Parts: []*genai.Part{{Text: prompt}}},

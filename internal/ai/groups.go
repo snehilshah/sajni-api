@@ -27,7 +27,7 @@ var toolGroup = map[string]string{
 	"update_reminder": "reminders", "delete_reminder": "reminders", "snooze_reminder": "reminders",
 	"skip_reminder_occurrence": "reminders", "delete_reminder_history": "reminders",
 	// money
-	"update_transaction": "money", "delete_transaction": "money", "finance_month": "money",
+	"delete_transaction": "money", "finance_month": "money",
 	"list_finance_budgets": "money", "create_budget": "money", "list_slates": "money", "create_slate": "money",
 	"update_slate": "money", "move_transactions_to_slate": "money", "list_captures": "money",
 	"set_capture_tracking": "money", "list_billers": "money", "create_biller": "money", "pay_biller": "money",
@@ -72,13 +72,13 @@ var groups = []struct {
 	{"reminders", "edit, snooze, skip or delete reminders",
 		regexp.MustCompile(`(?i)\b(remind|reminder|reminders|snooze|nudge)`)},
 	{"money", "edit or delete transactions, month analytics, budgets, slates, captured bank messages, billers, accounts",
-		regexp.MustCompile(`(?i)(₹|\brs\.?\s*\d|\b(budget|slate|capture|captured|biller|bill|bills|account|card|spend|spent|spending|expense|income|salary|transfer|refund|categor|transaction|money|finance|paid|pay|emi|sms))`)},
+		regexp.MustCompile(`(?i)(₹|\brs\.?\s*\d|\b(budget|slate|capture|captured|biller|bill|bills|account|card|spend|spent|spending|expense|income|salary|transfer|refund|categor|transaction|money|finance|paid|pay|emi|sms|trip|cost|costs|saving|savings|expensive|subscription|subscriptions|renewal|renew|netflix|rent))|month.{0,25}\b(high|much|expensive|over)\b`)},
 	{"people", "lends, splits, settling up, money owed both ways",
-		regexp.MustCompile(`(?i)\b(lend|lent|owe|owes|owed|borrow|borrowed|settle|settled|paid .{0,12}back|pay .{0,12}back|gave .{0,12}back|returned|split|splitwise|forgive|adjust|friend|people)`)},
+		regexp.MustCompile(`(?i)\b(lend|lent|owe|owes|owed|borrow|borrowed|settle|settled|paid .{0,12}back|pay .{0,12}back|gave .{0,12}back|gave me|sent me|received from|got .{0,10}from|returned|split|splitwise|forgive|adjust|friend|people)`)},
 	{"investments", "investments: RDs, FDs, SIPs, auto-debit",
-		regexp.MustCompile(`(?i)\b(invest|investment|sip|rd|fd|deposit|mutual|stock|maturity|matures)`)},
+		regexp.MustCompile(`(?i)\b(invest|investment|investments|sip|rd|fd|ppf|nps|mf|deposit|mutual|stock|stocks|share|shares|redeem|redeemed|maturity|matures|matured)`)},
 	{"library", "movies, shows, books (list, taste, TMDB) and saved bookmarks",
-		regexp.MustCompile(`(?i)\b(movie|movies|film|films|shows|series|tv|book|books|novel|watch|watched|watching|bookmark|bookmarks|video|videos|site|link|recommend|tmdb|anime)`)},
+		regexp.MustCompile(`(?i)\b(movie|movies|film|films|shows|series|tv|book|books|novel|watch|watched|watching|bookmark|bookmarks|article|articles|read later|video|videos|site|link|recommend|tmdb|anime)`)},
 	{"notes", "new notes and folders, pins, time travel (what you wrote on a past day), insights",
 		regexp.MustCompile(`(?i)\b(note|notes|folder|pin|pinned|unpin|last year|on this day|time travel|insight|insights|pattern|patterns)`)},
 	{"habits", "create habits",
@@ -93,6 +93,15 @@ var groups = []struct {
 
 // groupOf is a tool's group; "" means core.
 func groupOf(tool string) string { return toolGroup[tool] }
+
+// coreFollows: after a core tool, its group stays loaded for the next
+// questions, so "make it 300" after a new transaction can edit or delete it.
+var coreFollows = map[string]string{
+	"create_transaction": "money", "update_transaction": "money", "list_finance_transactions": "money",
+	"create_task": "tasks", "update_task": "tasks", "complete_task": "tasks", "reschedule_task": "tasks", "list_tasks": "tasks",
+	"create_reminder": "reminders", "list_reminders": "reminders",
+	"add_media": "library", "log_habit": "habits", "list_habits": "habits",
+}
 
 // routeGroups picks the groups a question needs: from its words and the last
 // few user messages, and from the tools the chat has used.
@@ -110,7 +119,11 @@ func routeGroups(message string, history []*genai.Content) map[string]bool {
 				continue
 			}
 			if p.FunctionCall != nil {
-				if g := groupOf(p.FunctionCall.Name); g != "" {
+				g := groupOf(p.FunctionCall.Name)
+				if g == "" {
+					g = coreFollows[p.FunctionCall.Name]
+				}
+				if g != "" {
 					on[g] = true
 				}
 			}

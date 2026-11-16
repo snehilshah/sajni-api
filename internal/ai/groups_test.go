@@ -21,7 +21,7 @@ var coreTools = []string{
 	"list_journal_entries", "get_journal_entry", "create_journal_entry",
 	"list_recent_memos", "create_memo",
 	"list_reminders", "create_reminder", "list_plans", "find_free_slots", "add_media",
-	"list_finance_transactions", "create_transaction", "list_finance_accounts", "list_finance_categories",
+	"list_finance_transactions", "create_transaction", "update_transaction", "list_finance_accounts", "list_finance_categories",
 }
 
 func TestEveryToolHasAGroup(t *testing.T) {
@@ -97,6 +97,21 @@ func TestRoutingGoldenPrompts(t *testing.T) {
 		{prompt: "change my theme to something calm", need: []string{"generate_theme"}},
 		{prompt: "add to today's journal: lunch with Riya", need: []string{"create_journal_entry"}},
 		{prompt: "read me note 12", need: []string{"fetch"}},
+		{prompt: "what did the Goa trip cost?", need: []string{"list_slates"}},
+		{prompt: "why is this month so high?", need: []string{"finance_month"}},
+		{prompt: "when does my Netflix subscription renew?", need: []string{"list_billers"}},
+		{prompt: "Rahul gave me 500", need: []string{"settle_lends"}},
+		{prompt: "I redeemed my PPF", need: []string{"list_investments"}},
+		{prompt: "save this article to read later", need: []string{"create_bookmark"}},
+		{
+			// After a core write, its group stays for the follow-up.
+			prompt: "make it 300",
+			history: []*genai.Content{
+				{Role: "user", Parts: []*genai.Part{{Text: "250 chai from HDFC"}}},
+				{Role: "model", Parts: []*genai.Part{{FunctionCall: &genai.FunctionCall{Name: "create_transaction"}}}},
+			},
+			need: []string{"update_transaction", "delete_transaction"},
+		},
 		{
 			// A follow-up keeps the group the chat already used.
 			prompt: "and the other one too",

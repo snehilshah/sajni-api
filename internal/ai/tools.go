@@ -50,7 +50,8 @@ type Tool struct {
 func (s *Service) dispatch(ctx context.Context, uid string, name string, args map[string]any) (any, map[string]any, error) {
 	for _, t := range s.tools {
 		if t.Name == name {
-			data, meta, err := t.Handler(ctx, uid, args)
+			// Any model call a tool makes is counted for this user.
+			data, meta, err := t.Handler(WithUser(ctx, uid), uid, args)
 			if kind, _ := meta["kind"].(string); kind != "" && meta["label"] == nil {
 				meta["label"] = KindLabel(kind)
 			}
@@ -604,7 +605,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "search",
-			Description: "Free-text search across memos, tasks, notes (titles and folders), journals, habits, events, media, and transactions. Use for 'find anything about X' style questions. Each hit has a ref; pass it to fetch for the full item.",
+			Description: "Free-text search across memos, tasks, notes (titles and folders), habits, events, media, and transactions (not journal text: use list_journal_entries). Use for 'find anything about X' style questions. Each hit has a ref; pass it to fetch for the full item.",
 			Schema: obj(map[string]*genai.Schema{
 				"q":     str("Search query."),
 				"types": arrayOf(str(""), "Optional whitelist of types: memo, task, note, journal, habit, media, transaction."),
@@ -747,7 +748,13 @@ func (s *Service) buildTools() []Tool {
 				if n := db.OpenSubtaskCount(ctx, d, uid, int64(id)); n > 0 {
 					return nil, nil, fmt.Errorf("%s", db.OpenSubtasksMessage(n))
 				}
+				var prev string
+				d.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=$1 AND user_id=$2`, id, uid).Scan(&prev)
 				_, err := d.Exec(`UPDATE tasks SET status='done', blocked_by_task_id=NULL, updated_at=NOW() WHERE id=$1 AND user_id=$2`, id, uid)
+				if err == nil && prev != "" && prev != "done" {
+					// The task's history shows it, as when done in the app.
+					d.ExecContext(ctx, `INSERT INTO task_events (user_id, task_id, kind, from_val, to_val) VALUES ($1,$2,'status',$3,'done')`, uid, id, prev)
+				}
 				if err != nil {
 					return nil, nil, err
 				}

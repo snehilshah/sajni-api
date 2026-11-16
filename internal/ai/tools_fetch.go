@@ -38,7 +38,8 @@ func fetchTool(d *db.DB, store storage.Storage) Tool {
 		Name: "fetch",
 		Description: "Read one item in full by its ref, as search and the list tools give them: " +
 			"task:12, note:5 (with its text), memo:3, transaction:88, media:4, bookmark:9, reminder:2, habit:1, event:7, project:6, " +
-			"or journal:2026-11-16. Use it when a list or search shows the item but not the detail you need.",
+			"or journal:2026-11-16. Use it when a list or search shows the item but not the detail you need. " +
+			"Timestamps are UTC; convert to the user's time zone before reading out a day or time.",
 		Schema: obj(map[string]*genai.Schema{
 			"ref": str("type:id, e.g. note:5 or journal:2026-11-16."),
 		}, "ref"),
@@ -56,7 +57,15 @@ func runFetch(ctx context.Context, d *db.DB, store storage.Storage, uid, ref str
 		return nil, nil, fmt.Errorf("ref must look like note:5 or journal:2026-11-16")
 	}
 	if kind == "journal" {
-		return getJournalTool(ctx, d, store, uid, key)
+		out, meta, err := getJournalTool(ctx, d, store, uid, key)
+		if m, ok := out.(map[string]any); ok {
+			if text, ok := m["content"].(string); ok {
+				if clipped, cut := clipChars(text, fetchMaxChars); cut {
+					m["content"], m["truncated"] = clipped, true
+				}
+			}
+		}
+		return out, meta, err
 	}
 	table, known := fetchTables[kind]
 	if !known {
@@ -67,7 +76,7 @@ func runFetch(ctx context.Context, d *db.DB, store storage.Storage, uid, ref str
 		return nil, nil, fmt.Errorf("%s ids are numbers", kind)
 	}
 	var raw []byte
-	err = d.QueryRowContext(ctx, `SELECT to_jsonb(x) - 'user_id' FROM `+table+` x WHERE id=$1 AND user_id=$2`, id, uid).Scan(&raw)
+	err = d.QueryRowContext(ctx, `SELECT jsonb_strip_nulls(to_jsonb(x) - 'user_id') FROM `+table+` x WHERE id=$1 AND user_id=$2`, id, uid).Scan(&raw)
 	if err != nil {
 		return nil, nil, fmt.Errorf("no %s %d", kind, id)
 	}

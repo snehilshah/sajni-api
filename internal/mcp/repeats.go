@@ -4,14 +4,29 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"sync"
 	"time"
 )
 
-// repeatWindow is how long a change counts as "just made": a resend inside
-// it (an app retrying a slow reply) returns the first answer instead of
-// making the change twice.
-const repeatWindow = 30 * time.Second
+// repeatWindow is how long after it finished a new item counts as "just
+// made": a resend inside it (an app retrying a slow reply, often 45-60 s
+// after it gave up) returns the first answer instead of adding it twice.
+const repeatWindow = 90 * time.Second
+
+// addsSomething reports whether a tool adds a new row each time it runs, so a
+// resend would duplicate it. Edits, sets and deletes repeat harmlessly.
+func addsSomething(tool string) bool {
+	if strings.HasPrefix(tool, "create_") || strings.HasPrefix(tool, "add_") {
+		return true
+	}
+	switch tool {
+	case "log_event", "borrow", "pay_back", "pay_biller", "lend_before_sajni", "settle_lends",
+		"forgive_lend", "mark_paid_for", "net_off", "comment_on_thought":
+		return true
+	}
+	return false
+}
 
 // repeatNote rides on a dropped resend so the assistant knows why.
 const repeatNote = "This exact change was made moments ago, so it wasn't repeated. To make it twice on purpose, change something (a note or the time)."
@@ -22,7 +37,7 @@ type repeats struct {
 }
 
 type repeat struct {
-	at   time.Time
+	at   time.Time // when it finished (zero while running)
 	done chan struct{}
 	res  map[string]any
 }
@@ -45,12 +60,8 @@ func (r *repeats) claim(key string) (map[string]any, bool) {
 	}
 	now := time.Now()
 	for k, e := range r.seen {
-		if now.Sub(e.at) > repeatWindow {
-			select {
-			case <-e.done:
-				delete(r.seen, k)
-			default: // still running; keep it
-			}
+		if !e.at.IsZero() && now.Sub(e.at) > repeatWindow {
+			delete(r.seen, k)
 		}
 	}
 	if e, ok := r.seen[key]; ok {
@@ -62,7 +73,7 @@ func (r *repeats) claim(key string) (map[string]any, bool) {
 		}
 		return withNote(e.res), true
 	}
-	r.seen[key] = &repeat{at: now, done: make(chan struct{})}
+	r.seen[key] = &repeat{done: make(chan struct{})}
 	r.mu.Unlock()
 	return nil, false
 }
@@ -75,6 +86,7 @@ func (r *repeats) finish(key string, res map[string]any) {
 		case <-e.done:
 		default:
 			e.res = res
+			e.at = time.Now()
 			close(e.done)
 		}
 	}

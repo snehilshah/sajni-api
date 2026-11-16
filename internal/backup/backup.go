@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -126,7 +127,13 @@ func Dump(ctx context.Context, sdb *sql.DB, now time.Time, put Put) (Result, err
 		}
 		defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // read-only
 
-		tables, err := listTables(ctx, tx)
+		// By name: the dump needs no order, so a future foreign-key cycle
+		// can't stop backups (Restore sorts, and its test would catch one).
+		rows, err := tx.Query(ctx, `SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename`)
+		if err != nil {
+			return err
+		}
+		tables, err := pgx.CollectRows(rows, pgx.RowTo[string])
 		if err != nil {
 			return err
 		}
@@ -335,6 +342,11 @@ func loadTable(ctx context.Context, pg *pgconn.PgConn, table string, open Open) 
 func restoreGuide(now time.Time, res Result) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Sajni database backup, %s UTC\n\n%d tables, %d rows.\n\n", now.UTC().Format("2006-01-02 15:04"), res.Tables, res.Rows)
+	if rev := os.Getenv("K_REVISION"); rev != "" {
+		// Restore against the schema of the release that wrote it:
+		// `gcloud run revisions describe <rev>` shows its image and tag.
+		fmt.Fprintf(&b, "Written by Cloud Run revision `%s`.\n\n", rev)
+	}
 	b.WriteString("## Restore\n\n")
 	b.WriteString("1. Download this folder (`gcloud storage cp -r gs://<bucket>/<this prefix> ./restore`).\n")
 	b.WriteString("2. Start the API once against the new, empty database so it creates the current schema, then stop it.\n")

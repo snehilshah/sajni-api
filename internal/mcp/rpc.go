@@ -156,14 +156,16 @@ func (s *Server) callTool(ctx context.Context, who *caller, name string, args ma
 	}
 	// Apps resend a change when a reply is slow; the same change from the
 	// same user within a short window runs once and both get its answer.
-	if entry.tool.Mutating {
+	if entry.tool.Mutating && addsSomething(name) {
 		key := dedupeKey(who.uid, name, args)
 		if res, again := s.recent.claim(key); again {
 			log.Info().Str("uid", who.uid).Str("client", who.client).Str("tool", name).Msg("mcp call repeated, not run")
 			return res, nil
 		}
+		var res map[string]any
+		// Deferred, so a panic can't leave identical calls waiting forever.
+		defer func() { s.recent.finish(key, res) }()
 		res, rpcErr := s.runTool(ctx, who, name, args)
-		s.recent.finish(key, res)
 		return res, rpcErr
 	}
 	return s.runTool(ctx, who, name, args)
