@@ -604,7 +604,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "search",
-			Description: "Free-text search across memos, tasks, notes, journals, habits, events, media, and transactions. Use for 'find anything about X' style questions.",
+			Description: "Free-text search across memos, tasks, notes (titles and folders), journals, habits, events, media, and transactions. Use for 'find anything about X' style questions. Each hit has a ref; pass it to fetch for the full item.",
 			Schema: obj(map[string]*genai.Schema{
 				"q":     str("Search query."),
 				"types": arrayOf(str(""), "Optional whitelist of types: memo, task, note, journal, habit, media, transaction."),
@@ -1473,6 +1473,7 @@ func (s *Service) buildTools() []Tool {
 	tools = append(tools, financeSetupTools(d)...)
 	tools = append(tools, owedTools(d)...)
 	tools = append(tools, planTools(d, queue)...)
+	tools = append(tools, fetchTool(d, store))
 	return append(tools, standaloneReminderTools(d, queue)...)
 }
 
@@ -2182,7 +2183,7 @@ func runSearchTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 			var id int64
 			var title, sub string
 			rows.Scan(&id, &title, &sub)
-			out = append(out, map[string]any{"type": t, "id": id, "title": title, "subtitle": sub})
+			out = append(out, map[string]any{"type": t, "id": id, "ref": fmt.Sprintf("%s:%d", t, id), "title": title, "subtitle": sub})
 		}
 	}
 	if want("memo") {

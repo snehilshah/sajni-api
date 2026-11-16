@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"sajni/internal/db"
 	"sajni/internal/plan"
 )
 
@@ -39,6 +40,8 @@ Tool use:
 - Before suggesting a free time slot: find_free_slots.
 - For mutations, confirm only if ambiguous — otherwise just do it and state what was created. Multiple required actions in one request? Call all the tools in parallel in the same round.
 - If a tool errors, fix args and retry once. No retry loops.
+- Your everyday tools are loaded; the rest come in groups. If none of yours fits the request, call more_tools for the group and carry on. Never mention this to the user.
+- Search and list rows carry ids; fetch reads one item in full (a note's text, a task's subtasks) by ref.
 - A list with has_more: true was cut at its limit. Before totalling or saying "all", narrow it (dates, type) or raise limit.
 
 ` + agendaRules + `
@@ -93,7 +96,32 @@ func (s *Service) liveContext(ctx context.Context, uid string) string {
 		}
 		parts = append(parts, "Plans today: "+strings.Join(names, ", "))
 	}
+	// Names with ids, so "add to Work" or "paid from HDFC" needs no lookup.
+	if names := idNames(ctx, s.db, `SELECT id, name FROM task_lists WHERE user_id=$1 ORDER BY sort_order, id LIMIT 20`, uid); names != "" {
+		parts = append(parts, "Task lists: "+names)
+	}
+	if names := idNames(ctx, s.db, `SELECT id, name FROM fin_accounts WHERE user_id=$1 AND NOT archived ORDER BY id LIMIT 20`, uid); names != "" {
+		parts = append(parts, "Accounts: "+names)
+	}
 	return wrapNow(parts)
+}
+
+// idNames renders rows of (id, name) as "Work (id 2), Home (id 3)".
+func idNames(ctx context.Context, d *db.DB, q, uid string) string {
+	rows, err := d.QueryContext(ctx, q, uid)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id int64
+		var name string
+		if rows.Scan(&id, &name) == nil && strings.TrimSpace(name) != "" {
+			out = append(out, fmt.Sprintf("%s (id %d)", name, id))
+		}
+	}
+	return strings.Join(out, ", ")
 }
 
 // nowDates spells out today, tomorrow and the current week (Monday to

@@ -39,6 +39,8 @@ type Server struct {
 
 	toolsOnce sync.Once
 	tools     []toolEntry
+
+	recent repeats // mutating calls just run, to drop resends
 }
 
 // New builds the server. appURL is the public web origin.

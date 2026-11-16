@@ -10,10 +10,12 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -48,6 +50,10 @@ const (
 	// split steps across more rounds than the full flash model).
 	maxToolRounds = 10
 	paletteRounds = 6
+	// roundIdle is how long a round may go without a streamed chunk before
+	// it's cut (and tried once more if nothing was shown yet).
+	roundIdleChat    = 30 * time.Second
+	roundIdlePalette = 20 * time.Second
 	// GenerateContent caps include reasoning tokens as well as visible output.
 	// Leave headroom for Gemini 3.8, which cannot disable thinking.
 	maxOutputTokens      = 8192
@@ -93,6 +99,8 @@ type Service struct {
 	// Gate, when set, is asked before every model call and may refuse it
 	// (a *LimitError when the user is over budget). uid as for OnUsage.
 	Gate func(ctx context.Context, uid, kind string) error
+
+	roundIdle time.Duration // tests: overrides roundIdleChat/roundIdlePalette
 }
 
 // LimitError is a refusal from Gate: the caller may try again after
@@ -203,6 +211,8 @@ func friendlyAIError(err error) string {
 		return "Conversation history was invalid. Start a new chat to clear it."
 	case strings.Contains(low, "invalid_argument"):
 		return "Sajni couldn't process that request. Try again."
+	case errors.Is(err, errRoundStalled):
+		return "Sajni stopped responding. Try again."
 	case strings.Contains(low, "deadline exceeded"),
 		strings.Contains(low, "context canceled"):
 		return "Sajni took too long. Try a shorter prompt."
@@ -341,6 +351,20 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		h[msgAt] = &genai.Content{Role: "user", Parts: []*genai.Part{{Text: req.Message}}}
 		return h
 	}
+	// fail ends the turn with a message, and keeps the question (and any
+	// tool work so far) in the history so the chat isn't lost.
+	fail := func(msg string) {
+		if strings.Contains(msg, "Start a new chat") {
+			// The history itself is the problem; don't save it again.
+			send("error", map[string]any{"message": msg})
+			return
+		}
+		h := append(saved(), &genai.Content{Role: "model", Parts: []*genai.Part{{Text: msg}}})
+		send("error", map[string]any{"message": msg, "history": h})
+	}
+
+	// Core tools plus the groups this question needs (groups.go).
+	active := routeGroups(req.Message, req.History)
 
 	// One log line per question: rounds, tools used, tokens and cost.
 	started := time.Now()
@@ -356,7 +380,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			ev = log.Warn()
 		}
 		total.fields(ev.Str("uid", req.UserID).Str("mode", req.Mode).Str("model", s.model).
-			Str("outcome", outcome).Int("rounds", roundsRun).Strs("tools", toolsUsed).
+			Str("outcome", outcome).Int("rounds", roundsRun).Strs("tools", toolsUsed).Strs("groups", groupNames(active)).
 			Int("msg_chars", len(req.Message)).Int64("ms", time.Since(started).Milliseconds())).
 			Msg("ai turn")
 	}()
@@ -375,14 +399,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 
 	sysPrompt := systemPrompt
 
-	decls := make([]*genai.FunctionDeclaration, len(s.tools))
-	for i, t := range s.tools {
-		decls[i] = &genai.FunctionDeclaration{
-			Name:        t.Name,
-			Description: t.Description,
-			Parameters:  t.Schema,
-		}
-	}
+	decls := s.declsFor(active)
 	level := genai.ThinkingLevelMedium
 	maxOut := int32(maxOutputTokens)
 	if req.Mode == "palette" {
@@ -408,8 +425,13 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 	}
 
 	rounds := maxToolRounds
+	idle := roundIdleChat
 	if req.Mode == "palette" {
 		rounds = paletteRounds
+		idle = roundIdlePalette
+	}
+	if s.roundIdle > 0 {
+		idle = s.roundIdle
 	}
 
 	var finalText strings.Builder
@@ -430,42 +452,50 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		// same call twice across stream chunks; without this guard we'd
 		// dispatch the tool twice and pollute history with two responses.
 		seenCalls := map[string]int{}
-		for resp, err := range s.client.GenerateContentStream(ctx, s.model, contents, cfg) {
-			if err != nil {
-				streamErr = err
+		for attempt := 0; attempt < 2; attempt++ {
+			streamErr = nil
+			for resp, err := range s.stream(ctx, contents, cfg, idle) {
+				if err != nil {
+					streamErr = err
+					break
+				}
+				// Each chunk carries the running count; the last one is the total.
+				if resp != nil && resp.UsageMetadata != nil {
+					used = usageOf(resp.UsageMetadata)
+				}
+				if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
+					continue
+				}
+				for _, p := range resp.Candidates[0].Content.Parts {
+					if p.Text != "" && !p.Thought {
+						turnText.WriteString(p.Text)
+						send("delta", map[string]string{"text": p.Text})
+					}
+					if p.FunctionCall != nil {
+						key := functionCallKey(p.FunctionCall)
+						if index, seen := seenCalls[key]; seen {
+							// Some stream variants emit the signature on a later copy
+							// of the same call. Keep it without dispatching twice.
+							if len(callParts[index].ThoughtSignature) == 0 && len(p.ThoughtSignature) > 0 {
+								callParts[index].ThoughtSignature = append([]byte(nil), p.ThoughtSignature...)
+							}
+							continue
+						}
+						seenCalls[key] = len(calls)
+						call := *p.FunctionCall
+						part := *p
+						part.FunctionCall = &call
+						part.ThoughtSignature = append([]byte(nil), p.ThoughtSignature...)
+						calls = append(calls, &call)
+						callParts = append(callParts, &part)
+					}
+				}
+			}
+			// A stalled or failed round that showed nothing is tried once more.
+			if streamErr == nil || turnText.Len() > 0 || len(calls) > 0 || ctx.Err() != nil {
 				break
 			}
-			// Each chunk carries the running count; the last one is the total.
-			if resp != nil && resp.UsageMetadata != nil {
-				used = usageOf(resp.UsageMetadata)
-			}
-			if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
-				continue
-			}
-			for _, p := range resp.Candidates[0].Content.Parts {
-				if p.Text != "" && !p.Thought {
-					turnText.WriteString(p.Text)
-					send("delta", map[string]string{"text": p.Text})
-				}
-				if p.FunctionCall != nil {
-					key := functionCallKey(p.FunctionCall)
-					if index, seen := seenCalls[key]; seen {
-						// Some stream variants emit the signature on a later copy
-						// of the same call. Keep it without dispatching twice.
-						if len(callParts[index].ThoughtSignature) == 0 && len(p.ThoughtSignature) > 0 {
-							callParts[index].ThoughtSignature = append([]byte(nil), p.ThoughtSignature...)
-						}
-						continue
-					}
-					seenCalls[key] = len(calls)
-					call := *p.FunctionCall
-					part := *p
-					part.FunctionCall = &call
-					part.ThoughtSignature = append([]byte(nil), p.ThoughtSignature...)
-					calls = append(calls, &call)
-					callParts = append(callParts, &part)
-				}
-			}
+			log.Warn().Err(streamErr).Str("uid", req.UserID).Int("round", r+1).Msg("ai round retry")
 		}
 		names := make([]string, len(calls))
 		for i, c := range calls {
@@ -473,7 +503,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		}
 		round(r+1, used, time.Since(roundAt).Milliseconds(), names, streamErr)
 		if streamErr != nil {
-			send("error", map[string]string{"message": friendlyAIError(streamErr)})
+			fail(friendlyAIError(streamErr))
 			return
 		}
 
@@ -499,6 +529,16 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 
 		respParts := make([]*genai.Part, 0, len(calls))
 		for _, fc := range calls {
+			if fc.Name == moreToolsName {
+				// Not a user-visible action: widen the tools for the next round.
+				loaded := s.loadGroups(active, fc.Args)
+				cfg.Tools = []*genai.Tool{{FunctionDeclarations: s.declsFor(active)}}
+				toolsUsed = append(toolsUsed, fc.Name)
+				respParts = append(respParts, &genai.Part{FunctionResponse: &genai.FunctionResponse{
+					ID: fc.ID, Name: fc.Name, Response: map[string]any{"result": loaded},
+				}})
+				continue
+			}
 			send("tool_call", map[string]any{"name": fc.Name, "args": fc.Args})
 			toolAt := time.Now()
 			data, meta, err := s.dispatch(ctx, req.UserID, fc.Name, fc.Args)
@@ -544,10 +584,10 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		synthUsed     usage
 		synthAt       = time.Now()
 	)
-	for resp, err := range s.client.GenerateContentStream(ctx, s.model, contents, &synthesisCfg) {
+	for resp, err := range s.stream(ctx, contents, &synthesisCfg, idle) {
 		if err != nil {
 			round(rounds+1, synthUsed, time.Since(synthAt).Milliseconds(), nil, err)
-			send("error", map[string]string{"message": friendlyAIError(err)})
+			fail(friendlyAIError(err))
 			return
 		}
 		if resp != nil && resp.UsageMetadata != nil {
@@ -573,13 +613,39 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		})
 	}
 	if finalText.Len() == 0 {
-		send("error", map[string]string{"message": "I couldn't finish that one in time."})
+		fail("I couldn't finish that one in time.")
 		return
 	}
 	// Out of tool rounds: the answer came from the no-tools wrap-up call.
 	outcome = "round_limit"
 	send("done", map[string]any{"text": finalText.String(), "history": saved()})
 }
+
+// stream is GenerateContentStream that gives up when no chunk arrives for
+// idle (the error says so), so one stalled round can't eat the whole turn.
+func (s *Service) stream(ctx context.Context, contents []*genai.Content, cfg *genai.GenerateContentConfig, idle time.Duration) iter.Seq2[*genai.GenerateContentResponse, error] {
+	return func(yield func(*genai.GenerateContentResponse, error) bool) {
+		rctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		var stalled atomic.Bool
+		timer := time.AfterFunc(idle, func() { stalled.Store(true); cancel() })
+		defer timer.Stop()
+		for resp, err := range s.client.GenerateContentStream(rctx, s.model, contents, cfg) {
+			timer.Reset(idle)
+			if err != nil && stalled.Load() && ctx.Err() == nil {
+				err = errRoundStalled
+			}
+			if !yield(resp, err) || err != nil {
+				return
+			}
+		}
+		if stalled.Load() && ctx.Err() == nil {
+			yield(nil, errRoundStalled)
+		}
+	}
+}
+
+var errRoundStalled = errors.New("model stopped responding")
 
 // logTool logs one tool call: how long it took, whether it worked, and how
 // big its result is (that size goes back to Gemini as input tokens).

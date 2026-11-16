@@ -189,7 +189,8 @@ func registerAIRoutes(mux *http.ServeMux, deps Deps, svc *ai.Service) {
 
 		var finalHistory []*genai.Content
 		for ev := range svc.Chat(ctx, req) {
-			if ev.Type == "done" {
+			// A failed turn carries its history too, so the question is kept.
+			if ev.Type == "done" || ev.Type == "error" {
 				var raw struct {
 					History []*genai.Content `json:"history"`
 				}

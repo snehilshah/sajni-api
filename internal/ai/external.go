@@ -24,6 +24,7 @@ const MCPInstructions = `Sajni is the user's personal knowledge app: tasks, habi
 
 - Call get_current_context first whenever dates matter; resolve "tomorrow", "this week" or "next monday" from its dates, never from your own clock.
 - Never invent ids, dates or items. Look them up with the list_ and search tools.
+- Search and list rows carry ids; fetch reads one item in full by ref (note:5 gives the note's text, journal:2026-11-16 a day).
 - A list with has_more: true was cut at its limit. Before totalling or saying "all", narrow it (dates, type) or raise limit.
 - Amounts are in the user's currency (INR) unless a row says otherwise.
 - When the user says they watched, read or finished something, call add_media with status='complete'.

@@ -154,6 +154,22 @@ func (s *Server) callTool(ctx context.Context, who *caller, name string, args ma
 	if entry.tool.Mutating && !who.write {
 		return toolText("This connection can only read Sajni. To allow changes, remove Sajni from this app and connect it again with changes allowed.", true), nil
 	}
+	// Apps resend a change when a reply is slow; the same change from the
+	// same user within a short window runs once and both get its answer.
+	if entry.tool.Mutating {
+		key := dedupeKey(who.uid, name, args)
+		if res, again := s.recent.claim(key); again {
+			log.Info().Str("uid", who.uid).Str("client", who.client).Str("tool", name).Msg("mcp call repeated, not run")
+			return res, nil
+		}
+		res, rpcErr := s.runTool(ctx, who, name, args)
+		s.recent.finish(key, res)
+		return res, rpcErr
+	}
+	return s.runTool(ctx, who, name, args)
+}
+
+func (s *Server) runTool(ctx context.Context, who *caller, name string, args map[string]any) (map[string]any, *rpcError) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
