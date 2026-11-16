@@ -90,11 +90,47 @@ type Service struct {
 	// hold each user to a spending budget. uid is empty when the caller
 	// didn't know it; the hook then reads the signed-in user from ctx.
 	OnUsage func(ctx context.Context, uid, kind string, costUSD float64)
+	// Gate, when set, is asked before every model call and may refuse it
+	// (a *LimitError when the user is over budget). uid as for OnUsage.
+	Gate func(ctx context.Context, uid, kind string) error
 }
 
+// LimitError is a refusal from Gate: the caller may try again after
+// RetryAfter.
+type LimitError struct {
+	RetryAfter time.Duration
+	Message    string
+}
+
+func (e *LimitError) Error() string { return e.Message }
+
+type userKey struct{}
+
+// WithUser marks ctx as work for uid, for calls made off a request (a
+// background goroutine), so their cost lands on the right user.
+func WithUser(ctx context.Context, uid string) context.Context {
+	return context.WithValue(ctx, userKey{}, uid)
+}
+
+func userOf(ctx context.Context, uid string) string {
+	if uid == "" {
+		uid, _ = ctx.Value(userKey{}).(string)
+	}
+	return uid
+}
+
+func (s *Service) gate(ctx context.Context, uid, kind string) error {
+	if s.Gate == nil {
+		return nil
+	}
+	return s.Gate(ctx, userOf(ctx, uid), kind)
+}
+
+// spent reports one call, even a failed one with no usage, so a retry loop
+// still counts toward the call cap.
 func (s *Service) spent(ctx context.Context, uid, kind string, u usage) {
-	if s.OnUsage != nil && u.Total() > 0 {
-		s.OnUsage(ctx, uid, kind, u.CostUSD())
+	if s.OnUsage != nil {
+		s.OnUsage(ctx, userOf(ctx, uid), kind, u.CostUSD())
 	}
 }
 
@@ -285,6 +321,11 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		case out <- newEvent(t, v):
 		case <-ctx.Done():
 		}
+	}
+
+	if err := s.gate(ctx, req.UserID, req.Mode); err != nil {
+		send("error", map[string]string{"message": err.Error()})
+		return
 	}
 
 	// Gemini sees the message after a <now> block; the saved history keeps

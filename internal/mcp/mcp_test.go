@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
+	"sajni/internal/dbtest"
 	"strings"
 	"testing"
 
@@ -75,7 +75,7 @@ func TestSchemaConversion(t *testing.T) {
 // refresh, disconnect. Needs a scratch Postgres:
 // SAJNI_TEST_DATABASE_URL=postgres://… go test ./internal/mcp
 func TestConnectFlow(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

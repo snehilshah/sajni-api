@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"sajni/internal/dbtest"
 	"strconv"
 	"testing"
 	"time"
@@ -18,7 +18,7 @@ import (
 
 // Needs a scratch Postgres: SAJNI_TEST_DATABASE_URL=postgres://… go test ./internal/api -run PlansAndRepeats
 func TestPlansAndRepeats(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

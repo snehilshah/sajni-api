@@ -2552,16 +2552,18 @@ func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, ui
 		// Validate list ownership.
 		var ok int
 		d.QueryRowContext(ctx, `SELECT 1 FROM task_lists WHERE id=$1 AND user_id=$2`, lid, uid).Scan(&ok)
-		if ok == 1 {
-			listArg = lid
+		if ok != 1 {
+			return nil, nil, fmt.Errorf("no task list %d; call list_task_lists for the ids", lid)
 		}
+		listArg = lid
 	}
 	if pid := argInt(args, "parent_task_id", 0); pid != 0 {
 		var ok int
 		d.QueryRowContext(ctx, `SELECT 1 FROM tasks WHERE id=$1 AND user_id=$2`, pid, uid).Scan(&ok)
-		if ok == 1 {
-			parentArg = pid
+		if ok != 1 {
+			return nil, nil, fmt.Errorf("no task %d to put this under; call list_tasks for the ids", pid)
 		}
+		parentArg = pid
 	}
 
 	// Steps: accept array of strings ("buy milk") or array of objects.
@@ -2629,6 +2631,8 @@ func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, ui
 	if err != nil {
 		return nil, nil, err
 	}
+	// The task's history starts here, as it does for one made in the app.
+	d.ExecContext(ctx, `INSERT INTO task_events (user_id, task_id, kind, from_val, to_val) VALUES ($1,$2,'created','',$3)`, uid, id, title)
 	if remind && scheduledAt.Valid {
 		enqueueTaskReminder(ctx, queue, id, scheduledAt.Time)
 	}

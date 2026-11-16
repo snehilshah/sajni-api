@@ -344,10 +344,20 @@ gcloud logging read 'resource.labels.service_name="sajni-api" AND jsonPayload.me
 
 ### Spending limits
 
-Every call's cost (`ai.Service.OnUsage`) counts toward the user's budget
-(`api/ailimit.go`): at most 240 calls and $0.50 per trailing hour (in memory),
-and `AI_DAILY_BUDGET_USD` (default $2) per UTC day, kept in `ai_spend` so it
-survives restarts. Past either, AI endpoints answer 429 with when to retry.
+Every model call asks `ai.Service.Gate` first and reports its cost to
+`ai.Service.OnUsage` (`api/ailimit.go`), so chat, palette, capture, themes,
+insight narration and Projects enrichment share one budget per user:
+
+- per trailing hour (in memory): at most 240 calls (failed ones count), and
+  $0.50 of chat and palette questions (capture parsing is exempt, so a long
+  chat can't stall bank capture);
+- per UTC day (`ai_spend`, survives restarts): `AI_DAILY_BUDGET_USD` (default
+  $2) per user, and `AI_GLOBAL_DAILY_BUDGET_USD` (default $6) for everyone
+  together, since sign-up is open.
+
+Past a limit, AI endpoints answer 429 with when to retry; a chat shows the
+same sentence. Background work (Projects enrichment) carries its user with
+`ai.WithUser`.
 
 ```sh
 # Today's spend per user.
@@ -449,13 +459,19 @@ gcloud storage cp -r data/blobs/* gs://sajni-blobs/blobs/
 - **Database:** the quarter-hour sweep makes a weekly copy (first sweep in
   the 21:00 UTC hour once the last copy is a week old; `internal/backup`,
   table `db_backups`): `gs://$GCS_BUCKET/backups/db/<stamp>/<table>.csv.gz`
-  plus `RESTORE.md` with row counts and the restore steps. A bucket lifecycle
-  rule deletes copies after 63 days. Check the last one:
+  plus `RESTORE.md` with row counts and the restore steps. A run is capped at
+  45 s and logs `ms`; past ~20 s, move it to a Cloud Run job. A bucket
+  lifecycle rule deletes copies after 63 days. Check the last one:
   `echo "SELECT * FROM db_backups ORDER BY id DESC LIMIT 3;" | finance/work/q`.
-  For an on-demand copy to disk: `go run ./cmd/dbdump`.
+  For an on-demand copy to disk: `go run ./cmd/dbdump` (same format).
+  **Restore:** start the API once against a new, empty database (creates the
+  schema), then `go run ./cmd/dbrestore -from <folder> -db '<new URL>'`. It
+  loads by column name in foreign-key order and resets sequences in one
+  transaction; it never reads `.env`. `internal/backup` tests the round trip.
 - **Blobs (journal, notes, uploads):** object versioning is on (2026-11-16),
-  so an overwrite or delete keeps the old version: the newest 20 per object,
-  each for 90 days; plus the 7-day soft delete. Restore one:
+  so an overwrite or delete keeps every old version for 90 days (journal
+  autosave makes many; a cap of 1,000 per object only stops a runaway), plus
+  the 7-day soft delete. Restore one:
 
 ```sh
 gcloud storage ls --all-versions gs://$GCS_BUCKET/user_<uid>/journal/2026-11-16.md
@@ -464,7 +480,7 @@ gcloud storage cp gs://$GCS_BUCKET/user_<uid>/journal/2026-11-16.md#<generation>
 ```
 
 The lifecycle rules (set once, `gcloud storage buckets update --lifecycle-file`):
-noncurrent versions with 20 newer → delete; noncurrent for 90 days → delete;
+noncurrent versions with 1,000 newer → delete; noncurrent for 90 days → delete;
 `backups/db/` older than 63 days → delete.
 
 ---

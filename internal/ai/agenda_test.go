@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"iter"
-	"os"
+	"sajni/internal/dbtest"
 	"strings"
 	"sync"
 	"testing"
@@ -96,7 +96,7 @@ func TestNowBlockSentButNotSaved(t *testing.T) {
 
 // Needs a scratch Postgres: SAJNI_TEST_DATABASE_URL=postgres://… go test ./internal/ai -run ListTasks
 func TestListTasksOpenByDeadline(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

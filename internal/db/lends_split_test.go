@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"math"
-	"os"
+	"sajni/internal/dbtest"
 	"testing"
 	"time"
 )
@@ -13,7 +13,7 @@ import (
 // keeps the user's part, and the card always shows the whole charge.
 // Needs a scratch Postgres: SAJNI_TEST_DATABASE_URL=postgres://… go test ./internal/db
 func TestSplitBillSeveral(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

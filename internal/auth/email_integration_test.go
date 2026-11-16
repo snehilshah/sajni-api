@@ -2,7 +2,7 @@ package auth
 
 import (
 	"context"
-	"os"
+	"sajni/internal/dbtest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,7 +12,7 @@ import (
 )
 
 func TestEmailCodeConcurrentConsumption(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL is not set")
 	}

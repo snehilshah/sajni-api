@@ -124,7 +124,7 @@ func addThoughtTool(ctx context.Context, s *Service, uid string, args map[string
 	// Async enrichment using sibling context (with prior enrichments).
 	// userID is a UUID string; project + card ids stay int64 (BIGSERIAL).
 	go func(cardID, projID int64, userID string) {
-		s.EnrichCardWithContext(context.Background(), userID, projID, cardID)
+		s.EnrichCardWithContext(WithUser(context.Background(), userID), userID, projID, cardID)
 	}(id, pid, uid)
 
 	return map[string]any{"id": id, "kind": kind, "project_id": pid},

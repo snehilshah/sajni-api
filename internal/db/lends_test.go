@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"math"
-	"os"
+	"sajni/internal/dbtest"
 	"strings"
 	"testing"
 	"time"
@@ -31,7 +31,7 @@ func TestCardCycleDue(t *testing.T) {
 
 // Needs a scratch Postgres: SAJNI_TEST_DATABASE_URL=postgres://… go test ./internal/db
 func TestPaidForSettleFlow(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}
@@ -139,7 +139,7 @@ func TestPaidForSettleFlow(t *testing.T) {
 
 // Needs a scratch Postgres, like TestPaidForSettleFlow.
 func TestSplitAndForgive(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}
@@ -304,7 +304,7 @@ func TestSplitAndForgive(t *testing.T) {
 // Needs a scratch Postgres, like TestPaidForSettleFlow. The cashback case: a
 // payment pinned to one lend pays that lend; unpinned money touches none.
 func TestPinnedSettlements(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}
@@ -411,7 +411,7 @@ func TestPinnedSettlements(t *testing.T) {
 }
 
 func TestLendOrder(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

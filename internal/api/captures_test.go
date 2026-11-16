@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"sajni/internal/dbtest"
 	"strconv"
 	"strings"
 	"testing"
@@ -22,7 +22,7 @@ import (
 // The messages are the owner's real ones from the 13 Nov 2026 recon
 // (finance/recon-2026-11-13.md); the AI parse is canned.
 func TestCaptureMemory(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}
@@ -169,7 +169,7 @@ func TestCaptureMemory(t *testing.T) {
 // Salman: the owner calls his ₹22 smokes "Office Smoke" and his ₹60 Coke
 // "Salman's shop". Kotak cuts his name to 20 characters.
 func TestPayeeNames(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}
@@ -258,7 +258,7 @@ func TestPayeeNames(t *testing.T) {
 
 // Papa owes the card bill; his NEFT credit arrives as "Ronak Arvind Shah".
 func TestSettleSuggestion(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

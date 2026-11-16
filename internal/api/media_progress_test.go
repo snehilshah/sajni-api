@@ -2,7 +2,7 @@ package api
 
 import (
 	"encoding/json"
-	"os"
+	"sajni/internal/dbtest"
 	"testing"
 
 	"sajni/internal/db"
@@ -37,7 +37,7 @@ func TestPlanProgress(t *testing.T) {
 
 // Needs a scratch Postgres: SAJNI_TEST_DATABASE_URL=postgres://… go test ./internal/api
 func TestLogMediaProgressMerges(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

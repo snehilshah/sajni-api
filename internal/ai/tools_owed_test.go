@@ -2,7 +2,7 @@ package ai
 
 import (
 	"context"
-	"os"
+	"sajni/internal/dbtest"
 	"testing"
 
 	"sajni/internal/db"
@@ -10,7 +10,7 @@ import (
 
 // Needs a scratch Postgres: SAJNI_TEST_DATABASE_URL=postgres://… go test ./internal/ai
 func TestOwedTools(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

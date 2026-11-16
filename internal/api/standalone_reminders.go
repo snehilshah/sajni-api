@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog/log"
 
@@ -263,12 +264,7 @@ func sendStandaloneReminder(ctx context.Context, deps Deps, occurrenceID int64) 
 		return false, err
 	}
 	route := fmt.Sprintf("/tasks?tab=reminders&focus=%d", item.reminderID)
-	// With notes, the reminder is the title and its notes the body (the
-	// phone expands long text); without, it reads "Reminder" over the message.
-	title, body := "Reminder", item.message
-	if notes := strings.TrimSpace(item.notes); notes != "" {
-		title, body = item.message, notes
-	}
+	title, body := reminderPushText(item.message, item.notes)
 	pushed := notifyPush(ctx, deps, item.uid, push.Notification{
 		Type:     push.TypeReminder,
 		Title:    title,
@@ -286,7 +282,7 @@ func sendStandaloneReminder(ctx context.Context, deps Deps, occurrenceID int64) 
 		if name == "" {
 			name = item.email
 		}
-		if err := deps.Auth.SendTaskReminder(ctx, item.email, name, item.message, formatReminderWhen(item.fireAt, item.timezone), route); err != nil {
+		if err := deps.Auth.SendReminder(ctx, item.email, name, item.message, formatReminderWhen(item.fireAt, item.timezone), route, item.notes); err != nil {
 			if !pushed {
 				_, _ = deps.DB.ExecContext(ctx, `UPDATE reminder_occurrences SET claimed_until=NULL WHERE id=$1`, occurrenceID)
 				return false, err
@@ -304,4 +300,40 @@ func sendStandaloneReminder(ctx context.Context, deps Deps, occurrenceID int64) 
 		return false, err
 	}
 	return true, nil
+}
+
+// Push text limits. Android draws the title on one line and expands only the
+// body; FCM caps a data message at 4 KB, and a reminder's notes alone may be
+// 4,000 bytes, so the body is cut to fit.
+const (
+	reminderTitleRunes = 40
+	reminderBodyBytes  = 1000
+)
+
+// reminderPushText lays out a reminder's notification. A short message with
+// notes becomes the title over the notes; a long one stays in the body under
+// "Reminder" so it can be read in full when expanded.
+func reminderPushText(message, notes string) (title, body string) {
+	message, notes = strings.TrimSpace(message), strings.TrimSpace(notes)
+	switch {
+	case notes == "":
+		title, body = "Reminder", message
+	case utf8.RuneCountInString(message) <= reminderTitleRunes:
+		title, body = message, notes
+	default:
+		title, body = "Reminder", message+"\n\n"+notes
+	}
+	return title, clipBytes(body, reminderBodyBytes)
+}
+
+// clipBytes cuts s to at most n bytes on a rune boundary, ending in "…".
+func clipBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := n - len("…")
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return strings.TrimRight(s[:cut], " \n") + "…"
 }

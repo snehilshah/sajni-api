@@ -81,6 +81,9 @@ func roundCost(v float64) float64 { return float64(int64(v*1e6+0.5)) / 1e6 }
 // generate is one non-streaming model call, logged with its tokens and
 // cost under kind ("categorize", "parse_text", …).
 func (s *Service) generate(ctx context.Context, kind string, contents []*genai.Content, cfg *genai.GenerateContentConfig) (*genai.GenerateContentResponse, error) {
+	if err := s.gate(ctx, "", kind); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	resp, err := s.client.GenerateContent(ctx, s.model, contents, cfg)
 	var u usage

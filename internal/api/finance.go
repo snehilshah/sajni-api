@@ -3347,7 +3347,7 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 		}
 
 		// Rate-limit before touching the model.
-		if ok, retryAfter := deps.AILimiter.check(r.Context(), uid); !ok {
+		if ok, retryAfter := deps.AILimiter.checkCheap(r.Context(), uid); !ok {
 			secs := int(math.Ceil(retryAfter.Seconds()))
 			if secs < 1 {
 				secs = 1
@@ -3385,15 +3385,10 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 
-		picked, tokens, err := deps.AI.CategorizeExpense(ctx, title, kind, names)
+		picked, _, err := deps.AI.CategorizeExpense(ctx, title, kind, names)
 		if err != nil {
 			// Don't 500 — fall back to Others so the form still works.
 			picked = "Others"
-		}
-		// Record usage regardless of outcome so failed calls still count
-		// against quota (prevents retry loops from bypassing the cap).
-		if tokens <= 0 {
-			tokens = 50 // conservative floor for cap accounting
 		}
 
 		// Look up the id for the matched category. If the user has no
@@ -3653,7 +3648,7 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 			text = text[:2000]
 		}
 
-		if ok, retryAfter := deps.AILimiter.check(r.Context(), uid); !ok {
+		if ok, retryAfter := deps.AILimiter.checkCheap(r.Context(), uid); !ok {
 			secs := int(math.Ceil(retryAfter.Seconds()))
 			if secs < 1 {
 				secs = 1
@@ -3667,11 +3662,8 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 		now := userNow(deps.DB, uid)
 		today := now.Format("2006-01-02")
 		pctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		parsed, tokens, err := deps.AI.ParseTransactionMessage(pctx, text, today, body.Auto)
+		parsed, _, err := deps.AI.ParseTransactionMessage(pctx, text, today, body.Auto)
 		cancel()
-		if tokens <= 0 {
-			tokens = 80 // conservative floor for cap accounting
-		}
 		if err != nil && body.Auto {
 			// Not "this isn't a transaction": the phone retries and then
 			// tells the user, instead of dropping a real payment unseen.
@@ -3725,10 +3717,7 @@ func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed
 				}
 				crows.Close()
 			}
-			picked, ctoks, cerr := deps.AI.CategorizeExpense(ctx, parsed.Description, kind, names)
-			if ctoks <= 0 {
-				ctoks = 30
-			}
+			picked, _, cerr := deps.AI.CategorizeExpense(ctx, parsed.Description, kind, names)
 			if cerr == nil && !(auto && strings.EqualFold(strings.TrimSpace(picked), "others")) {
 				for _, c := range cats {
 					if strings.EqualFold(c.name, picked) {
@@ -3837,7 +3826,7 @@ func parseTransactionImage(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		if ok, retryAfter := deps.AILimiter.check(r.Context(), uid); !ok {
+		if ok, retryAfter := deps.AILimiter.checkCheap(r.Context(), uid); !ok {
 			secs := int(math.Ceil(retryAfter.Seconds()))
 			if secs < 1 {
 				secs = 1
@@ -3853,10 +3842,7 @@ func parseTransactionImage(deps Deps) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
 
-		parsed, tokens, err := deps.AI.ParseTransactionImage(ctx, imgBytes, mimeType, today)
-		if tokens <= 0 {
-			tokens = 250
-		}
+		parsed, _, err := deps.AI.ParseTransactionImage(ctx, imgBytes, mimeType, today)
 		if err != nil {
 			writeJSON(w, 200, map[string]any{
 				"amount": 0, "type": "expense", "description": "", "note": "",

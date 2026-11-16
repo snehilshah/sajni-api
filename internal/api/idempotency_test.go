@@ -5,7 +5,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"sajni/internal/dbtest"
 	"testing"
 
 	"sajni/internal/auth"
@@ -16,7 +16,7 @@ import (
 // reply back; a failed one (5xx) runs again.
 // Needs a scratch Postgres: SAJNI_TEST_DATABASE_URL=postgres://… go test ./internal/api -run Idempotency
 func TestIdempotency(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

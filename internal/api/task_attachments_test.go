@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
-	"os"
+	"sajni/internal/dbtest"
 	"strconv"
 	"testing"
 
@@ -18,7 +18,7 @@ import (
 
 // Needs a scratch Postgres: SAJNI_TEST_DATABASE_URL=postgres://… go test ./internal/api -run Attachment
 func TestTaskAttachments(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

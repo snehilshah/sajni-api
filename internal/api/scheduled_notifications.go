@@ -96,10 +96,10 @@ func ProcessScheduledNotifications(ctx context.Context, deps Deps) (map[string]i
 		res, err := backup.Run(ctx, deps.DB, deps.Storage, id, time.Now())
 		result["backup_rows"] = int(res.Rows)
 		if err != nil {
-			log.Error().Err(err).Msg("database backup failed")
+			log.Error().Err(err).Int64("ms", res.Took.Milliseconds()).Msg("database backup failed")
 			jobErrors = append(jobErrors, err)
 		} else {
-			log.Info().Str("prefix", res.Prefix).Int("tables", res.Tables).Int64("rows", res.Rows).Int("bytes", res.Bytes).Msg("database backup")
+			log.Info().Str("prefix", res.Prefix).Int("tables", res.Tables).Int64("rows", res.Rows).Int("bytes", res.Bytes).Int64("ms", res.Took.Milliseconds()).Msg("database backup")
 		}
 	}
 

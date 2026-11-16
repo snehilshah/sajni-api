@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"sajni/internal/dbtest"
 	"strconv"
 	"testing"
 
@@ -16,7 +16,7 @@ import (
 
 // Needs a scratch Postgres: SAJNI_TEST_DATABASE_URL=postgres://… go test ./internal/api -run Capture
 func TestCaptureRules(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}
@@ -115,7 +115,7 @@ func TestCaptureRules(t *testing.T) {
 // Needs a scratch Postgres. An RD maturing: own money back is a transfer,
 // the rest Interest; the investment closes; deleting the transfer undoes both.
 func TestInvestmentMaturity(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

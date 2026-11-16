@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"sajni/internal/dbtest"
 	"strconv"
 	"testing"
 
@@ -21,7 +21,7 @@ import (
 // Money prompts, Kotak's ActivMoney FD maturing as ₹20k of "income", and
 // UPI Lite loads to the owner's own name.
 func TestCaptureDay(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

@@ -163,6 +163,12 @@ func (s *Service) SendEmail(ctx context.Context, to, subject, html string) error
 // "today at 5:00 PM"); route is the in-app path the CTA opens (e.g.
 // "/tasks"). Kept here so the AppURL + embedded template stay in one place.
 func (s *Service) SendTaskReminder(ctx context.Context, to, name, taskTitle, whenLabel, route string) error {
+	return s.SendReminder(ctx, to, name, taskTitle, whenLabel, route, "")
+}
+
+// SendReminder is SendTaskReminder with the reminder's notes (may be empty)
+// shown under the title.
+func (s *Service) SendReminder(ctx context.Context, to, name, taskTitle, whenLabel, route, notes string) error {
 	tpl, err := template.ParseFS(emailTemplatesFS, "email_templates/reminder.html")
 	if err != nil {
 		return err
@@ -177,6 +183,7 @@ func (s *Service) SendTaskReminder(ctx context.Context, to, name, taskTitle, whe
 		"Name":      displayName,
 		"TaskTitle": taskTitle,
 		"WhenLabel": whenLabel,
+		"Notes":     strings.TrimSpace(notes),
 		"AppURL":    appURL,
 		"CTAURL":    appURL + route,
 	}); err != nil {

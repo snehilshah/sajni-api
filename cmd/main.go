@@ -105,6 +105,7 @@ func main() {
 	if aiSvc != nil {
 		aiSvc.OnChange = func(uid, scope string) { api.NotifySync(deps, uid, scope) }
 		aiSvc.OnUsage = deps.AILimiter.Record
+		aiSvc.Gate = deps.AILimiter.Gate
 	}
 	handler := api.Router(deps)
 

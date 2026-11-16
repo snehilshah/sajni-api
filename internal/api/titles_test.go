@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"sajni/internal/dbtest"
 	"testing"
 
 	"sajni/internal/auth"
@@ -14,7 +14,7 @@ import (
 
 // "Sew" → Sewri (₹22 Smoke on RuPay, used most), not the Office Smoke rows.
 func TestSuggestTitles(t *testing.T) {
-	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
+	dsn := dbtest.URL(t)
 	if dsn == "" {
 		t.Skip("SAJNI_TEST_DATABASE_URL not set")
 	}

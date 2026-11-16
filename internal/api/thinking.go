@@ -93,7 +93,7 @@ func classifyThinkingKind(deps Deps) http.HandlerFunc {
 Pick the BEST single kind. Tie-break toward more specific (question > note, decision > todo when both fit).`
 		kind, _, err := deps.AI.Classify(r.Context(), sys, body.Content, opts, "note")
 		if err != nil {
-			errJSON(w, 500, err.Error())
+			aiFailed(w, err)
 			return
 		}
 		writeJSON(w, 200, map[string]string{"kind": kind})
@@ -474,7 +474,7 @@ func createThinkingCard(deps Deps) http.HandlerFunc {
 			// userID stays string (UUID); project + card ids are int64
 			// (BIGSERIAL).
 			go func(cardID, projID int64, userID string) {
-				bg := context.Background()
+				bg := ai.WithUser(context.Background(), userID)
 				if err := runEnrichment(bg, deps, userID, projID, cardID); err == nil {
 					reEnrichNeighbors(deps, userID, projID, cardID)
 				}
@@ -596,7 +596,7 @@ func enrichThinkingCard(deps Deps) http.HandlerFunc {
 			return
 		}
 		if err := runEnrichment(r.Context(), deps, uid, pid, id); err != nil {
-			errJSON(w, 500, err.Error())
+			aiFailed(w, err)
 			return
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
@@ -629,7 +629,7 @@ func synthesizeThinkingProject(deps Deps) http.HandlerFunc {
 		}
 		thesis, questions, err := deps.AI.SynthesizeThinking(r.Context(), title, desc, cards)
 		if err != nil {
-			errJSON(w, 500, err.Error())
+			aiFailed(w, err)
 			return
 		}
 		qj, _ := json.Marshal(questions)
@@ -667,7 +667,7 @@ func reEnrichNeighbors(deps Deps, uid string, projectID, justAddedCardID int64) 
 	}
 	for _, id := range ids {
 		go func(cid int64) {
-			runEnrichment(context.Background(), deps, uid, projectID, cid)
+			runEnrichment(ai.WithUser(context.Background(), uid), deps, uid, projectID, cid)
 		}(id)
 	}
 }
