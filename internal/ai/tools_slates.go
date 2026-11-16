@@ -231,5 +231,5 @@ func moveToSlateTool(ctx context.Context, d *db.DB, uid string, args map[string]
 	}
 	moved, _ := res.RowsAffected()
 	return map[string]any{"moved": moved, "slate_id": target, "slate_name": name},
-		map[string]any{"kind": "transactions_updated", "id": target, "title": name, "route": "/finance/transactions"}, nil
+		map[string]any{"kind": "transaction_moved", "id": target, "title": name, "route": "/finance/transactions"}, nil
 }

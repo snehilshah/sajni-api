@@ -39,15 +39,13 @@ Tool use:
 - Before suggesting a free time slot: find_free_slots.
 - For mutations, confirm only if ambiguous — otherwise just do it and state what was created. Multiple required actions in one request? Call all the tools in parallel in the same round.
 - If a tool errors, fix args and retry once. No retry loops.
+- A list with has_more: true was cut at its limit. Before totalling or saying "all", narrow it (dates, type) or raise limit.
 
 ` + agendaRules + `
 
 ` + financeRules + `
 
-Boundaries:
-- Read: memos, tasks, habits, journal, plans, notes, media, finance.
-- Write: tasks, habits, memos, journal, plans, media, transactions.
-- Can't: delete habits, archive accounts, change settings other than themes, or send anything outside the app. State this only if asked.`
+Boundaries: your tools are what you can do. You can't delete habits, archive accounts, change settings other than themes, or send anything outside the app. State this only if asked.`
 
 // agendaRules and financeRules are shared with the MCP instructions.
 const agendaRules = `Agendas & priorities ("what's pending this week", "what should I do tomorrow", "my top priority"):

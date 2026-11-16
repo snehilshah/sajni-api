@@ -51,6 +51,9 @@ func (s *Service) dispatch(ctx context.Context, uid string, name string, args ma
 	for _, t := range s.tools {
 		if t.Name == name {
 			data, meta, err := t.Handler(ctx, uid, args)
+			if kind, _ := meta["kind"].(string); kind != "" && meta["label"] == nil {
+				meta["label"] = KindLabel(kind)
+			}
 			// Let native caches (widgets) know a write landed.
 			if err == nil && s.OnChange != nil {
 				kind, _ := meta["kind"].(string)
@@ -65,6 +68,60 @@ func (s *Service) dispatch(ctx context.Context, uid string, name string, args ma
 		}
 	}
 	return nil, nil, fmt.Errorf("unknown tool: %s", name)
+}
+
+// kindLabels name the write tools' meta kinds where the plain reading of
+// the kind ("journal_created" → "Created journal") would be off.
+var kindLabels = map[string]string{
+	"journal_created":        "Saved journal entry",
+	"memo_created":           "Saved memo",
+	"media_added":            "Added to library",
+	"transaction_created":    "Recorded transaction",
+	"lend_created":           "Recorded lend",
+	"lend_repayment_created": "Recorded repayment",
+	"biller_paid":            "Paid bill",
+	"habit_logged":           "Logged habit",
+	"event_logged":           "Logged event",
+	"capture_tracking":       "Changed capture tracking",
+	"avatar_rerolled":        "New avatar",
+	"folder_created":         "Created folder",
+}
+
+var kindVerbs = map[string]string{
+	"created": "Created", "updated": "Updated", "deleted": "Deleted", "completed": "Completed",
+	"added": "Added", "logged": "Logged", "moved": "Moved", "skipped": "Skipped",
+	"snoozed": "Snoozed", "activated": "Activated", "commented": "Commented on",
+	"changed": "Changed", "paid": "Paid", "settled": "Settled", "rerolled": "Rerolled",
+	"scratched": "Scratched", "unpinned": "Unpinned", "blocked": "Blocked", "rescheduled": "Rescheduled", "pinned": "Pinned",
+}
+
+// KindLabel is the short past-tense line a client shows for a write
+// ("Created task", "Deleted event entry"); clients fall back to it for kinds
+// they don't know, so a new write tool never shows a raw kind.
+func KindLabel(kind string) string {
+	if l, ok := kindLabels[kind]; ok {
+		return l
+	}
+	parts := strings.Split(kind, "_")
+	if len(parts) >= 2 {
+		if verb, ok := kindVerbs[parts[len(parts)-1]]; ok {
+			noun := strings.Join(parts[:len(parts)-1], " ")
+			noun = strings.TrimPrefix(noun, "thinking ")
+			return verb + " " + noun
+		}
+	}
+	return strings.ReplaceAll(kind, "_", " ")
+}
+
+// page shapes a list read: the query fetched one row past limit, so
+// has_more tells the model the list was cut (it must not sum or count a
+// cut list as if it were everything).
+func page(out []map[string]any, limit int64) map[string]any {
+	more := int64(len(out)) > limit
+	if more {
+		out = out[:limit]
+	}
+	return map[string]any{"items": out, "count": len(out), "has_more": more}
 }
 
 // ----- schema helpers -----
@@ -584,7 +641,7 @@ func (s *Service) buildTools() []Tool {
 		// ---------------- WRITE ----------------
 		{
 			Name:        "create_task",
-			Description: "Create a new task. Resolve relative dates ('tomorrow', 'next monday') against get_current_context first. Use list_task_lists to look up list_id by name; use list_tasks to find a parent_task_id when nesting. Explicit 'remind me to X at <time>' wording belongs in create_reminder, not here. Use scheduled_at + remind only when the user explicitly asks for a task that also carries a notification.",
+			Description: "Create a new task. Resolve relative dates ('tomorrow', 'next monday') from today's date (get_current_context only if you don't have it). Use list_task_lists to look up list_id by name; use list_tasks to find a parent_task_id when nesting. Explicit 'remind me to X at <time>' wording belongs in create_reminder, not here. Use scheduled_at + remind only when the user explicitly asks for a task that also carries a notification.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"title":            str("Required. Short title."),
@@ -713,7 +770,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "reschedule_task",
-			Description: "Move an existing task's due date and/or time. The main way to clear 'missed' (overdue) tasks — set due_date to a future day. Resolve relative dates against get_current_context. Moving a past due_date forward is recorded as a reschedule in the task's lifecycle (not a miss). Pass scheduled_at to also set a time + reminder; due_date follows the scheduled day if omitted.",
+			Description: "Move an existing task's due date and/or time. The main way to clear 'missed' (overdue) tasks — set due_date to a future day. Resolve relative dates from today's date (get_current_context only if you don't have it). Moving a past due_date forward is recorded as a reschedule in the task's lifecycle (not a miss). Pass scheduled_at to also set a time + reminder; due_date follows the scheduled day if omitted.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"id":           intg("Required. Task id (use list_tasks, smart='missed' to find overdue ones)."),
@@ -759,7 +816,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "add_task_reminder",
-			Description: "Add a reminder to a task at a specific time. A task can carry multiple reminders on any date — each emails the user at that instant, independent of the task's own time. Resolve relative times against get_current_context; use list_tasks to find the task id.",
+			Description: "Add a reminder to a task at a specific time. A task can carry multiple reminders on any date — each emails the user at that instant, independent of the task's own time. Resolve relative times from today's date (get_current_context only if you don't have it); use list_tasks to find the task id.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"task_id":   intg("Required. Task to remind about."),
@@ -1542,7 +1599,7 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	      FROM tasks WHERE ` + strings.Join(clauses, " AND ") +
 		fmt.Sprintf(` ORDER BY (status='done') ASC, important DESC NULLS LAST,
 		              CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END,
-		              %s NULLS LAST, created_at DESC LIMIT %d`, deadline, limit)
+		              %s NULLS LAST, created_at DESC LIMIT %d`, deadline, limit+1)
 	rows, err := d.QueryContext(ctx, q, vals...)
 	if err != nil {
 		return nil, nil, err
@@ -1614,7 +1671,7 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		}
 		out = append(out, row)
 	}
-	return map[string]any{"items": out, "count": len(out)}, nil, nil
+	return page(out, limit), nil, nil
 }
 
 // daysBetween counts calendar days from a to b in their own zone.
@@ -1724,10 +1781,10 @@ func listJournalTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		clauses = append(clauses, fmt.Sprintf("date <= $%d", len(vals)+1))
 		vals = append(vals, dt)
 	}
-	limit := argInt(args, "limit", 20)
+	limit := min(max(argInt(args, "limit", 20), 1), 100)
 	q := `SELECT id, date::text FROM journal_entries WHERE ` +
 		strings.Join(clauses, " AND ") +
-		fmt.Sprintf(` ORDER BY date DESC LIMIT %d`, limit)
+		fmt.Sprintf(` ORDER BY date DESC LIMIT %d`, limit+1)
 	rows, err := d.QueryContext(ctx, q, vals...)
 	if err != nil {
 		return nil, nil, err
@@ -1740,7 +1797,7 @@ func listJournalTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		rows.Scan(&id, &date)
 		out = append(out, map[string]any{"id": id, "date": date})
 	}
-	return map[string]any{"items": out, "count": len(out)}, nil, nil
+	return page(out, limit), nil, nil
 }
 
 func getJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid string, date string) (any, map[string]any, error) {
@@ -1768,13 +1825,13 @@ func getJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid st
 }
 
 func listMemosTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
-	limit := argInt(args, "limit", 20)
+	limit := min(max(argInt(args, "limit", 20), 1), 100)
 	q := argStr(args, "query")
 	rows, err := d.QueryContext(ctx, `
 		SELECT id, content, pinned, created_at
 		FROM memos
 		WHERE user_id=$1 AND ($2 = '' OR content ILIKE '%' || $2 || '%')
-		ORDER BY pinned DESC, created_at DESC LIMIT $3`, uid, q, limit)
+		ORDER BY pinned DESC, created_at DESC LIMIT $3`, uid, q, limit+1)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1787,7 +1844,7 @@ func listMemosTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		rows.Scan(&id, &content, &pinned, &created)
 		out = append(out, map[string]any{"id": id, "content": content, "pinned": pinned, "created_at": created})
 	}
-	return map[string]any{"items": out, "count": len(out)}, nil, nil
+	return page(out, limit), nil, nil
 }
 
 // mediaTasteTool digests the library into a small taste profile so the
@@ -1935,10 +1992,10 @@ func listMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		clauses = append(clauses, fmt.Sprintf("type=$%d", len(vals)+1))
 		vals = append(vals, t)
 	}
-	limit := argInt(args, "limit", 30)
+	limit := min(max(argInt(args, "limit", 30), 1), 100)
 	q := `SELECT id, title, type, status, COALESCE(rating,0), COALESCE(genre,''), COALESCE(year,0)
 	      FROM media WHERE ` + strings.Join(clauses, " AND ") +
-		fmt.Sprintf(` ORDER BY updated_at DESC LIMIT %d`, limit)
+		fmt.Sprintf(` ORDER BY updated_at DESC LIMIT %d`, limit+1)
 	rows, err := d.QueryContext(ctx, q, vals...)
 	if err != nil {
 		return nil, nil, err
@@ -1952,7 +2009,7 @@ func listMediaTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 		rows.Scan(&id, &title, &mtype, &status, &rating, &genre, &year)
 		out = append(out, map[string]any{"id": id, "title": title, "type": mtype, "status": status, "rating": rating, "genre": genre, "year": year})
 	}
-	return map[string]any{"items": out, "count": len(out)}, nil, nil
+	return page(out, limit), nil, nil
 }
 
 func listAccountsTool(ctx context.Context, d *db.DB, uid string) (any, map[string]any, error) {
@@ -2020,7 +2077,7 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		clauses = append(clauses, fmt.Sprintf("t.slate_id=$%d", len(vals)+1))
 		vals = append(vals, p)
 	}
-	limit := argInt(args, "limit", 50)
+	limit := min(max(argInt(args, "limit", 50), 1), 200)
 	q := `SELECT t.id, t.account_id, t.type, t.amount, t.description, (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date::text, t.category_id, COALESCE(c.name, ''), t.slate_id, s.name,
 	      t.split_of, t.refund_of,
 	      (SELECT json_agg(json_build_object('person', l.borrower, 'share', sp.amount, 'lend_id', l.id) ORDER BY sp.id)
@@ -2030,7 +2087,7 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 	      LEFT JOIN fin_categories c ON c.id = t.category_id
 	      JOIN fin_slates s ON s.id = t.slate_id
 	      WHERE ` + strings.Join(clauses, " AND ") +
-		fmt.Sprintf(` ORDER BY t.txn_at DESC LIMIT %d`, limit)
+		fmt.Sprintf(` ORDER BY t.txn_at DESC LIMIT %d`, limit+1)
 	rows, err := d.QueryContext(ctx, q, vals...)
 	if err != nil {
 		return nil, nil, err
@@ -2096,7 +2153,7 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		}
 		out = append(out, row)
 	}
-	return map[string]any{"items": out, "count": len(out)}, nil, nil
+	return page(out, limit), nil, nil
 }
 
 func runSearchTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {

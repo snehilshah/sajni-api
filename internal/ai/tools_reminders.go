@@ -41,7 +41,7 @@ func standaloneReminderTools(d *db.DB, queue reminderqueue.Queue) []Tool {
 		},
 		{
 			Name:        "create_reminder",
-			Description: "Create a standalone personal reminder. Use for explicit wording such as 'remind me to call Mom tomorrow at 4'. Do not use create_task for these. starts_at is required: if the user gave a date but no clock time, ask one short follow-up before calling. Resolve relative dates against get_current_context. Supports practical recurrence via recurrence; omit it for one-time reminders.",
+			Description: "Create a standalone personal reminder. Use for explicit wording such as 'remind me to call Mom tomorrow at 4'. Do not use create_task for these. starts_at is required: if the user gave a date but no clock time, ask one short follow-up before calling. Resolve relative dates from today's date (get_current_context only if you don't have it). Supports practical recurrence via recurrence; omit it for one-time reminders.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"message":    str("Required reminder message."),
