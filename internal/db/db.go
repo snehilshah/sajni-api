@@ -304,9 +304,15 @@ func (d *DB) ensureSchema() error {
 		steps            JSONB       NOT NULL DEFAULT '[]'::jsonb,
 		important        BOOLEAN     NOT NULL DEFAULT FALSE,
 		sort_order       INTEGER     NOT NULL DEFAULT 0,
+		-- Where the owner placed it in its Board lane (smaller is higher).
+		-- NULL until first placed: then it sorts as -updated_at in ms, so new
+		-- and edited tasks still come first. Moving it never bumps updated_at.
+		board_rank       DOUBLE PRECISION,
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
+	-- Prod's tasks table predates board_rank (2026-11-16); drop once shipped.
+	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS board_rank DOUBLE PRECISION;
 	CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_list ON tasks(list_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);

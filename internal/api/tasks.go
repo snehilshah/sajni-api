@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/mail"
 	"strings"
@@ -228,7 +229,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
 			       t.list_id, t.parent_task_id, parent.title, t.blocked_by_task_id,
 			       blocker.title, blocker.status, t.important, t.steps,
-			       COALESCE(t.sort_order, 0),
+			       COALESCE(t.sort_order, 0), t.board_rank,
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
 			       t.created_at, t.updated_at, t.plan_id, plan.name, t.recurrence
 			FROM tasks t
@@ -249,7 +250,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			&t.Remind, &t.RemindedAt, &emailsRaw,
 			&t.ListID, &t.ParentTaskID, &t.ParentTaskTitle, &t.BlockedByTaskID,
 			&t.BlockedByTaskTitle, &t.BlockedByTaskStatus, &t.Important, &stepsRaw,
-			&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
+			&t.SortOrder, &t.BoardRank, &t.SubtaskCount, &t.SubtasksDone,
 			&t.CreatedAt, &t.UpdatedAt, &t.PlanID, &t.PlanName, &recurrenceRaw,
 		)
 		if err != nil {
@@ -298,15 +299,16 @@ type taskRow struct {
 	ParentTaskID *int64   `json:"parent_task_id"`
 	// ParentTaskTitle lets a subtask listed flat (smart lists, planner,
 	// Today) say which task it belongs to.
-	ParentTaskTitle     *string `json:"parent_task_title"`
-	BlockedByTaskID     *int64  `json:"blocked_by_task_id"`
-	BlockedByTaskTitle  *string `json:"blocked_by_task_title"`
-	BlockedByTaskStatus *string `json:"blocked_by_task_status"`
-	Important           bool    `json:"important"`
-	Steps               []Step  `json:"steps"`
-	SortOrder           int     `json:"sort_order"`
-	SubtaskCount        int     `json:"subtask_count"`
-	SubtasksDone        int     `json:"subtasks_done"`
+	ParentTaskTitle     *string  `json:"parent_task_title"`
+	BlockedByTaskID     *int64   `json:"blocked_by_task_id"`
+	BlockedByTaskTitle  *string  `json:"blocked_by_task_title"`
+	BlockedByTaskStatus *string  `json:"blocked_by_task_status"`
+	Important           bool     `json:"important"`
+	Steps               []Step   `json:"steps"`
+	SortOrder           int      `json:"sort_order"`
+	BoardRank           *float64 `json:"board_rank"` // place in its Board lane; null = by updated_at
+	SubtaskCount        int      `json:"subtask_count"`
+	SubtasksDone        int      `json:"subtasks_done"`
 	// Subtasks are embedded (brief shape) so the list view can render the
 	// nested children instantly on expand — no per-row /subtasks round-trip.
 	Subtasks  []subtaskBrief `json:"subtasks"`
@@ -473,7 +475,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
 			       t.list_id, t.parent_task_id, parent.title, t.blocked_by_task_id,
 			       blocker.title, blocker.status, t.important, t.steps,
-			       COALESCE(t.sort_order, 0),
+			       COALESCE(t.sort_order, 0), t.board_rank,
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
 			       t.created_at, t.updated_at, t.plan_id, plan.name, t.recurrence
 			FROM tasks t
@@ -508,7 +510,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 				&t.Remind, &t.RemindedAt, &emailsRaw,
 				&t.ListID, &t.ParentTaskID, &t.ParentTaskTitle, &t.BlockedByTaskID,
 				&t.BlockedByTaskTitle, &t.BlockedByTaskStatus, &t.Important, &stepsRaw,
-				&t.SortOrder, &t.SubtaskCount, &t.SubtasksDone,
+				&t.SortOrder, &t.BoardRank, &t.SubtaskCount, &t.SubtasksDone,
 				&t.CreatedAt, &t.UpdatedAt, &t.PlanID, &t.PlanName, &recurrenceRaw,
 			); err != nil {
 				errJSON(w, 500, err.Error())
@@ -836,6 +838,7 @@ func updateTask(deps Deps) http.HandlerFunc {
 			Important       *bool            `json:"important"`
 			Steps           *[]Step          `json:"steps"`
 			SortOrder       *int             `json:"sort_order"`
+			BoardRank       *float64         `json:"board_rank"`
 			Recurrence      *taskrepeat.Rule `json:"recurrence"`
 			ClearPlan       bool             `json:"clear_plan"`
 			ClearList       bool             `json:"clear_list"`
@@ -1097,6 +1100,11 @@ func updateTask(deps Deps) http.HandlerFunc {
 		}
 		if body.SortOrder != nil {
 			q.Exec("UPDATE tasks SET sort_order=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3", *body.SortOrder, id, uid)
+		}
+		// Placing a card on the Board is arrangement, not an edit: it leaves
+		// updated_at (and so every list's order) alone.
+		if body.BoardRank != nil && !math.IsNaN(*body.BoardRank) && !math.IsInf(*body.BoardRank, 0) {
+			q.Exec("UPDATE tasks SET board_rank=$1 WHERE id=$2 AND user_id=$3", *body.BoardRank, id, uid)
 		}
 		if body.ClearPlan {
 			q.Exec("UPDATE tasks SET plan_id=NULL, updated_at=NOW() WHERE id=$1 AND user_id=$2", id, uid)
