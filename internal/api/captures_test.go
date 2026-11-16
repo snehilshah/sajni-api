@@ -47,7 +47,7 @@ func TestCaptureMemory(t *testing.T) {
 	parse := func(text string, p ai.ParsedTxn) string { canned[text] = p; return text }
 	captureParserSwapped = true
 	old := captureParser
-	captureParser = func(_ context.Context, _ Deps, text, _ string) (ai.ParsedTxn, int, error) {
+	captureParser = func(_ context.Context, _ Deps, _, text, _ string) (ai.ParsedTxn, int, error) {
 		return canned[text], 1, nil
 	}
 	defer func() { captureParser, captureParserSwapped = old, false }()
@@ -190,7 +190,7 @@ func TestPayeeNames(t *testing.T) {
 
 	captureParserSwapped = true
 	old := captureParser
-	captureParser = func(_ context.Context, _ Deps, text, _ string) (ai.ParsedTxn, int, error) {
+	captureParser = func(_ context.Context, _ Deps, _, text, _ string) (ai.ParsedTxn, int, error) {
 		var amt float64
 		json.Unmarshal([]byte(text[:strings.Index(text, " ")]), &amt)
 		return ai.ParsedTxn{Amount: amt, Type: "expense", Description: "Salman Mohammad Isma", Date: "2026-11-13", Time: "13:" + text[len(text)-2:], AccountHint: "2851"}, 1, nil
@@ -286,7 +286,7 @@ func TestSettleSuggestion(t *testing.T) {
 
 	captureParserSwapped = true
 	old := captureParser
-	captureParser = func(_ context.Context, _ Deps, text, _ string) (ai.ParsedTxn, int, error) {
+	captureParser = func(_ context.Context, _ Deps, _, text, _ string) (ai.ParsedTxn, int, error) {
 		return ai.ParsedTxn{Amount: 4911, Type: "income", Description: "Ronak Arvind Shah", Date: "2026-11-12", Time: "12:0" + text[len(text)-1:], AccountHint: "2851"}, 1, nil
 	}
 	defer func() { captureParser, captureParserSwapped = old, false }()

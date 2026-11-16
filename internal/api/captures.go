@@ -164,8 +164,8 @@ func formatINR(v float64) string {
 }
 
 // captureParser reads a message; tests swap it for a canned parse.
-var captureParser = func(ctx context.Context, deps Deps, text, today string) (ai.ParsedTxn, int, error) {
-	return deps.AI.ParseTransactionMessage(ctx, text, today, true)
+var captureParser = func(ctx context.Context, deps Deps, uid, text, today string) (ai.ParsedTxn, int, error) {
+	return deps.AI.ParseTransactionMessage(ctx, text, today, true, txnCategories(ctx, deps.DB, uid))
 }
 
 func captureTransaction(deps Deps) http.HandlerFunc {
@@ -261,8 +261,8 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 		}
 		loc := userLocation(d, uid)
 		now := userNow(d, uid)
-		pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		parsed, _, err := captureParser(pctx, deps, b.Text, now.Format("2006-01-02"))
+		pctx, cancel := context.WithTimeout(ctx, 9*time.Second) // under the phone's 10 s read timeout
+		parsed, _, err := captureParser(pctx, deps, uid, b.Text, now.Format("2006-01-02"))
 		cancel()
 		if err != nil {
 			log.Warn().Err(err).Msg("capture parse failed")

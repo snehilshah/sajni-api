@@ -51,7 +51,7 @@ func TestCaptureDay(t *testing.T) {
 	parse := func(text string, p ai.ParsedTxn) string { canned[text] = p; return text }
 	captureParserSwapped = true
 	old := captureParser
-	captureParser = func(_ context.Context, _ Deps, text, _ string) (ai.ParsedTxn, int, error) {
+	captureParser = func(_ context.Context, _ Deps, _, text, _ string) (ai.ParsedTxn, int, error) {
 		return canned[text], 1, nil
 	}
 	defer func() { captureParser, captureParserSwapped = old, false }()

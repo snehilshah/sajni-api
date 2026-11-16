@@ -3381,8 +3381,10 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 			}
 		}
 
-		// Hard 5s ceiling — categorize is meant to feel typing-paced.
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		// Gemini refuses a call whose deadline it can't meet with its queue
+		// (29% of categorise calls failed at 5 s in 2026-11). 9 s leaves it
+		// room and stays under the phone's 10 s read timeout.
+		ctx, cancel := context.WithTimeout(r.Context(), 9*time.Second)
 		defer cancel()
 
 		picked, _, err := deps.AI.CategorizeExpense(ctx, title, kind, names)
@@ -3661,8 +3663,8 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 		loc := userLocation(deps.DB, uid)
 		now := userNow(deps.DB, uid)
 		today := now.Format("2006-01-02")
-		pctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		parsed, _, err := deps.AI.ParseTransactionMessage(pctx, text, today, body.Auto)
+		pctx, cancel := context.WithTimeout(r.Context(), 9*time.Second) // under the phone's 10 s read timeout
+		parsed, _, err := deps.AI.ParseTransactionMessage(pctx, text, today, body.Auto, txnCategories(r.Context(), deps.DB, uid))
 		cancel()
 		if err != nil && body.Auto {
 			// Not "this isn't a transaction": the phone retries and then
@@ -3700,6 +3702,15 @@ func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed
 		}
 		if id, name := lookupMerchantCategory(deps.DB, uid, parsed.Description, kind); id != nil {
 			catID, catName = id, name
+		} else if parsed.Category != "" {
+			// Chosen in the parse itself. For an automatic capture "Others"
+			// stays blank, so the row reads as uncategorised, not filed.
+			if name := parsed.Category; !(auto && strings.EqualFold(name, "Others")) {
+				var id int64
+				if deps.DB.QueryRowContext(ctx, `SELECT id, name FROM fin_categories WHERE user_id=$1 AND kind=$2 AND LOWER(name)=LOWER($3) ORDER BY id LIMIT 1`, uid, kind, name).Scan(&id, &name) == nil {
+					catID, catName = &id, name
+				}
+			}
 		} else if deps.AI != nil {
 			type cat struct {
 				id   int64
@@ -3854,4 +3865,31 @@ func parseTransactionImage(deps Deps) http.HandlerFunc {
 		out := resolveParsedTransaction(ctx, deps, uid, parsed, loc, now, false)
 		writeJSON(w, 200, out)
 	}
+}
+
+// txnCategories loads the user's category names by kind for a parse to
+// choose from; nil when there are none (the parse then skips choosing).
+func txnCategories(ctx context.Context, d *db.DB, uid string) *ai.TxnCategories {
+	rows, err := d.QueryContext(ctx, `SELECT kind, name FROM fin_categories WHERE user_id=$1 ORDER BY name`, uid)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var c ai.TxnCategories
+	for rows.Next() {
+		var kind, name string
+		if rows.Scan(&kind, &name) != nil {
+			continue
+		}
+		switch kind {
+		case "expense":
+			c.Expense = append(c.Expense, name)
+		case "income":
+			c.Income = append(c.Income, name)
+		}
+	}
+	if len(c.Expense)+len(c.Income) == 0 {
+		return nil
+	}
+	return &c
 }
