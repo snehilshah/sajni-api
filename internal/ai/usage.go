@@ -87,6 +87,7 @@ func (s *Service) generate(ctx context.Context, kind string, contents []*genai.C
 	if resp != nil {
 		u = usageOf(resp.UsageMetadata)
 	}
+	s.spent(ctx, "", kind, u)
 	ev := log.Info()
 	if err != nil {
 		ev = log.Warn().Err(err)

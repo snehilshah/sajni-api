@@ -100,9 +100,11 @@ func main() {
 		Storage:       store,
 		AI:            aiSvc,
 		Push:          pushSvc,
+		AILimiter:     api.NewAILimiter(database),
 	}
 	if aiSvc != nil {
 		aiSvc.OnChange = func(uid, scope string) { api.NotifySync(deps, uid, scope) }
+		aiSvc.OnUsage = deps.AILimiter.Record
 	}
 	handler := api.Router(deps)
 

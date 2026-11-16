@@ -1300,6 +1300,30 @@ func (d *DB) ensureSchema() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices(user_id);
 
+	-- What each user's Gemini calls cost per UTC day, from the model's usage
+	-- numbers; the AI limiter refuses calls past the daily budget
+	-- (api/ailimit.go). Rows older than 90 days are pruned by the sweep.
+	CREATE TABLE IF NOT EXISTS ai_spend (
+		user_id     UUID    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		day         DATE    NOT NULL,
+		cost_micros BIGINT  NOT NULL DEFAULT 0,
+		calls       INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (user_id, day)
+	);
+
+	-- Weekly database backups to the blob bucket (internal/backup), one row
+	-- per run; the scheduled sweep claims a run when the last one is a week old.
+	CREATE TABLE IF NOT EXISTS db_backups (
+		id          BIGSERIAL   PRIMARY KEY,
+		started_at  TIMESTAMPTZ NOT NULL,
+		finished_at TIMESTAMPTZ,
+		prefix      TEXT        NOT NULL DEFAULT '',
+		tables      INTEGER     NOT NULL DEFAULT 0,
+		row_count   BIGINT      NOT NULL DEFAULT 0,
+		bytes       BIGINT      NOT NULL DEFAULT 0,
+		error       TEXT        NOT NULL DEFAULT ''
+	);
+
 	-- A change sent with an Idempotency-Key (the Android offline outbox) runs
 	-- once: a retry replays the stored reply. status 0 = still running.
 	-- Rows older than a month are pruned as new ones arrive (api/idempotency.go).

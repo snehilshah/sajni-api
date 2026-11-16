@@ -4,6 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
+
+	"github.com/rs/zerolog/log"
+
+	"sajni/internal/backup"
 )
 
 // RegisterScheduledNotificationHandler mounts the one Cloud Scheduler target
@@ -79,6 +84,23 @@ func ProcessScheduledNotifications(ctx context.Context, deps Deps) (map[string]i
 	result["lend_reminders"] = lends
 	if err != nil {
 		jobErrors = append(jobErrors, err)
+	}
+
+	if _, err := deps.DB.ExecContext(ctx, `DELETE FROM ai_spend WHERE day < CURRENT_DATE - 90`); err != nil {
+		jobErrors = append(jobErrors, err)
+	}
+
+	if id, err := backup.Due(ctx, deps.DB, time.Now()); err != nil {
+		jobErrors = append(jobErrors, err)
+	} else if id > 0 && deps.Storage != nil {
+		res, err := backup.Run(ctx, deps.DB, deps.Storage, id, time.Now())
+		result["backup_rows"] = int(res.Rows)
+		if err != nil {
+			log.Error().Err(err).Msg("database backup failed")
+			jobErrors = append(jobErrors, err)
+		} else {
+			log.Info().Str("prefix", res.Prefix).Int("tables", res.Tables).Int64("rows", res.Rows).Int("bytes", res.Bytes).Msg("database backup")
+		}
 	}
 
 	return result, errors.Join(jobErrors...)

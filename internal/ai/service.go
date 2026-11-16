@@ -86,6 +86,16 @@ type Service struct {
 	// OnChange, when set, is told after a mutating tool writes data in a
 	// scope ("habits") so devices can be pinged to refresh.
 	OnChange func(uid, scope string)
+	// OnUsage, when set, is told what every model call cost, so the API can
+	// hold each user to a spending budget. uid is empty when the caller
+	// didn't know it; the hook then reads the signed-in user from ctx.
+	OnUsage func(ctx context.Context, uid, kind string, costUSD float64)
+}
+
+func (s *Service) spent(ctx context.Context, uid, kind string, u usage) {
+	if s.OnUsage != nil && u.Total() > 0 {
+		s.OnUsage(ctx, uid, kind, u.CostUSD())
+	}
 }
 
 // modelClient is the part of Gemini consumed by Sajni. Keeping this interface
@@ -313,6 +323,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 	round := func(n int, u usage, ms int64, calls []string, err error) {
 		roundsRun++
 		total.add(u)
+		s.spent(ctx, req.UserID, req.Mode, u)
 		ev := log.Info()
 		if err != nil {
 			ev = log.Warn().Err(err)

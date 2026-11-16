@@ -342,6 +342,18 @@ gcloud logging read 'resource.labels.service_name="sajni-api" AND jsonPayload.me
   --freshness=1d --format='table(timestamp, jsonPayload.mode, jsonPayload.rounds, jsonPayload.tools, jsonPayload.in_tokens, jsonPayload.cache_pct, jsonPayload.cost_usd)'
 ```
 
+### Spending limits
+
+Every call's cost (`ai.Service.OnUsage`) counts toward the user's budget
+(`api/ailimit.go`): at most 240 calls and $0.50 per trailing hour (in memory),
+and `AI_DAILY_BUDGET_USD` (default $2) per UTC day, kept in `ai_spend` so it
+survives restarts. Past either, AI endpoints answer 429 with when to retry.
+
+```sh
+# Today's spend per user.
+echo "SELECT user_id, cost_micros/1e6 AS usd, calls FROM ai_spend WHERE day = CURRENT_DATE ORDER BY 2 DESC;" | finance/work/q
+```
+
 ## Connected apps (MCP)
 
 ChatGPT, Gemini and Claude connect to `https://www.ohmysajni.com/mcp`.
@@ -431,6 +443,29 @@ Migrate any local dev blobs once before going to prod:
 ```sh
 gcloud storage cp -r data/blobs/* gs://sajni-blobs/blobs/
 ```
+
+## Backups
+
+- **Database:** the quarter-hour sweep makes a weekly copy (first sweep in
+  the 21:00 UTC hour once the last copy is a week old; `internal/backup`,
+  table `db_backups`): `gs://$GCS_BUCKET/backups/db/<stamp>/<table>.csv.gz`
+  plus `RESTORE.md` with row counts and the restore steps. A bucket lifecycle
+  rule deletes copies after 63 days. Check the last one:
+  `echo "SELECT * FROM db_backups ORDER BY id DESC LIMIT 3;" | finance/work/q`.
+  For an on-demand copy to disk: `go run ./cmd/dbdump`.
+- **Blobs (journal, notes, uploads):** object versioning is on (2026-11-16),
+  so an overwrite or delete keeps the old version: the newest 20 per object,
+  each for 90 days; plus the 7-day soft delete. Restore one:
+
+```sh
+gcloud storage ls --all-versions gs://$GCS_BUCKET/user_<uid>/journal/2026-11-16.md
+gcloud storage cp gs://$GCS_BUCKET/user_<uid>/journal/2026-11-16.md#<generation> \
+  gs://$GCS_BUCKET/user_<uid>/journal/2026-11-16.md
+```
+
+The lifecycle rules (set once, `gcloud storage buckets update --lifecycle-file`):
+noncurrent versions with 20 newer → delete; noncurrent for 90 days → delete;
+`backups/db/` older than 63 days → delete.
 
 ---
 

@@ -3347,13 +3347,13 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 		}
 
 		// Rate-limit before touching the model.
-		if ok, retryAfter := deps.AILimiter.check(uid); !ok {
+		if ok, retryAfter := deps.AILimiter.check(r.Context(), uid); !ok {
 			secs := int(math.Ceil(retryAfter.Seconds()))
 			if secs < 1 {
 				secs = 1
 			}
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
-			errJSON(w, 429, "AI hourly limit reached. Try again later.")
+			errJSON(w, 429, aiLimitMessage(retryAfter))
 			return
 		}
 
@@ -3395,7 +3395,6 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 		if tokens <= 0 {
 			tokens = 50 // conservative floor for cap accounting
 		}
-		deps.AILimiter.record(uid, tokens)
 
 		// Look up the id for the matched category. If the user has no
 		// explicit "Others", id stays null and the client shows the
@@ -3654,13 +3653,13 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 			text = text[:2000]
 		}
 
-		if ok, retryAfter := deps.AILimiter.check(uid); !ok {
+		if ok, retryAfter := deps.AILimiter.check(r.Context(), uid); !ok {
 			secs := int(math.Ceil(retryAfter.Seconds()))
 			if secs < 1 {
 				secs = 1
 			}
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
-			errJSON(w, 429, "AI hourly limit reached. Try again later.")
+			errJSON(w, 429, aiLimitMessage(retryAfter))
 			return
 		}
 
@@ -3673,7 +3672,6 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 		if tokens <= 0 {
 			tokens = 80 // conservative floor for cap accounting
 		}
-		deps.AILimiter.record(uid, tokens)
 		if err != nil && body.Auto {
 			// Not "this isn't a transaction": the phone retries and then
 			// tells the user, instead of dropping a real payment unseen.
@@ -3731,7 +3729,6 @@ func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed
 			if ctoks <= 0 {
 				ctoks = 30
 			}
-			deps.AILimiter.record(uid, ctoks)
 			if cerr == nil && !(auto && strings.EqualFold(strings.TrimSpace(picked), "others")) {
 				for _, c := range cats {
 					if strings.EqualFold(c.name, picked) {
@@ -3840,13 +3837,13 @@ func parseTransactionImage(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		if ok, retryAfter := deps.AILimiter.check(uid); !ok {
+		if ok, retryAfter := deps.AILimiter.check(r.Context(), uid); !ok {
 			secs := int(math.Ceil(retryAfter.Seconds()))
 			if secs < 1 {
 				secs = 1
 			}
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
-			errJSON(w, 429, "AI hourly limit reached. Try again later.")
+			errJSON(w, 429, aiLimitMessage(retryAfter))
 			return
 		}
 
@@ -3860,7 +3857,6 @@ func parseTransactionImage(deps Deps) http.HandlerFunc {
 		if tokens <= 0 {
 			tokens = 250
 		}
-		deps.AILimiter.record(uid, tokens)
 		if err != nil {
 			writeJSON(w, 200, map[string]any{
 				"amount": 0, "type": "expense", "description": "", "note": "",

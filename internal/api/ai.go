@@ -129,13 +129,13 @@ func registerAIRoutes(mux *http.ServeMux, deps Deps, svc *ai.Service) {
 			return
 		}
 		uid := userID(r.Context())
-		if ok, retryAfter := limiter.check(uid); !ok {
+		if ok, retryAfter := limiter.check(r.Context(), uid); !ok {
 			secs := int(math.Ceil(retryAfter.Seconds()))
 			if secs < 1 {
 				secs = 1
 			}
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", secs))
-			errJSON(w, 429, "AI hourly limit reached. Try again later.")
+			errJSON(w, 429, aiLimitMessage(retryAfter))
 			return
 		}
 
@@ -187,31 +187,20 @@ func registerAIRoutes(mux *http.ServeMux, deps Deps, svc *ai.Service) {
 			History: ai.TrimHistory(prior),
 		}
 
-		var (
-			finalHistory []*genai.Content
-			finalText    string
-		)
+		var finalHistory []*genai.Content
 		for ev := range svc.Chat(ctx, req) {
 			if ev.Type == "done" {
 				var raw struct {
-					Text    string           `json:"text"`
 					History []*genai.Content `json:"history"`
 				}
 				_ = json.Unmarshal(ev.Data, &raw)
 				finalHistory = raw.History
-				finalText = raw.Text
 			}
 			if err := writeSSE(w, ev.Type, ev.Data); err != nil {
 				return
 			}
 			flusher.Flush()
 		}
-
-		// Estimate token cost (no usage metadata on the streaming path)
-		// at ~4 chars/token plus a 300-token floor for system prompt +
-		// tool schemas. Conservative; favours over-counting heavy chats.
-		est := 300 + (len(body.Message)+len(finalText))/4
-		limiter.record(uid, est)
 
 		// Persist whenever a session id is supplied, regardless of mode.
 		// Background ctx because request ctx may be cancelled at stream end.

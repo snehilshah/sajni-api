@@ -254,9 +254,9 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 			}
 		}
 
-		if ok, retryAfter := deps.AILimiter.check(uid); !ok {
+		if ok, retryAfter := deps.AILimiter.check(r.Context(), uid); !ok {
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(math.Max(1, math.Ceil(retryAfter.Seconds())))))
-			errJSON(w, 429, "AI hourly limit reached. Try again later.")
+			errJSON(w, 429, aiLimitMessage(retryAfter))
 			return
 		}
 		loc := userLocation(d, uid)
@@ -267,7 +267,6 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 		if tokens <= 0 {
 			tokens = 80
 		}
-		deps.AILimiter.record(uid, tokens)
 		if err != nil {
 			log.Warn().Err(err).Msg("capture parse failed")
 			record(captureResp{Outcome: "failed", Reason: "Couldn't read it."}, 0, "", "", nil)

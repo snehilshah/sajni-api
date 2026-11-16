@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -73,7 +74,10 @@ func obj(props map[string]*genai.Schema, required ...string) *genai.Schema {
 }
 func str(d string) *genai.Schema  { return &genai.Schema{Type: genai.TypeString, Description: d} }
 func intg(d string) *genai.Schema { return &genai.Schema{Type: genai.TypeInteger, Description: d} }
-func num(d string) *genai.Schema  { return &genai.Schema{Type: genai.TypeNumber, Description: d} }
+func strEnum(d string, vals ...string) *genai.Schema {
+	return &genai.Schema{Type: genai.TypeString, Description: d, Enum: vals}
+}
+func num(d string) *genai.Schema { return &genai.Schema{Type: genai.TypeNumber, Description: d} }
 func boolean(d string) *genai.Schema {
 	return &genai.Schema{Type: genai.TypeBoolean, Description: d}
 }
@@ -949,12 +953,13 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "create_journal_entry",
-			Description: "Create or replace a journal entry for the given date. Content is stored as a markdown blob; optional location_label (short, e.g. 'Cinepolis, Vashi') powers the location pill.",
+			Description: "Write in the journal for a date. Adds the text to the end of that day's entry (creating it if needed); mode='replace' overwrites the whole day and is only for when the user asks to rewrite it. Markdown; optional location_label (short, e.g. 'Cinepolis, Vashi') sets the location pill.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"date":           str("ISO date. Defaults to today."),
-				"content":        str("The entry body in markdown."),
-				"location_label": str("Optional short place label like 'Cinepolis, Vashi'."),
+				"date":           str("ISO date. Defaults to today in the user's timezone."),
+				"content":        str("Markdown to add (or, with mode='replace', the whole entry)."),
+				"mode":           strEnum("append (default) or replace.", "append", "replace"),
+				"location_label": str("Optional short place label like 'Cinepolis, Vashi'. Omit to keep the current one."),
 			}, "content"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return createJournalTool(ctx, d, store, uid, args)
@@ -3613,29 +3618,54 @@ func createMemoTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 }
 
 func createJournalTool(ctx context.Context, d *db.DB, store storage.Storage, uid string, args map[string]any) (any, map[string]any, error) {
-	content := argStr(args, "content")
+	content := strings.TrimSpace(argStr(args, "content"))
 	if content == "" {
 		return nil, nil, fmt.Errorf("missing content")
 	}
 	date := argStr(args, "date")
 	if date == "" {
-		date = time.Now().Format("2006-01-02")
+		date = userTZNow(ctx, d, uid).Format("2006-01-02")
 	}
-	locLabel := argStr(args, "location_label")
-	blobKey := fmt.Sprintf("user_%s/journal/%s.md", uid, date)
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		return nil, nil, fmt.Errorf("date must be YYYY-MM-DD")
+	}
+	replace := argStr(args, "mode") == "replace"
+	blobKey := storage.UserKey(uid, "journal", date+".md")
+	// Append keeps what's already written that day: new text goes after a
+	// blank line, so a "log this" from any assistant never wipes the entry.
+	if !replace {
+		old, _, err := store.Get(ctx, blobKey)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, nil, fmt.Errorf("read entry: %w", err)
+		}
+		if prev := strings.TrimRight(string(old), " \n"); prev != "" {
+			content = prev + "\n\n" + content
+		}
+	}
 	if err := store.Put(ctx, blobKey, []byte(content), "text/markdown"); err != nil {
 		return nil, nil, err
 	}
+	var loc *string
+	if v, ok := args["location_label"].(string); ok && strings.TrimSpace(v) != "" {
+		v = strings.TrimSpace(v)
+		loc = &v
+	}
 	var id int64
 	err := d.QueryRowContext(ctx, `
-		INSERT INTO journal_entries (user_id, date, blob_key, location_label) VALUES ($1,$2,$3,$4)
+		INSERT INTO journal_entries (user_id, date, blob_key, location_label) VALUES ($1,$2,$3,COALESCE($4,''))
 		ON CONFLICT (user_id, date) DO UPDATE SET blob_key=EXCLUDED.blob_key,
-		  location_label=EXCLUDED.location_label, updated_at=NOW()
-		RETURNING id`, uid, date, blobKey, locLabel).Scan(&id)
+		  location_label=COALESCE($4, journal_entries.location_label), updated_at=NOW()
+		RETURNING id`, uid, date, blobKey, loc).Scan(&id)
 	if err != nil {
 		return nil, nil, err
 	}
-	return map[string]any{"id": id, "date": date},
+	_ = db.SyncTags(ctx, d, uid, "journal", id, content)
+	_ = db.SyncBacklinks(ctx, d, uid, "journal", id, content)
+	mode := "appended"
+	if replace {
+		mode = "replaced"
+	}
+	return map[string]any{"id": id, "date": date, "mode": mode},
 		map[string]any{"kind": "journal_created", "id": id, "title": date, "route": "/journal?date=" + date}, nil
 }
 

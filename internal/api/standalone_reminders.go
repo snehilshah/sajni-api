@@ -234,6 +234,7 @@ func sendStandaloneReminder(ctx context.Context, deps Deps, occurrenceID int64) 
 	type due struct {
 		reminderID int64
 		message    string
+		notes      string
 		fireAt     time.Time
 		uid        string
 		email      string
@@ -251,10 +252,10 @@ func sendStandaloneReminder(ctx context.Context, deps Deps, occurrenceID int64) 
 			  AND (o.claimed_until IS NULL OR o.claimed_until<NOW())
 			RETURNING o.reminder_id,o.user_id,o.fire_at
 		)
-		SELECT c.reminder_id,r.message,c.fire_at,u.id,u.email,u.name,COALESCE(u.timezone,r.timezone),COALESCE(u.notify_channel,'both')
+		SELECT c.reminder_id,r.message,r.notes,c.fire_at,u.id,u.email,u.name,COALESCE(u.timezone,r.timezone),COALESCE(u.notify_channel,'both')
 		FROM claimed c JOIN reminders r ON r.id=c.reminder_id JOIN users u ON u.id=c.user_id
 		WHERE u.deleted_at IS NULL`, occurrenceID, int(reminderClaimLease.Seconds()), int(reminderGrace.Seconds())).
-		Scan(&item.reminderID, &item.message, &item.fireAt, &item.uid, &item.email, &item.name, &item.timezone, &item.channel)
+		Scan(&item.reminderID, &item.message, &item.notes, &item.fireAt, &item.uid, &item.email, &item.name, &item.timezone, &item.channel)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -262,10 +263,16 @@ func sendStandaloneReminder(ctx context.Context, deps Deps, occurrenceID int64) 
 		return false, err
 	}
 	route := fmt.Sprintf("/tasks?tab=reminders&focus=%d", item.reminderID)
+	// With notes, the reminder is the title and its notes the body (the
+	// phone expands long text); without, it reads "Reminder" over the message.
+	title, body := "Reminder", item.message
+	if notes := strings.TrimSpace(item.notes); notes != "" {
+		title, body = item.message, notes
+	}
 	pushed := notifyPush(ctx, deps, item.uid, push.Notification{
 		Type:     push.TypeReminder,
-		Title:    "Reminder",
-		Body:     item.message,
+		Title:    title,
+		Body:     body,
 		Route:    route,
 		DataOnly: true,
 		Data: map[string]string{

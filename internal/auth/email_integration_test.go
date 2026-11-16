@@ -12,9 +12,9 @@ import (
 )
 
 func TestEmailCodeConcurrentConsumption(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
+	dsn := os.Getenv("SAJNI_TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL is not set")
+		t.Skip("SAJNI_TEST_DATABASE_URL is not set")
 	}
 	database, err := db.New(dsn)
 	if err != nil {
