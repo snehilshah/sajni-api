@@ -108,9 +108,16 @@ type Report struct {
 	// Rate is Saved / Income in %; nil without income.
 	Rate     *float64 `json:"rate"`
 	DailyAvg float64  `json:"daily_avg"`
-	// BaseMonths is how many earlier months "usual" averages (0–3).
+	// BaseMonths is how many earlier months "usual" averages (0–3): only
+	// months the user recorded in full, so a first part-month or a gap with
+	// nothing recorded never counts as a month of ₹0.
 	BaseMonths int `json:"base_months"`
+	// UsualBasis says what "usual" is made of, for the label: "October",
+	// "Sep–Oct average", "Aug–Oct average"; "" without earlier months.
+	UsualBasis string `json:"usual_basis"`
 	// Comparable is Plain spending to Day; Usual the same for earlier months.
+	// A finished month (Day = DaysInMonth) compares whole months: earlier
+	// months' days past this month's length still count.
 	Comparable float64  `json:"comparable"`
 	Usual      *float64 `json:"usual"`
 	VsUsual    *float64 `json:"vs_usual"`
@@ -154,11 +161,16 @@ func Load(ctx context.Context, d *db.DB, uid string, month time.Time) ([]Row, ti
 	loc := month.Location()
 	from := month.AddDate(0, -(trendMonths - 1), 0)
 	to := month.AddDate(0, 1, 0)
+	// A row without a category counts as the user's expense "Others", so
+	// there is one Others, never a second one for the blanks.
 	rows, err := d.QueryContext(ctx, `SELECT t.id, t.type, t.amount, t.description,
-			(t.txn_at AT TIME ZONE $4)::date::text, t.category_id, COALESCE(c.name, 'Others'),
-			COALESCE(c.color, '#6B7280'), COALESCE(s.is_plain, TRUE), COALESCE(s.name, '')
+			(t.txn_at AT TIME ZONE $4)::date::text, COALESCE(t.category_id, o.id), COALESCE(c.name, o.name, 'Others'),
+			COALESCE(c.color, o.color, '#6B7280'), COALESCE(s.is_plain, TRUE), COALESCE(s.name, '')
 		FROM fin_transactions t
 		LEFT JOIN fin_categories c ON c.id = t.category_id
+		LEFT JOIN LATERAL (SELECT id, name, color FROM fin_categories
+			WHERE user_id = t.user_id AND kind = 'expense' AND LOWER(BTRIM(name)) IN ('other','others')
+			ORDER BY id LIMIT 1) o ON t.category_id IS NULL
 		LEFT JOIN fin_slates s ON s.id = t.slate_id
 		WHERE t.user_id = $1 AND t.type IN ('income','expense','writeoff','refund')
 		  AND (t.txn_at AT TIME ZONE $4)::date >= $2::date AND (t.txn_at AT TIME ZONE $4)::date < $3::date
@@ -180,11 +192,13 @@ func Load(ctx context.Context, d *db.DB, uid string, month time.Time) ([]Row, ti
 	if err := rows.Err(); err != nil {
 		return nil, time.Time{}, err
 	}
-	// The first day the user recorded anything bounds "usual": months before
-	// they started aren't months of ₹0.
+	// The first day the user recorded a spend or income bounds "usual":
+	// months before they started aren't months of ₹0. Other kinds don't
+	// count: a debt from before Sajni is dated before the user started.
 	var first time.Time
 	var firstDay *string
-	if err := d.QueryRowContext(ctx, `SELECT MIN((txn_at AT TIME ZONE $2)::date)::text FROM fin_transactions WHERE user_id = $1`, uid, loc.String()).Scan(&firstDay); err != nil {
+	if err := d.QueryRowContext(ctx, `SELECT MIN((txn_at AT TIME ZONE $2)::date)::text FROM fin_transactions
+		WHERE user_id = $1 AND type IN ('income','expense','writeoff','refund')`, uid, loc.String()).Scan(&firstDay); err != nil {
 		return nil, time.Time{}, err
 	}
 	if firstDay != nil {
@@ -204,6 +218,29 @@ func daysIn(m time.Time) int { return m.AddDate(0, 1, -1).Day() }
 // started: the user had begun recording by the end of month m.
 func started(m, first time.Time) bool { return first.IsZero() || m.AddDate(0, 1, 0).After(first) }
 
+// full: the user was recording for all of month m.
+func full(m, first time.Time) bool { return first.IsZero() || !first.After(m) }
+
+// basis names the months "usual" averages (newest first): "October",
+// "Sep–Oct average", "Aug, Oct average" when a month in between is empty.
+func basis(base []time.Time) string {
+	switch len(base) {
+	case 0:
+		return ""
+	case 1:
+		return base[0].Format("January")
+	}
+	newest, oldest := base[0], base[len(base)-1]
+	if newest.AddDate(0, -(len(base) - 1), 0).Equal(oldest) {
+		return oldest.Format("Jan") + "–" + newest.Format("Jan") + " average"
+	}
+	var names []string
+	for i := len(base) - 1; i >= 0; i-- {
+		names = append(names, base[i].Format("Jan"))
+	}
+	return strings.Join(names, ", ") + " average"
+}
+
 // MerchantKey groups a transaction title: case and spacing don't matter.
 func MerchantKey(title string) string {
 	return strings.Join(strings.Fields(strings.ToLower(title)), " ")
@@ -220,18 +257,30 @@ func Compute(rows []Row, month, now, first time.Time) Report {
 		rep.Day = now.Day()
 	}
 	D := rep.Day
+	// whole: the month is over (or on its last day), so earlier months count
+	// in full, not cut at this month's length.
+	whole := D == rep.DaysInMonth
 
-	// Earlier months that "usual" averages: up to three, none before the
-	// user's first record.
+	// Months with anything recorded: an empty month is a gap, not ₹0.
+	hasData := map[string]bool{}
+	for _, r := range rows {
+		hasData[monthKey(r.Day)] = true
+	}
+
+	// Earlier months that "usual" averages: of the three before this one,
+	// those recorded in full and not empty.
 	var base []time.Time
 	for i := 1; i <= baseMonths; i++ {
 		m := month.AddDate(0, -i, 0)
-		if !started(m, first) {
+		if !full(m, first) {
 			break
 		}
-		base = append(base, m)
+		if hasData[monthKey(m)] {
+			base = append(base, m)
+		}
 	}
 	rep.BaseMonths = len(base)
+	rep.UsualBasis = basis(base)
 	inBase := map[string]bool{}
 	for _, m := range base {
 		inBase[monthKey(m)] = true
@@ -336,7 +385,7 @@ func Compute(rows []Row, month, now, first time.Time) Report {
 			continue
 		}
 		if mStart.Before(month) {
-			if inBase[k] && r.Plain && r.Day.Day() <= D {
+			if inBase[k] && r.Plain && (whole || r.Day.Day() <= D) {
 				ca := cats[ck]
 				if ca == nil {
 					ca = &catAgg{c: Category{ID: r.CategoryID, Name: r.Category, Color: r.Color}}
@@ -364,13 +413,20 @@ func Compute(rows []Row, month, now, first time.Time) Report {
 		rep.DailyAvg = round(rep.Spent / float64(D))
 	}
 
-	// Cumulative Plain lines: this month to today, last month, usual.
+	// Cumulative Plain lines: this month to today, last month, usual. A
+	// longer earlier month's last days land on this month's last day, so the
+	// lines end at whole-month totals (October's 31st isn't lost in November).
 	cum := func(a []float64, upto int) []float64 {
 		out := make([]float64, rep.DaysInMonth+1)
 		run := 0.0
 		for d := 1; d <= rep.DaysInMonth; d++ {
 			if d < len(a) && d <= upto {
 				run += a[d]
+			}
+			if d == rep.DaysInMonth && upto >= d {
+				for _, v := range a[min(d+1, len(a)):] {
+					run += v
+				}
 			}
 			out[d] = run
 		}
@@ -504,10 +560,14 @@ func Compute(rows []Row, month, now, first time.Time) Report {
 				reason = fmt.Sprintf("Big one-off: %.0f%% of this month's spending", r.Amount/rep.Spent*100)
 			}
 		}
-		// "New" needs a month of history before this one to mean anything.
-		if reason == "" && !first.IsZero() && month.AddDate(0, -1, 0).After(first) &&
+		// "New" needs three full months of history before this one: with
+		// less, most things are new.
+		if reason == "" && !first.IsZero() && full(month.AddDate(0, -baseMonths, 0), first) &&
 			!seenBefore[mk] && !seenThisMonth[mk] && r.Amount >= newFloor {
-			reason = "New: nothing like it in the last year"
+			reason = "New: nothing like it since you started"
+			if !full(month.AddDate(0, -(trendMonths-1), 0), first) {
+				reason = "New: nothing like it in the last year"
+			}
 		}
 		seenThisMonth[mk] = true
 		if reason != "" {
@@ -520,10 +580,11 @@ func Compute(rows []Row, month, now, first time.Time) Report {
 		rep.Unusual = rep.Unusual[:5]
 	}
 
-	// Trend: the twelve months ending this one, from the first with data.
+	// Trend: the twelve months ending this one, from the first with data;
+	// an earlier month with nothing recorded is left out, not drawn as ₹0.
 	for i := trendMonths - 1; i >= 0; i-- {
 		m := month.AddDate(0, -i, 0)
-		if !started(m, first) {
+		if !started(m, first) || (i > 0 && !hasData[monthKey(m)]) {
 			continue
 		}
 		tm := trend[monthKey(m)]

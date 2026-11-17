@@ -513,7 +513,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "finance_month",
-			Description: "How a month's money went, for 'why is this month so high', 'what did I spend on', savings questions: spent (expenses + adjusted lends − refunds; lends and split shares excluded), income, saved and savings rate; vs_usual (Plain spending to the same day minus the average of up to 3 earlier months); projected month end; categories with change vs usual (positive = driving it up); top merchants by title; the 5 largest spends; unusual ones with a reason; a 12-month trend. Slates count in totals but not in comparisons. Read-only.",
+			Description: "How a month's money went, for 'why is this month so high', 'what did I spend on', savings questions: spent (expenses + adjusted lends − refunds; lends and split shares excluded), income, saved and savings rate; vs_usual (Plain spending to the same day, or the whole month once it's over, minus the average of up to 3 earlier months the user recorded in full; usual_basis names them, e.g. 'October' — say 'vs October' when it is one month); projected month end; categories with change vs usual (positive = driving it up, negative = holding it down; uncategorised rows count as Others); top merchants by title; the 5 largest spends; unusual ones with a reason; a 12-month trend. Slates count in totals but not in comparisons. Read-only.",
 			Schema: obj(map[string]*genai.Schema{
 				"month": str("YYYY-MM. Defaults to this month."),
 			}),

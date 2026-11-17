@@ -135,6 +135,88 @@ func TestCompute(t *testing.T) {
 	}
 }
 
+// The owner's first months: recording from 1 Oct, Home Contrib ₹22,000 paid
+// on 5 Oct and 6 Nov. On 15 Nov its usual is October's ₹22,000, not
+// (22,000 + an empty September) ÷ 2.
+func TestFirstMonthsAndWholeMonths(t *testing.T) {
+	ist, _ := time.LoadLocation("Asia/Kolkata")
+	day := func(s string) time.Time { d, _ := time.ParseInLocation("2006-01-02", s, ist); return d }
+	home, food := int64(4350), int64(1)
+	var id int64
+	row := func(date string, amount float64, title string, cat *int64) Row {
+		id++
+		name := map[*int64]string{&home: "Home Contrib", &food: "Food"}[cat]
+		return Row{ID: id, Type: "expense", Amount: amount, Title: title, Day: day(date), CategoryID: cat, Category: name, Plain: true}
+	}
+	rows := []Row{
+		row("2026-10-01", 500, "Zara Perfume", &food),
+		row("2026-10-05", 22000, "Home Contrib", &home),
+		row("2026-10-31", 1000, "Halloween", &food),
+		row("2026-11-06", 22000, "Home Contrib", &home),
+		row("2026-11-10", 700, "Zomato", &food),
+	}
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, ist)
+	nov, _ := ParseMonth("", now)
+	r := Compute(rows, nov, now, day("2026-10-01"))
+	if r.BaseMonths != 1 || r.UsualBasis != "October" || r.Usual == nil || *r.Usual != 22500 || *r.VsUsual != 200 {
+		t.Fatalf("usual: base %d %q usual %v vs %v", r.BaseMonths, r.UsualBasis, r.Usual, r.VsUsual)
+	}
+	for _, c := range r.Categories {
+		if c.Name == "Home Contrib" && (*c.Usual != 22000 || *c.Change != 0) {
+			t.Fatalf("home contrib: usual %v change %v", *c.Usual, *c.Change)
+		}
+	}
+	// One month of history: nothing is "new" yet.
+	if len(r.Unusual) != 0 {
+		t.Fatalf("unusual: %+v", r.Unusual)
+	}
+	// October's rest (the 31st) is still to come at this pace.
+	if r.Projected == nil || *r.Projected != 23700 {
+		t.Fatalf("projected: %v", r.Projected)
+	}
+	if len(r.Trend) != 2 || r.Trend[0].Month != "2026-10" {
+		t.Fatalf("trend: %+v", r.Trend)
+	}
+
+	// November, looked back on in December, compares whole months: October's
+	// 31st counts in usual and on the last point of its line.
+	dec := time.Date(2026, 12, 2, 9, 0, 0, 0, ist)
+	novPast, _ := ParseMonth("2026-11", dec)
+	p := Compute(rows, novPast, dec, day("2026-10-01"))
+	if p.Day != 30 || *p.Usual != 23500 || *p.VsUsual != -800 || p.LastMonth != 23500 || p.Cumulative[29].Last != 23500 {
+		t.Fatalf("whole months: usual %v vs %v last %v", *p.Usual, *p.VsUsual, p.LastMonth)
+	}
+	for _, c := range p.Categories {
+		if c.Name == "Food" && (*c.Usual != 1500 || *c.Change != -800) {
+			t.Fatalf("food whole month: usual %v change %v", *c.Usual, *c.Change)
+		}
+	}
+
+	// A month with nothing recorded is a gap, not ₹0: February's usual skips
+	// an empty December and averages October and November.
+	feb := time.Date(2027, 2, 10, 9, 0, 0, 0, ist)
+	gap := append(rows[:len(rows):len(rows)], row("2027-01-03", 400, "Lunch", &food), row("2027-02-03", 400, "Lunch", &food))
+	fm, _ := ParseMonth("", feb)
+	g := Compute(gap, fm, feb, day("2026-10-01"))
+	if g.BaseMonths != 2 || g.UsualBasis != "Nov, Jan average" {
+		t.Fatalf("gap: base %d %q", g.BaseMonths, g.UsualBasis)
+	}
+	for _, m := range g.Trend {
+		if m.Month == "2026-12" {
+			t.Fatalf("empty December in the trend: %+v", g.Trend)
+		}
+	}
+	// A first part-month never counts: recording from 20 Oct, November has
+	// nothing to compare with.
+	late := Compute(rows[3:], nov, now, day("2026-10-20"))
+	if late.BaseMonths != 0 || late.Usual != nil || late.UsualBasis != "" {
+		t.Fatalf("part month: %+v", late)
+	}
+	if b := basis([]time.Time{day("2026-12-01"), day("2026-11-01"), day("2026-10-01")}); b != "Oct–Dec average" {
+		t.Fatalf("basis: %q", b)
+	}
+}
+
 func TestMoney(t *testing.T) {
 	for in, want := range map[float64]string{0: "0.00", 999: "999.00", 1000.5: "1,000.50", 125000: "1,25,000.00", 12345678.9: "1,23,45,678.90", -42.25: "-42.25"} {
 		if got := money(in); got != want {
