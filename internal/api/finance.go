@@ -902,6 +902,9 @@ func createTransaction(deps Deps) http.HandlerFunc {
 			OweDueDate *string `json:"owe_due_date"`
 			// expense only: paying this person back (not spending).
 			PayBackTo string `json:"pay_back_to"`
+			// The capture this files, from its review notification: the
+			// capture is linked to the row (no longer waiting).
+			CaptureID *int64 `json:"capture_id"`
 		}
 		if err := readJSON(r, &b); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -1231,6 +1234,13 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		if b.PayBackTo != "" {
 			if err := db.PayBack(ctx, tx, uid, b.PayBackTo, id); err != nil {
 				lendError(w, r, "pay back", err)
+				return
+			}
+		}
+		if b.CaptureID != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE fin_captures SET outcome = 'created', txn_id = $1, reason = 'Filed from its review.'
+				WHERE id = $2 AND user_id = $3 AND outcome = 'review'`, id, *b.CaptureID, uid); err != nil {
+				internalError(w, r, "link capture", err)
 				return
 			}
 		}
@@ -3521,8 +3531,12 @@ func lookupMerchantCategory(d *db.DB, uid, merchant, kind string) (*int64, strin
 // >=4-digit suffix of one — exact last-4, NOT the loose substring the web
 // client used (which mis-matched a short/other token onto the wrong account, so
 // the confirm sheet showed "matched" but never switched to the right account).
-// Text tokens (bank names, >=3 chars) match as a case-insensitive substring.
-// Numeric matches (more specific) win over name matches. Returns nil,false when
+// Text tokens (bank names, >=3 chars) match as whole words, case-insensitive
+// ("pop" not inside "poptech"), and the longest matching token wins ("amazon
+// pay icici" over "amazon pay"). Numeric matches (more specific) win over name
+// matches; a hint naming card or account digits (4+) that belong to none of
+// the accounts matches nothing, so "Kotak card XX9148" goes to review instead
+// of landing on the Kotak savings account through "kotak". Returns nil when
 // nothing matches.
 func matchAccountByHint(d *db.DB, uid, hint string) *int64 {
 	h := strings.ToLower(strings.TrimSpace(hint))
@@ -3562,16 +3576,44 @@ func matchAccountByHint(d *db.DB, uid, hint string) *int64 {
 			}
 		}
 	}
-	// Pass 2: bank-name substring.
+	// Pass 2: bank names as whole words, the longest that fits.
+	var best *int64
+	bestTok := ""
 	for _, c := range cands {
 		for _, tok := range splitMatchHints(c.hints) {
-			if !isAllDigits(tok) && len(tok) >= 3 && strings.Contains(h, tok) {
+			if !isAllDigits(tok) && len(tok) >= 3 && len(tok) > len(bestTok) && hasWord(h, tok) {
 				id := c.id
-				return &id
+				best, bestTok = &id, tok
 			}
 		}
 	}
-	return nil
+	// Digits that are none of the owner's accounts (and not part of the name
+	// that matched, like a wallet's "8169558980@amazonpay"): another card or
+	// account.
+	for _, run := range runs {
+		if len(run) >= 4 && !strings.Contains(bestTok, run) {
+			return nil
+		}
+	}
+	return best
+}
+
+// hasWord reports whether tok appears in s with no letter or digit on
+// either side.
+func hasWord(s, tok string) bool {
+	alnum := func(b byte) bool { return b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b >= 0x80 }
+	for from := 0; ; {
+		i := strings.Index(s[from:], tok)
+		if i < 0 {
+			return false
+		}
+		i += from
+		end := i + len(tok)
+		if (i == 0 || !alnum(s[i-1])) && (end == len(s) || !alnum(s[end])) {
+			return true
+		}
+		from = i + 1
+	}
 }
 
 func splitMatchHints(s string) []string {

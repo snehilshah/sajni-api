@@ -42,11 +42,28 @@ var captureParserSwapped bool
 //     already reported by "sms" and becomes its own row.
 //  5. Otherwise a new row (or "review" when no account matched).
 //
+// A copy keeps the best of both: a fuller name (the Kotak app cuts names at
+// 14 letters, the SMS doesn't) or a shop's receipt naming what was bought
+// replaces a title Sajni chose, never one the owner typed. A receipt never
+// makes a row by itself; with no bank message to join it waits as a review,
+// and a later message for the same payment resolves that review (the reply
+// lists it in Resolved, so the phone clears its notification).
+//
+// A card bill paid from the bank is a transfer: the card's "payment
+// received" pairs with the bank's debit, and when the card was credited a
+// little more than the bank paid (POP's ₹18 off a ₹9,392.77 bill), the gap is
+// Cashback income on the card.
+//
 // "Add anyway" re-posts with force and skips 1, 2 and 4.
 
 const (
 	captureRefWindow  = 14 * 24 * time.Hour
 	captureCopyWindow = 3 * time.Hour
+	// The same text with no reference, not ignored, is one message only
+	// this long: the Kotak app words every ₹22 to Salman identically.
+	captureSameTextWindow = 30 * time.Minute
+	// A card's "payment received" can trail the bank's debit by hours.
+	cardBillWindow = 24 * time.Hour
 )
 
 type captureReq struct {
@@ -78,6 +95,12 @@ type captureResp struct {
 	// Suggest is a one-tap link offered with a new row: a credit from
 	// someone who owes the owner → "Paid back · Papa".
 	Suggest *captureSuggest `json:"suggest,omitempty"`
+	// CaptureID is this message's capture: the phone numbers a review
+	// notification by it, and filing the review sends it back.
+	CaptureID int64 `json:"capture_id,omitempty"`
+	// Resolved are earlier reviews this message settled (the same payment,
+	// now with its account): the phone clears their notifications.
+	Resolved []int64 `json:"resolved,omitempty"`
 }
 
 type captureSuggest struct {
@@ -95,6 +118,9 @@ var (
 	reAmPm = regexp.MustCompile(`(?i)\d\s*(am|pm|a\.m\.|p\.m\.)(\W|$)`)
 	// An FD (or "fixed deposit") maturing.
 	reFDMatured = regexp.MustCompile(`(?i)\b(fd|fixed deposit|term deposit)\b.{0,40}\bmatur|\bmatur\w*\b.{0,40}\b(fd|fixed deposit|term deposit)\b`)
+	// A card saying its bill was paid ("Payment of Rs 9,392.77 received",
+	// "Thank you for your payment").
+	reCardPaid = regexp.MustCompile(`(?i)\b(re)?payment\b.{0,60}\b(received|credited|successful|processed|realised)\b|\breceived\b.{0,40}\bpayment\b|\bthank you for\b.{0,30}\bpayment\b`)
 )
 
 func captureHash(text string) string {
@@ -230,9 +256,14 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 			var was string
 			// Asked about or ignored before counts too: the Messages app
 			// re-posting an SMS shouldn't ask a second time.
+			// Only an ignored message or one with a reference is the same for
+			// 14 days; the rest for half an hour, since a notification without
+			// date or reference reads the same every time.
 			if d.QueryRowContext(ctx, `SELECT txn_id, amount, description, outcome FROM fin_captures
-				WHERE user_id = $1 AND text_hash = $2 AND outcome IN ('created','absorbed','confirmed','review','ignored') AND created_at > NOW() - $3::interval
-				ORDER BY id DESC LIMIT 1`, uid, hash, fmt.Sprintf("%d seconds", int(captureRefWindow.Seconds()))).Scan(&txnID, &amt, &desc, &was) == nil {
+				WHERE user_id = $1 AND text_hash = $2 AND outcome IN ('created','absorbed','confirmed','review','ignored')
+				  AND created_at > NOW() - CASE WHEN outcome = 'ignored' OR ref <> '' THEN $3::interval ELSE $4::interval END
+				ORDER BY id DESC LIMIT 1`, uid, hash, fmt.Sprintf("%d seconds", int(captureRefWindow.Seconds())),
+				fmt.Sprintf("%d seconds", int(captureSameTextWindow.Seconds()))).Scan(&txnID, &amt, &desc, &was) == nil {
 				c := captureResp{Outcome: "absorbed", Reason: "The same message again.", TxnID: txnID.Int64, Label: moneyLabel(amt, desc)}
 				if was == "ignored" {
 					c = captureResp{Outcome: "ignored", Reason: "The same message again."}
@@ -301,8 +332,19 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 		own := parsed.OwnMoney || ownName(ctx, d, uid, parsed.Description)
 		hint := strings.ToLower(strings.TrimSpace(parsed.AccountHint))
 		acct, _ := fields["account_id"].(*int64)
-		catID, _ := fields["category_id"].(*int64)
 		typ := parsed.Type
+		receipt := parsed.Receipt
+		if receipt {
+			// "UPI: Amazon" names how a receipt was paid far too loosely to
+			// pick an account (it put a wallet payment on Salary).
+			acct = nil
+			fields["account_id"] = acct
+		}
+		card := acct != nil && accountType(ctx, d, uid, *acct) == "credit_card"
+		if card && typ == "income" && reCardPaid.MatchString(b.Text) {
+			own = true // the card's bill, paid from one of the owner's accounts
+		}
+		catID, _ := fields["category_id"].(*int64)
 		resp := captureResp{Parsed: fields}
 
 		tx, err := d.BeginTx(ctx, nil)
@@ -317,12 +359,22 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 		}
 		finish := func(c captureResp) {
 			c.Parsed = fields
-			if _, err := tx.ExecContext(ctx, `INSERT INTO fin_captures
-				(user_id, source, channel, sender_label, text, text_hash, received_at, ref, amount, type, description, account_id, outcome, reason, txn_id, suggestion, own_money, account_hint)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULLIF($15,0),$16,$17,$18)`,
-				uid, b.Source, channel, b.SenderLabel, b.Text, hash, receivedAt, ref, parsed.Amount, typ, parsed.Description, acct, c.Outcome, c.Reason, c.TxnID, suggestionKey(c.Suggest), own, hint); err != nil {
+			if err := tx.QueryRowContext(ctx, `INSERT INTO fin_captures
+				(user_id, source, channel, sender_label, text, text_hash, received_at, ref, amount, type, description, account_id, outcome, reason, txn_id, suggestion, own_money, account_hint, receipt)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULLIF($15,0),$16,$17,$18,$19) RETURNING id`,
+				uid, b.Source, channel, b.SenderLabel, b.Text, hash, receivedAt, ref, parsed.Amount, typ, parsed.Description, acct, c.Outcome, c.Reason, c.TxnID, suggestionKey(c.Suggest), own, hint, receipt).Scan(&c.CaptureID); err != nil {
 				internalError(w, r, "record capture", err)
 				return
+			}
+			// The same payment asked about earlier, now known: settle that
+			// review, and take a receipt's shop name.
+			if (c.Outcome == "created" || c.Outcome == "absorbed") && c.TxnID != 0 {
+				ids, err := resolveReviews(ctx, tx, uid, c.CaptureID, c.TxnID, channel, ref, typ, parsed.Amount, receivedAt)
+				if err != nil {
+					internalError(w, r, "resolve reviews", err)
+					return
+				}
+				c.Resolved = ids
 			}
 			if err := tx.Commit(); err != nil {
 				internalError(w, r, "commit capture", err)
@@ -375,7 +427,7 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 					SELECT id, name FROM fin_investments
 					WHERE user_id = $1 AND account_id = $2 AND maturity_date IS NOT NULL
 					  AND invested_amount > 0 AND $3 >= invested_amount - 0.5
-					  AND ABS(EXTRACT(EPOCH FROM (maturity_date - $4::timestamptz))) <= 2*86400 + 43200
+					  AND EXTRACT(EPOCH FROM ($4::timestamptz - maturity_date)) BETWEEN -1.5*86400 AND 7.5*86400
 					ORDER BY ABS(EXTRACT(EPOCH FROM (maturity_date - $4::timestamptz))) LIMIT 1`, uid, *acct, parsed.Amount, txnAt).Scan(&invID, &invName) == nil {
 					id, gain, err := db.TransferFromInvestment(ctx, tx, uid, *acct, invID, parsed.Amount, invName+" matured", parsed.Note, txnAt, 0)
 					if err != nil {
@@ -440,14 +492,34 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 
 		// 4. One report per channel per payment.
 		if !b.Force {
-			if id, label, ok, err := copyFromOtherChannel(ctx, tx, uid, channel, ref, typ, parsed.Amount, acct, txnAt, receivedAt); err != nil {
+			// A receipt's number is the shop's order id, not the bank's
+			// reference: it can't tell two payments apart.
+			copyRef := ref
+			if receipt {
+				copyRef = ""
+			}
+			if id, label, ok, err := copyFromOtherChannel(ctx, tx, uid, channel, copyRef, typ, parsed.Amount, acct, txnAt, receivedAt); err != nil {
 				internalError(w, r, "match capture copy", err)
 				return
 			} else if ok {
+				if title, err := betterTitle(ctx, tx, uid, id, parsed.Description, receipt); err != nil {
+					internalError(w, r, "copy title", err)
+					return
+				} else if title != "" {
+					label = moneyLabel(parsed.Amount, title)
+				}
 				resp.Outcome, resp.Reason, resp.TxnID, resp.Label = "absorbed", "Another copy of a payment already added.", id, label
 				finish(resp)
 				return
 			}
+		}
+
+		// A receipt with no bank message yet: ask, and let the bank's
+		// message settle it when it comes.
+		if receipt && !b.Force {
+			resp.Outcome, resp.Reason, resp.Label = "review", "A receipt; the bank's message for it hasn't come.", moneyLabel(parsed.Amount, parsed.Description)
+			finish(resp)
+			return
 		}
 
 		if acct == nil {
@@ -489,6 +561,15 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 					finish(resp)
 					return
 				}
+			}
+			// A card bill: the bank's debit and the card's "payment received",
+			// a discount apart.
+			if c, ok, err := pairCardBill(ctx, tx, uid, channel, typ, parsed.Amount, *acct, card, own, txnAt); err != nil {
+				internalError(w, r, "pair card bill", err)
+				return
+			} else if ok {
+				finish(c)
+				return
 			}
 		}
 		desc := strings.TrimSpace(parsed.Description)
@@ -856,4 +937,213 @@ func removeCaptureIgnore(deps Deps) http.HandlerFunc {
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
+}
+
+func accountType(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, uid string, id int64) string {
+	var typ string
+	q.QueryRowContext(ctx, `SELECT type FROM fin_accounts WHERE id = $1 AND user_id = $2`, id, uid).Scan(&typ)
+	return typ
+}
+
+// betterTitle lets a copy improve the title of the row it joins, only while
+// that title is still the one capture chose (never one the owner typed or a
+// learned payee name): a shop's receipt names what was bought ("Supercell"
+// over the wallet's "Apay Wallet"), and a fuller name replaces one cut short
+// ("Himanshu Jitendra Ch" over the Kotak app's "Himanshu Jiten"). Returns the
+// new title, or "" when the row keeps its own.
+func betterTitle(ctx context.Context, tx *sql.Tx, uid string, rowID int64, name string, receipt bool) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", nil
+	}
+	var title string
+	var captured sql.NullString
+	var untouched bool
+	err := tx.QueryRowContext(ctx, `SELECT t.description,
+			(SELECT c.description FROM fin_captures c WHERE c.txn_id = t.id AND c.outcome = 'created' ORDER BY c.id LIMIT 1),
+			t.updated_at <= t.created_at + INTERVAL '2 seconds'
+		FROM fin_transactions t WHERE t.id = $1 AND t.user_id = $2`, rowID, uid).Scan(&title, &captured, &untouched)
+	if errors.Is(err, sql.ErrNoRows) || !captured.Valid {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	title = strings.TrimSpace(title)
+	capTitle := strings.TrimSpace(captured.String)
+	auto := capTitle != "" && strings.EqualFold(title, capTitle) || capTitle == "" && untouched
+	if !auto || strings.EqualFold(title, name) {
+		return "", nil
+	}
+	cut := title != "" && len(name) > len(title) && strings.HasPrefix(strings.ToLower(name), strings.ToLower(title))
+	if !receipt && !cut {
+		return "", nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET description = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`, name, rowID, uid); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// resolveReviews settles earlier reviews of the payment this capture just
+// filed or joined: the same type and amount from another channel, with the
+// same reference or within captureCopyWindow. A receipt among them lends the
+// row its shop name. Returns their capture ids for the phone to clear.
+func resolveReviews(ctx context.Context, tx *sql.Tx, uid string, captureID, txnID int64, channel, ref, typ string, amount float64, received time.Time) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, `UPDATE fin_captures SET outcome = 'absorbed', txn_id = $2, reason = 'Settled by a later copy of the same payment.'
+		WHERE user_id = $1 AND outcome = 'review' AND id <> $3 AND type = $4 AND ABS(amount - $5) < 0.005 AND channel <> $6
+		  AND created_at > NOW() - $9::interval
+		  AND (($7 <> '' AND ref = $7) OR ABS(EXTRACT(EPOCH FROM (received_at - $8))) <= $10)
+		RETURNING id, receipt, description`,
+		uid, txnID, captureID, typ, amount, channel, ref, received, fmt.Sprintf("%d seconds", int(captureRefWindow.Seconds())), captureCopyWindow.Seconds())
+	if err != nil {
+		return nil, err
+	}
+	var ids []int64
+	shop := ""
+	for rows.Next() {
+		var id int64
+		var receipt bool
+		var desc string
+		if err := rows.Scan(&id, &receipt, &desc); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+		if receipt && shop == "" {
+			shop = desc
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if shop != "" {
+		if _, err := betterTitle(ctx, tx, uid, txnID, shop, true); err != nil {
+			return nil, err
+		}
+	}
+	return ids, nil
+}
+
+// pairCardBill files a card bill paid from the bank when the two sides
+// differ by a discount: the card was credited a little more than the bank
+// paid (POP's ₹18 off the ₹9,392.77 ICICI bill: Kotak paid ₹9,374.77). The
+// bank's part is a transfer to the card and the gap Cashback income on it.
+// Either message may come first; exact amounts are pairOwnMoney's.
+func pairCardBill(ctx context.Context, tx *sql.Tx, uid, channel, typ string, amount float64, acct int64, card, own bool, at time.Time) (captureResp, bool, error) {
+	var out captureResp
+	// Both sides often come by SMS (Kotak's, then ICICI's), so unlike other
+	// copies the channel may repeat: they are on two different accounts.
+	const gapOK = `$3 - t.amount > -0.005 AND $3 - t.amount <= LEAST(500, 0.02 * $3)`
+	win := cardBillWindow.Seconds()
+	switch {
+	case typ == "income" && card && own:
+		// The bank's debit already a transfer to this card (a learned payee).
+		var id int64
+		var paid float64
+		var title string
+		err := tx.QueryRowContext(ctx, `SELECT t.id, t.amount, t.description FROM fin_transactions t
+			WHERE t.user_id = $1 AND t.account_id = $2 AND t.type = 'transfer_in' AND `+gapOK+`
+			  AND ABS(EXTRACT(EPOCH FROM (t.txn_at - $4))) <= $5
+			  AND NOT EXISTS (SELECT 1 FROM fin_captures c WHERE c.txn_id = t.id AND c.channel = $6)
+			ORDER BY ABS(EXTRACT(EPOCH FROM (t.txn_at - $4))) LIMIT 1`, uid, acct, amount, at, win, channel).Scan(&id, &paid, &title)
+		if err == nil {
+			if err := cardDiscount(ctx, tx, uid, acct, amount-paid, at); err != nil {
+				return out, false, err
+			}
+			out.Outcome, out.Reason, out.TxnID, out.Label = "absorbed", "The card confirming its bill; the difference is cashback.", id, moneyLabel(paid, title)
+			return out, true, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return out, false, err
+		}
+		// The bank's debit still an expense.
+		var bank int64
+		err = tx.QueryRowContext(ctx, `SELECT t.id, t.amount, t.account_id FROM fin_transactions t
+			JOIN fin_captures c ON c.txn_id = t.id AND c.outcome = 'created'
+			WHERE t.user_id = $1 AND t.account_id <> $2 AND t.type = 'expense' AND `+gapOK+`
+			  AND ABS(EXTRACT(EPOCH FROM (t.txn_at - $4))) <= $5
+			ORDER BY ABS(EXTRACT(EPOCH FROM (t.txn_at - $4))) LIMIT 1`, uid, acct, amount, at, win).Scan(&id, &paid, &bank)
+		if errors.Is(err, sql.ErrNoRows) {
+			return out, false, nil
+		} else if err != nil {
+			return out, false, err
+		}
+		newLeg, err := cardTransfer(ctx, tx, uid, id, acct, acct)
+		if err != nil {
+			return out, false, err
+		}
+		if err := cardDiscount(ctx, tx, uid, acct, amount-paid, at); err != nil {
+			return out, false, err
+		}
+		out.Outcome, out.Reason, out.TxnID = "created", "The other side of a card bill; the difference is cashback.", newLeg
+		out.Label = moneyLabel(paid, "Transfer to "+accountName(ctx, tx, uid, acct))
+		out.Transfer = accountName(ctx, tx, uid, bank) + " → " + accountName(ctx, tx, uid, acct)
+		return out, true, nil
+	case typ == "expense" && !card:
+		// The card's "payment received" already filed as income, a little
+		// more than the bank paid: it becomes the bank's part, the rest
+		// cashback.
+		var id, cardAcct int64
+		var credited float64
+		err := tx.QueryRowContext(ctx, `SELECT t.id, t.amount, t.account_id FROM fin_transactions t
+			JOIN fin_accounts a ON a.id = t.account_id AND a.type = 'credit_card'
+			JOIN fin_captures c ON c.txn_id = t.id AND c.outcome = 'created'
+			WHERE t.user_id = $1 AND t.account_id <> $2 AND t.type = 'income'
+			  AND t.amount - $3 > -0.005 AND t.amount - $3 <= LEAST(500, 0.02 * t.amount)
+			  AND (c.own_money OR $6) AND ABS(EXTRACT(EPOCH FROM (t.txn_at - $4))) <= $5
+			ORDER BY ABS(EXTRACT(EPOCH FROM (t.txn_at - $4))) LIMIT 1`, uid, acct, amount, at, win, own).Scan(&id, &credited, &cardAcct)
+		if errors.Is(err, sql.ErrNoRows) {
+			return out, false, nil
+		} else if err != nil {
+			return out, false, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET amount = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`, amount, id, uid); err != nil {
+			return out, false, err
+		}
+		if err := cardDiscount(ctx, tx, uid, cardAcct, credited-amount, at); err != nil {
+			return out, false, err
+		}
+		newLeg, err := cardTransfer(ctx, tx, uid, id, acct, cardAcct)
+		if err != nil {
+			return out, false, err
+		}
+		out.Outcome, out.Reason, out.TxnID = "created", "A card bill; the card got a little more, filed as cashback.", newLeg
+		out.Label = moneyLabel(amount, "Transfer to "+accountName(ctx, tx, uid, cardAcct))
+		out.Transfer = accountName(ctx, tx, uid, acct) + " → " + accountName(ctx, tx, uid, cardAcct)
+		return out, true, nil
+	}
+	return out, false, nil
+}
+
+// cardTransfer turns row id into a transfer with account other (the new leg
+// is on other) titled "Transfer to <card>".
+func cardTransfer(ctx context.Context, tx *sql.Tx, uid string, id, other, to int64) (int64, error) {
+	newLeg, err := db.MakeTransfer(ctx, tx, uid, id, other)
+	if err != nil {
+		return 0, err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE fin_transactions SET description = $1 WHERE id IN ($2,$3) AND user_id = $4`,
+		"Transfer to "+accountName(ctx, tx, uid, to), id, newLeg, uid)
+	return newLeg, err
+}
+
+// cardDiscount files what reached the card beyond what the bank paid as
+// Cashback income on the card.
+func cardDiscount(ctx context.Context, tx *sql.Tx, uid string, card int64, gap float64, at time.Time) error {
+	gap = math.Round(gap*100) / 100
+	if gap < 0.01 {
+		return nil
+	}
+	var cat sql.NullInt64
+	tx.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND kind = 'income' AND LOWER(BTRIM(name)) = 'cashback' LIMIT 1`, uid).Scan(&cat)
+	var slate int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM fin_slates WHERE user_id = $1 AND is_plain`, uid).Scan(&slate); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_at, slate_id)
+		VALUES ($1,$2,$3,'income',$4,'Discount on card bill',$5,$6)`, uid, card, cat, gap, at, slate)
+	return err
 }

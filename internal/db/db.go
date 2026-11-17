@@ -1205,6 +1205,7 @@ func (d *DB) ensureSchema() error {
 		suggestion   TEXT        NOT NULL DEFAULT '',      -- one-tap offered, e.g. "settle:Papa"
 		suggestion_taken TIMESTAMPTZ,                      -- when the owner tapped it
 		own_money    BOOLEAN     NOT NULL DEFAULT FALSE,   -- the message says it moved between the owner's own accounts
+		receipt      BOOLEAN     NOT NULL DEFAULT FALSE,   -- a shop's own receipt (Google Play, Uber): never makes a row by itself
 		account_hint TEXT        NOT NULL DEFAULT '',      -- the account as the message names it ("Zomato Money", "7287")
 		created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);

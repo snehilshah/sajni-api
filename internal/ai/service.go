@@ -859,6 +859,11 @@ type ParsedTxn struct {
 	// user's own account or wallet (a wallet top-up, "added to your
 	// balance", a transfer to their own name). Auto captures only.
 	OwnMoney bool `json:"own_money,omitempty"`
+	// Receipt: the message is a shop's or service's own receipt (Google
+	// Play, Uber, an order email), not the bank, card, wallet or UPI app
+	// reporting the money. It names the shop well but the account loosely,
+	// so it never makes a row by itself. Auto captures only.
+	Receipt bool `json:"receipt,omitempty"`
 	// Category is the user's category picked in the same call when the
 	// caller passed TxnCategories ("Others" when none fits); "" otherwise.
 	Category string `json:"category,omitempty"`
@@ -903,7 +908,8 @@ func txnSchema(cats *TxnCategories, auto bool) *genai.Schema {
 	order := []string{"amount", "type", "description", "note", "date", "time", "account_hint", "ref_id"}
 	if auto {
 		props["own_money"] = &genai.Schema{Type: genai.TypeBoolean}
-		order = append(order, "own_money")
+		props["receipt"] = &genai.Schema{Type: genai.TypeBoolean}
+		order = append(order, "own_money", "receipt")
 	}
 	if cats != nil {
 		seen := map[string]bool{"Others": true}
@@ -984,14 +990,11 @@ func (s *Service) parseMessage(ctx context.Context, msg, today string, auto bool
 	if msg == "" {
 		return zero, 0, nil
 	}
-	if len(msg) > 1000 {
-		msg = msg[:1000]
-	}
 
 	sys := `You read a single bank / UPI transaction message and extract its fields as JSON.
 
 Reply with ONLY a JSON object — no markdown, no prose:
-{"amount": number, "type": "expense"|"income", "description": string, "note": string, "date": "YYYY-MM-DD", "time": "HH:MM", "account_hint": string, "ref_id": string, "own_money": boolean}
+{"amount": number, "type": "expense"|"income", "description": string, "note": string, "date": "YYYY-MM-DD", "time": "HH:MM", "account_hint": string, "ref_id": string, "own_money": boolean, "receipt": boolean}
 
 Rules:
 - amount: the transaction amount as a positive number (no currency symbol, no commas).
@@ -1016,10 +1019,16 @@ Income categories: ` + strings.Join(cats.Income, ", ")
 - If the amount isn't stated in the text, set amount to 0. Never guess an amount.
 - A merchant's receipt that splits the total across ways of paying (e.g. "Uber Cash ₹5.54 + Amazon Pay ₹82.13"): amount is only the part that left the user's account, card or wallet (82.13), and account_hint names it ("Amazon Pay"). Store credit, coins and the merchant's own cash are not money that moved.
 - An order confirmation or delivery receipt ("Thank you for ordering", "Your order from X was delivered") that doesn't say which card, account or wallet paid is not a payment report: set amount to 0. The payment itself arrives as its own message.
-- Also return "own_money": true when the money moved between the user's own accounts or wallets: a wallet or balance top-up ("added to your Amazon Pay balance", "Amazon Pay Bala credited"), a UPI Lite load, or money sent to or received from an account in the user's own name. Otherwise false.`
+- Also return "own_money": true when the money moved between the user's own accounts or wallets: a wallet or balance top-up ("added to your Amazon Pay balance", "Amazon Pay Bala credited"), a UPI Lite load, or money sent to or received from an account in the user's own name, or a credit card bill payment (paying one of the user's cards, or a card saying a payment was received). Otherwise false.
+- Also return "receipt": true when the message is a shop's, app store's or service's own receipt or invoice (Google Play, Uber, Swiggy, an order email), not a bank, card, wallet or UPI app reporting the money. Otherwise false.`
 	}
 
+	// Cut long emails after the boilerplate is gone, on a character
+	// boundary (a ₹ cut in half confuses the model).
 	msg = cleanTxnMessage(msg)
+	if r := []rune(msg); len(r) > 1000 {
+		msg = string(r[:1000])
+	}
 	prompt := "Today is " + today + ".\n<msg>" + msg + "</msg>"
 
 	maxOut := int32(quickMaxOutputTokens)
