@@ -942,6 +942,8 @@ func lookupPayeeTransfer(ctx context.Context, tx *sql.Tx, uid, payee, kind strin
 type captureIgnore struct {
 	Hint  string `json:"hint"`
 	Label string `json:"label"`
+	// Resolved: reviews this settled (now ignored); the phone clears them.
+	Resolved []int64 `json:"resolved,omitempty"`
 }
 
 func listCaptureIgnores(deps Deps) http.HandlerFunc {
@@ -981,8 +983,8 @@ func addCaptureIgnoreRow(ctx context.Context, d *db.DB, uid, hint, label string)
 	if c.Hint == "" {
 		return c, errors.New("hint is required")
 	}
-	_, err := d.ExecContext(ctx, `INSERT INTO fin_capture_ignores (user_id, hint, label) VALUES ($1,$2,$3)
-		ON CONFLICT (user_id, hint) DO UPDATE SET label = EXCLUDED.label`, uid, c.Hint, c.Label)
+	var err error
+	c.Resolved, err = db.IgnoreCaptureAccount(ctx, d, uid, c.Hint, c.Label)
 	return c, err
 }
 

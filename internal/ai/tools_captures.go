@@ -109,14 +109,14 @@ func setCaptureTrackingTool(ctx context.Context, d *db.DB, uid string, args map[
 	}
 	track, _ := args["track"].(bool)
 	var err error
+	var settled []int64
 	if track {
 		_, err = d.ExecContext(ctx, `DELETE FROM fin_capture_ignores WHERE user_id = $1 AND hint = $2`, uid, hint)
 	} else {
-		_, err = d.ExecContext(ctx, `INSERT INTO fin_capture_ignores (user_id, hint, label) VALUES ($1,$2,$3)
-			ON CONFLICT (user_id, hint) DO UPDATE SET label = EXCLUDED.label`, uid, hint, label)
+		settled, err = db.IgnoreCaptureAccount(ctx, d, uid, hint, label)
 	}
 	if err != nil {
 		return nil, nil, err
 	}
-	return map[string]any{"hint": hint, "tracked": track}, map[string]any{"kind": "capture_tracking", "route": "/finance/transactions"}, nil
+	return map[string]any{"hint": hint, "tracked": track, "reviews_settled": len(settled)}, map[string]any{"kind": "capture_tracking", "route": "/finance/transactions"}, nil
 }

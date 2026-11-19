@@ -131,7 +131,13 @@ func TestCaptureDay(t *testing.T) {
 	want("Zomato Money", post(zm, "sms", "15:56"), "review")
 	want("Messages copy", post("JD-ZOMATO-S "+zm, "com.google.android.apps.messaging", "17:37"), "absorbed")
 	// "Don't track Zomato Money": the next one is ignored.
-	call("POST", "/api/finance/captures/ignores", map[string]string{"hint": "Zomato Money", "label": "Zomato Money"})
+	var ign captureIgnore
+	json.Unmarshal(call("POST", "/api/finance/captures/ignores", map[string]string{"hint": "Zomato Money", "label": "Zomato Money"}).Body.Bytes(), &ign)
+	var waiting int
+	d.QueryRow(`SELECT COUNT(*) FROM fin_captures WHERE user_id = $1 AND outcome = 'review'`, uid).Scan(&waiting)
+	if len(ign.Resolved) != 1 || waiting != 0 {
+		t.Fatalf("Don't track should settle the Zomato review: %+v, %d still waiting", ign, waiting)
+	}
 	zm2 := parse("Rs. 16.59 added to Zomato Money", ai.ParsedTxn{Amount: 16.59, Type: "income", Description: "Zomato Money", Date: day, AccountHint: "Zomato Money"})
 	want("untracked wallet", post(zm2, "sms", "16:37"), "ignored")
 
