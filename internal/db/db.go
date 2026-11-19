@@ -639,8 +639,6 @@ func (d *DB) ensureSchema() error {
 		fallback   BOOLEAN   NOT NULL DEFAULT FALSE,  -- the kind's "Unknown": what a row with no better category gets; can't be deleted or renamed
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
-	-- Prod predates fallback; delete this ALTER once v0.104.0 has shipped.
-	ALTER TABLE fin_categories ADD COLUMN IF NOT EXISTS fallback BOOLEAN NOT NULL DEFAULT FALSE;
 	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_categories_user_id ON fin_categories(user_id,id);
 	CREATE UNIQUE INDEX IF NOT EXISTS uq_fin_categories_fallback ON fin_categories(user_id, kind) WHERE fallback;
 
@@ -980,8 +978,6 @@ func (d *DB) ensureSchema() error {
 		CONSTRAINT fk_fin_biller_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (account_id),
 		CONSTRAINT fk_fin_biller_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id)
 	);
-	-- Prod predates income; delete this ALTER once v0.104.0 has shipped.
-	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS income BOOLEAN NOT NULL DEFAULT FALSE;
 	CREATE INDEX IF NOT EXISTS idx_fin_billers_user ON fin_billers(user_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_billers_due ON fin_billers(user_id, next_due_date) WHERE archived = FALSE;
 
@@ -1055,9 +1051,6 @@ func (d *DB) ensureSchema() error {
 	END $fn$ LANGUAGE plpgsql;
 	CREATE OR REPLACE TRIGGER trg_fin_txn_default_category BEFORE INSERT OR UPDATE OF category_id, type ON fin_transactions
 		FOR EACH ROW EXECUTE FUNCTION fin_txn_default_category();
-	-- Rows left blank before Unknown existed; delete once v0.104.0 has shipped.
-	UPDATE fin_transactions SET category_id = NULL
-		WHERE category_id IS NULL AND type IN ('expense','writeoff','refund','income');
 
 	-- Which slates a budget counts. No rows = Plain only.
 	CREATE TABLE IF NOT EXISTS fin_budget_slates (
