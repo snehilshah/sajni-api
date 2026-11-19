@@ -31,6 +31,7 @@ var toolGroup = map[string]string{
 	"list_finance_budgets": "money", "create_budget": "money", "list_slates": "money", "create_slate": "money",
 	"update_slate": "money", "move_transactions_to_slate": "money", "list_captures": "money",
 	"set_capture_tracking": "money", "list_billers": "money", "create_biller": "money", "pay_biller": "money",
+	"unlink_biller_payment": "money", "dismiss_recurring_suggestion": "money",
 	"create_finance_account": "money", "update_finance_account": "money",
 	// people: lends and money owed, both ways
 	"list_lends": "people", "mark_paid_for": "people", "set_split_share": "people", "forgive_lend": "people",
@@ -71,8 +72,8 @@ var groups = []struct {
 		regexp.MustCompile(`(?i)\b(delete|remove|scratch|drop|block|blocked|star|starred|important|plan|plans|planning|skip|new list|task list|subtask|cancel)`)},
 	{"reminders", "edit, snooze, skip or delete reminders",
 		regexp.MustCompile(`(?i)\b(remind|reminder|reminders|snooze|nudge)`)},
-	{"money", "edit or delete transactions, month analytics, budgets, slates, captured bank messages, billers, accounts",
-		regexp.MustCompile(`(?i)(₹|\brs\.?\s*\d|\b(budget|slate|capture|captured|biller|bill|bills|account|card|spend|spent|spending|expense|income|salary|transfer|refund|categor|transaction|money|finance|paid|pay|emi|sms|trip|cost|costs|saving|savings|expensive|subscription|subscriptions|renewal|renew|netflix|rent))|month.{0,25}\b(high|much|expensive|over)\b`)},
+	{"money", "edit or delete transactions, month analytics, budgets, slates, captured bank messages, recurring items (billers), accounts",
+		regexp.MustCompile(`(?i)(₹|\brs\.?\s*\d|\b(budget|slate|capture|captured|biller|bill|bills|account|card|spend|spent|spending|expense|income|salary|transfer|refund|categor|transaction|money|finance|paid|pay|emi|sms|trip|cost|costs|saving|savings|expensive|subscription|subscriptions|recurring|repeats|renewal|renew|netflix|rent))|month.{0,25}\b(high|much|expensive|over)\b`)},
 	{"people", "lends, splits, settling up, money owed both ways",
 		regexp.MustCompile(`(?i)\b(lend|lent|owe|owes|owed|borrow|borrowed|settle|settled|paid .{0,12}back|pay .{0,12}back|gave .{0,12}back|gave me|sent me|received from|got .{0,10}from|returned|split|splitwise|forgive|adjust|friend|people)`)},
 	{"investments", "investments: RDs, FDs, SIPs, auto-debit",

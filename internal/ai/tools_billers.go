@@ -17,7 +17,9 @@ func listBillersTool(ctx context.Context, d *db.DB, uid string, args map[string]
 	includeArchived := argBool(args, "include_archived", false)
 	q := `SELECT b.id, b.name, b.kind, b.amount, b.frequency, b.next_due_date::text,
 		a.name, b.auto_renew, b.alert_days, b.income,
-		(SELECT MAX(paid_date)::text FROM fin_biller_payments p WHERE p.biller_id = b.id)
+		(SELECT MAX(paid_date)::text FROM fin_biller_payments p WHERE p.biller_id = b.id),
+		COALESCE((SELECT MAX(due_date)::text FROM fin_biller_payments p WHERE p.biller_id = b.id), ''),
+		(SELECT id FROM fin_biller_payments p WHERE p.biller_id = b.id ORDER BY due_date DESC LIMIT 1)
 		FROM fin_billers b LEFT JOIN fin_accounts a ON a.id = b.account_id
 		WHERE b.user_id = $1`
 	if !includeArchived {
@@ -29,15 +31,17 @@ func listBillersTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		return nil, nil, err
 	}
 	defer rows.Close()
+	now := time.Now().In(userTZLoc(ctx, d, uid))
 	out := []map[string]any{}
 	for rows.Next() {
 		var id int64
-		var name, kind, freq, due string
+		var name, kind, freq, due, lastDue string
 		var amount float64
 		var account, lastPaid sql.NullString
+		var lastPayment sql.NullInt64
 		var autoRenew, income bool
 		var alertDays int
-		if err := rows.Scan(&id, &name, &kind, &amount, &freq, &due, &account, &autoRenew, &alertDays, &income, &lastPaid); err != nil {
+		if err := rows.Scan(&id, &name, &kind, &amount, &freq, &due, &account, &autoRenew, &alertDays, &income, &lastPaid, &lastDue, &lastPayment); err != nil {
 			return nil, nil, err
 		}
 		row := map[string]any{
@@ -54,9 +58,21 @@ func listBillersTool(ctx context.Context, d *db.DB, uid string, args map[string]
 		if lastPaid.Valid {
 			row["last_paid_date"] = lastPaid.String
 		}
+		if lastPayment.Valid {
+			row["last_payment_id"] = lastPayment.Int64
+		}
+		next, _ := time.Parse("2006-01-02", due[:10])
+		row["state"], _ = db.RecurringState(next, lastDue, lastPaid.String, now)
 		out = append(out, row)
 	}
-	return map[string]any{"items": out, "count": len(out)}, nil, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	res := map[string]any{"items": out, "count": len(out)}
+	if sugg, err := db.RecurringSuggestions(ctx, d, uid); err == nil && len(sugg) > 0 {
+		res["suggestions"] = sugg
+	}
+	return res, nil, nil
 }
 
 func createBillerTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
@@ -140,7 +156,7 @@ func payBillerTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	defer tx.Rollback()
 	paid, err := db.PayRecurring(ctx, tx, uid, id, p)
 	if errors.Is(err, db.ErrRecurringNotFound) {
-		return nil, nil, fmt.Errorf("biller not found")
+		return nil, nil, fmt.Errorf("recurring item not found")
 	}
 	if err != nil {
 		return nil, nil, err
@@ -150,4 +166,36 @@ func payBillerTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	}
 	return map[string]any{"id": id, "txn_id": paid.TxnID, "already_paid": paid.AlreadyPaid, "next_due_date": paid.NextDue},
 		map[string]any{"kind": "biller_paid", "id": id, "title": paid.Name, "route": "/finance/billers"}, nil
+}
+
+func unlinkBillerPaymentTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	id, pid := argInt(args, "biller_id", 0), argInt(args, "payment_id", 0)
+	if id == 0 || pid == 0 {
+		return nil, nil, fmt.Errorf("biller_id and payment_id are required")
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	next, err := db.UnlinkRecurringPayment(ctx, tx, uid, id, pid)
+	if errors.Is(err, db.ErrRecurringNotFound) {
+		return nil, nil, fmt.Errorf("recurring item not found")
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"id": id, "unlinked": pid, "next_due_date": next},
+		map[string]any{"kind": "biller_paid", "id": id, "title": "Cycle undone", "route": "/finance/billers"}, nil
+}
+
+func dismissRecurringSuggestionTool(ctx context.Context, d *db.DB, uid string, args map[string]any) (any, map[string]any, error) {
+	key := argStr(args, "key")
+	if err := db.DismissRecurringSuggestion(ctx, d, uid, key); err != nil {
+		return nil, nil, err
+	}
+	return map[string]any{"dismissed": key}, map[string]any{"kind": "biller_paid", "id": 0, "title": "Suggestion hidden", "route": "/finance/billers"}, nil
 }

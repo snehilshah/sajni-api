@@ -203,3 +203,109 @@ func TestRecurringItemsTickThemselves(t *testing.T) {
 		t.Fatalf("nudge: %+v", n)
 	}
 }
+
+// Slice 2: how a row reads, undoing a wrong match, and "make it recurring?"
+// suggestions from two months of ChatGPT Plus (not a daily ₹22 ride).
+func TestRecurringStatesUnlinkAndSuggestions(t *testing.T) {
+	day := func(s string) time.Time { v, _ := time.Parse("2006-01-02", s); return v }
+	at := func(s string) time.Time { v, _ := time.Parse("2006-01-02 15:04", s); return v }
+	for _, c := range []struct {
+		next, lastDue, lastPaid, now, state, date string
+	}{
+		{"2026-12-05", "2026-11-05", "2026-11-06", "2026-11-20 10:00", "paid", "2026-11-06"},
+		{"2026-12-05", "2026-11-05", "2026-11-06", "2026-12-03 10:00", "due", "2026-12-05"},
+		{"2026-12-05", "", "", "2026-12-05 19:59", "due", "2026-12-05"},
+		{"2026-12-05", "", "", "2026-12-05 20:00", "not_recorded", "2026-12-05"},
+		{"2026-12-05", "2026-11-05", "2026-11-06", "2026-12-07 09:00", "not_recorded", "2026-12-05"},
+	} {
+		if s, d := db.RecurringState(day(c.next), c.lastDue, c.lastPaid, at(c.now)); s != c.state || d != c.date {
+			t.Errorf("%s on %s: %s %s, want %s %s", c.next, c.now, s, d, c.state, c.date)
+		}
+	}
+
+	dsn := dbtest.URL(t)
+	if dsn == "" {
+		t.Skip("SAJNI_TEST_DATABASE_URL not set")
+	}
+	d, err := db.New(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	uid := "01900000-0000-7000-8000-0000000000e5"
+	d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	d.Exec(`INSERT INTO users (id, email, name, timezone) VALUES ($1, 'recurring2@test', 'T', 'Asia/Kolkata')`, uid)
+	d.Exec(`INSERT INTO fin_slates (user_id, name, is_plain) VALUES ($1, 'Plain', TRUE)`, uid)
+	defer d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	var rupay, salary int64
+	d.QueryRow(`INSERT INTO fin_accounts (user_id, name, type) VALUES ($1,'RuPay','credit_card') RETURNING id`, uid).Scan(&rupay)
+	d.QueryRow(`INSERT INTO fin_accounts (user_id, name, type) VALUES ($1,'Salary','salary') RETURNING id`, uid).Scan(&salary)
+	deps := Deps{DB: d, AILimiter: newAILimiter()}
+	mux := http.NewServeMux()
+	registerFinanceRoutes(mux, deps)
+	registerBillerRoutes(mux, deps)
+	call := func(method, path string, body any) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		json.NewEncoder(&buf).Encode(body)
+		req := httptest.NewRequest(method, path, &buf)
+		req = req.WithContext(context.WithValue(req.Context(), auth.ContextKey{}, uid))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code >= 300 {
+			t.Fatalf("%s %s: %d %s", method, path, rec.Code, rec.Body.String())
+		}
+		return rec.Body.Bytes()
+	}
+	ist, _ := time.LoadLocation("Asia/Kolkata")
+	now := time.Now().In(ist)
+	thisMonth := time.Date(now.Year(), now.Month(), 1, 12, 0, 0, 0, ist)
+	add := func(acct int64, title string, amount float64, when time.Time) {
+		t.Helper()
+		call("POST", "/api/finance/transactions?force=true", map[string]any{"account_id": acct, "type": "expense", "amount": amount, "description": title, "txn_at": when.Format(time.RFC3339)})
+	}
+	// ChatGPT Plus on the 1st of last month and this month; a ₹22 ride
+	// several times a month.
+	add(rupay, "ChatGPT Plus", 1950, thisMonth.AddDate(0, -1, 0))
+	add(rupay, "ChatGPT Plus", 1950, thisMonth)
+	for _, dd := range []int{0, 1, 2} {
+		add(rupay, "Vashi Station", 22, thisMonth.AddDate(0, -1, dd))
+		add(rupay, "Vashi Station", 22, thisMonth.AddDate(0, 0, dd))
+	}
+	var sugg []db.RecurringSuggestion
+	json.Unmarshal(call("GET", "/api/finance/billers/suggestions", nil), &sugg)
+	if len(sugg) != 1 || sugg[0].Title != "ChatGPT Plus" || sugg[0].AccountID != rupay || len(sugg[0].Months) != 2 || sugg[0].Day != 1 {
+		t.Fatalf("suggestions: %+v", sugg)
+	}
+	call("POST", "/api/finance/billers/suggestions/dismiss", map[string]any{"key": sugg[0].Key})
+	sugg = nil
+	json.Unmarshal(call("GET", "/api/finance/billers/suggestions", nil), &sugg)
+	if len(sugg) != 0 {
+		t.Fatalf("after dismiss: %+v", sugg)
+	}
+
+	// Unlink: a wrong match is undone and the cycle is due again.
+	var item struct{ ID int64 }
+	json.Unmarshal(call("POST", "/api/finance/billers", map[string]any{"name": "Rent", "amount": 9000, "next_due_date": now.Format("2006-01-02"), "account_id": salary}), &item)
+	call("POST", fmt.Sprintf("/api/finance/billers/%d/pay", item.ID), map[string]any{"due_date": now.Format("2006-01-02")})
+	var pays []struct{ ID int64 }
+	json.Unmarshal(call("GET", fmt.Sprintf("/api/finance/billers/%d/payments", item.ID), nil), &pays)
+	var listed []billerResp
+	json.Unmarshal(call("GET", "/api/finance/billers", nil), &listed)
+	if len(pays) != 1 || len(listed) != 1 || listed[0].State != "paid" {
+		t.Fatalf("paid: %+v %+v", pays, listed)
+	}
+	var undo map[string]any
+	json.Unmarshal(call("DELETE", fmt.Sprintf("/api/finance/billers/%d/payments/%d", item.ID, pays[0].ID), nil), &undo)
+	var rows int
+	d.QueryRow(`SELECT COUNT(*) FROM fin_transactions WHERE user_id = $1 AND description = 'Rent'`, uid).Scan(&rows)
+	if undo["next_due_date"] != now.Format("2006-01-02") || rows != 1 {
+		t.Fatalf("unlink: %v, rows %d", undo, rows)
+	}
+
+	// The nudge carries what its action fills the sheet with.
+	data := recurringNudgeData(context.Background(), deps, item.ID, uid)
+	if data["txn_amount"] != "9000.00" || data["txn_type"] != "expense" || data["txn_account_id"] != fmt.Sprint(salary) || data["txn_title"] != "Rent" {
+		t.Fatalf("nudge data: %v", data)
+	}
+}

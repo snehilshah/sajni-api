@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -376,4 +377,258 @@ func nullInt(v sql.NullInt64) any {
 		return v.Int64
 	}
 	return nil
+}
+
+// RecurringState says how an item's row reads: "paid" (the cycle before next
+// is paid and next's window hasn't opened; date = when it was paid),
+// "not_recorded" (next is past, or it's its day after 8 pm; date = next) or
+// "due" (date = next). lastDue/lastPaid are the newest payment's dates ("" =
+// none); now is the user's local time.
+func RecurringState(next time.Time, lastDue, lastPaid string, now time.Time) (string, string) {
+	today, _ := time.Parse("2006-01-02", now.Format("2006-01-02"))
+	nextS := next.Format("2006-01-02")
+	if today.After(next) || (today.Equal(next) && now.Hour() >= 20) {
+		return "not_recorded", nextS
+	}
+	if lastDue != "" && lastDue < nextS && today.Before(next.AddDate(0, 0, -RecurringBefore)) {
+		return "paid", lastPaid
+	}
+	return "due", nextS
+}
+
+// UnlinkRecurringPayment undoes one recorded cycle (a payment Sajni attached
+// by mistake, or a tap on the wrong item): the cycle is due again and its
+// rows stay as they are. Undoing the newest cycle moves the due date back to
+// it. Returns the item's next due date.
+func UnlinkRecurringPayment(ctx context.Context, tx *sql.Tx, uid string, id, paymentID int64) (string, error) {
+	var next string
+	if err := tx.QueryRowContext(ctx, `SELECT next_due_date::text FROM fin_billers WHERE id = $1 AND user_id = $2 FOR UPDATE`, id, uid).Scan(&next); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrRecurringNotFound
+		}
+		return "", err
+	}
+	var due string
+	if err := tx.QueryRowContext(ctx, `DELETE FROM fin_biller_payments WHERE id = $1 AND biller_id = $2 AND user_id = $3 RETURNING due_date::text`,
+		paymentID, id, uid).Scan(&due); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", errors.New("that payment isn't on this item")
+		}
+		return "", err
+	}
+	var later bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_biller_payments WHERE biller_id = $1 AND due_date > $2)`, id, due).Scan(&later); err != nil {
+		return "", err
+	}
+	if due < next && !later {
+		if _, err := tx.ExecContext(ctx, `UPDATE fin_billers SET next_due_date = $1, updated_at = NOW() WHERE id = $2`, due, id); err != nil {
+			return "", err
+		}
+		next = due
+	}
+	return next, nil
+}
+
+// RecurringSuggestion is something that looks like it repeats monthly but
+// isn't an item yet ("ChatGPT Plus ₹1,950 on RuPay around the 23rd").
+type RecurringSuggestion struct {
+	Key         string   `json:"key"`
+	Title       string   `json:"title"`
+	Income      bool     `json:"income"`
+	Amount      float64  `json:"amount"`
+	AccountID   int64    `json:"account_id"`
+	AccountName string   `json:"account_name"`
+	CategoryID  *int64   `json:"category_id"`
+	Day         int      `json:"day"`
+	Months      []string `json:"months"` // "2026-10", oldest first
+	NextDueDate string   `json:"next_due_date"`
+}
+
+// RecurringSuggestions finds titles paid (or received) once a month in at
+// least two months running, the latest this month or last, on one account,
+// within 10% and 5 days of each other, that no item covers and the owner
+// hasn't dismissed. Anything that happens more than once in a month (a daily
+// auto ride) never qualifies. Rows already attached to an item don't count.
+func RecurringSuggestions(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, uid string) ([]RecurringSuggestion, error) {
+	rows, err := q.QueryContext(ctx, `
+		WITH u AS (SELECT COALESCE(NULLIF(timezone,''),'Asia/Kolkata') AS z FROM users WHERE id = $1),
+		t AS (
+			SELECT t.type = 'income' AS income, LOWER(BTRIM(t.description)) AS k, t.description, t.amount, t.account_id, a.name AS acct,
+			       t.category_id, (t.txn_at AT TIME ZONE u.z)::date AS d
+			FROM fin_transactions t JOIN fin_accounts a ON a.id = t.account_id, u
+			WHERE t.user_id = $1 AND t.type IN ('expense','income') AND t.split_of IS NULL AND BTRIM(t.description) <> ''
+			  AND (t.txn_at AT TIME ZONE u.z)::date >= date_trunc('month', (NOW() AT TIME ZONE u.z)::date) - INTERVAL '5 months'
+			  AND NOT EXISTS (SELECT 1 FROM fin_biller_payment_txns l WHERE l.txn_id = t.id)
+		)
+		SELECT income, k, description, amount, account_id, acct, category_id, d::text,
+		       (SELECT to_char(date_trunc('month', (NOW() AT TIME ZONE u.z)::date), 'YYYY-MM') FROM u)
+		FROM t ORDER BY income, k, account_id, d`, uid)
+	if err != nil {
+		return nil, err
+	}
+	type hit struct {
+		title  string
+		amount float64
+		cat    sql.NullInt64
+		day    time.Time
+	}
+	type group struct {
+		income bool
+		k      string
+		acct   int64
+		name   string
+		hits   []hit
+	}
+	var groups []*group
+	byKey := map[string]*group{}
+	var thisMonth string
+	for rows.Next() {
+		var g group
+		var h hit
+		var d string
+		if err := rows.Scan(&g.income, &g.k, &h.title, &h.amount, &g.acct, &g.name, &h.cat, &d, &thisMonth); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		h.day, _ = time.Parse("2006-01-02", d)
+		key := fmt.Sprintf("%t:%s:%d", g.income, g.k, g.acct)
+		if byKey[key] == nil {
+			gg := g
+			byKey[key] = &gg
+			groups = append(groups, &gg)
+		}
+		byKey[key].hits = append(byKey[key].hits, h)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	dismissed := map[string]bool{}
+	drows, err := q.QueryContext(ctx, `SELECT key FROM fin_recurring_dismissed WHERE user_id = $1`, uid)
+	if err != nil {
+		return nil, err
+	}
+	for drows.Next() {
+		var k string
+		drows.Scan(&k)
+		dismissed[k] = true
+	}
+	drows.Close()
+	type item struct {
+		name   string
+		income bool
+		acct   sql.NullInt64
+		amount float64
+		anchor int
+	}
+	var items []item
+	irows, err := q.QueryContext(ctx, `SELECT LOWER(BTRIM(name)), income, account_id, amount, COALESCE(anchor_day, EXTRACT(DAY FROM next_due_date)::INTEGER)
+		FROM fin_billers WHERE user_id = $1 AND NOT archived`, uid)
+	if err != nil {
+		return nil, err
+	}
+	for irows.Next() {
+		var it item
+		irows.Scan(&it.name, &it.income, &it.acct, &it.amount, &it.anchor)
+		items = append(items, it)
+	}
+	irows.Close()
+
+	now, _ := time.Parse("2006-01", thisMonth)
+	lastMonth := now.AddDate(0, -1, 0).Format("2006-01")
+	out := []RecurringSuggestion{}
+	for _, g := range groups {
+		key := fmt.Sprintf("%t:%s:%d", g.income, g.k, g.acct)
+		if dismissed[key] {
+			continue
+		}
+		perMonth := map[string]int{}
+		for _, h := range g.hits {
+			perMonth[h.day.Format("2006-01")]++
+		}
+		once := true
+		for _, n := range perMonth {
+			if n > 1 {
+				once = false
+			}
+		}
+		if !once || len(g.hits) < 2 {
+			continue
+		}
+		// The latest run of consecutive months, ending this month or last.
+		last := g.hits[len(g.hits)-1]
+		if m := last.day.Format("2006-01"); m != thisMonth && m != lastMonth {
+			continue
+		}
+		run := []hit{last}
+		for i := len(g.hits) - 2; i >= 0; i-- {
+			if g.hits[i].day.Format("2006-01") != run[0].day.AddDate(0, 0, -run[0].day.Day()+1).AddDate(0, -1, 0).Format("2006-01") {
+				break
+			}
+			run = append([]hit{g.hits[i]}, run...)
+		}
+		if len(run) < 2 {
+			continue
+		}
+		lo, hi, dlo, dhi := run[0].amount, run[0].amount, run[0].day.Day(), run[0].day.Day()
+		for _, h := range run {
+			lo, hi = math.Min(lo, h.amount), math.Max(hi, h.amount)
+			if h.day.Day() < dlo {
+				dlo = h.day.Day()
+			}
+			if h.day.Day() > dhi {
+				dhi = h.day.Day()
+			}
+		}
+		if hi > lo*1.1 || dhi-dlo > 5 {
+			continue
+		}
+		covered := false
+		for _, it := range items {
+			fits := it.income == g.income && (!it.acct.Valid || it.acct.Int64 == g.acct) &&
+				math.Abs(it.amount-last.amount) <= math.Max(1, 0.1*it.amount) && absInt(it.anchor-last.day.Day()) <= 5
+			if it.name == g.k || fits {
+				covered = true
+				break
+			}
+		}
+		if covered {
+			continue
+		}
+		s := RecurringSuggestion{
+			Key: key, Title: last.title, Income: g.income, Amount: last.amount, AccountID: g.acct, AccountName: g.name,
+			Day: last.day.Day(), NextDueDate: AdvanceDue(last.day, "monthly", last.day.Day()).Format("2006-01-02"),
+		}
+		if last.cat.Valid {
+			c := last.cat.Int64
+			s.CategoryID = &c
+		}
+		for _, h := range run {
+			s.Months = append(s.Months, h.day.Format("2006-01"))
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// DismissRecurringSuggestion hides one suggestion for good ("It doesn't
+// repeat").
+func DismissRecurringSuggestion(ctx context.Context, q interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, uid, key string) error {
+	if key == "" {
+		return errors.New("missing key")
+	}
+	_, err := q.ExecContext(ctx, `INSERT INTO fin_recurring_dismissed (user_id, key) VALUES ($1,$2) ON CONFLICT DO NOTHING`, uid, key)
+	return err
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }

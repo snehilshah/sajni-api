@@ -100,6 +100,8 @@ func TestRoutingGoldenPrompts(t *testing.T) {
 		{prompt: "what did the Goa trip cost?", need: []string{"list_slates"}},
 		{prompt: "why is this month so high?", need: []string{"finance_month"}},
 		{prompt: "when does my Netflix subscription renew?", need: []string{"list_billers"}},
+		{prompt: "did home contrib go this month? it's recurring", need: []string{"list_billers"}},
+		{prompt: "that recurring match was wrong, undo it", need: []string{"unlink_biller_payment"}},
 		{prompt: "Rahul gave me 500", need: []string{"settle_lends"}},
 		{prompt: "I redeemed my PPF", need: []string{"list_investments"}},
 		{prompt: "save this article to read later", need: []string{"create_bookmark"}},

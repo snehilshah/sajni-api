@@ -1128,7 +1128,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_billers",
-			Description: "List the user's recurring items (shown as Billers): payments that repeat (Home Contrib, ChatGPT, electricity) and money expected in (income: true, e.g. Salary). kind 'subscription' = a fixed amount, 'bill' = it varies (amount is an estimate). Each has its next due date, account, frequency and whether Sajni posts it by itself (auto_renew); otherwise it waits for the payment, which ticks it when one that fits is recorded. Use for 'what's coming up?' or 'did Home Contrib go?'.",
+			Description: "List the user's recurring items (shown as Billers): payments that repeat (Home Contrib, ChatGPT, electricity) and money expected in (income: true, e.g. Salary). kind 'subscription' = a fixed amount, 'bill' = it varies (amount is an estimate). Each has its next due date, account, frequency and whether Sajni posts it by itself (auto_renew); otherwise it waits for the payment, which ticks it when one that fits is recorded. state is 'due', 'paid' (this cycle is done) or 'not_recorded' (its day passed with nothing recorded). suggestions lists things paid monthly that aren't items yet (offer to make one; never create without the user). Use for 'what's coming up?' or 'did Home Contrib go?'.",
 			Schema: obj(map[string]*genai.Schema{
 				"include_archived": boolean("Include archived rows."),
 			}),
@@ -1171,6 +1171,29 @@ func (s *Service) buildTools() []Tool {
 			}, "biller_id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return payBillerTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "unlink_biller_payment",
+			Description: "Undo one recorded cycle of a recurring item: a payment Sajni attached to the wrong item, or a cycle marked paid by mistake. The cycle is due again; its transactions stay as they are. payment_id comes from the item's payments (list_billers gives last_payment_id for the newest).",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"biller_id":  intg("Required."),
+				"payment_id": intg("Required. The cycle's payment id."),
+			}, "biller_id", "payment_id"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return unlinkBillerPaymentTool(ctx, d, uid, args)
+			},
+		},
+		{
+			Name:        "dismiss_recurring_suggestion",
+			Description: "Hide a 'looks like it repeats' suggestion for good (the user says it doesn't repeat). key comes from list_billers' suggestions. To accept one instead, create_biller with its title, amount, account and next_due_date.",
+			Mutating:    true,
+			Schema: obj(map[string]*genai.Schema{
+				"key": str("Required. The suggestion's key."),
+			}, "key"),
+			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
+				return dismissRecurringSuggestionTool(ctx, d, uid, args)
 			},
 		},
 		{

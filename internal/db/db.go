@@ -985,6 +985,15 @@ func (d *DB) ensureSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_fin_billers_user ON fin_billers(user_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_billers_due ON fin_billers(user_id, next_due_date) WHERE archived = FALSE;
 
+	-- "Make it recurring?" suggestions the owner dismissed ("It doesn't
+	-- repeat"); key = income:title:account (db.RecurringSuggestions).
+	CREATE TABLE IF NOT EXISTS fin_recurring_dismissed (
+		user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		key        TEXT        NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (user_id, key)
+	);
+
 	CREATE TABLE IF NOT EXISTS fin_biller_payments (
 		id          BIGSERIAL   PRIMARY KEY,
 		user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,

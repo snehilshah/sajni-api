@@ -29,30 +29,37 @@ func registerBillerRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("DELETE /api/finance/billers/{id}", deleteBiller(deps))
 	mux.HandleFunc("POST /api/finance/billers/{id}/pay", payBiller(deps))
 	mux.HandleFunc("GET /api/finance/billers/{id}/payments", listBillerPayments(deps))
+	mux.HandleFunc("DELETE /api/finance/billers/{id}/payments/{pid}", unlinkBillerPayment(deps))
+	mux.HandleFunc("GET /api/finance/billers/suggestions", listRecurringSuggestions(deps))
+	mux.HandleFunc("POST /api/finance/billers/suggestions/dismiss", dismissRecurringSuggestion(deps))
 
 	mux.HandleFunc("GET /api/finance/billers/alerts", listBillerAlerts(deps))
 	mux.HandleFunc("POST /api/finance/billers/alerts/{id}/seen", markBillerAlertSeen(deps))
 }
 
 type billerResp struct {
-	ID             int64    `json:"id"`
-	Name           string   `json:"name"`
-	Kind           string   `json:"kind"`
-	Amount         float64  `json:"amount"`
-	Frequency      string   `json:"frequency"`
-	NextDueDate    string   `json:"next_due_date"`
-	AccountID      *int64   `json:"account_id"`
-	AccountName    *string  `json:"account_name"`
-	CategoryID     *int64   `json:"category_id"`
-	CategoryName   *string  `json:"category_name"`
-	CategoryColor  *string  `json:"category_color"`
-	AutoRenew      bool     `json:"auto_renew"`
-	RemindTask     bool     `json:"remind_task"`
-	AlertDays      int      `json:"alert_days"`
-	Color          string   `json:"color"`
-	Notes          string   `json:"notes"`
-	Archived       bool     `json:"archived"`
-	Income         bool     `json:"income"`
+	ID            int64   `json:"id"`
+	Name          string  `json:"name"`
+	Kind          string  `json:"kind"`
+	Amount        float64 `json:"amount"`
+	Frequency     string  `json:"frequency"`
+	NextDueDate   string  `json:"next_due_date"`
+	AccountID     *int64  `json:"account_id"`
+	AccountName   *string `json:"account_name"`
+	CategoryID    *int64  `json:"category_id"`
+	CategoryName  *string `json:"category_name"`
+	CategoryColor *string `json:"category_color"`
+	AutoRenew     bool    `json:"auto_renew"`
+	RemindTask    bool    `json:"remind_task"`
+	AlertDays     int     `json:"alert_days"`
+	Color         string  `json:"color"`
+	Notes         string  `json:"notes"`
+	Archived      bool    `json:"archived"`
+	Income        bool    `json:"income"`
+	// State: "due" (or expected), "paid" (this cycle is done; StateDate =
+	// when) or "not_recorded" (its day has passed, or it's after 8 pm).
+	State          string   `json:"state"`
+	StateDate      string   `json:"state_date"`
 	LastPaidDate   *string  `json:"last_paid_date"`
 	LastPaidAmount *float64 `json:"last_paid_amount"`
 	CreatedAt      string   `json:"created_at"`
@@ -75,7 +82,8 @@ func listBillers(deps Deps) http.HandlerFunc {
 			b.auto_renew, b.remind_task, b.alert_days, b.color, b.notes, b.archived, b.income,
 			(SELECT MAX(paid_date)::text FROM fin_biller_payments p WHERE p.biller_id = b.id),
 			(SELECT amount FROM fin_biller_payments p WHERE p.biller_id = b.id ORDER BY paid_date DESC, id DESC LIMIT 1),
-			b.created_at::text
+			b.created_at::text,
+			COALESCE((SELECT MAX(due_date)::text FROM fin_biller_payments p WHERE p.biller_id = b.id), '')
 			FROM fin_billers b
 			LEFT JOIN fin_accounts a ON a.id = b.account_id
 			LEFT JOIN fin_categories c ON c.id = b.category_id
@@ -91,13 +99,21 @@ func listBillers(deps Deps) http.HandlerFunc {
 			return
 		}
 		defer rows.Close()
+		now := userNow(d, uid)
 		out := []billerResp{}
 		for rows.Next() {
 			var b billerResp
+			var lastDue string
 			rows.Scan(&b.ID, &b.Name, &b.Kind, &b.Amount, &b.Frequency, &b.NextDueDate,
 				&b.AccountID, &b.AccountName, &b.CategoryID, &b.CategoryName, &b.CategoryColor,
 				&b.AutoRenew, &b.RemindTask, &b.AlertDays, &b.Color, &b.Notes, &b.Archived, &b.Income,
-				&b.LastPaidDate, &b.LastPaidAmount, &b.CreatedAt)
+				&b.LastPaidDate, &b.LastPaidAmount, &b.CreatedAt, &lastDue)
+			next, _ := time.Parse("2006-01-02", b.NextDueDate)
+			lastPaid := ""
+			if b.LastPaidDate != nil {
+				lastPaid = *b.LastPaidDate
+			}
+			b.State, b.StateDate = db.RecurringState(next, lastDue, lastPaid, now)
 			out = append(out, b)
 		}
 		writeJSON(w, 200, out)
@@ -128,7 +144,7 @@ func createBiller(deps Deps) http.HandlerFunc {
 			return
 		}
 		if strings.TrimSpace(body.Name) == "" {
-			errJSON(w, 400, "Give the biller a name.")
+			errJSON(w, 400, "Give it a name.")
 			return
 		}
 		if body.Kind == "" {
@@ -248,7 +264,7 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		var curAmount float64
 		if err := d.QueryRow(`SELECT kind, amount FROM fin_billers WHERE id = $1 AND user_id = $2`,
 			id, uid).Scan(&curKind, &curAmount); err != nil {
-			errJSON(w, 404, "biller not found")
+			errJSON(w, 404, "recurring item not found")
 			return
 		}
 		effKind, effAmount := curKind, curAmount
@@ -384,7 +400,7 @@ func payBiller(deps Deps) http.HandlerFunc {
 			DueDate: body.DueDate, PaidDate: body.PaidDate, Amount: body.Amount, AttachTxnIDs: body.AttachTxnIDs,
 		})
 		if errors.Is(err, db.ErrRecurringNotFound) {
-			errJSON(w, 404, "biller not found")
+			errJSON(w, 404, "recurring item not found")
 			return
 		}
 		if err != nil {
@@ -401,6 +417,70 @@ func payBiller(deps Deps) http.HandlerFunc {
 			"already_paid":  paid.AlreadyPaid,
 			"next_due_date": paid.NextDue,
 		})
+	}
+}
+
+// unlinkBillerPayment undoes one recorded cycle (db.UnlinkRecurringPayment):
+// the cycle is due again; its transactions stay.
+func unlinkBillerPayment(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		id, err := intParam(r, "id")
+		pid, perr := intParam(r, "pid")
+		if err != nil || perr != nil {
+			errJSON(w, 400, "invalid id")
+			return
+		}
+		tx, err := deps.DB.BeginTx(r.Context(), nil)
+		if err != nil {
+			internalError(w, r, "begin unlink", err)
+			return
+		}
+		defer tx.Rollback()
+		next, err := db.UnlinkRecurringPayment(r.Context(), tx, uid, id, pid)
+		if errors.Is(err, db.ErrRecurringNotFound) {
+			errJSON(w, 404, "recurring item not found")
+			return
+		}
+		if err != nil {
+			errJSON(w, 400, err.Error())
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit unlink", err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"status": "ok", "next_due_date": next})
+	}
+}
+
+// listRecurringSuggestions: things that look like they repeat monthly but
+// aren't items yet (db.RecurringSuggestions).
+func listRecurringSuggestions(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		out, err := db.RecurringSuggestions(r.Context(), deps.DB, userID(r.Context()))
+		if err != nil {
+			internalError(w, r, "recurring suggestions", err)
+			return
+		}
+		writeJSON(w, 200, out)
+	}
+}
+
+func dismissRecurringSuggestion(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var b struct {
+			Key string `json:"key"`
+		}
+		if err := readJSON(r, &b); err != nil || strings.TrimSpace(b.Key) == "" {
+			errJSON(w, 400, "key is required")
+			return
+		}
+		if err := db.DismissRecurringSuggestion(r.Context(), deps.DB, userID(r.Context()), b.Key); err != nil {
+			internalError(w, r, "dismiss suggestion", err)
+			return
+		}
+		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
 }
 
@@ -653,7 +733,9 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 					continue
 				}
 				if n, _ := res.RowsAffected(); n == 1 {
-					notifyPush(ctx, deps, b.userID, recurringNudge(b.name, b.amount, b.income, cycle, todayT))
+					n := recurringNudge(b.name, b.amount, b.income, cycle, todayT)
+					n.Data = recurringNudgeData(ctx, deps, b.id, b.userID)
+					notifyPush(ctx, deps, b.userID, n)
 					upcomingNoticed++
 				}
 			}
@@ -724,12 +806,41 @@ func recurringNudge(name string, amount float64, income bool, cycle, today time.
 	if amount <= 0 {
 		body = strings.ToUpper(when[:1]) + when[1:] + ". Add it once it's done."
 	}
+	// Data-only: the phone draws it with an "Add ₹22,000" action that opens
+	// the transaction sheet filled in (recurringNudgeData). Older apps show
+	// the same title and text without the action.
 	return push.Notification{
-		Type:  push.TypeBillDue,
-		Title: name + " isn't recorded yet",
-		Body:  body,
-		Route: "/finance/billers",
+		Type:     push.TypeBillDue,
+		Title:    name + " isn't recorded yet",
+		Body:     body,
+		Route:    "/finance/billers",
+		DataOnly: true,
 	}
+}
+
+// recurringNudgeData is what the nudge's action fills the sheet with.
+func recurringNudgeData(ctx context.Context, deps Deps, id int64, uid string) map[string]string {
+	var name string
+	var amount float64
+	var income bool
+	var account, category sql.NullInt64
+	if deps.DB.QueryRowContext(ctx, `SELECT name, amount, income, account_id, category_id FROM fin_billers WHERE id = $1 AND user_id = $2`, id, uid).
+		Scan(&name, &amount, &income, &account, &category) != nil {
+		return nil
+	}
+	data := map[string]string{
+		"recurring_id": fmt.Sprint(id),
+		"txn_title":    name,
+		"txn_type":     map[bool]string{true: "income", false: "expense"}[income],
+		"txn_amount":   fmt.Sprintf("%.2f", amount),
+	}
+	if account.Valid {
+		data["txn_account_id"] = fmt.Sprint(account.Int64)
+	}
+	if category.Valid {
+		data["txn_category_id"] = fmt.Sprint(category.Int64)
+	}
+	return data
 }
 
 // spawnBillerTask creates a "Pay {name}" reminder task for a biller's due

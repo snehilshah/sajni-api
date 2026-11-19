@@ -101,8 +101,10 @@ type captureResp struct {
 	// Resolved are earlier reviews this message settled (the same payment,
 	// now with its account): the phone clears their notifications.
 	Resolved []int64 `json:"resolved,omitempty"`
-	// Recurring is the recurring item this payment ticked ("Home Contrib").
-	Recurring string `json:"recurring,omitempty"`
+	// Recurring is the recurring item this payment ticked ("Home Contrib"),
+	// RecurringDue the cycle it paid ("2026-12-05").
+	Recurring    string `json:"recurring,omitempty"`
+	RecurringDue string `json:"recurring_due,omitempty"`
 }
 
 type captureSuggest struct {
@@ -641,7 +643,7 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 			internalError(w, r, "match recurring", err)
 			return
 		} else if ok {
-			resp.Recurring, resp.Label = m.Name, moneyLabel(parsed.Amount, m.Title)
+			resp.Recurring, resp.RecurringDue, resp.Label = m.Name, m.Due, moneyLabel(parsed.Amount, m.Title)
 			finish(resp)
 			return
 		}
