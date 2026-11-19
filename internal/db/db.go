@@ -636,9 +636,33 @@ func (d *DB) ensureSchema() error {
 		kind       TEXT      NOT NULL DEFAULT 'expense',
 		color      TEXT      NOT NULL DEFAULT '#6B7280',
 		icon       TEXT      NOT NULL DEFAULT '',
+		fallback   BOOLEAN   NOT NULL DEFAULT FALSE,  -- the kind's "Unknown": what a row with no better category gets; can't be deleted or renamed
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
+	-- Prod predates fallback; delete this ALTER once v0.104.0 has shipped.
+	ALTER TABLE fin_categories ADD COLUMN IF NOT EXISTS fallback BOOLEAN NOT NULL DEFAULT FALSE;
 	CREATE UNIQUE INDEX IF NOT EXISTS uniq_fin_categories_user_id ON fin_categories(user_id,id);
+	CREATE UNIQUE INDEX IF NOT EXISTS uq_fin_categories_fallback ON fin_categories(user_id, kind) WHERE fallback;
+
+	-- The user's "Unknown" category of a kind, made on first use (an existing
+	-- category already named Unknown becomes it).
+	CREATE OR REPLACE FUNCTION fin_category_fallback(u UUID, k TEXT) RETURNS BIGINT AS $fn$
+	DECLARE cid BIGINT;
+	BEGIN
+		SELECT id INTO cid FROM fin_categories WHERE user_id = u AND kind = k AND fallback;
+		IF cid IS NOT NULL THEN RETURN cid; END IF;
+		UPDATE fin_categories SET fallback = TRUE
+			WHERE id = (SELECT id FROM fin_categories WHERE user_id = u AND kind = k AND LOWER(BTRIM(name)) = 'unknown' ORDER BY id LIMIT 1)
+			RETURNING id INTO cid;
+		IF cid IS NOT NULL THEN RETURN cid; END IF;
+		INSERT INTO fin_categories (user_id, name, kind, color, icon, fallback)
+			VALUES (u, 'Unknown', k, '#9CA3AF', 'help-circle', TRUE)
+			ON CONFLICT DO NOTHING RETURNING id INTO cid;
+		IF cid IS NULL THEN
+			SELECT id INTO cid FROM fin_categories WHERE user_id = u AND kind = k AND fallback;
+		END IF;
+		RETURN cid;
+	END $fn$ LANGUAGE plpgsql;
 	CREATE INDEX IF NOT EXISTS idx_fin_categories_user ON fin_categories(user_id);
 
 	-- ─── Slates: is this normal life, or not? ─────────────────────────
@@ -949,12 +973,15 @@ func (d *DB) ensureSchema() error {
 		color           TEXT        NOT NULL DEFAULT '#2D5A4F',
 		notes           TEXT        NOT NULL DEFAULT '',
 		archived        BOOLEAN     NOT NULL DEFAULT FALSE,
+		income          BOOLEAN     NOT NULL DEFAULT FALSE,  -- money expected in (Salary), not a payment out
 		last_run_at     TIMESTAMPTZ,
 		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		CONSTRAINT fk_fin_biller_account_user FOREIGN KEY(user_id,account_id) REFERENCES fin_accounts(user_id,id) ON DELETE SET NULL (account_id),
 		CONSTRAINT fk_fin_biller_category_user FOREIGN KEY(user_id,category_id) REFERENCES fin_categories(user_id,id) ON DELETE SET NULL (category_id)
 	);
+	-- Prod predates income; delete this ALTER once v0.104.0 has shipped.
+	ALTER TABLE fin_billers ADD COLUMN IF NOT EXISTS income BOOLEAN NOT NULL DEFAULT FALSE;
 	CREATE INDEX IF NOT EXISTS idx_fin_billers_user ON fin_billers(user_id);
 	CREATE INDEX IF NOT EXISTS idx_fin_billers_due ON fin_billers(user_id, next_due_date) WHERE archived = FALSE;
 
@@ -1005,6 +1032,23 @@ func (d *DB) ensureSchema() error {
 	END $fn$ LANGUAGE plpgsql;
 	CREATE OR REPLACE TRIGGER trg_fin_txn_default_slate BEFORE INSERT ON fin_transactions
 		FOR EACH ROW EXECUTE FUNCTION fin_txn_default_slate();
+
+	-- Every spend and income row has a category: with none (any writer, or
+	-- its category deleted) it gets the kind's Unknown. Lends, paybacks and
+	-- transfers don't need one. Skipped while the user is being deleted.
+	CREATE OR REPLACE FUNCTION fin_txn_default_category() RETURNS trigger AS $fn$
+	BEGIN
+		IF NEW.category_id IS NULL AND NEW.type IN ('expense','writeoff','refund','income')
+		   AND EXISTS (SELECT 1 FROM users WHERE id = NEW.user_id) THEN
+			NEW.category_id := fin_category_fallback(NEW.user_id, CASE WHEN NEW.type = 'income' THEN 'income' ELSE 'expense' END);
+		END IF;
+		RETURN NEW;
+	END $fn$ LANGUAGE plpgsql;
+	CREATE OR REPLACE TRIGGER trg_fin_txn_default_category BEFORE INSERT OR UPDATE OF category_id, type ON fin_transactions
+		FOR EACH ROW EXECUTE FUNCTION fin_txn_default_category();
+	-- Rows left blank before Unknown existed; delete once v0.104.0 has shipped.
+	UPDATE fin_transactions SET category_id = NULL
+		WHERE category_id IS NULL AND type IN ('expense','writeoff','refund','income');
 
 	-- Which slates a budget counts. No rows = Plain only.
 	CREATE TABLE IF NOT EXISTS fin_budget_slates (

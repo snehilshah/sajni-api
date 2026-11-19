@@ -158,6 +158,7 @@ func ensureDefaultCategories(deps Deps, uid string) {
 	for _, c := range defaultIncomeCategories {
 		d.Exec("INSERT INTO fin_categories (user_id, name, kind, color, icon) VALUES ($1, $2, 'income', $3, $4) ON CONFLICT DO NOTHING", uid, c.Name, c.Color, c.Icon)
 	}
+	d.Exec("SELECT fin_category_fallback($1, 'expense'), fin_category_fallback($1, 'income')", uid)
 }
 
 func categoryNameKey(name string) string {
@@ -447,7 +448,7 @@ func listCategories(deps Deps) http.HandlerFunc {
 		ensureSlates(deps, uid)
 		kind := queryParam(r, "kind")
 		args := []any{uid}
-		q := "SELECT id, name, kind, color, icon FROM fin_categories WHERE user_id = $1"
+		q := "SELECT id, name, kind, color, icon, fallback FROM fin_categories WHERE user_id = $1"
 		if kind != "" {
 			q += " AND kind = $2"
 			args = append(args, kind)
@@ -465,11 +466,13 @@ func listCategories(deps Deps) http.HandlerFunc {
 			Kind  string `json:"kind"`
 			Color string `json:"color"`
 			Icon  string `json:"icon"`
+			// Fallback: the kind's Unknown, which can't be deleted or renamed.
+			Fallback bool `json:"fallback"`
 		}
 		var out []Cat
 		for rows.Next() {
 			var c Cat
-			rows.Scan(&c.ID, &c.Name, &c.Kind, &c.Color, &c.Icon)
+			rows.Scan(&c.ID, &c.Name, &c.Kind, &c.Color, &c.Icon, &c.Fallback)
 			out = append(out, c)
 		}
 		if out == nil {
@@ -549,13 +552,18 @@ func updateCategory(deps Deps) http.HandlerFunc {
 		}
 		if b.Name != nil {
 			var currentName, kind string
-			if err := d.QueryRow("SELECT name, kind FROM fin_categories WHERE id=$1 AND user_id=$2", id, uid).Scan(&currentName, &kind); err != nil {
+			var fallback bool
+			if err := d.QueryRow("SELECT name, kind, fallback FROM fin_categories WHERE id=$1 AND user_id=$2", id, uid).Scan(&currentName, &kind, &fallback); err != nil {
 				errJSON(w, 404, "category not found")
 				return
 			}
 			name := strings.TrimSpace(*b.Name)
 			if name == "" {
 				errJSON(w, 400, "Give the category a name.")
+				return
+			}
+			if fallback && name != currentName {
+				errJSON(w, http.StatusConflict, currentName+" can't be renamed: it holds what still needs a category.")
 				return
 			}
 			if categoryNameExists(d, uid, kind, name, id) || (categoryNameKey(currentName) != categoryNameKey(name) && isDefaultCategoryName(kind, name)) {
@@ -590,6 +598,14 @@ func deleteCategory(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "invalid id")
 			return
 		}
+		var name string
+		var fallback bool
+		if d.QueryRow("SELECT name, fallback FROM fin_categories WHERE id = $1 AND user_id = $2", id, uid).Scan(&name, &fallback) == nil && fallback {
+			errJSON(w, http.StatusConflict, name+" can't be deleted: it holds what still needs a category.")
+			return
+		}
+		// Its spend and income rows move to Unknown (the database's default
+		// for a row left without one); lends and paybacks go blank.
 		d.Exec("DELETE FROM fin_categories WHERE id = $1 AND user_id = $2", id, uid)
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	}
@@ -1237,6 +1253,13 @@ func createTransaction(deps Deps) http.HandlerFunc {
 				return
 			}
 		}
+		// A payment that fits a recurring item ticks it (Home Contrib on the
+		// 5th); before the capture link, so the title stays the one typed.
+		recurring, _, err := db.MatchRecurring(ctx, tx, uid, id, false)
+		if err != nil {
+			internalError(w, r, "match recurring", err)
+			return
+		}
 		if b.CaptureID != nil {
 			if _, err := tx.ExecContext(ctx, `UPDATE fin_captures SET outcome = 'created', txn_id = $1, reason = 'Filed from its review.'
 				WHERE id = $2 AND user_id = $3 AND outcome = 'review'`, id, *b.CaptureID, uid); err != nil {
@@ -1256,7 +1279,11 @@ func createTransaction(deps Deps) http.HandlerFunc {
 		if !direct {
 			learnMerchantCategory(d, uid, b.Description, b.CategoryID)
 		}
-		writeJSON(w, 201, map[string]int64{"id": id})
+		out := map[string]any{"id": id}
+		if recurring.Name != "" {
+			out["recurring"] = recurring.Name // the item it paid
+		}
+		writeJSON(w, 201, out)
 	}
 }
 
@@ -2972,7 +2999,7 @@ func financeOverview(deps Deps) http.HandlerFunc {
 			Amount float64 `json:"amount"`
 		}
 		var topCats []CatStat
-		crows, _ := d.Query(`SELECT c.id, COALESCE(c.name, 'Uncategorized'), COALESCE(c.color, '#6B7280'), SUM(`+db.Spend("t")+`)
+		crows, _ := d.Query(`SELECT c.id, COALESCE(c.name, 'Unknown'), COALESCE(c.color, '#6B7280'), SUM(`+db.Spend("t")+`)
 			FROM fin_transactions t LEFT JOIN fin_categories c ON c.id = t.category_id
 			WHERE t.user_id = $1 AND t.type IN `+db.SpendTypes+` AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3
 			GROUP BY c.id, c.name, c.color HAVING SUM(`+db.Spend("t")+`) > 0 ORDER BY 4 DESC LIMIT 8`, uid, monthStart, monthEnd)
@@ -3427,7 +3454,7 @@ func categorizeTransaction(deps Deps) http.HandlerFunc {
 // learnMerchantCategory remembers (or refreshes) the category the owner
 // filed a merchant under. Only the owner's own choices teach: callers skip
 // rows the phone filed by itself, and "Others" is never learned (it would
-// stop the AI from ever looking at that merchant again). merchant is keyed
+// stop the AI from ever looking at that merchant again), nor is Unknown. merchant is keyed
 // lowercase so casing doesn't fork the rule.
 func learnMerchantCategory(d *db.DB, uid, merchant string, categoryID *int64) {
 	m := strings.ToLower(strings.TrimSpace(merchant))
@@ -3436,7 +3463,7 @@ func learnMerchantCategory(d *db.DB, uid, merchant string, categoryID *int64) {
 	}
 	d.Exec(`INSERT INTO fin_merchant_categories (user_id, merchant, category_id)
 	        SELECT $1, $2, c.id FROM fin_categories c
-	        WHERE c.id = $3 AND c.user_id = $1 AND LOWER(BTRIM(c.name)) <> 'others'
+	        WHERE c.id = $3 AND c.user_id = $1 AND LOWER(BTRIM(c.name)) <> 'others' AND NOT c.fallback
 	        ON CONFLICT (user_id, merchant)
 	        DO UPDATE SET category_id = EXCLUDED.category_id, updated_at = NOW()`,
 		uid, m, *categoryID)
@@ -3448,7 +3475,8 @@ func learnMerchantCategory(d *db.DB, uid, merchant string, categoryID *int64) {
 func learnPayeeName(ctx context.Context, d *db.DB, uid string, txnID int64, kind string) {
 	if _, err := d.ExecContext(ctx, `
 		INSERT INTO fin_payee_names (user_id, payee, kind, title, amount, category_id, last_txn_id)
-		SELECT t.user_id, LOWER(BTRIM(c.description)), $3, BTRIM(t.description), t.amount, t.category_id, t.id
+		SELECT t.user_id, LOWER(BTRIM(c.description)), $3, BTRIM(t.description), t.amount,
+		       (SELECT k.id FROM fin_categories k WHERE k.id = t.category_id AND NOT k.fallback), t.id
 		FROM fin_transactions t
 		JOIN LATERAL (SELECT description FROM fin_captures
 		              WHERE txn_id = t.id AND user_id = t.user_id AND outcome = 'created' AND description <> ''
@@ -3513,7 +3541,7 @@ func lookupMerchantCategory(d *db.DB, uid, merchant, kind string) (*int64, strin
 	err := d.QueryRow(`SELECT mc.category_id, c.name
 	                   FROM fin_merchant_categories mc
 	                   JOIN fin_categories c ON c.id = mc.category_id AND c.user_id = mc.user_id
-	                   WHERE mc.user_id = $1 AND c.kind = $3 AND LOWER(BTRIM(c.name)) <> 'others'
+	                   WHERE mc.user_id = $1 AND c.kind = $3 AND LOWER(BTRIM(c.name)) <> 'others' AND NOT c.fallback
 	                     AND (mc.merchant = $2
 	                       OR (length($2) >= $4 AND (starts_with(mc.merchant, $2)
 	                           OR (length(mc.merchant) >= $4 AND starts_with($2, mc.merchant)))))
@@ -3732,8 +3760,8 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 }
 
 // resolveParsedTransaction adds the account and category to a parse. For an
-// automatic capture an AI guess of "Others" is left blank, so the row shows
-// up as uncategorised for the owner to sort rather than looking filed.
+// automatic capture an AI guess of "Others" is left blank, so the row lands
+// in Unknown for the owner to sort rather than looking filed.
 func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed ai.ParsedTxn, loc *time.Location, now time.Time, auto bool) map[string]any {
 	var catID *int64
 	var catName string
@@ -3746,7 +3774,7 @@ func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed
 			catID, catName = id, name
 		} else if parsed.Category != "" {
 			// Chosen in the parse itself. For an automatic capture "Others"
-			// stays blank, so the row reads as uncategorised, not filed.
+			// stays blank, so the row lands in Unknown, not filed.
 			if name := parsed.Category; !(auto && strings.EqualFold(name, "Others")) {
 				var id int64
 				if deps.DB.QueryRowContext(ctx, `SELECT id, name FROM fin_categories WHERE user_id=$1 AND kind=$2 AND LOWER(name)=LOWER($3) ORDER BY id LIMIT 1`, uid, kind, name).Scan(&id, &name) == nil {
@@ -3760,7 +3788,7 @@ func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed
 			}
 			var cats []cat
 			var names []string
-			if crows, qerr := deps.DB.Query(`SELECT id, name FROM fin_categories WHERE user_id=$1 AND kind=$2 ORDER BY name`, uid, kind); qerr == nil {
+			if crows, qerr := deps.DB.Query(`SELECT id, name FROM fin_categories WHERE user_id=$1 AND kind=$2 AND NOT fallback ORDER BY name`, uid, kind); qerr == nil {
 				for crows.Next() {
 					var c cat
 					if crows.Scan(&c.id, &c.name) == nil {

@@ -161,16 +161,15 @@ func Load(ctx context.Context, d *db.DB, uid string, month time.Time) ([]Row, ti
 	loc := month.Location()
 	from := month.AddDate(0, -(trendMonths - 1), 0)
 	to := month.AddDate(0, 1, 0)
-	// A row without a category counts as the user's expense "Others", so
-	// there is one Others, never a second one for the blanks.
+	// The database gives every spend and income row a category (Unknown
+	// when nothing better fits); a blank one still reads as Unknown.
 	rows, err := d.QueryContext(ctx, `SELECT t.id, t.type, t.amount, t.description,
-			(t.txn_at AT TIME ZONE $4)::date::text, COALESCE(t.category_id, o.id), COALESCE(c.name, o.name, 'Others'),
-			COALESCE(c.color, o.color, '#6B7280'), COALESCE(s.is_plain, TRUE), COALESCE(s.name, '')
+			(t.txn_at AT TIME ZONE $4)::date::text, COALESCE(t.category_id, o.id), COALESCE(c.name, o.name, 'Unknown'),
+			COALESCE(c.color, o.color, '#9CA3AF'), COALESCE(s.is_plain, TRUE), COALESCE(s.name, '')
 		FROM fin_transactions t
 		LEFT JOIN fin_categories c ON c.id = t.category_id
 		LEFT JOIN LATERAL (SELECT id, name, color FROM fin_categories
-			WHERE user_id = t.user_id AND kind = 'expense' AND LOWER(BTRIM(name)) IN ('other','others')
-			ORDER BY id LIMIT 1) o ON t.category_id IS NULL
+			WHERE user_id = t.user_id AND fallback AND kind = CASE WHEN t.type = 'income' THEN 'income' ELSE 'expense' END) o ON t.category_id IS NULL
 		LEFT JOIN fin_slates s ON s.id = t.slate_id
 		WHERE t.user_id = $1 AND t.type IN ('income','expense','writeoff','refund')
 		  AND (t.txn_at AT TIME ZONE $4)::date >= $2::date AND (t.txn_at AT TIME ZONE $4)::date < $3::date

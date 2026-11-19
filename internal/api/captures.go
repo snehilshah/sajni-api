@@ -101,6 +101,8 @@ type captureResp struct {
 	// Resolved are earlier reviews this message settled (the same payment,
 	// now with its account): the phone clears their notifications.
 	Resolved []int64 `json:"resolved,omitempty"`
+	// Recurring is the recurring item this payment ticked ("Home Contrib").
+	Recurring string `json:"recurring,omitempty"`
 }
 
 type captureSuggest struct {
@@ -630,6 +632,16 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 			title := "Transfer to " + to
 			tx.ExecContext(ctx, `UPDATE fin_transactions SET description = $1 WHERE id IN ($2,$3) AND user_id = $4`, title, id, newLeg, uid)
 			resp.Label, resp.Transfer = moneyLabel(parsed.Amount, title), from+" → "+to
+			finish(resp)
+			return
+		}
+		// A payment that fits a recurring item ticks it and takes its name
+		// (₹22,000 to Papa on the 5th → Home Contrib).
+		if m, ok, err := db.MatchRecurring(ctx, tx, uid, id, true); err != nil {
+			internalError(w, r, "match recurring", err)
+			return
+		} else if ok {
+			resp.Recurring, resp.Label = m.Name, moneyLabel(parsed.Amount, m.Title)
 			finish(resp)
 			return
 		}

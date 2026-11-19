@@ -284,7 +284,7 @@ func detectSpendingSpikes(ctx context.Context, d *db.DB, uid string, cutoff stri
 		if expected <= 0 || actual <= expected*1.4 {
 			continue
 		}
-		label := "Uncategorized"
+		label := "Unknown"
 		if name != nil {
 			label = *name
 		}

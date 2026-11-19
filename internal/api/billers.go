@@ -11,14 +11,16 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"sajni/internal/db"
 	"sajni/internal/push"
 )
 
-// Billers live alongside finance in two kinds: 'subscription' (fixed amount,
-// may auto_renew — the cron posts the txn) and 'bill' (variable amount, e.g.
-// electricity — amount is an optional estimate; the user marks paid with the
-// actual). The hourly tick (see ProcessBillerCron) emits "upcoming" alerts
-// before the due date and posts auto-renew txns once the date passes.
+// Billers are recurring items (db/recurring.go has the shared logic): kind
+// 'subscription' = a fixed amount, 'bill' = it varies (the amount is an
+// estimate); income = money expected in (Salary). An item waits for its
+// payment, which attaches itself when it fits (db.MatchRecurring); auto_renew
+// posts it instead. The sweep (ProcessBillerCron) raises "upcoming" alerts,
+// posts auto-renew cycles and nudges at 8 pm on a due day with nothing paid.
 
 func registerBillerRoutes(mux *http.ServeMux, deps Deps) {
 	mux.HandleFunc("GET /api/finance/billers", listBillers(deps))
@@ -50,6 +52,7 @@ type billerResp struct {
 	Color          string   `json:"color"`
 	Notes          string   `json:"notes"`
 	Archived       bool     `json:"archived"`
+	Income         bool     `json:"income"`
 	LastPaidDate   *string  `json:"last_paid_date"`
 	LastPaidAmount *float64 `json:"last_paid_amount"`
 	CreatedAt      string   `json:"created_at"`
@@ -59,30 +62,7 @@ func validBillerKind(k string) bool {
 	return k == "subscription" || k == "bill"
 }
 
-// validFrequency keeps the schema strict (we lean on this in advanceDueDate).
-func validFrequency(f string) bool {
-	switch f {
-	case "weekly", "fortnightly", "monthly", "bimonthly", "quarterly":
-		return true
-	}
-	return false
-}
-
-// advanceDueDate rolls a due date forward by one period.
-func advanceDueDate(d time.Time, freq string, anchorDay int) time.Time {
-	switch freq {
-	case "weekly":
-		return d.AddDate(0, 0, 7)
-	case "fortnightly":
-		return d.AddDate(0, 0, 14)
-	case "bimonthly":
-		return advanceRecurringMonth(d, 2, anchorDay)
-	case "quarterly":
-		return advanceRecurringMonth(d, 3, anchorDay)
-	default: // monthly
-		return advanceRecurringMonth(d, 1, anchorDay)
-	}
-}
+func validFrequency(f string) bool { return db.ValidRecurringFrequency(f) }
 
 func listBillers(deps Deps) http.HandlerFunc {
 	d := deps.DB
@@ -92,7 +72,7 @@ func listBillers(deps Deps) http.HandlerFunc {
 
 		q := `SELECT b.id, b.name, b.kind, b.amount, b.frequency, b.next_due_date::text,
 			b.account_id, a.name, b.category_id, c.name, c.color,
-			b.auto_renew, b.remind_task, b.alert_days, b.color, b.notes, b.archived,
+			b.auto_renew, b.remind_task, b.alert_days, b.color, b.notes, b.archived, b.income,
 			(SELECT MAX(paid_date)::text FROM fin_biller_payments p WHERE p.biller_id = b.id),
 			(SELECT amount FROM fin_biller_payments p WHERE p.biller_id = b.id ORDER BY paid_date DESC, id DESC LIMIT 1),
 			b.created_at::text
@@ -116,7 +96,7 @@ func listBillers(deps Deps) http.HandlerFunc {
 			var b billerResp
 			rows.Scan(&b.ID, &b.Name, &b.Kind, &b.Amount, &b.Frequency, &b.NextDueDate,
 				&b.AccountID, &b.AccountName, &b.CategoryID, &b.CategoryName, &b.CategoryColor,
-				&b.AutoRenew, &b.RemindTask, &b.AlertDays, &b.Color, &b.Notes, &b.Archived,
+				&b.AutoRenew, &b.RemindTask, &b.AlertDays, &b.Color, &b.Notes, &b.Archived, &b.Income,
 				&b.LastPaidDate, &b.LastPaidAmount, &b.CreatedAt)
 			out = append(out, b)
 		}
@@ -141,6 +121,7 @@ func createBiller(deps Deps) http.HandlerFunc {
 			AlertDays   *int    `json:"alert_days"`
 			Color       string  `json:"color"`
 			Notes       string  `json:"notes"`
+			Income      bool    `json:"income"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -206,10 +187,10 @@ func createBiller(deps Deps) http.HandlerFunc {
 		var id int64
 		err = d.QueryRow(`INSERT INTO fin_billers
 			(user_id, name, kind, amount, frequency, next_due_date, anchor_day, account_id, category_id,
-			 auto_renew, remind_task, alert_days, color, notes)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+			 auto_renew, remind_task, alert_days, color, notes, income)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
 			uid, body.Name, body.Kind, body.Amount, body.Frequency, body.NextDueDate, due.Day(), body.AccountID, body.CategoryID,
-			body.AutoRenew, body.RemindTask, alertDays, body.Color, body.Notes).Scan(&id)
+			body.AutoRenew, body.RemindTask, alertDays, body.Color, body.Notes, body.Income).Scan(&id)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
@@ -241,6 +222,7 @@ func updateBiller(deps Deps) http.HandlerFunc {
 			Color       *string  `json:"color"`
 			Notes       *string  `json:"notes"`
 			Archived    *bool    `json:"archived"`
+			Income      *bool    `json:"income"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			errJSON(w, 400, "invalid json")
@@ -343,6 +325,9 @@ func updateBiller(deps Deps) http.HandlerFunc {
 		if body.Archived != nil {
 			add("archived", *body.Archived)
 		}
+		if body.Income != nil {
+			add("income", *body.Income)
+		}
 		args = append(args, id, uid)
 		q := "UPDATE fin_billers SET " + strings.Join(set, ", ") +
 			" WHERE id = $" + itoa(ph) + " AND user_id = $" + itoa(ph+1)
@@ -368,15 +353,11 @@ func deleteBiller(deps Deps) http.HandlerFunc {
 	}
 }
 
-// payBiller records the biller's current due cycle and rolls next_due_date
-// forward. Two modes:
-//   - record (default): posts an expense txn like before; `amount` overrides
-//     the stored amount (a Bill's mark-paid asks the actual).
-//   - attach (attach_txn_ids set): links pre-existing txns to the cycle and
-//     creates NO txn — no account needed since nothing posts.
-//
-// Idempotent on (biller_id, due_date); a second pay of the same cycle
-// returns already_paid instead of double-posting.
+// payBiller records one cycle of an item (db.PayRecurring): it posts a row
+// (`amount` overrides the stored one, a bill's actual) or, with
+// attach_txn_ids, links rows that already exist and posts nothing. due_date
+// is the cycle the client showed; a second tap on it reads already_paid
+// instead of paying next month too.
 func payBiller(deps Deps) http.HandlerFunc {
 	d := deps.DB
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -388,168 +369,39 @@ func payBiller(deps Deps) http.HandlerFunc {
 		}
 		var body struct {
 			PaidDate     string   `json:"paid_date"`
+			DueDate      string   `json:"due_date"`
 			Amount       *float64 `json:"amount"`
 			AttachTxnIDs []int64  `json:"attach_txn_ids"`
 		}
 		readJSON(r, &body)
-
-		var name, freq string
-		var amount float64
-		var dueDate string
-		var anchorDay int
-		var accountID, categoryID sql.NullInt64
-		err = d.QueryRow(`SELECT name, amount, frequency, next_due_date::text, COALESCE(anchor_day, EXTRACT(DAY FROM next_due_date)::INTEGER), account_id, category_id
-			FROM fin_billers WHERE id = $1 AND user_id = $2`,
-			id, uid).Scan(&name, &amount, &freq, &dueDate, &anchorDay, &accountID, &categoryID)
+		tx, err := d.BeginTx(r.Context(), nil)
 		if err != nil {
+			internalError(w, r, "begin pay", err)
+			return
+		}
+		defer tx.Rollback()
+		paid, err := db.PayRecurring(r.Context(), tx, uid, id, db.RecurringPay{
+			DueDate: body.DueDate, PaidDate: body.PaidDate, Amount: body.Amount, AttachTxnIDs: body.AttachTxnIDs,
+		})
+		if errors.Is(err, db.ErrRecurringNotFound) {
 			errJSON(w, 404, "biller not found")
 			return
 		}
-		if body.Amount != nil {
-			amount = *body.Amount
+		if err != nil {
+			errJSON(w, 400, err.Error())
+			return
 		}
-		paidDate := body.PaidDate
-		if paidDate == "" {
-			paidDate = userNow(d, uid).Format("2006-01-02")
+		if err := tx.Commit(); err != nil {
+			internalError(w, r, "commit pay", err)
+			return
 		}
-
-		var txnID int64
-		var alreadyPaid bool
-		if len(body.AttachTxnIDs) > 0 {
-			alreadyPaid, err = attachBillerTxns(r.Context(), deps, uid, id, body.AttachTxnIDs,
-				body.Amount, paidDate, dueDate)
-			if err != nil {
-				errJSON(w, 400, err.Error())
-				return
-			}
-		} else {
-			if !accountID.Valid {
-				errJSON(w, 400, "This biller has no account. Pick one before paying.")
-				return
-			}
-			txnID, alreadyPaid, err = postBillerTxn(r.Context(), deps, uid, id, accountID.Int64, categoryID,
-				name, amount, paidDate, dueDate, false)
-			if err != nil {
-				errJSON(w, 500, err.Error())
-				return
-			}
-		}
-
-		due, _ := time.Parse("2006-01-02", dueDate)
-		next := advanceDueDate(due, freq, anchorDay)
-		d.Exec(`UPDATE fin_billers SET next_due_date = $1, updated_at = NOW(), last_run_at = NOW()
-			WHERE id = $2 AND user_id = $3`, next.Format("2006-01-02"), id, uid)
-
 		writeJSON(w, 200, map[string]any{
 			"status":        "ok",
-			"txn_id":        txnID,
-			"already_paid":  alreadyPaid,
-			"next_due_date": next.Format("2006-01-02"),
+			"txn_id":        paid.TxnID,
+			"already_paid":  paid.AlreadyPaid,
+			"next_due_date": paid.NextDue,
 		})
 	}
-}
-
-// postBillerTxn posts one biller cycle inside a single DB transaction,
-// payment-row-FIRST so the UNIQUE(biller_id, due_date) key gates the txn
-// insert — concurrent manual pay + cron can never double-post a cycle.
-// Returns (0, true, nil) when the cycle was already recorded.
-func postBillerTxn(ctx context.Context, deps Deps, uid string, billerID, accountID int64,
-	categoryID sql.NullInt64, name string, amount float64, paidDate, dueDate string, auto bool,
-) (int64, bool, error) {
-	tzName := userLocation(deps.DB, uid).String()
-	tx, err := deps.DB.Begin()
-	if err != nil {
-		return 0, false, err
-	}
-	defer tx.Rollback()
-
-	var paymentID int64
-	err = tx.QueryRowContext(ctx,
-		`INSERT INTO fin_biller_payments (user_id, biller_id, due_date, paid_date, amount, auto)
-		 VALUES ($1,$2,$3,$4,$5,$6)
-		 ON CONFLICT (biller_id, due_date) DO NOTHING RETURNING id`,
-		uid, billerID, dueDate, paidDate, amount, auto).Scan(&paymentID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, true, tx.Commit() // cycle already recorded
-		}
-		return 0, false, err
-	}
-
-	desc := name
-	if auto {
-		desc = name + " (auto)"
-	}
-	var catArg any
-	if categoryID.Valid {
-		catArg = categoryID.Int64
-	}
-	// System-posted txn: no slate, so it lands in Plain.
-	var txnID int64
-	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO fin_transactions (user_id, account_id, category_id, type, amount, description, txn_at)
-		 VALUES ($1,$2,$3,'expense',$4,$5,($6::timestamp AT TIME ZONE $7)) RETURNING id`,
-		uid, accountID, catArg, amount, desc, paidDate, tzName).Scan(&txnID); err != nil {
-		return 0, false, err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO fin_biller_payment_txns (payment_id, txn_id) VALUES ($1,$2)`,
-		paymentID, txnID); err != nil {
-		return 0, false, err
-	}
-	return txnID, false, tx.Commit()
-}
-
-// attachBillerTxns records a cycle as paid by linking pre-existing txns to
-// it (no new txn). Payment amount = the explicit override or the sum of the
-// attached txns. Returns alreadyPaid=true when the cycle was recorded before.
-func attachBillerTxns(ctx context.Context, deps Deps, uid string, billerID int64,
-	txnIDs []int64, amountOverride *float64, paidDate, dueDate string,
-) (bool, error) {
-	d := deps.DB
-	// Verify ownership + sum in one shot; a count mismatch means a foreign
-	// or missing txn id.
-	var cnt int
-	var sum float64
-	if err := d.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(amount),0)
-		FROM fin_transactions WHERE user_id = $1 AND id = ANY($2)`,
-		uid, txnIDs).Scan(&cnt, &sum); err != nil {
-		return false, err
-	}
-	if cnt != len(txnIDs) {
-		return false, errors.New("one or more transactions not found")
-	}
-	amount := sum
-	if amountOverride != nil {
-		amount = *amountOverride
-	}
-
-	tx, err := d.Begin()
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-
-	var paymentID int64
-	err = tx.QueryRowContext(ctx,
-		`INSERT INTO fin_biller_payments (user_id, biller_id, due_date, paid_date, amount, auto)
-		 VALUES ($1,$2,$3,$4,$5,FALSE)
-		 ON CONFLICT (biller_id, due_date) DO NOTHING RETURNING id`,
-		uid, billerID, dueDate, paidDate, amount).Scan(&paymentID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return true, tx.Commit()
-		}
-		return false, err
-	}
-	for _, tid := range txnIDs {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO fin_biller_payment_txns (payment_id, txn_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-			paymentID, tid); err != nil {
-			return false, err
-		}
-	}
-	return false, tx.Commit()
 }
 
 // listBillerPayments returns the payment history for one biller with each
@@ -676,12 +528,14 @@ func markBillerAlertSeen(deps Deps) http.HandlerFunc {
 	}
 }
 
-// ProcessBillerCron walks every active biller for every user and:
-//  1. for `auto_renew=true` rows whose due date has passed, posts the txn
-//     and rolls next_due_date forward (catches up multiple missed cycles);
-//  2. for rows within the alert_days window, inserts an "upcoming" alert.
+// ProcessBillerCron walks every active recurring item for every user and:
+//  1. auto_renew items: posts each cycle due by today (dated its own due
+//     day), never one due before the item existed;
+//  2. raises an "upcoming" alert alert_days before a payment's due date;
+//  3. at 8 pm on a due day (or later, inside the cycle's window) with
+//     nothing paid for it, nudges once: Home Contrib isn't recorded yet.
 //
-// Idempotent: alerts are uniq on (biller_id, kind, due_date) and payments
+// Idempotent: alerts are unique on (biller_id, kind, due_date) and payments
 // on (biller_id, due_date).
 func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcomingNoticed int, err error) {
 	d := deps.DB
@@ -689,8 +543,8 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 
 	rows, err := d.QueryContext(ctx, `SELECT b.id, b.user_id, b.name, b.amount, b.frequency, b.next_due_date::text,
 		COALESCE(b.anchor_day, EXTRACT(DAY FROM b.next_due_date)::INTEGER),
-		b.account_id, b.category_id, b.auto_renew, b.remind_task, b.alert_days,
-		COALESCE(u.timezone,'')
+		b.account_id, b.auto_renew, b.remind_task, b.alert_days, b.income,
+		COALESCE(u.timezone,''), b.created_at
 		FROM fin_billers b
 		JOIN users u ON u.id = b.user_id
 		WHERE b.archived = FALSE AND u.deleted_at IS NULL`)
@@ -700,22 +554,24 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 	defer rows.Close()
 
 	type bill struct {
-		id                    int64
-		userID                string
-		name, freq, dueDate   string
-		amount                float64
-		accountID, categoryID sql.NullInt64
-		autoRenew             bool
-		remindTask            bool
-		alertDays             int
-		anchorDay             int
-		timezone              string
+		id                  int64
+		userID              string
+		name, freq, dueDate string
+		amount              float64
+		accountID           sql.NullInt64
+		autoRenew           bool
+		remindTask          bool
+		income              bool
+		alertDays           int
+		anchorDay           int
+		timezone            string
+		created             time.Time
 	}
 	var bills []bill
 	for rows.Next() {
 		var b bill
 		if err := rows.Scan(&b.id, &b.userID, &b.name, &b.amount, &b.freq, &b.dueDate, &b.anchorDay,
-			&b.accountID, &b.categoryID, &b.autoRenew, &b.remindTask, &b.alertDays, &b.timezone); err != nil {
+			&b.accountID, &b.autoRenew, &b.remindTask, &b.alertDays, &b.income, &b.timezone, &b.created); err != nil {
 			return 0, 0, fmt.Errorf("scan biller cron row: %w", err)
 		}
 		bills = append(bills, b)
@@ -726,64 +582,91 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 
 	var jobErrors []error
 	for _, b := range bills {
-		today := runAt.In(timezoneLocation(b.timezone)).Format("2006-01-02")
-		todayT, _ := time.Parse("2006-01-02", today)
+		loc := timezoneLocation(b.timezone)
+		local := runAt.In(loc)
+		todayT, _ := time.Parse("2006-01-02", local.Format("2006-01-02"))
+		createdT, _ := time.Parse("2006-01-02", b.created.In(loc).Format("2006-01-02"))
 		due, perr := time.Parse("2006-01-02", b.dueDate)
 		if perr != nil {
 			jobErrors = append(jobErrors, fmt.Errorf("biller %d has invalid next_due_date: %w", b.id, perr))
 			continue
 		}
-		// 1) auto-renew (subscriptions only — bills never carry the flag):
-		// catch up every cycle whose due date is <= today. A cycle the user
-		// already paid manually just skips (alreadyPaid) and keeps rolling.
+		// 1) Posts by itself. A cycle due before the item was made is skipped,
+		// not back-posted; a cycle already paid (by hand, or by a payment that
+		// attached itself) just moves on.
 		if b.autoRenew && b.accountID.Valid {
 			failed := false
 			for !due.After(todayT) {
-				_, alreadyPaid, terr := postBillerTxn(ctx, deps, b.userID, b.id, b.accountID.Int64, b.categoryID,
-					b.name, b.amount, today, due.Format("2006-01-02"), true)
+				if due.Before(createdT) {
+					due = db.AdvanceDue(due, b.freq, b.anchorDay)
+					continue
+				}
+				day := due.Format("2006-01-02")
+				tx, terr := d.BeginTx(ctx, nil)
+				var paid db.RecurringPaid
+				if terr == nil {
+					paid, terr = db.PayRecurring(ctx, tx, b.userID, b.id, db.RecurringPay{DueDate: day, PaidDate: day, Auto: true})
+					if terr == nil {
+						terr = tx.Commit()
+					} else {
+						tx.Rollback()
+					}
+				}
 				if terr != nil {
 					log.Warn().Err(terr).Int64("biller", b.id).Msg("biller auto-post failed")
 					jobErrors = append(jobErrors, fmt.Errorf("post biller %d cycle: %w", b.id, terr))
 					failed = true
 					break
 				}
-				if !alreadyPaid {
+				if !paid.AlreadyPaid {
 					if _, err := d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
-						VALUES ($1,$2,'auto_paid',$3) ON CONFLICT DO NOTHING`,
-						b.userID, b.id, due.Format("2006-01-02")); err != nil {
+						VALUES ($1,$2,'auto_paid',$3) ON CONFLICT DO NOTHING`, b.userID, b.id, day); err != nil {
 						jobErrors = append(jobErrors, fmt.Errorf("record biller %d auto-paid alert: %w", b.id, err))
-						failed = true
-						break
 					}
 					autoPosted++
 				}
-				due = advanceDueDate(due, b.freq, b.anchorDay)
+				due = db.AdvanceDue(due, b.freq, b.anchorDay)
 			}
 			if failed {
 				continue
 			}
-			if _, err := d.ExecContext(ctx, `UPDATE fin_billers SET next_due_date = $1, last_run_at = NOW() WHERE id = $2`,
+			if _, err := d.ExecContext(ctx, `UPDATE fin_billers SET next_due_date = $1, last_run_at = NOW() WHERE id = $2 AND next_due_date < $1`,
 				due.Format("2006-01-02"), b.id); err != nil {
 				jobErrors = append(jobErrors, fmt.Errorf("advance biller %d due date: %w", b.id, err))
-				continue
 			}
-			b.dueDate = due.Format("2006-01-02")
+			continue // auto_paid alerts say it after the fact
 		}
-		// 2) upcoming alert: due within alert_days but still in the future
-		// (or today). Suppressed for auto-renew because they get auto_paid
-		// alerts after the fact.
-		if b.autoRenew {
+
+		// 3) Nothing recorded by 8 pm on the due day: one nudge for the cycle.
+		cycle := db.RecurringCycleOn(due, b.freq, b.anchorDay, todayT)
+		late := todayT.After(cycle) && !todayT.After(cycle.AddDate(0, 0, db.RecurringAfter))
+		if (todayT.Equal(cycle) && local.Hour() >= 20) || late {
+			var paid bool
+			d.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_biller_payments WHERE biller_id = $1 AND due_date = $2)`,
+				b.id, cycle.Format("2006-01-02")).Scan(&paid)
+			if !paid {
+				res, err := d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
+					VALUES ($1,$2,'missed',$3) ON CONFLICT DO NOTHING`, b.userID, b.id, cycle.Format("2006-01-02"))
+				if err != nil {
+					jobErrors = append(jobErrors, fmt.Errorf("record biller %d missed alert: %w", b.id, err))
+					continue
+				}
+				if n, _ := res.RowsAffected(); n == 1 {
+					notifyPush(ctx, deps, b.userID, recurringNudge(b.name, b.amount, b.income, cycle, todayT))
+					upcomingNoticed++
+				}
+			}
+		}
+
+		// 2) Upcoming: due within alert_days. Money expected in needs no warning.
+		if b.income {
 			continue
 		}
 		gap := int(due.Sub(todayT).Hours() / 24)
 		if gap >= 0 && gap <= b.alertDays {
 			if b.remindTask {
-				// Opt-in: spawn one bill-pay reminder task for this cycle.
-				// The 'reminder_task' alert row (uniq on biller,kind,due) is
-				// the idempotency sentinel — only create the task when the
-				// insert actually took, so re-runs don't duplicate it. The
-				// task itself carries the nudge, so we skip the 'upcoming'
-				// alert for these billers.
+				// Opt-in: one bill-pay reminder task per cycle; the
+				// 'reminder_task' alert row is the idempotency sentinel.
 				res, err := d.ExecContext(ctx, `INSERT INTO fin_biller_alerts (user_id, biller_id, kind, due_date)
 					VALUES ($1,$2,'reminder_task',$3) ON CONFLICT DO NOTHING`,
 					b.userID, b.id, due.Format("2006-01-02"))
@@ -791,12 +674,7 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 					jobErrors = append(jobErrors, fmt.Errorf("record biller %d reminder alert: %w", b.id, err))
 					continue
 				}
-				n, err := res.RowsAffected()
-				if err != nil {
-					jobErrors = append(jobErrors, fmt.Errorf("read biller %d reminder alert result: %w", b.id, err))
-					continue
-				}
-				if n == 1 {
+				if n, _ := res.RowsAffected(); n == 1 {
 					spawnBillerTask(ctx, deps, b.userID, b.name, due)
 					upcomingNoticed++
 				}
@@ -808,15 +686,9 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 					jobErrors = append(jobErrors, fmt.Errorf("record biller %d upcoming alert: %w", b.id, err))
 					continue
 				}
-				n, err := res.RowsAffected()
-				if err != nil {
-					jobErrors = append(jobErrors, fmt.Errorf("read biller %d upcoming alert result: %w", b.id, err))
-					continue
-				}
 				// First time this cycle's alert lands, nudge any registered
-				// device. The in-app alert row stays the durable record; there
-				// was never an email for this kind, so push is best-effort only.
-				if n == 1 {
+				// device; the alert row is the durable record.
+				if n, _ := res.RowsAffected(); n == 1 {
 					when := "today"
 					if gap == 1 {
 						when = "tomorrow"
@@ -826,15 +698,36 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 					notifyPush(ctx, deps, b.userID, push.Notification{
 						Type:  push.TypeBillDue,
 						Title: "Bill due " + when,
-						Body:  fmt.Sprintf("%s · ₹%.2f due %s", b.name, b.amount, due.Format("Jan 2")),
-						Route: "/finance",
+						Body:  fmt.Sprintf("%s · ₹%s due %s", b.name, formatINR(b.amount), due.Format("Jan 2")),
+						Route: "/finance/billers",
 					})
+					upcomingNoticed++
 				}
-				upcomingNoticed++
 			}
 		}
 	}
 	return autoPosted, upcomingNoticed, errors.Join(jobErrors...)
+}
+
+// recurringNudge words the 8 pm nudge for a cycle with nothing recorded.
+func recurringNudge(name string, amount float64, income bool, cycle, today time.Time) push.Notification {
+	when := "was due today"
+	if today.After(cycle) {
+		when = "was due " + cycle.Format("Jan 2")
+	}
+	if income {
+		when = strings.Replace(when, "was due", "was expected", 1)
+	}
+	body := fmt.Sprintf("₹%s %s. Add it once it's done.", formatINR(amount), when)
+	if amount <= 0 {
+		body = strings.ToUpper(when[:1]) + when[1:] + ". Add it once it's done."
+	}
+	return push.Notification{
+		Type:  push.TypeBillDue,
+		Title: name + " isn't recorded yet",
+		Body:  body,
+		Route: "/finance/billers",
+	}
 }
 
 // spawnBillerTask creates a "Pay {name}" reminder task for a biller's due

@@ -659,7 +659,7 @@ func weeklySummary(deps Deps) http.HandlerFunc {
 			Amount float64 `json:"amount"`
 		}
 		var top *TopCat
-		if rows, err := d.Query(`SELECT t.category_id, COALESCE(c.name, 'Uncategorized'), SUM(`+db.Spend("t")+`) AS total
+		if rows, err := d.Query(`SELECT t.category_id, COALESCE(c.name, 'Unknown'), SUM(`+db.Spend("t")+`) AS total
 			FROM fin_transactions t
 			LEFT JOIN fin_categories c ON c.id = t.category_id
 			WHERE t.user_id = $1 AND t.type IN `+db.SpendTypes+` AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3
@@ -966,7 +966,7 @@ func monthlySummary(deps Deps) http.HandlerFunc {
 			Amount float64 `json:"amount"`
 		}
 		var top *TopCat
-		if rows, err := d.Query(`SELECT t.category_id, COALESCE(c.name, 'Uncategorized'), SUM(`+db.Spend("t")+`) AS total
+		if rows, err := d.Query(`SELECT t.category_id, COALESCE(c.name, 'Unknown'), SUM(`+db.Spend("t")+`) AS total
 			FROM fin_transactions t
 			LEFT JOIN fin_categories c ON c.id = t.category_id
 			WHERE t.user_id = $1 AND t.type IN `+db.SpendTypes+` AND (t.txn_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3

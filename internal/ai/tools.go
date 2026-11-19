@@ -459,7 +459,7 @@ func (s *Service) buildTools() []Tool {
 			Description: "List finance transactions with filters. Each transaction includes its category_id/category_name and the slate it sits on. Filter by slate_id to see everything on one slate — that is how you answer 'what did the Goa trip cost'. Types: expense, income, transfer_out/transfer_in (a transfer_out with to_investment went into that investment), lend (money someone owes), lend_repayment, refund (money back on a purchase; nets off spending, not income) and writeoff (an adjusted lend: the user let it go, so it counts as spending and moves no money; shown as \"Adjusted\").",
 			Schema: obj(map[string]*genai.Schema{
 				"account_id":    intg("Filter by account."),
-				"category_name": str("Filter by category name; several separated by commas match any of them. 'Uncategorised' = expenses, income and refunds with no category."),
+				"category_name": str("Filter by category name; several separated by commas match any of them. 'Unknown' = expenses, income and refunds still waiting for a category (the fallback every such row gets when nothing better fits)."),
 				"date_from":     str("ISO date."),
 				"date_to":       str("ISO date."),
 				"slate_id":      intg("Filter to one slate, from list_slates. Plain is a real slate, so pass its id to see normal life only."),
@@ -513,7 +513,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "finance_month",
-			Description: "How a month's money went, for 'why is this month so high', 'what did I spend on', savings questions: spent (expenses + adjusted lends − refunds; lends and split shares excluded), income, saved and savings rate; vs_usual (Plain spending to the same day, or the whole month once it's over, minus the average of up to 3 earlier months the user recorded in full; usual_basis names them, e.g. 'October' — say 'vs October' when it is one month); projected month end; categories with change vs usual (positive = driving it up, negative = holding it down; uncategorised rows count as Others); top merchants by title; the 5 largest spends; unusual ones with a reason; a 12-month trend. Slates count in totals but not in comparisons. Read-only.",
+			Description: "How a month's money went, for 'why is this month so high', 'what did I spend on', savings questions: spent (expenses + adjusted lends − refunds; lends and split shares excluded), income, saved and savings rate; vs_usual (Plain spending to the same day, or the whole month once it's over, minus the average of up to 3 earlier months the user recorded in full; usual_basis names them, e.g. 'October' — say 'vs October' when it is one month); projected month end; categories with change vs usual (positive = driving it up, negative = holding it down; rows still waiting for a category show as Unknown); top merchants by title; the 5 largest spends; unusual ones with a reason; a 12-month trend. Slates count in totals but not in comparisons. Read-only.",
 			Schema: obj(map[string]*genai.Schema{
 				"month": str("YYYY-MM. Defaults to this month."),
 			}),
@@ -569,7 +569,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_finance_categories",
-			Description: "List the user's finance categories (such as 'Food & Dining', 'Rent', 'Utilities', 'Salary', etc.) with their kind ('expense' or 'income').",
+			Description: "List the user's finance categories (such as 'Food & Dining', 'Rent', 'Utilities', 'Salary', etc.) with their kind ('expense' or 'income'). Each kind has one 'Unknown' (fallback: true): where a row goes when no better category fits; it can't be deleted or renamed, and a row in it still needs sorting.",
 			Schema: obj(map[string]*genai.Schema{
 				"kind": str("Optional filter: 'expense' | 'income'."),
 			}),
@@ -1128,7 +1128,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "list_billers",
-			Description: "List the user's billers with kind ('subscription' = fixed amount, may auto-renew; 'bill' = variable amount like electricity), next due date, amount/estimate, account, and auto-renew flag. Use this to answer 'what bills are coming up?' or before creating a transaction the user might be paying via a biller.",
+			Description: "List the user's recurring items (shown as Billers): payments that repeat (Home Contrib, ChatGPT, electricity) and money expected in (income: true, e.g. Salary). kind 'subscription' = a fixed amount, 'bill' = it varies (amount is an estimate). Each has its next due date, account, frequency and whether Sajni posts it by itself (auto_renew); otherwise it waits for the payment, which ticks it when one that fits is recorded. Use for 'what's coming up?' or 'did Home Contrib go?'.",
 			Schema: obj(map[string]*genai.Schema{
 				"include_archived": boolean("Include archived rows."),
 			}),
@@ -1138,19 +1138,20 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "create_biller",
-			Description: "Create a biller. kind='subscription' (fixed amount required, e.g. Netflix — may auto_renew) or kind='bill' (variable amount like electricity — amount is an optional estimate; the user records the actual when marking paid; never auto-renews). Resolve frequency to one of weekly | fortnightly | monthly | bimonthly. If auto_renew=true an account_id is required; the cron will post the expense automatically each cycle.",
+			Description: "Create a recurring item (shown as a Biller). kind='subscription' for a fixed amount (Netflix, Home Contrib ₹22,000) or 'bill' when it varies (electricity; amount is an optional estimate). income=true for money expected in (Salary). By default it waits: a payment that fits (same account, amount, within 3 days before to 7 after the due date) ticks it, and if nothing is recorded by 8 pm on the due day the user gets one nudge. auto_renew=true makes Sajni post it itself on the due date (needs account_id); only for payments that send no message.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
-				"name":          str("Required. e.g. 'Netflix' or 'Electricity'."),
-				"kind":          str("'subscription' (default) or 'bill'."),
-				"amount":        num("Required for subscriptions; optional estimate for bills."),
-				"frequency":     str("weekly | fortnightly | monthly | bimonthly. Default monthly."),
-				"next_due_date": str("ISO date for the next charge. Defaults to today."),
-				"account_id":    intg("Account that pays this. Required when auto_renew=true."),
-				"category_id":   intg("Optional expense category."),
-				"auto_renew":    boolean("Subscriptions only: cron posts the expense automatically on/after due date."),
-				"remind_task":   boolean("If true (and not auto_renew), the biller cron spawns a 'Pay {name}' reminder task each cycle that emails the user."),
-				"alert_days":    intg("Days before due_date to alert (default 3)."),
+				"name":          str("Required. e.g. 'Netflix', 'Home Contrib', 'Salary'."),
+				"kind":          str("'subscription' (fixed amount, default) or 'bill' (varies)."),
+				"amount":        num("Required for a fixed amount; the estimate when it varies."),
+				"frequency":     str("weekly | fortnightly | monthly | bimonthly | quarterly | yearly. Default monthly."),
+				"next_due_date": str("ISO date of the next payment. Defaults to today. Its day of the month is kept (a 31st stays the last day in shorter months)."),
+				"account_id":    intg("The account it is paid from (or lands in, for income). Required when auto_renew=true."),
+				"category_id":   intg("Optional category (an income category for income)."),
+				"income":        boolean("Money expected in (Salary), not a payment."),
+				"auto_renew":    boolean("Sajni posts it itself on each due date. Off by default."),
+				"remind_task":   boolean("If true (and not auto_renew), a 'Pay {name}' task is made each cycle."),
+				"alert_days":    intg("Days before the due date to alert (default 3)."),
 				"notes":         str("Optional."),
 			}, "name"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
@@ -1159,13 +1160,14 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "pay_biller",
-			Description: "Mark a biller paid for its current cycle and roll next_due_date forward. Default: posts an expense transaction against the biller's account (pass amount for the actual, e.g. a variable bill). Alternative: pass attach_txn_ids to link already-recorded transactions to the cycle instead — no new transaction is created. Idempotent per (biller, due_date); already_paid=true means the cycle was recorded before.",
+			Description: "Mark one cycle of a recurring item paid and move its due date on. Default: posts a row on the item's account (an expense, or income for income items; pass amount for the actual). With attach_txn_ids it links rows already recorded instead and posts nothing; prefer that when the payment is already in transactions (a payment that fits usually ticks the item by itself). Pass due_date from list_billers so a repeat can't pay the next cycle too; already_paid=true means that cycle was recorded before.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"biller_id":      intg("Required."),
-				"amount":         num("Override the biller's amount for this cycle (the actual for a variable bill)."),
-				"paid_date":      str("ISO date. Defaults to today."),
-				"attach_txn_ids": arrayOf(intg(""), "Existing transaction ids to link as this cycle's payment (no new txn is posted)."),
+				"due_date":       str("The cycle's due date as list_billers shows it (next_due_date)."),
+				"amount":         num("Override the item's amount for this cycle (the actual, when it varies)."),
+				"paid_date":      str("ISO date. Defaults to the user's today."),
+				"attach_txn_ids": arrayOf(intg(""), "Existing transaction ids to link as this cycle's payment (nothing is posted)."),
 			}, "biller_id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return payBillerTool(ctx, d, uid, args)
@@ -2054,7 +2056,7 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		for _, n := range strings.Split(names, ",") {
 			switch n = strings.TrimSpace(n); strings.ToLower(n) {
 			case "":
-			case "uncategorised", "uncategorized", "none":
+			case "unknown", "uncategorised", "uncategorized", "none":
 				none = true
 			default:
 				if c := resolveCategoryID(ctx, d, uid, n); c > 0 {
@@ -2067,7 +2069,7 @@ func listTxnsTool(ctx context.Context, d *db.DB, uid string, args map[string]any
 		}
 		clause := fmt.Sprintf("t.category_id = ANY($%d)", len(vals)+1)
 		if none {
-			clause = "(" + clause + " OR (t.category_id IS NULL AND t.type IN ('expense','income','refund','writeoff')))"
+			clause = "(" + clause + " OR t.category_id IN (SELECT id FROM fin_categories WHERE user_id = $1 AND fallback) OR (t.category_id IS NULL AND t.type IN ('expense','income','refund','writeoff')))"
 		}
 		clauses = append(clauses, clause)
 		vals = append(vals, ids)
@@ -4109,10 +4111,7 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 			// 2. Try substring match
 			d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND name ILIKE $2 ORDER BY (kind = $3) DESC LIMIT 1`, uid, "%"+catName+"%", kind).Scan(&catID)
 		}
-		if catID == 0 {
-			// 3. Fallback to default "Other" or "Others"
-			d.QueryRowContext(ctx, `SELECT id FROM fin_categories WHERE user_id = $1 AND (LOWER(name) = 'other' OR LOWER(name) = 'others') ORDER BY (kind = $2) DESC LIMIT 1`, uid, kind).Scan(&catID)
-		}
+		// 3. Nothing by that name: left blank, the row lands in Unknown.
 	}
 
 	// A refund can point at its purchase and borrow its category and slate.
@@ -4207,8 +4206,17 @@ func createTxnTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	if err := db.SyncTags(ctx, tx, uid, "transaction", id, note); err != nil {
 		return nil, nil, err
 	}
+	// A payment that fits a recurring item ticks it.
+	recurring, _, err := db.MatchRecurring(ctx, tx, uid, id, false)
+	if err != nil {
+		return nil, nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, nil, err
+	}
+	if recurring.Name != "" {
+		return map[string]any{"id": id, "amount": amount, "type": ttype, "recurring": recurring.Name, "recurring_due": recurring.Due},
+			map[string]any{"kind": "transaction_created", "id": id, "title": fmt.Sprintf("%s %.2f", ttype, amount), "route": "/finance/transactions"}, nil
 	}
 	return map[string]any{"id": id, "amount": amount, "type": ttype},
 		map[string]any{"kind": "transaction_created", "id": id, "title": fmt.Sprintf("%s %.2f", ttype, amount), "route": "/finance/transactions"}, nil
@@ -4439,7 +4447,7 @@ func listCategoriesTool(ctx context.Context, d *db.DB, uid string, args map[stri
 		clauses = append(clauses, "kind=$2")
 		vals = append(vals, kind)
 	}
-	q := `SELECT id, name, kind, color, icon FROM fin_categories WHERE ` +
+	q := `SELECT id, name, kind, color, icon, fallback FROM fin_categories WHERE ` +
 		strings.Join(clauses, " AND ") + ` ORDER BY kind, name`
 	rows, err := d.QueryContext(ctx, q, vals...)
 	if err != nil {
@@ -4450,10 +4458,13 @@ func listCategoriesTool(ctx context.Context, d *db.DB, uid string, args map[stri
 	for rows.Next() {
 		var id int64
 		var name, k, color, icon string
-		rows.Scan(&id, &name, &k, &color, &icon)
-		out = append(out, map[string]any{
-			"id": id, "name": name, "kind": k, "color": color, "icon": icon,
-		})
+		var fallback bool
+		rows.Scan(&id, &name, &k, &color, &icon, &fallback)
+		item := map[string]any{"id": id, "name": name, "kind": k, "color": color, "icon": icon}
+		if fallback {
+			item["fallback"] = true // Unknown: rows waiting for a category
+		}
+		out = append(out, item)
 	}
 	return map[string]any{"items": out, "count": len(out)}, nil, nil
 }

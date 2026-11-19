@@ -69,10 +69,13 @@ func TestCaptureFilesTheParsesCategory(t *testing.T) {
 	if got := category("swiggy"); got == nil || *got != food {
 		t.Fatalf("Swiggy filed under %v, want Food %d", got, food)
 	}
-	if got := category("odd"); got != nil {
-		t.Fatalf("an automatic Others was filed: %v", *got)
+	// Not placed: the row lands in Unknown for the owner to sort.
+	var unknown int64
+	d.QueryRow(`SELECT fin_category_fallback($1, 'expense')`, uid).Scan(&unknown)
+	if got := category("odd"); got == nil || *got != unknown {
+		t.Fatalf("an automatic Others was filed: %v, want Unknown %d", got, unknown)
 	}
-	if got := category("wrong"); got != nil {
-		t.Fatalf("an expense was filed under an income category: %v", *got)
+	if got := category("wrong"); got == nil || *got != unknown {
+		t.Fatalf("an expense was filed under an income category: %v", got)
 	}
 }

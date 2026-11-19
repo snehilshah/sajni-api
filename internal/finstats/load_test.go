@@ -9,8 +9,9 @@ import (
 	"sajni/internal/dbtest"
 )
 
-// Load: blank categories join the user's Others, and a debt from before
-// Sajni doesn't move the start of history.
+// Load: a blank category becomes the user's Unknown (the database's
+// default), deleting a category moves its rows there too, and a debt from
+// before Sajni doesn't move the start of history.
 func TestLoad(t *testing.T) {
 	dsn := dbtest.URL(t)
 	if dsn == "" {
@@ -55,9 +56,29 @@ func TestLoad(t *testing.T) {
 	if len(rows) != 2 {
 		t.Fatalf("rows: %+v", rows)
 	}
-	for _, r := range rows {
-		if r.CategoryID == nil || *r.CategoryID != others || r.Category != "Others" || r.Color != "#123456" {
-			t.Fatalf("not one Others: %+v", r)
-		}
+	var unknown int64
+	must(d.QueryRow(`SELECT id FROM fin_categories WHERE user_id = $1 AND kind = 'expense' AND fallback AND name = 'Unknown'`, uid).Scan(&unknown))
+	if r := rows[0]; r.CategoryID == nil || *r.CategoryID != unknown || r.Category != "Unknown" {
+		t.Fatalf("blank row: %+v", r)
 	}
+	if r := rows[1]; r.CategoryID == nil || *r.CategoryID != others || r.Category != "Others" || r.Color != "#123456" {
+		t.Fatalf("Others row: %+v", r)
+	}
+	// Deleting Others moves its row to Unknown; the owed row stays blank.
+	_, err = d.Exec(`DELETE FROM fin_categories WHERE id = $1`, others)
+	must(err)
+	var blanks, inUnknown int
+	must(d.QueryRow(`SELECT COUNT(*) FILTER (WHERE category_id IS NULL), COUNT(*) FILTER (WHERE category_id = $2) FROM fin_transactions WHERE user_id = $1`, uid, unknown).Scan(&blanks, &inUnknown))
+	if blanks != 1 || inUnknown != 2 {
+		t.Fatalf("after delete: %d blank, %d Unknown", blanks, inUnknown)
+	}
+	// An income row gets the income Unknown; deleting the user still works.
+	add("income", nil, "2026-10-03T10:00:00+05:30")
+	var kind string
+	must(d.QueryRow(`SELECT c.kind FROM fin_transactions t JOIN fin_categories c ON c.id = t.category_id WHERE t.user_id = $1 AND t.type = 'income'`, uid).Scan(&kind))
+	if kind != "income" {
+		t.Fatalf("income row's Unknown kind = %q", kind)
+	}
+	_, err = d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	must(err)
 }
