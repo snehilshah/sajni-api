@@ -404,6 +404,25 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 			}
 		}
 
+		// A broker or wallet confirming money from the owner's bank names both
+		// accounts ("credited to your Kotak Neo account … Account number
+		// XXXXXX2851"), and the hint can land on the bank, which already holds
+		// this payment's other side. Money can't leave an account and come
+		// back to it as the owner's own: this side belongs to the other
+		// account the message names.
+		if own && acct != nil && !b.Force && !receipt {
+			if other := otherNamedAccount(ctx, tx, uid, b.Text, *acct); other != 0 {
+				if _, _, ok, err := ownMoneySide(ctx, tx, uid, channel, typ, parsed.Amount, *acct, txnAt, receivedAt, own, true); err != nil {
+					internalError(w, r, "own money side", err)
+					return
+				} else if ok {
+					acct = &other
+					fields["account_id"] = acct
+					card = accountType(ctx, tx, uid, other) == "credit_card"
+				}
+			}
+		}
+
 		if acct != nil && !b.Force {
 			// The bank confirming an instalment Sajni posted (RD, SIP).
 			if typ == "expense" {
@@ -816,6 +835,47 @@ func ownName(ctx context.Context, d *db.DB, uid, payee string) bool {
 // at least one of the two messages saying the money stayed the owner's.
 // Returns that row and its account's name.
 func pairOwnMoney(ctx context.Context, tx *sql.Tx, uid, channel, typ string, amount float64, acct int64, at, received time.Time, own bool) (int64, string, bool, error) {
+	return ownMoneySide(ctx, tx, uid, channel, typ, amount, acct, at, received, own, false)
+}
+
+// otherNamedAccount returns the one account other than acct that text names
+// by its name or a name hint (whole words, the longest wins; a tie between
+// two accounts is no answer), or 0.
+func otherNamedAccount(ctx context.Context, tx *sql.Tx, uid, text string, acct int64) int64 {
+	rows, err := tx.QueryContext(ctx, `SELECT id, name, COALESCE(match_hints,'') FROM fin_accounts WHERE user_id = $1 AND archived = false AND id <> $2`, uid, acct)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+	s := strings.ToLower(text)
+	var best int64
+	bestTok, tie := "", false
+	for rows.Next() {
+		var id int64
+		var name, hints string
+		if rows.Scan(&id, &name, &hints) != nil {
+			continue
+		}
+		for _, tok := range append(splitMatchHints(hints), strings.ToLower(strings.TrimSpace(name))) {
+			if isAllDigits(tok) || len(tok) < 4 || len(tok) < len(bestTok) || !hasWord(s, tok) {
+				continue
+			}
+			if len(tok) == len(bestTok) {
+				tie = tie || id != best
+				continue
+			}
+			best, bestTok, tie = id, tok, false
+		}
+	}
+	if tie {
+		return 0
+	}
+	return best
+}
+
+// ownMoneySide finds the other side of own money on another account, or
+// with same, on acct itself (a sign the message's account is the wrong one).
+func ownMoneySide(ctx context.Context, tx *sql.Tx, uid, channel, typ string, amount float64, acct int64, at, received time.Time, own, same bool) (int64, string, bool, error) {
 	other := "income"
 	if typ == "income" {
 		other = "expense"
@@ -826,11 +886,11 @@ func pairOwnMoney(ctx context.Context, tx *sql.Tx, uid, channel, typ string, amo
 		SELECT t.id, a.name FROM fin_transactions t
 		JOIN fin_accounts a ON a.id = t.account_id
 		JOIN fin_captures c ON c.txn_id = t.id AND c.outcome = 'created'
-		WHERE t.user_id = $1 AND t.type = $2 AND ABS(t.amount - $3) < 0.005 AND t.account_id <> $4
+		WHERE t.user_id = $1 AND t.type = $2 AND ABS(t.amount - $3) < 0.005 AND (t.account_id = $4) = $10
 		  AND c.channel <> $5 AND ($8 OR c.own_money)
 		  AND (ABS(EXTRACT(EPOCH FROM (t.txn_at - $6))) <= $9 OR ABS(EXTRACT(EPOCH FROM (c.received_at - $7))) <= $9)
 		ORDER BY ABS(EXTRACT(EPOCH FROM (t.txn_at - $6))) LIMIT 1`,
-		uid, other, amount, acct, channel, at, received, own, captureCopyWindow.Seconds()).Scan(&id, &name)
+		uid, other, amount, acct, channel, at, received, own, captureCopyWindow.Seconds(), same).Scan(&id, &name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, "", false, nil
 	}
@@ -958,18 +1018,21 @@ func betterTitle(ctx context.Context, tx *sql.Tx, uid string, rowID int64, name 
 	if name == "" {
 		return "", nil
 	}
-	var title string
+	var title, typ string
 	var captured sql.NullString
 	var untouched bool
-	err := tx.QueryRowContext(ctx, `SELECT t.description,
+	err := tx.QueryRowContext(ctx, `SELECT t.description, t.type,
 			(SELECT c.description FROM fin_captures c WHERE c.txn_id = t.id AND c.outcome = 'created' ORDER BY c.id LIMIT 1),
 			t.updated_at <= t.created_at + INTERVAL '2 seconds'
-		FROM fin_transactions t WHERE t.id = $1 AND t.user_id = $2`, rowID, uid).Scan(&title, &captured, &untouched)
+		FROM fin_transactions t WHERE t.id = $1 AND t.user_id = $2`, rowID, uid).Scan(&title, &typ, &captured, &untouched)
 	if errors.Is(err, sql.ErrNoRows) || !captured.Valid {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
+	}
+	if typ != "expense" && typ != "income" {
+		return "", nil // a transfer's title names its accounts
 	}
 	title = strings.TrimSpace(title)
 	capTitle := strings.TrimSpace(captured.String)
@@ -978,7 +1041,10 @@ func betterTitle(ctx context.Context, tx *sql.Tx, uid string, rowID int64, name 
 		return "", nil
 	}
 	cut := title != "" && len(name) > len(title) && strings.HasPrefix(strings.ToLower(name), strings.ToLower(title))
-	if !receipt && !cut {
+	// The first copy named no one ("₹8,850 debited" from the Kotak app), so
+	// the row carries a stand-in like "Expense": any name is better.
+	unnamed := capTitle == ""
+	if !receipt && !cut && !unnamed {
 		return "", nil
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE fin_transactions SET description = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3`, name, rowID, uid); err != nil {

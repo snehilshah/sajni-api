@@ -234,4 +234,38 @@ func TestCaptureSafety(t *testing.T) {
 	if rec.Code != 201 || outcome != "created" || linked != made.ID {
 		t.Fatalf("filed review: %d %s; capture %s → %d", rec.Code, rec.Body.String(), outcome, linked)
 	}
+
+	// 19 Nov, ₹8,850 from Salary to Kotak Neo for trading: the Kotak app
+	// (no name), Kotak Neo's email naming the source "XXXXXX2851", then the
+	// bank's SMS. One transfer, Salary → Kotak Neo.
+	neo := acct("Kotak Neo", "investment", "Kotak Neo, Kotak Securities")
+	app := parse("₹8,850 debited\nAmount debited from XX2851. Check out details.",
+		ai.ParsedTxn{Amount: 8850, Type: "expense", Date: "2026-11-19", AccountHint: "2851"})
+	mail := parse("Kotak Neo\nPayment successful for your Kotak neo account\nYour fund transfer of Rs. 8850.00 has been successfully credited to your Kotak Neo account.\nBank name: Kotak Mahindra Bank\nAccount number: XXXXXX2851\nReference number: SqTQKr1795079293",
+		ai.ParsedTxn{Amount: 8850, Type: "income", Description: "Kotak Neo", Date: "2026-11-19", Time: "14:38", AccountHint: "2851", RefID: "SqTQKr1795079293", OwnMoney: true})
+	bank := parse("Rs.8,850.00 has been debited from your Kotak Bank A/c XX2851 towards KSec trading account via Kotak Direct Access on 19-NOV-26 vide Ref No.0061473528",
+		ai.ParsedTxn{Amount: 8850, Type: "expense", Description: "Ksec Trading Account", Date: "2026-11-19", AccountHint: "2851", RefID: "0061473528", OwnMoney: true})
+	m = mark()
+	if c := post(app, "notification", "com.kotak.bank.mobile", "2026-11-19T14:38:21+05:30"); c.Outcome != "created" {
+		t.Fatalf("Kotak app: %+v", c)
+	}
+	if c := post(mail, "notification", "com.google.android.gm/kotak neo/payment successful for your kotak neo account", "2026-11-19T14:38:22+05:30"); c.Outcome != "created" || c.Transfer != "Salary → Kotak Neo" {
+		t.Fatalf("Kotak Neo's email: %+v", c)
+	}
+	if c := post(bank, "sms", "JD-KOTAKB-S", "2026-11-19T15:07:41+05:30"); c.Outcome != "absorbed" {
+		t.Fatalf("Kotak's SMS: %+v", c)
+	}
+	if got := rowsSince(m); len(got) != 2 || got[0] != (row{"transfer_out", "Transfer to Kotak Neo", 8850, salary}) || got[1] != (row{"transfer_in", "Transfer to Kotak Neo", 8850, neo}) {
+		t.Fatalf("₹8,850 to Kotak Neo: %+v", got)
+	}
+
+	// A first copy that names no one takes the next copy's name.
+	m = mark()
+	post(parse("₹500 debited\nAmount debited from XX2851.", ai.ParsedTxn{Amount: 500, Type: "expense", Date: "2026-11-19", AccountHint: "2851"}),
+		"notification", "com.kotak.bank.mobile", "2026-11-19T18:00:00+05:30")
+	post(parse("Sent Rs.500.00 from Kotak Bank A/c X2851 to RAMESH KUMAR on 19-11-26. UPI Ref 632300000001.", ai.ParsedTxn{Amount: 500, Type: "expense", Description: "Ramesh Kumar", Date: "2026-11-19", AccountHint: "2851", RefID: "632300000001"}),
+		"sms", "JD-KOTAKB-S", "2026-11-19T18:00:20+05:30")
+	if got := rowsSince(m); len(got) != 1 || got[0].title != "Ramesh Kumar" {
+		t.Fatalf("unnamed first copy: %+v", got)
+	}
 }
