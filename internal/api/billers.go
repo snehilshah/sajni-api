@@ -531,7 +531,8 @@ func markBillerAlertSeen(deps Deps) http.HandlerFunc {
 // ProcessBillerCron walks every active recurring item for every user and:
 //  1. auto_renew items: posts each cycle due by today (dated its own due
 //     day), never one due before the item existed;
-//  2. raises an "upcoming" alert alert_days before a payment's due date;
+//  2. from 9 am, raises an "upcoming" alert alert_days before a payment's
+//     due date (0 = the morning of the due day);
 //  3. at 8 pm on a due day (or later, inside the cycle's window) with
 //     nothing paid for it, nudges once: Home Contrib isn't recorded yet.
 //
@@ -658,8 +659,9 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 			}
 		}
 
-		// 2) Upcoming: due within alert_days. Money expected in needs no warning.
-		if b.income {
+		// 2) Upcoming: due within alert_days, from 9 am (the first sweep after
+		// midnight would wake the owner). Money expected in needs no warning.
+		if b.income || local.Hour() < 9 {
 			continue
 		}
 		gap := int(due.Sub(todayT).Hours() / 24)
