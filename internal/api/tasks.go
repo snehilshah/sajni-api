@@ -366,8 +366,18 @@ func listTasks(deps Deps) http.HandlerFunc {
 		// Dates are the USER's local day (userNow), not the server's UTC
 		// CURRENT_DATE — otherwise an IST user between 00:00–05:30 sees the
 		// wrong "today"/"overdue" set.
-		const active = "t.status NOT IN ('done','scratched')"
-		today := userNow(d, uid).Format("2006-01-02")
+		active := "t.status NOT IN ('done','scratched')"
+		now := userNow(d, uid)
+		today := now.Format("2006-01-02")
+		// done_today=1 (the Board): these views also keep what was finished
+		// today, so a card dropped on Done stays in its lane instead of
+		// vanishing from a view that only lists open tasks.
+		if queryParam(r, "done_today") == "1" {
+			dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+			active = "(t.status NOT IN ('done','scratched') OR (t.status = 'done' AND t.updated_at >= $" + itoa(ph) + "))"
+			args = append(args, dayStart)
+			ph++
+		}
 		switch queryParam(r, "smart") {
 		case "my_day":
 			clauses = append(clauses, "t.due_date = $"+itoa(ph), active)

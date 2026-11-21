@@ -83,3 +83,47 @@ func TestBoardRankIsArrangementNotAnEdit(t *testing.T) {
 		t.Fatalf("single attachment_count = %d", tr.AttachmentCount)
 	}
 }
+
+// Views that list open tasks (My Day, Planned…) keep what was finished today
+// for the Board (done_today=1), so a card dropped on Done doesn't vanish.
+func TestBoardKeepsDoneToday(t *testing.T) {
+	d, err := db.New(dbtest.URL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	uid := "01900000-0000-7000-8000-0000000000b1"
+	d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	d.Exec(`INSERT INTO users (id, email, name, timezone) VALUES ($1, 'board2@test', 'T', 'Asia/Kolkata')`, uid)
+	defer d.Exec(`DELETE FROM users WHERE id = $1`, uid)
+	mux := http.NewServeMux()
+	registerTaskRoutes(mux, Deps{DB: d})
+	titles := func(q string) map[string]bool {
+		req := httptest.NewRequest("GET", "/api/tasks?"+q, nil)
+		req = req.WithContext(context.WithValue(req.Context(), auth.ContextKey{}, uid))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		var list []taskRow
+		json.Unmarshal(rec.Body.Bytes(), &list)
+		out := map[string]bool{}
+		for _, x := range list {
+			out[x.Title] = true
+		}
+		return out
+	}
+	d.Exec(`INSERT INTO tasks (user_id, title, status, due_date) VALUES
+		($1, 'open', 'todo', (now() AT TIME ZONE 'Asia/Kolkata')::date),
+		($1, 'done now', 'done', (now() AT TIME ZONE 'Asia/Kolkata')::date)`, uid)
+	d.Exec(`INSERT INTO tasks (user_id, title, status, due_date, updated_at) VALUES
+		($1, 'done before', 'done', (now() AT TIME ZONE 'Asia/Kolkata')::date, now() - interval '2 days')`, uid)
+
+	if got := titles("smart=my_day"); !got["open"] || got["done now"] || got["done before"] {
+		t.Fatalf("my_day: %v", got)
+	}
+	if got := titles("smart=my_day&done_today=1"); !got["open"] || !got["done now"] || got["done before"] {
+		t.Fatalf("my_day&done_today: %v", got)
+	}
+	if got := titles("smart=planned&done_today=1"); !got["done now"] || got["done before"] {
+		t.Fatalf("planned&done_today: %v", got)
+	}
+}
