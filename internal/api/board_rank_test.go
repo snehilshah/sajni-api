@@ -62,7 +62,24 @@ func TestBoardRankIsArrangementNotAnEdit(t *testing.T) {
 	_, b = call("GET", "/api/tasks", nil)
 	var list []taskRow
 	json.Unmarshal(b, &list)
-	if len(list) != 1 || list[0].BoardRank == nil {
+	if len(list) != 1 || list[0].BoardRank == nil || list[0].AttachmentCount != 0 {
 		t.Fatalf("list: %s", b)
+	}
+
+	// The board shows how many images a task has.
+	for i := 0; i < 2; i++ {
+		if _, err := d.Exec(`INSERT INTO task_attachments (user_id, task_id, filename, content_type) VALUES ($1, $2, $3, 'image/png')`, uid, id, "a"+strconv.Itoa(i)+".png"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, b = call("GET", "/api/tasks", nil)
+	json.Unmarshal(b, &list)
+	if list[0].AttachmentCount != 2 {
+		t.Fatalf("attachment_count = %d", list[0].AttachmentCount)
+	}
+	_, b = call("GET", path, nil)
+	json.Unmarshal(b, &tr)
+	if tr.AttachmentCount != 2 {
+		t.Fatalf("single attachment_count = %d", tr.AttachmentCount)
 	}
 }

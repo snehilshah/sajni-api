@@ -230,6 +230,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			       t.list_id, t.parent_task_id, parent.title, t.blocked_by_task_id,
 			       blocker.title, blocker.status, t.important, t.steps,
 			       COALESCE(t.sort_order, 0), t.board_rank,
+			       (SELECT count(*) FROM task_attachments ta WHERE ta.task_id = t.id)::int,
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
 			       t.created_at, t.updated_at, t.plan_id, plan.name, t.recurrence
 			FROM tasks t
@@ -250,7 +251,7 @@ func getTask(deps Deps) http.HandlerFunc {
 			&t.Remind, &t.RemindedAt, &emailsRaw,
 			&t.ListID, &t.ParentTaskID, &t.ParentTaskTitle, &t.BlockedByTaskID,
 			&t.BlockedByTaskTitle, &t.BlockedByTaskStatus, &t.Important, &stepsRaw,
-			&t.SortOrder, &t.BoardRank, &t.SubtaskCount, &t.SubtasksDone,
+			&t.SortOrder, &t.BoardRank, &t.AttachmentCount, &t.SubtaskCount, &t.SubtasksDone,
 			&t.CreatedAt, &t.UpdatedAt, &t.PlanID, &t.PlanName, &recurrenceRaw,
 		)
 		if err != nil {
@@ -306,7 +307,8 @@ type taskRow struct {
 	Important           bool     `json:"important"`
 	Steps               []Step   `json:"steps"`
 	SortOrder           int      `json:"sort_order"`
-	BoardRank           *float64 `json:"board_rank"` // place in its Board lane; null = by updated_at
+	BoardRank           *float64 `json:"board_rank"`       // place in its Board lane; null = by updated_at
+	AttachmentCount     int      `json:"attachment_count"` // images in its Images section (board shows the count)
 	SubtaskCount        int      `json:"subtask_count"`
 	SubtasksDone        int      `json:"subtasks_done"`
 	// Subtasks are embedded (brief shape) so the list view can render the
@@ -476,6 +478,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 			       t.list_id, t.parent_task_id, parent.title, t.blocked_by_task_id,
 			       blocker.title, blocker.status, t.important, t.steps,
 			       COALESCE(t.sort_order, 0), t.board_rank,
+			       (SELECT count(*) FROM task_attachments ta WHERE ta.task_id = t.id)::int,
 			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
 			       t.created_at, t.updated_at, t.plan_id, plan.name, t.recurrence
 			FROM tasks t
@@ -510,7 +513,7 @@ func listTasks(deps Deps) http.HandlerFunc {
 				&t.Remind, &t.RemindedAt, &emailsRaw,
 				&t.ListID, &t.ParentTaskID, &t.ParentTaskTitle, &t.BlockedByTaskID,
 				&t.BlockedByTaskTitle, &t.BlockedByTaskStatus, &t.Important, &stepsRaw,
-				&t.SortOrder, &t.BoardRank, &t.SubtaskCount, &t.SubtasksDone,
+				&t.SortOrder, &t.BoardRank, &t.AttachmentCount, &t.SubtaskCount, &t.SubtasksDone,
 				&t.CreatedAt, &t.UpdatedAt, &t.PlanID, &t.PlanName, &recurrenceRaw,
 			); err != nil {
 				errJSON(w, 500, err.Error())
