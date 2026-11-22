@@ -374,10 +374,8 @@ func listTasks(deps Deps) http.HandlerFunc {
 		today := now.Format("2006-01-02")
 		// done=recent (both clients' Tasks screen): Done holds what was done
 		// in the last 7 days, in every view (My Day included); older done
-		// tasks are in the Archive (GET /api/tasks/archive). done_today=1 is
-		// the old Board's name for it (web v0.88); drop it after a release.
-		recentDone := queryParam(r, "done") == "recent" || queryParam(r, "done_today") == "1"
-		if recentDone {
+		// tasks are in the Archive (GET /api/tasks/archive).
+		if queryParam(r, "done") == "recent" {
 			n := itoa(ph)
 			active = "(t.status NOT IN ('done','scratched') OR (t.status = 'done' AND COALESCE(t.done_at, t.updated_at) >= $" + n + "))"
 			clauses = append(clauses, "NOT (t.status = 'done' AND COALESCE(t.done_at, t.updated_at) < $"+n+")")
@@ -478,13 +476,8 @@ func listTasks(deps Deps) http.HandlerFunc {
 			args = append(args, mo)
 			ph++
 		}
-		// done_date: tasks done on that day (Journal). completed_date is its
-		// old name, still sent by older Android and web builds.
-		dd := queryParam(r, "done_date")
-		if dd == "" {
-			dd = queryParam(r, "completed_date")
-		}
-		if dd != "" {
+		// done_date: tasks done on that day (Journal).
+		if dd := queryParam(r, "done_date"); dd != "" {
 			clauses = append(clauses, "t.status = 'done' AND t.updated_at::date = $"+itoa(ph))
 			args = append(args, dd)
 		}

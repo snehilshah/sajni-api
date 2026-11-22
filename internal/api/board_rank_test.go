@@ -147,7 +147,7 @@ func TestDoneIsSevenDaysThenArchive(t *testing.T) {
 	if got := titles("smart=all"); !got["done 30d"] {
 		t.Fatalf("all: %v", got)
 	}
-	for _, q := range []string{"smart=my_day&done=recent", "smart=planned&done=recent", "smart=my_day&done_today=1", "smart=all&done=recent"} {
+	for _, q := range []string{"smart=my_day&done=recent", "smart=planned&done=recent", "smart=all&done=recent"} {
 		got := titles(q)
 		if !got["open"] || !got["done now"] || !got["done 3d"] || got["done 9d"] || got["done 30d"] {
 			t.Fatalf("%s: %v", q, got)

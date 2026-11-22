@@ -314,11 +314,6 @@ func (d *DB) ensureSchema() error {
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
-	-- Prod's tasks table predates board_rank (2026-11-16); drop once shipped.
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS board_rank DOUBLE PRECISION;
-	-- Prod's tasks table predates done_at (2026-11-22); drop once shipped
-	-- (with its backfill after task_events).
-	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS done_at TIMESTAMPTZ;
 	-- Every writer (REST, AI, MCP, the repeat sweep, goal roll-ups) gets
 	-- done_at from here: stamped when a task becomes done, cleared when it
 	-- stops being done. An insert may bring its own (a restore).
@@ -1217,12 +1212,6 @@ func (d *DB) ensureSchema() error {
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
-	-- One-time (2026-11-22): date prod's done tasks by their last move to
-	-- done, else updated_at. Drop once shipped.
-	UPDATE tasks t SET done_at = COALESCE((
-		SELECT max(e.created_at) FROM task_events e
-		 WHERE e.task_id = t.id AND e.kind = 'status' AND e.to_val = 'done'), t.updated_at)
-	 WHERE t.status = 'done' AND t.done_at IS NULL;
 
 	-- ─── Tasks: multiple reminders ────────────────────────────────────
 	-- The legacy single reminder (tasks.remind + scheduled_at) only fires on

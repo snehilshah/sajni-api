@@ -87,8 +87,7 @@ func getAnalytics(deps Deps) http.HandlerFunc {
 		result["habit_streaks"] = streaks
 
 		// Task velocity: tasks done per week, last 8 weeks (by when they
-		// were done). "completed" is the old name for "done" (web v0.88);
-		// drop it after a release.
+		// were done).
 		velocity := []map[string]any{}
 		vrows, _ := d.Query(`
 			SELECT to_char(COALESCE(done_at, updated_at), 'IYYY-"W"IW') AS week, COUNT(*) AS done
@@ -100,7 +99,7 @@ func getAnalytics(deps Deps) http.HandlerFunc {
 				var week string
 				var done int
 				vrows.Scan(&week, &done)
-				velocity = append(velocity, map[string]any{"week": week, "done": done, "completed": done})
+				velocity = append(velocity, map[string]any{"week": week, "done": done})
 			}
 			vrows.Close()
 		}
