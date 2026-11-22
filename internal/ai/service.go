@@ -797,8 +797,13 @@ func (s *Service) CategorizeExpense(ctx context.Context, title, kind string, cat
 	}
 	// The Decisions API first (fast, calibrated, a fraction of the cost);
 	// the generative call below is the fallback when it can't answer.
-	if picked, cost, ok := s.chooseCategory(ctx, title, kind, categories); ok {
-		return picked, cost, nil
+	what := "an expense"
+	if kind == "income" {
+		what = "income"
+	}
+	input := "Title of " + what + " from a bank, card or UPI payment: " + title
+	if picked, _, ok := s.chooseCategory(ctx, input, kind, categories); ok {
+		return picked, len(input) / 4, nil
 	}
 
 	// Build the closed-set list. "Others" is always appended as the

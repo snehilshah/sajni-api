@@ -3735,15 +3735,24 @@ func parseTransactionMessage(deps Deps) http.HandlerFunc {
 
 		cctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
 		defer cancel()
-		out := resolveParsedTransaction(cctx, deps, uid, parsed, loc, now, body.Auto)
+		out := resolveParsedTransaction(cctx, deps, uid, parsed, text, loc, now, body.Auto)
 		writeJSON(w, 200, out)
 	}
 }
 
-// resolveParsedTransaction adds the account and category to a parse. For an
-// automatic capture an AI guess of "Others" is left blank, so the row lands
-// in Unknown for the owner to sort rather than looking filed.
-func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed ai.ParsedTxn, loc *time.Location, now time.Time, auto bool) map[string]any {
+// autoCategoryMinConfidence: an automatic capture takes the Decisions
+// API's category only when it's at least this sure; below it the row lands
+// in Unknown for the owner to sort. The ledger (ai_calls.confidence) is
+// where to tune it.
+const autoCategoryMinConfidence = 0.5
+
+// resolveParsedTransaction adds the account and category to a parse. The
+// category comes from, in order: the owner's merchant rules; the Gemini
+// Decisions API on the message and what was read from it (source is the
+// message, "" for an image); the category the parse itself picked. For an
+// automatic capture "Others" or an unsure pick stays blank, so the row
+// lands in Unknown for the owner to sort rather than looking filed.
+func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed ai.ParsedTxn, source string, loc *time.Location, now time.Time, auto bool) map[string]any {
 	var catID *int64
 	var catName string
 	if parsed.Amount > 0 && strings.TrimSpace(parsed.Description) != "" {
@@ -3753,23 +3762,14 @@ func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed
 		}
 		if id, name := lookupMerchantCategory(deps.DB, uid, parsed.Description, kind); id != nil {
 			catID, catName = id, name
-		} else if parsed.Category != "" {
-			// Chosen in the parse itself. For an automatic capture "Others"
-			// stays blank, so the row lands in Unknown, not filed.
-			if name := parsed.Category; !(auto && strings.EqualFold(name, "Others")) {
-				var id int64
-				if deps.DB.QueryRowContext(ctx, `SELECT id, name FROM fin_categories WHERE user_id=$1 AND kind=$2 AND LOWER(name)=LOWER($3) ORDER BY id LIMIT 1`, uid, kind, name).Scan(&id, &name) == nil {
-					catID, catName = &id, name
-				}
-			}
-		} else if deps.AI != nil {
+		} else {
 			type cat struct {
 				id   int64
 				name string
 			}
 			var cats []cat
 			var names []string
-			if crows, qerr := deps.DB.Query(`SELECT id, name FROM fin_categories WHERE user_id=$1 AND kind=$2 AND NOT fallback ORDER BY name`, uid, kind); qerr == nil {
+			if crows, qerr := deps.DB.QueryContext(ctx, `SELECT id, name FROM fin_categories WHERE user_id=$1 AND kind=$2 AND NOT fallback ORDER BY name`, uid, kind); qerr == nil {
 				for crows.Next() {
 					var c cat
 					if crows.Scan(&c.id, &c.name) == nil {
@@ -3779,15 +3779,30 @@ func resolveParsedTransaction(ctx context.Context, deps Deps, uid string, parsed
 				}
 				crows.Close()
 			}
-			picked, _, cerr := deps.AI.CategorizeExpense(ctx, parsed.Description, kind, names)
-			if cerr == nil && !(auto && strings.EqualFold(strings.TrimSpace(picked), "others")) {
+			pick := func(name string) {
 				for _, c := range cats {
-					if strings.EqualFold(c.name, picked) {
+					if strings.EqualFold(c.name, strings.TrimSpace(name)) {
 						id := c.id
 						catID, catName = &id, c.name
-						break
+						return
 					}
 				}
+			}
+			decided := false
+			if deps.AI != nil && len(names) > 0 {
+				name, conf, ok := deps.AI.ChooseTxnCategory(ctx, ai.TxnFacts{
+					Type: kind, Amount: parsed.Amount, Description: parsed.Description, Note: parsed.Note, Message: source,
+				}, names)
+				if ok {
+					decided = true
+					if !(auto && (strings.EqualFold(name, "Others") || conf < autoCategoryMinConfidence)) {
+						pick(name)
+					}
+				}
+			}
+			// The Decisions API couldn't answer: the parse's own pick.
+			if !decided && parsed.Category != "" && !(auto && strings.EqualFold(parsed.Category, "Others")) {
+				pick(parsed.Category)
 			}
 		}
 	}
@@ -3913,7 +3928,7 @@ func parseTransactionImage(deps Deps) http.HandlerFunc {
 			return
 		}
 
-		out := resolveParsedTransaction(ctx, deps, uid, parsed, loc, now, false)
+		out := resolveParsedTransaction(ctx, deps, uid, parsed, "", loc, now, false)
 		writeJSON(w, 200, out)
 	}
 }

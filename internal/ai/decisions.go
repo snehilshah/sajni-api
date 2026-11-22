@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -68,10 +69,45 @@ func (s *Service) logEvent(err error) *zerolog.Event {
 	return log.Info()
 }
 
+// TxnFacts is what's known about a transaction when choosing its category.
+type TxnFacts struct {
+	Type        string // expense | income
+	Amount      float64
+	Description string // the payee or shop as read
+	Note        string
+	Message     string // the bank message or pasted text it came from ("" for an image)
+}
+
+// ChooseTxnCategory picks one of categories (or Others) for a captured
+// transaction with the Decisions API, from the message and what was read
+// from it. ok is false when it couldn't answer; conf is the pick's
+// calibrated probability.
+func (s *Service) ChooseTxnCategory(ctx context.Context, f TxnFacts, categories []string) (string, float64, bool) {
+	kind := f.Type
+	if kind != "income" {
+		kind = "expense"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s of %s", map[string]string{"expense": "Expense", "income": "Income"}[kind], strconv.FormatFloat(f.Amount, 'f', -1, 64))
+	if d := strings.TrimSpace(f.Description); d != "" {
+		b.WriteString(" · Paid to/from: " + d)
+	}
+	if n := strings.TrimSpace(f.Note); n != "" {
+		b.WriteString(" · Note: " + n)
+	}
+	if m := strings.TrimSpace(f.Message); m != "" {
+		if len(m) > 1500 {
+			m = m[:1500]
+		}
+		b.WriteString("\nMessage it came from:\n" + m)
+	}
+	return s.chooseCategory(ctx, b.String(), kind, categories)
+}
+
 // chooseCategory picks one of categories (plus Others) for a transaction
-// title with the Decisions API. ok is false when it couldn't answer, so the
-// caller falls back to the generative path.
-func (s *Service) chooseCategory(ctx context.Context, title, kind string, categories []string) (string, int, bool) {
+// described by input, with the Decisions API. ok is false when it couldn't
+// answer, so the caller falls back.
+func (s *Service) chooseCategory(ctx context.Context, input, kind string, categories []string) (string, float64, bool) {
 	options := map[string]string{}
 	canon := map[string]string{}
 	for _, c := range append(append([]string(nil), categories...), "Others") {
@@ -83,20 +119,19 @@ func (s *Service) chooseCategory(ctx context.Context, title, kind string, catego
 		canon[key] = c
 		options[c] = ""
 	}
-	what, whose := "an expense", "spending"
+	whose := "spending"
 	if kind == "income" {
-		what, whose = "income", "income"
+		whose = "income"
 	}
-	input := "Title of " + what + " from a bank, card or UPI payment: " + title
-	instr := "Which of the user's own " + whose + " categories does this belong to? Use Others only if nothing fits."
-	choice, _, err := s.choose(ctx, "categorize", input, instr, options)
+	instr := "Which of the user's own " + whose + " categories does this transaction belong to? Use Others only if nothing fits."
+	choice, conf, err := s.choose(ctx, "categorize", input, instr, options)
 	if err != nil {
 		// Including a budget refusal: the fallback asks the same gate and
 		// returns its error to the caller without calling Gemini.
 		return "", 0, false
 	}
 	if c, ok := canon[strings.ToLower(choice)]; ok {
-		return c, len(input) / 4, true
+		return c, conf, true
 	}
 	return "", 0, false
 }
@@ -139,4 +174,10 @@ func (s *Service) postDecision(ctx context.Context, body []byte) (string, float6
 		return "", 0, u, errors.New("decisions api: no answer")
 	}
 	return a.Choice, a.Confidence, u, nil
+}
+
+// NewDecisionsOnly is a Service that can only call the Decisions API at
+// url: for other packages' tests.
+func NewDecisionsOnly(apiKey, url string) *Service {
+	return &Service{model: "test", apiKey: apiKey, decisionsURL: url}
 }

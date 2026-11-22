@@ -315,7 +315,7 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 			ref = normRef(parsed.RefID)
 		}
 		cctx, ccancel := context.WithTimeout(ctx, 6*time.Second)
-		fields := resolveParsedTransaction(cctx, deps, uid, parsed, loc, now, true)
+		fields := resolveParsedTransaction(cctx, deps, uid, parsed, b.Text, loc, now, true)
 		ccancel()
 		txnAt := composeTxnAt(loc, parsed.Date, parsed.Time, now)
 		// No time in the message and it waited on the phone: the phone's
