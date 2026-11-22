@@ -128,11 +128,7 @@ func registerFinanceRoutes(mux *http.ServeMux, deps Deps) {
 
 // --- helpers ---------------------------------------------------------------
 
-var defaultExpenseCategories = []struct {
-	Name  string
-	Color string
-	Icon  string
-}{
+var defaultExpenseCategories = []struct{ Name, Color, Icon string }{
 	{"Food & Dining", "#F97316", "utensils"},
 	{"Transport", "#3B82F6", "car"},
 	{"Bills & Utilities", "#06B6D4", "plug"},
@@ -140,24 +136,30 @@ var defaultExpenseCategories = []struct {
 	{"Others", "#6B7280", "circle"},
 }
 
-var defaultIncomeCategories = []struct {
-	Name  string
-	Color string
-	Icon  string
-}{
+var defaultIncomeCategories = []struct{ Name, Color, Icon string }{
 	{"Salary", "#10B981", "wallet"},
 	{"Interest", "#22C55E", "trending-up"},
 	{"Others", "#6B7280", "circle"},
 }
 
+// ensureDefaultCategories gives a new user the starter categories of a kind,
+// once: only while they have none of that kind besides Unknown. A starter
+// renamed or deleted later stays that way (renaming Food & Dining to Food
+// must not bring Food & Dining back on the next list).
 func ensureDefaultCategories(deps Deps, uid string) {
 	d := deps.DB
-	for _, c := range defaultExpenseCategories {
-		d.Exec("INSERT INTO fin_categories (user_id, name, kind, color, icon) VALUES ($1, $2, 'expense', $3, $4) ON CONFLICT DO NOTHING", uid, c.Name, c.Color, c.Icon)
+	seed := func(kind string, defaults []struct{ Name, Color, Icon string }) {
+		var has bool
+		d.QueryRow("SELECT EXISTS (SELECT 1 FROM fin_categories WHERE user_id = $1 AND kind = $2 AND NOT fallback)", uid, kind).Scan(&has)
+		if has {
+			return
+		}
+		for _, c := range defaults {
+			d.Exec("INSERT INTO fin_categories (user_id, name, kind, color, icon) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING", uid, c.Name, kind, c.Color, c.Icon)
+		}
 	}
-	for _, c := range defaultIncomeCategories {
-		d.Exec("INSERT INTO fin_categories (user_id, name, kind, color, icon) VALUES ($1, $2, 'income', $3, $4) ON CONFLICT DO NOTHING", uid, c.Name, c.Color, c.Icon)
-	}
+	seed("expense", defaultExpenseCategories)
+	seed("income", defaultIncomeCategories)
 	d.Exec("SELECT fin_category_fallback($1, 'expense'), fin_category_fallback($1, 'income')", uid)
 }
 
@@ -167,27 +169,6 @@ func categoryNameKey(name string) string {
 		return "others"
 	}
 	return key
-}
-
-func isDefaultCategoryName(kind, name string) bool {
-	key := categoryNameKey(name)
-	var defaults []struct {
-		Name  string
-		Color string
-		Icon  string
-	}
-	switch kind {
-	case "income":
-		defaults = defaultIncomeCategories
-	case "expense":
-		defaults = defaultExpenseCategories
-	}
-	for _, category := range defaults {
-		if categoryNameKey(category.Name) == key {
-			return true
-		}
-	}
-	return false
 }
 
 func categoryNameExists(d *db.DB, uid, kind, name string, excludeID int64) bool {
@@ -508,7 +489,7 @@ func createCategory(deps Deps) http.HandlerFunc {
 			errJSON(w, 400, "A category is either expense or income.")
 			return
 		}
-		if isDefaultCategoryName(b.Kind, b.Name) || categoryNameExists(d, uid, b.Kind, b.Name, 0) {
+		if categoryNameExists(d, uid, b.Kind, b.Name, 0) {
 			errJSON(w, 409, "A category with that name already exists.")
 			return
 		}
@@ -566,7 +547,7 @@ func updateCategory(deps Deps) http.HandlerFunc {
 				errJSON(w, http.StatusConflict, currentName+" can't be renamed: it holds what still needs a category.")
 				return
 			}
-			if categoryNameExists(d, uid, kind, name, id) || (categoryNameKey(currentName) != categoryNameKey(name) && isDefaultCategoryName(kind, name)) {
+			if categoryNameExists(d, uid, kind, name, id) {
 				errJSON(w, 409, "A category with that name already exists.")
 				return
 			}
