@@ -484,7 +484,9 @@ func trunc(s string, n int) string {
 // blocks the daily cron. Returns the same number of entries as the
 // input (empty string on parse miss).
 func tryNarrateInsights(ctx context.Context, deps Deps, items []detected) []string {
-	if deps.AI == nil || len(items) == 0 {
+	// Parked 2026-11-22 (unused, and Hydrogen costs more): findings show
+	// as detected. AI_INSIGHTS_NARRATION=on brings the rewording back.
+	if deps.AI == nil || !deps.AI.InsightsNarration || len(items) == 0 {
 		return nil
 	}
 	var b strings.Builder

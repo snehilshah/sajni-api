@@ -80,6 +80,12 @@ func ProcessScheduledNotifications(ctx context.Context, deps Deps) (map[string]i
 		jobErrors = append(jobErrors, err)
 	}
 
+	aiPurged, err := purgeAICalls(ctx, deps.DB)
+	result["ai_calls_dropped"] = int(aiPurged)
+	if err != nil {
+		jobErrors = append(jobErrors, err)
+	}
+
 	lends, err := ProcessLendReminders(ctx, deps)
 	result["lend_reminders"] = lends
 	if err != nil {

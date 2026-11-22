@@ -83,13 +83,18 @@ func newEvent(t string, v any) Event {
 // disabled (no GEMINI_API_KEY). Construct once at startup; reuse per
 // request.
 type Service struct {
-	db            *db.DB
-	store         storage.Storage
-	client        modelClient
-	model         string
-	tools         []Tool
-	tmdbAPIKey    string
-	reminderQueue reminderqueue.Queue
+	db           *db.DB
+	store        storage.Storage
+	client       modelClient
+	model        string            // default model
+	modelByKind  map[string]string // per kind of call (config.AI.ModelFor)
+	apiKey       string            // for the Decisions API (REST)
+	decisionsURL string            // tests point it at a fake
+	// InsightsNarration: Gemini may reword Analytics → Insights findings.
+	InsightsNarration bool
+	tools             []Tool
+	tmdbAPIKey        string
+	reminderQueue     reminderqueue.Queue
 	// OnChange, when set, is told after a mutating tool writes data in a
 	// scope ("habits") so devices can be pinged to refresh.
 	OnChange func(uid, scope string)
@@ -137,9 +142,9 @@ func (s *Service) gate(ctx context.Context, uid, kind string) error {
 
 // spent reports one call, even a failed one with no usage, so a retry loop
 // still counts toward the call cap.
-func (s *Service) spent(ctx context.Context, uid, kind string, u usage) {
+func (s *Service) spent(ctx context.Context, uid, kind, model string, u usage) {
 	if s.OnUsage != nil {
-		s.OnUsage(ctx, userOf(ctx, uid), kind, u.CostUSD())
+		s.OnUsage(ctx, userOf(ctx, uid), kind, u.CostUSD(model, time.Now()))
 	}
 }
 
@@ -175,12 +180,16 @@ func NewService(ctx context.Context, database *db.DB, store storage.Storage, cfg
 		return nil, fmt.Errorf("gemini client: %w", err)
 	}
 	s := &Service{
-		db:            database,
-		store:         store,
-		client:        geminiModels{models: client.Models},
-		model:         cfg.GeminiModel,
-		tmdbAPIKey:    media.TMDBAPIKey,
-		reminderQueue: queue,
+		db:                database,
+		store:             store,
+		client:            geminiModels{models: client.Models},
+		model:             cfg.GeminiModel,
+		modelByKind:       cfg.ModelFor,
+		apiKey:            cfg.GeminiAPIKey,
+		decisionsURL:      decisionsEndpoint,
+		InsightsNarration: cfg.InsightsNarration,
+		tmdbAPIKey:        media.TMDBAPIKey,
+		reminderQueue:     queue,
 	}
 	s.tools = s.buildTools()
 	return s, nil
@@ -358,10 +367,13 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 	// the message alone (see saved), so the chat never shows the block.
 	contents := append([]*genai.Content(nil), req.History...)
 	msgAt := len(contents)
+	nowBlock := s.liveContext(ctx, req.UserID)
 	contents = append(contents, &genai.Content{
 		Role:  "user",
-		Parts: []*genai.Part{{Text: s.liveContext(ctx, req.UserID)}, {Text: req.Message}},
+		Parts: []*genai.Part{{Text: nowBlock}, {Text: req.Message}},
 	})
+	model := s.modelFor(req.Mode)
+	turn := newTurnID()
 	saved := func() []*genai.Content {
 		h := append([]*genai.Content(nil), contents...)
 		h[msgAt] = &genai.Content{Role: "user", Parts: []*genai.Part{{Text: req.Message}}}
@@ -401,23 +413,51 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		if outcome == "error" {
 			ev = log.Warn()
 		}
-		total.fields(ev.Str("uid", req.UserID).Str("mode", req.Mode).Str("model", s.model).
+		total.fields(ev.Str("uid", req.UserID).Str("mode", req.Mode).Str("turn", turn).
 			Str("outcome", outcome).Int("rounds", roundsRun).Strs("tools", toolsUsed).Strs("groups", groupNames(active)).
-			Int("msg_chars", len(req.Message)).Int64("ms", time.Since(started).Milliseconds())).
+			Int("msg_chars", len(req.Message)).Int64("ms", time.Since(started).Milliseconds()), model).
 			Msg("ai turn")
 	}()
-	// round logs one model call of this question.
+	// round logs one model call of this question and queues its ledger
+	// row, which is written once the round's tool results are known
+	// (flush), at the next round or when the turn ends.
 	finish := ""
-	round := func(n int, u usage, ms int64, calls []string, err error) {
+	var pending *callRecord
+	flush := func() {
+		if pending != nil {
+			s.record(ctx, *pending)
+			pending = nil
+		}
+	}
+	defer flush()
+	round := func(n int, u usage, ms int64, calls []string, err error, c *genai.GenerateContentConfig) {
+		flush()
 		roundsRun++
 		total.add(u)
-		s.spent(ctx, req.UserID, req.Mode, u)
+		s.spent(ctx, req.UserID, req.Mode, model, u)
 		ev := log.Info()
 		if err != nil {
 			ev = log.Warn().Err(err)
 		}
-		u.fields(ev.Str("uid", req.UserID).Str("mode", req.Mode).Int("round", n).
-			Strs("calls", calls).Str("finish", finish).Int64("ms", ms)).Msg("ai round")
+		u.fields(ev.Str("uid", req.UserID).Str("mode", req.Mode).Str("turn", turn).Int("round", n).
+			Strs("calls", calls).Str("finish", finish).Int64("ms", ms), model).Msg("ai round")
+		var decls []*genai.FunctionDeclaration
+		for _, t := range c.Tools {
+			decls = append(decls, t.FunctionDeclarations...)
+		}
+		pending = &callRecord{
+			UID: req.UserID, Kind: req.Mode, Model: model, Thinking: thinkingOf(c), Turn: turn, Round: n,
+			Usage: u, At: time.Now().Add(-time.Duration(ms) * time.Millisecond),
+			Parts: scaleParts(map[string]int{
+				"system":  contentChars(c.SystemInstruction),
+				"tools":   declChars(decls),
+				"now":     len(nowBlock),
+				"history": contentChars(req.History...),
+				"turn":    contentChars(contents[msgAt+1:]...),
+				"message": len(req.Message),
+			}, u.Prompt),
+			Tools: len(decls), Groups: groupNames(active), Calls: calls, Finish: finish, Err: err, Ms: ms,
+		}
 		finish = ""
 	}
 
@@ -478,7 +518,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		seenCalls := map[string]int{}
 		for attempt := 0; attempt < 2; attempt++ {
 			streamErr = nil
-			for resp, err := range s.stream(ctx, contents, cfg, idle) {
+			for resp, err := range s.stream(ctx, model, contents, cfg, idle) {
 				if err != nil {
 					streamErr = err
 					break
@@ -540,7 +580,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		for i, c := range calls {
 			names[i] = c.Name
 		}
-		round(r+1, used, time.Since(roundAt).Milliseconds(), names, streamErr)
+		round(r+1, used, time.Since(roundAt).Milliseconds(), names, streamErr, cfg)
 		if streamErr != nil {
 			fail(streamErr, friendlyAIError(streamErr))
 			return
@@ -571,6 +611,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		}
 
 		respParts := make([]*genai.Part, 0, len(calls))
+		results := map[string]int{}
 		for _, fc := range calls {
 			if fc.Name == moreToolsName {
 				// Not a user-visible action: widen the tools for the next round.
@@ -610,6 +651,12 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 				},
 			})
 		}
+		for _, p := range respParts {
+			results[p.FunctionResponse.Name] += contentChars(&genai.Content{Parts: []*genai.Part{p}}) / 4
+		}
+		if pending != nil {
+			pending.Results = results
+		}
 		contents = append(contents, &genai.Content{Role: "user", Parts: respParts})
 	}
 
@@ -627,9 +674,9 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 		synthUsed     usage
 		synthAt       = time.Now()
 	)
-	for resp, err := range s.stream(ctx, contents, &synthesisCfg, idle) {
+	for resp, err := range s.stream(ctx, model, contents, &synthesisCfg, idle) {
 		if err != nil {
-			round(rounds+1, synthUsed, time.Since(synthAt).Milliseconds(), nil, err)
+			round(rounds+1, synthUsed, time.Since(synthAt).Milliseconds(), nil, err, &synthesisCfg)
 			fail(err, friendlyAIError(err))
 			return
 		}
@@ -648,7 +695,7 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 			send("delta", map[string]string{"text": part.Text})
 		}
 	}
-	round(rounds+1, synthUsed, time.Since(synthAt).Milliseconds(), nil, nil)
+	round(rounds+1, synthUsed, time.Since(synthAt).Milliseconds(), nil, nil, &synthesisCfg)
 	if synthesisText.Len() > 0 {
 		contents = append(contents, &genai.Content{
 			Role:  "model",
@@ -666,14 +713,14 @@ func (s *Service) run(ctx context.Context, req ChatRequest, out chan<- Event) {
 
 // stream is GenerateContentStream that gives up when no chunk arrives for
 // idle (the error says so), so one stalled round can't eat the whole turn.
-func (s *Service) stream(ctx context.Context, contents []*genai.Content, cfg *genai.GenerateContentConfig, idle time.Duration) iter.Seq2[*genai.GenerateContentResponse, error] {
+func (s *Service) stream(ctx context.Context, model string, contents []*genai.Content, cfg *genai.GenerateContentConfig, idle time.Duration) iter.Seq2[*genai.GenerateContentResponse, error] {
 	return func(yield func(*genai.GenerateContentResponse, error) bool) {
 		rctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		var stalled atomic.Bool
 		timer := time.AfterFunc(idle, func() { stalled.Store(true); cancel() })
 		defer timer.Stop()
-		for resp, err := range s.client.GenerateContentStream(rctx, s.model, contents, cfg) {
+		for resp, err := range s.client.GenerateContentStream(rctx, model, contents, cfg) {
 			timer.Reset(idle)
 			if err != nil && stalled.Load() && ctx.Err() == nil {
 				err = errRoundStalled
@@ -747,6 +794,11 @@ func (s *Service) CategorizeExpense(ctx context.Context, title, kind string, cat
 	}
 	if len(categories) == 0 {
 		return "Others", 0, nil
+	}
+	// The Decisions API first (fast, calibrated, a fraction of the cost);
+	// the generative call below is the fallback when it can't answer.
+	if picked, cost, ok := s.chooseCategory(ctx, title, kind, categories); ok {
+		return picked, cost, nil
 	}
 
 	// Build the closed-set list. "Others" is always appended as the

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"strings"
@@ -51,7 +52,29 @@ type Auth struct {
 
 type AI struct {
 	GeminiAPIKey string
-	GeminiModel  string
+	// GeminiModel is the model for every call unless ModelFor names
+	// another for its kind ("parse_text" → "gemini-3.8-flash").
+	// AI_MODEL overrides the default; AI_MODEL_FOR="kind=model,…" per kind.
+	GeminiModel string
+	ModelFor    map[string]string
+	// InsightsNarration lets Gemini reword Analytics → Insights findings.
+	// Parked (off) since 2026-11-22; AI_INSIGHTS_NARRATION=on brings it back.
+	InsightsNarration bool
+}
+
+// DefaultGeminiModel is the model when AI_MODEL is unset.
+const DefaultGeminiModel = "gemini-4-hydrogen"
+
+// parseModelFor reads AI_MODEL_FOR: "chat=gemini-4-hydrogen,parse_text=gemini-3.8-flash".
+func parseModelFor(v string) map[string]string {
+	out := map[string]string{}
+	for _, pair := range strings.Split(v, ",") {
+		kind, model, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		if ok && strings.TrimSpace(kind) != "" && strings.TrimSpace(model) != "" {
+			out[strings.TrimSpace(kind)] = strings.TrimSpace(model)
+		}
+	}
+	return out
 }
 
 type Media struct {
@@ -133,8 +156,10 @@ func Load(dotEnvPath string) (Config, error) {
 			DevAuthBypassName:  strings.TrimSpace(os.Getenv("DEV_AUTH_BYPASS_NAME")),
 		},
 		AI: AI{
-			GeminiAPIKey: os.Getenv("GEMINI_API_KEY"),
-			GeminiModel:  "gemini-3.8-flash",
+			GeminiAPIKey:      os.Getenv("GEMINI_API_KEY"),
+			GeminiModel:       cmp.Or(strings.TrimSpace(os.Getenv("AI_MODEL")), DefaultGeminiModel),
+			ModelFor:          parseModelFor(os.Getenv("AI_MODEL_FOR")),
+			InsightsNarration: strings.EqualFold(strings.TrimSpace(os.Getenv("AI_INSIGHTS_NARRATION")), "on"),
 		},
 		Media: Media{
 			TMDBAPIKey: os.Getenv("TMDB_API_KEY"),

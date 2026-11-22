@@ -34,7 +34,7 @@ func TestNowDatesOnASunday(t *testing.T) {
 func TestUsageCost(t *testing.T) {
 	u := usage{Prompt: 1_000_000, Cached: 800_000, Output: 100_000, Thinking: 100_000}
 	// 200k fresh × 0.75 + 800k cached × 0.075 + 200k out × 3.75, per million.
-	if got, want := roundCost(u.CostUSD()), 0.96; got != want {
+	if got, want := roundCost(u.CostUSD("gemini-3.8-flash", time.Date(2026, 11, 22, 0, 0, 0, 0, time.UTC))), 0.96; got != want {
 		t.Fatalf("cost = %v, want %v", got, want)
 	}
 	if u.CachePct() != 80 {

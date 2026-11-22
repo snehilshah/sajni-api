@@ -755,6 +755,15 @@ func copyFromOtherChannel(ctx context.Context, tx *sql.Tx, uid, channel, ref, ty
 	return 0, "", false, rows.Err()
 }
 
+// purgeAICalls drops AI usage ledger rows older than a year.
+func purgeAICalls(ctx context.Context, d *db.DB) (int64, error) {
+	res, err := d.ExecContext(ctx, `DELETE FROM ai_calls WHERE at < NOW() - INTERVAL '1 year'`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // purgeCaptureText clears raw message text after 30 days and drops capture
 // rows after a year (the parsed fields and outcome are what's kept).
 func purgeCaptureText(ctx context.Context, d *db.DB) (int64, error) {

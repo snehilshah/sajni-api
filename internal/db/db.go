@@ -1385,6 +1385,37 @@ func (d *DB) ensureSchema() error {
 		PRIMARY KEY (user_id, day)
 	);
 
+	-- The AI usage ledger: one row per model call (internal/ai/ledger.go),
+	-- kept a year (the quarter-hour sweep drops older rows). Token counts
+	-- and an estimate of where the input went; never the prompt itself.
+	CREATE TABLE IF NOT EXISTS ai_calls (
+		id              BIGSERIAL PRIMARY KEY,
+		user_id         UUID REFERENCES users(id) ON DELETE CASCADE, -- NULL: no user known
+		at              TIMESTAMPTZ NOT NULL,
+		kind            TEXT NOT NULL,            -- chat, palette, parse_text, categorize, …
+		model           TEXT NOT NULL,
+		thinking        TEXT NOT NULL DEFAULT '', -- low / medium / high; '' when none
+		turn_id         TEXT,                     -- a chat question's rounds share one
+		round           INTEGER,
+		in_tokens       INTEGER NOT NULL DEFAULT 0, -- cached ones included
+		cached_tokens   INTEGER NOT NULL DEFAULT 0,
+		out_tokens      INTEGER NOT NULL DEFAULT 0,
+		thinking_tokens INTEGER NOT NULL DEFAULT 0,
+		cost_usd        DOUBLE PRECISION NOT NULL DEFAULT 0, -- list price at the time
+		parts           JSONB,  -- input tokens by part: system, tools, now, history, turn, message
+		tools_declared  INTEGER NOT NULL DEFAULT 0,
+		groups          TEXT[] NOT NULL DEFAULT '{}',
+		calls           TEXT[] NOT NULL DEFAULT '{}', -- tools the model called
+		results         JSONB,  -- tool → estimated tokens it returned
+		finish          TEXT,
+		confidence      DOUBLE PRECISION, -- Decisions API
+		ok              BOOLEAN NOT NULL,
+		error           TEXT,
+		ms              INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE INDEX IF NOT EXISTS idx_ai_calls_at ON ai_calls(at);
+	CREATE INDEX IF NOT EXISTS idx_ai_calls_user ON ai_calls(user_id, at DESC);
+
 	-- Weekly database backups to the blob bucket (internal/backup), one row
 	-- per run; the scheduled sweep claims a run when the last one is a week old.
 	CREATE TABLE IF NOT EXISTS db_backups (

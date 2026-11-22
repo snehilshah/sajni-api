@@ -324,8 +324,15 @@ gcloud run services update-traffic sajni-api --region asia-south1 \
 
 ## AI usage logs
 
-Every Gemini call logs its tokens and an estimated cost (`internal/ai/usage.go`,
-list prices in USD, cached input at a tenth):
+Every Gemini call logs its tokens and an estimated cost at its model's list
+price (`priceOf` in `internal/ai/usage.go`; keep it in step with Google's
+pricing page) and writes one row to the **usage ledger**, table `ai_calls`
+(`internal/ai/ledger.go`, kept a year; the quarter-hour sweep drops older
+rows). A row has kind, model, thinking level, `turn_id` + `round` for chat,
+tokens, `cost_usd`, `parts` (input tokens by prompt part: system, tools, now,
+history, turn, message; characters scaled to Gemini's count), tools declared
+and called, `results` (tokens each tool returned), finish, Decisions
+`confidence`, ok/error, ms. Never the prompt.
 
 | Line | One per | Fields |
 | --- | --- | --- |
@@ -360,6 +367,10 @@ same sentence. Background work (Projects enrichment) carries its user with
 `ai.WithUser`.
 
 ```sh
+# Last 30 days by kind and model: calls, tokens, cost.
+echo "SELECT kind, model, count(*), sum(in_tokens) AS input, sum(cached_tokens) AS cached, sum(out_tokens+thinking_tokens) AS output, round(sum(cost_usd)::numeric,4) AS usd FROM ai_calls WHERE at > now()-interval '30 days' GROUP BY 1,2 ORDER BY usd DESC;" | finance/work/q
+# Where chat input goes, by prompt part.
+echo "SELECT key AS part, sum(value::int) AS tokens FROM ai_calls, jsonb_each_text(parts) WHERE kind IN ('chat','palette') AND at > now()-interval '30 days' GROUP BY 1 ORDER BY 2 DESC;" | finance/work/q
 # Today's spend per user.
 echo "SELECT user_id, cost_micros/1e6 AS usd, calls FROM ai_spend WHERE day = CURRENT_DATE ORDER BY 2 DESC;" | finance/work/q
 ```
@@ -408,17 +419,23 @@ listed above, with `APP_ENV=local` and `COOKIE_INSECURE=1`. Leave
 `REMINDER_CRON_SECRET` and the Cloud Tasks vars blank: config validation
 requires them together, and a local run must never enqueue prod reminders.
 
-All AI features in web and Android use the shared backend model
-`gemini-3.8-flash`, pinned in `internal/config/config.go`. A model change takes
-effect when the API is deployed; there is no model environment override.
-Thinking effort is `low` for palette actions, insights narration, themes,
-classification, and transaction text/image parsing, and `medium` for chat,
-project enrichment, and synthesis. `internal/ai/` uses named thinking levels
+All AI features in web and Android use the shared backend model, by default
+`gemini-4-hydrogen` (`config.DefaultGeminiModel`; since 2026-11-22). Env
+`AI_MODEL` overrides it for every call, and `AI_MODEL_FOR` per kind of call
+(`chat=…,palette=…,parse_text=…,parse_image=…,categorize=…,quick=…,theme=…,classify=…,project_enrich=…,project_synthesis=…`),
+e.g. `AI_MODEL_FOR=parse_text=gemini-3.8-flash` to move capture back without a
+code change. Categorise asks the **Gemini Decisions API** first
+(`gemini-decision-1`, `internal/ai/decisions.go`, REST with the same key,
+about $0.10 per million input tokens and no output), falling back to the model.
+Thinking effort is set on every call, never the model's default (Hydrogen
+defaults to `high`): `low` for palette actions, themes, classification, and
+transaction text/image parsing, and `medium` for chat, project enrichment, and
+synthesis. `internal/ai/` uses named thinking levels
 and default sampling parameters. Output caps of 4096 (`low`) and 8192
 (`medium`) include reasoning tokens, not just the visible reply.
-Insights narration is the short written explanation in Analytics → Insights:
-the backend detects findings from user data, then Gemini rewrites them into
-readable summaries with `low` thinking effort.
+Insights narration (Gemini rewording Analytics → Insights findings) is parked
+since 2026-11-22: findings show as detected. `AI_INSIGHTS_NARRATION=on` brings
+it back.
 See [Google’s Gemini 3.8 migration guide](https://ai.google.dev/gemini-api/docs/latest-model)
 and [GenerateContent thinking guide](https://ai.google.dev/gemini-api/docs/generate-content/thinking).
 
