@@ -1118,6 +1118,12 @@ func updateTask(deps Deps) http.HandlerFunc {
 				logTaskEvent(q, uid, id, "list", listLabel(q, uid, currentListID), listLabel(q, uid, v))
 			}
 		}
+		// A subtask of its own subtask would loop every tree walk; refuse it.
+		if body.ParentTaskID != nil && !body.ClearParent && *body.ParentTaskID != id &&
+			db.ParentWouldLoop(r.Context(), tx, uid, id, *body.ParentTaskID) {
+			errJSON(w, 400, "A task can't go under one of its own subtasks.")
+			return
+		}
 		if body.ParentTaskID != nil || body.ClearParent {
 			var v sql.NullInt64
 			if body.ParentTaskID != nil && !body.ClearParent && *body.ParentTaskID != id {
@@ -1243,7 +1249,7 @@ func deleteTask(deps Deps) http.HandlerFunc {
 		descRows, _ := d.Query(`
 			WITH RECURSIVE tree AS (
 				SELECT id FROM tasks WHERE id=$1 AND user_id=$2
-				UNION ALL
+				UNION
 				SELECT t.id FROM tasks t JOIN tree ON t.parent_task_id = tree.id
 			) SELECT id FROM tree`, id, uid)
 		var ids []int64

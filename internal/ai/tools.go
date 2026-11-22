@@ -732,8 +732,12 @@ func (s *Service) buildTools() []Tool {
 					return nil, nil, fmt.Errorf("missing id")
 				}
 				val := argBool(args, "important", false)
-				if _, err := d.ExecContext(ctx, `UPDATE tasks SET important=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, val, id, uid); err != nil {
+				res, err := d.ExecContext(ctx, `UPDATE tasks SET important=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3`, val, id, uid)
+				if err != nil {
 					return nil, nil, err
+				}
+				if n, _ := res.RowsAffected(); n == 0 {
+					return nil, nil, fmt.Errorf("task not found")
 				}
 				return map[string]any{"id": id, "important": val},
 					map[string]any{"kind": "task_updated", "id": id, "route": "/tasks"}, nil
@@ -761,13 +765,16 @@ func (s *Service) buildTools() []Tool {
 				if id == 0 {
 					return nil, nil, fmt.Errorf("missing id")
 				}
+				var prev string
+				d.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=$1 AND user_id=$2`, id, uid).Scan(&prev)
+				if prev == "" {
+					return nil, nil, fmt.Errorf("task not found")
+				}
 				if n := db.OpenSubtaskCount(ctx, d, uid, int64(id)); n > 0 {
 					return nil, nil, fmt.Errorf("%s", db.OpenSubtasksMessage(n))
 				}
-				var prev string
-				d.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=$1 AND user_id=$2`, id, uid).Scan(&prev)
 				_, err := d.Exec(`UPDATE tasks SET status='done', blocked_by_task_id=NULL, updated_at=NOW() WHERE id=$1 AND user_id=$2`, id, uid)
-				if err == nil && prev != "" && prev != "done" {
+				if err == nil && prev != "done" {
 					// The task's history shows it, as when done in the app.
 					d.ExecContext(ctx, `INSERT INTO task_events (user_id, task_id, kind, from_val, to_val) VALUES ($1,$2,'status',$3,'done')`, uid, id, prev)
 				}
@@ -827,7 +834,23 @@ func (s *Service) buildTools() []Tool {
 				if id == 0 {
 					return nil, nil, fmt.Errorf("missing id")
 				}
+				var exists int
+				d.QueryRowContext(ctx, `SELECT 1 FROM tasks WHERE id=$1 AND user_id=$2`, id, uid).Scan(&exists)
+				if exists != 1 {
+					return nil, nil, fmt.Errorf("task not found")
+				}
 				unblockAITaskTreeDependents(ctx, d, uid, id)
+				// As in the app: the rows cascade down the subtasks, but tags
+				// and backlinks sit in side tables keyed by id.
+				d.ExecContext(ctx, `
+					WITH RECURSIVE tree AS (
+						SELECT id FROM tasks WHERE id=$1 AND user_id=$2
+						UNION
+						SELECT t.id FROM tasks t JOIN tree ON t.parent_task_id=tree.id WHERE t.user_id=$2
+					), gone_tags AS (
+						DELETE FROM tags WHERE user_id=$2 AND entity_type='task' AND entity_id IN (SELECT id FROM tree)
+					)
+					DELETE FROM backlinks WHERE user_id=$2 AND source_type='task' AND source_id IN (SELECT id FROM tree)`, id, uid)
 				d.DeleteTaskFiles(ctx, store, uid, int64(id))
 				_, err := d.Exec(`DELETE FROM tasks WHERE id=$1 AND user_id=$2`, id, uid)
 				if err != nil {
@@ -2447,7 +2470,7 @@ func unblockAITaskTreeDependents(ctx context.Context, d *db.DB, uid string, root
 	rows, err := d.QueryContext(ctx, `
 		WITH RECURSIVE tree AS (
 			SELECT id FROM tasks WHERE id=$1 AND user_id=$2
-			UNION ALL
+			UNION
 			SELECT t.id FROM tasks t JOIN tree ON t.parent_task_id=tree.id WHERE t.user_id=$2
 		)
 		UPDATE tasks SET status='todo',blocked_by_task_id=NULL,updated_at=NOW()
@@ -2999,6 +3022,9 @@ func updateTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 		d.QueryRowContext(ctx, `SELECT 1 FROM tasks WHERE id=$1 AND user_id=$2`, pid, uid).Scan(&ok)
 		if ok != 1 {
 			return nil, nil, fmt.Errorf("parent task not found")
+		}
+		if db.ParentWouldLoop(ctx, d, uid, int64(id), int64(pid)) {
+			return nil, nil, fmt.Errorf("a task can't go under itself or one of its own subtasks")
 		}
 		add("parent_task_id", pid)
 	}

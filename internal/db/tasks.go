@@ -20,12 +20,33 @@ func OpenSubtaskCount(ctx context.Context, q rowQueryer, userID string, taskID i
 	q.QueryRowContext(ctx, `
 		WITH RECURSIVE tree AS (
 			SELECT id, status FROM tasks WHERE parent_task_id = $1 AND user_id = $2
-			UNION ALL
+			UNION
 			SELECT t.id, t.status FROM tasks t JOIN tree ON t.parent_task_id = tree.id
 			 WHERE t.user_id = $2
 		)
 		SELECT COUNT(*) FROM tree WHERE status NOT IN ('done','scratched')`, taskID, userID).Scan(&n)
 	return n
+}
+
+// ParentWouldLoop reports whether putting taskID under parentID would make
+// the task its own ancestor: parentID is the task itself or one of its
+// subtasks (any depth). A loop would make every tree walk (delete, the open
+// subtask count) run until the statement timeout. UNION (not UNION ALL)
+// stops the walk even on a loop that already exists.
+func ParentWouldLoop(ctx context.Context, q rowQueryer, userID string, taskID, parentID int64) bool {
+	if taskID == parentID {
+		return true
+	}
+	var loop bool
+	q.QueryRowContext(ctx, `
+		WITH RECURSIVE up AS (
+			SELECT id, parent_task_id FROM tasks WHERE id = $1 AND user_id = $2
+			UNION
+			SELECT t.id, t.parent_task_id FROM tasks t JOIN up ON t.id = up.parent_task_id
+			 WHERE t.user_id = $2
+		)
+		SELECT EXISTS (SELECT 1 FROM up WHERE id = $3)`, parentID, userID, taskID).Scan(&loop)
+	return loop
 }
 
 // OpenSubtasksMessage is the user-facing refusal shared by the API and AI.
@@ -42,7 +63,7 @@ func (d *DB) DeleteTaskFiles(ctx context.Context, store storage.Storage, userID 
 	rows, err := d.QueryContext(ctx, `
 		WITH RECURSIVE tree AS (
 			SELECT id FROM tasks WHERE id = $1 AND user_id = $2
-			UNION ALL
+			UNION
 			SELECT t.id FROM tasks t JOIN tree ON t.parent_task_id = tree.id WHERE t.user_id = $2
 		)
 		SELECT a.filename FROM task_attachments a JOIN tree ON a.task_id = tree.id`, taskID, userID)
