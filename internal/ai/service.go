@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"iter"
 	"regexp"
+	"sajni/internal/auth"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -129,6 +130,11 @@ func WithUser(ctx context.Context, uid string) context.Context {
 func userOf(ctx context.Context, uid string) string {
 	if uid == "" {
 		uid, _ = ctx.Value(userKey{}).(string)
+	}
+	if uid == "" {
+		// A request's signed-in user (capture parse, categorise): the
+		// budget gate falls back to it too, so the ledger names the same user.
+		uid, _ = auth.UserIDFromContext(ctx)
 	}
 	return uid
 }
