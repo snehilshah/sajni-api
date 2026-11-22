@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/mail"
+	"strconv"
 	"strings"
 	"time"
 
@@ -191,6 +192,7 @@ func completeParentGoalIfDone(d sqlRunner, uid string, childID int64) {
 func registerTaskRoutes(mux *http.ServeMux, deps Deps) {
 	// Specific paths must register before /{id}.
 	mux.HandleFunc("GET /api/tasks/missed", listMissedTasks(deps))
+	mux.HandleFunc("GET /api/tasks/archive", listArchivedTasks(deps))
 	mux.HandleFunc("PUT /api/tasks/reorder", withSync(deps, "tasks", reorderTasks(deps)))
 	mux.HandleFunc("GET /api/tasks/{id}/history", getTaskHistory(deps))
 	mux.HandleFunc("GET /api/tasks/{id}/events", getTaskEvents(deps))
@@ -309,6 +311,7 @@ type taskRow struct {
 	SortOrder           int      `json:"sort_order"`
 	BoardRank           *float64 `json:"board_rank"`       // place in its Board lane; null = by updated_at
 	AttachmentCount     int      `json:"attachment_count"` // images in its Images section (board shows the count)
+	DoneAt              *string  `json:"done_at"`          // when it was marked done; null unless done
 	SubtaskCount        int      `json:"subtask_count"`
 	SubtasksDone        int      `json:"subtasks_done"`
 	// Subtasks are embedded (brief shape) so the list view can render the
@@ -369,13 +372,16 @@ func listTasks(deps Deps) http.HandlerFunc {
 		active := "t.status NOT IN ('done','scratched')"
 		now := userNow(d, uid)
 		today := now.Format("2006-01-02")
-		// done_today=1 (the Board): these views also keep what was finished
-		// today, so a card dropped on Done stays in its lane instead of
-		// vanishing from a view that only lists open tasks.
-		if queryParam(r, "done_today") == "1" {
-			dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-			active = "(t.status NOT IN ('done','scratched') OR (t.status = 'done' AND t.updated_at >= $" + itoa(ph) + "))"
-			args = append(args, dayStart)
+		// done=recent (both clients' Tasks screen): Done holds what was done
+		// in the last 7 days, in every view (My Day included); older done
+		// tasks are in the Archive (GET /api/tasks/archive). done_today=1 is
+		// the old Board's name for it (web v0.88); drop it after a release.
+		recentDone := queryParam(r, "done") == "recent" || queryParam(r, "done_today") == "1"
+		if recentDone {
+			n := itoa(ph)
+			active = "(t.status NOT IN ('done','scratched') OR (t.status = 'done' AND COALESCE(t.done_at, t.updated_at) >= $" + n + "))"
+			clauses = append(clauses, "NOT (t.status = 'done' AND COALESCE(t.done_at, t.updated_at) < $"+n+")")
+			args = append(args, time.Now().Add(-archiveAfter))
 			ph++
 		}
 		switch queryParam(r, "smart") {
@@ -472,120 +478,207 @@ func listTasks(deps Deps) http.HandlerFunc {
 			args = append(args, mo)
 			ph++
 		}
-		if cd := queryParam(r, "completed_date"); cd != "" {
+		// done_date: tasks done on that day (Journal). completed_date is its
+		// old name, still sent by older Android and web builds.
+		dd := queryParam(r, "done_date")
+		if dd == "" {
+			dd = queryParam(r, "completed_date")
+		}
+		if dd != "" {
 			clauses = append(clauses, "t.status = 'done' AND t.updated_at::date = $"+itoa(ph))
-			args = append(args, cd)
+			args = append(args, dd)
 		}
 
 		// Every task view (open, done, scratched alike) reads most recently
 		// touched first — one predictable order across web, Android and AI.
 		orderBy := `ORDER BY t.updated_at DESC, t.id DESC`
 
-		q := `
-			SELECT t.id, t.title, t.description, t.status, t.priority, t.color,
-			       t.due_date::text, t.week_of::text, t.month_of::text, t.scheduled_at::text,
-			       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
-			       t.list_id, t.parent_task_id, parent.title, t.blocked_by_task_id,
-			       blocker.title, blocker.status, t.important, t.steps,
-			       COALESCE(t.sort_order, 0), t.board_rank,
-			       (SELECT count(*) FROM task_attachments ta WHERE ta.task_id = t.id)::int,
-			       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
-			       t.created_at, t.updated_at, t.plan_id, plan.name, t.recurrence
-			FROM tasks t
-			LEFT JOIN (
-				SELECT parent_task_id,
-				       COUNT(*) AS cnt,
-				       COUNT(*) FILTER (WHERE status = 'done') AS done
-				FROM tasks
-				WHERE parent_task_id IS NOT NULL
-				GROUP BY parent_task_id
-			) c ON c.parent_task_id = t.id
-			LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
-			LEFT JOIN tasks parent ON parent.id=t.parent_task_id AND parent.user_id=t.user_id
-			LEFT JOIN plans plan ON plan.id=t.plan_id AND plan.user_id=t.user_id
-			WHERE ` + strings.Join(clauses, " AND ") + `
-			` + orderBy
-
-		rows, err := d.Query(q, args...)
+		tasks, err := loadTasks(d, uid, strings.Join(clauses, " AND "), args, orderBy)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
-		defer rows.Close()
-
-		var tasks []taskRow
-		for rows.Next() {
-			var t taskRow
-			var stepsRaw, emailsRaw, recurrenceRaw []byte
-			if err := rows.Scan(
-				&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority, &t.Color,
-				&t.DueDate, &t.WeekOf, &t.MonthOf, &t.ScheduledAt,
-				&t.Remind, &t.RemindedAt, &emailsRaw,
-				&t.ListID, &t.ParentTaskID, &t.ParentTaskTitle, &t.BlockedByTaskID,
-				&t.BlockedByTaskTitle, &t.BlockedByTaskStatus, &t.Important, &stepsRaw,
-				&t.SortOrder, &t.BoardRank, &t.AttachmentCount, &t.SubtaskCount, &t.SubtasksDone,
-				&t.CreatedAt, &t.UpdatedAt, &t.PlanID, &t.PlanName, &recurrenceRaw,
-			); err != nil {
-				errJSON(w, 500, err.Error())
-				return
-			}
-			t.Steps = decodeSteps(stepsRaw)
-			t.NotifyEmails = decodeEmails(emailsRaw)
-			t.Recurrence = taskrepeat.Decode(recurrenceRaw)
-			tagRows, err := d.Query("SELECT tag FROM tags WHERE user_id = $1 AND entity_type = 'task' AND entity_id = $2", uid, t.ID)
-			if err == nil {
-				for tagRows.Next() {
-					var tag string
-					tagRows.Scan(&tag)
-					t.Tags = append(t.Tags, tag)
-				}
-				tagRows.Close()
-			}
-			if t.Tags == nil {
-				t.Tags = []string{}
-			}
-			tasks = append(tasks, t)
-		}
-		if tasks == nil {
-			tasks = []taskRow{}
-		}
-
-		// Prefetch every returned task's children in ONE query and attach them,
-		// so the client can expand subtasks instantly (no per-row request).
-		if len(tasks) > 0 {
-			idx := make(map[int64]int, len(tasks))
-			ph2 := []string{}
-			cargs := []any{uid}
-			for i := range tasks {
-				idx[tasks[i].ID] = i
-				cargs = append(cargs, tasks[i].ID)
-				ph2 = append(ph2, "$"+itoa(len(cargs)))
-			}
-			crows, cerr := d.Query(`
-				SELECT t.id, t.title, COALESCE(t.description, ''), t.status, t.priority, t.color, t.due_date::text,
-				       t.important, t.parent_task_id, t.blocked_by_task_id,
-				       blocker.title, blocker.status, COALESCE(t.sort_order, 0)
-				FROM tasks t
-				LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
-				WHERE t.user_id = $1 AND t.parent_task_id IN (`+strings.Join(ph2, ",")+`)
-				ORDER BY t.sort_order ASC, t.created_at ASC`, cargs...)
-			if cerr == nil {
-				for crows.Next() {
-					var s subtaskBrief
-					if crows.Scan(&s.ID, &s.Title, &s.Description, &s.Status, &s.Priority, &s.Color, &s.DueDate,
-						&s.Important, &s.ParentTaskID, &s.BlockedByTaskID,
-						&s.BlockedByTaskTitle, &s.BlockedByTaskStatus, &s.SortOrder) == nil && s.ParentTaskID != nil {
-						if i, ok := idx[*s.ParentTaskID]; ok {
-							tasks[i].Subtasks = append(tasks[i].Subtasks, s)
-						}
-					}
-				}
-				crows.Close()
-			}
-		}
-
 		writeJSON(w, 200, tasks)
 	}
+}
+
+// listArchivedTasks is the Archive fold: tasks done more than 7 days ago,
+// newest done first, a page at a time (?limit=, default 50; ?cursor= from
+// next_cursor). ?list=<id> keeps one list's top-level tasks, as that list
+// shows them; without it, every task (the All view). limit=0 returns just
+// the count, which the fold shows before it is opened.
+func listArchivedTasks(deps Deps) http.HandlerFunc {
+	d := deps.DB
+	return func(w http.ResponseWriter, r *http.Request) {
+		uid := userID(r.Context())
+		args := []any{uid, time.Now().Add(-archiveAfter)}
+		where := "t.user_id = $1 AND t.status = 'done' AND COALESCE(t.done_at, t.updated_at) < $2"
+		if list := queryParam(r, "list"); list != "" {
+			id, err := strconv.ParseInt(list, 10, 64)
+			if err != nil {
+				errJSON(w, 400, "invalid list")
+				return
+			}
+			args = append(args, id)
+			where += " AND t.list_id = $3 AND t.parent_task_id IS NULL"
+		}
+		var count int
+		if err := d.QueryRow(`SELECT count(*) FROM tasks t WHERE `+where, args...).Scan(&count); err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		limit := 50
+		if v, err := strconv.Atoi(queryParam(r, "limit")); err == nil && v >= 0 {
+			limit = min(v, 200)
+		}
+		out := map[string]any{"items": []taskRow{}, "count": count, "has_more": count > 0, "next_cursor": nil}
+		if limit == 0 {
+			writeJSON(w, 200, out)
+			return
+		}
+		// cursor = "<done_at RFC3339Nano>,<id>" of the last row shown.
+		if c := queryParam(r, "cursor"); c != "" {
+			at, idStr, ok := strings.Cut(c, ",")
+			ts, terr := time.Parse(time.RFC3339Nano, at)
+			id, ierr := strconv.ParseInt(idStr, 10, 64)
+			if !ok || terr != nil || ierr != nil {
+				errJSON(w, 400, "invalid cursor")
+				return
+			}
+			n := len(args)
+			args = append(args, ts, id)
+			where += " AND (COALESCE(t.done_at, t.updated_at), t.id) < ($" + itoa(n+1) + ", $" + itoa(n+2) + ")"
+		}
+		tasks, err := loadTasks(d, uid, where, args,
+			"ORDER BY COALESCE(t.done_at, t.updated_at) DESC, t.id DESC LIMIT "+itoa(limit+1))
+		if err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		more := len(tasks) > limit
+		if more {
+			tasks = tasks[:limit]
+			last := tasks[len(tasks)-1]
+			at := last.UpdatedAt
+			if last.DoneAt != nil {
+				at = *last.DoneAt
+			}
+			out["next_cursor"] = at + "," + strconv.FormatInt(last.ID, 10)
+		}
+		out["items"], out["has_more"] = tasks, more
+		writeJSON(w, 200, out)
+	}
+}
+
+// archiveAfter: a done task leaves Done (Board lane, list fold) for the
+// Archive this long after it was done. Fixed for now; no setting.
+const archiveAfter = 7 * 24 * time.Hour
+
+// loadTasks reads task rows (with tags and embedded subtasks) matching where
+// (args are its placeholders, $1 = uid), ordered/limited by tail.
+func loadTasks(d *db.DB, uid string, where string, args []any, tail string) ([]taskRow, error) {
+	q := `
+		SELECT t.id, t.title, t.description, t.status, t.priority, t.color,
+		       t.due_date::text, t.week_of::text, t.month_of::text, t.scheduled_at::text,
+		       t.remind, t.reminded_at::text, COALESCE(t.notify_emails, '[]'::jsonb),
+		       t.list_id, t.parent_task_id, parent.title, t.blocked_by_task_id,
+		       blocker.title, blocker.status, t.important, t.steps,
+		       COALESCE(t.sort_order, 0), t.board_rank, t.done_at,
+		       (SELECT count(*) FROM task_attachments ta WHERE ta.task_id = t.id)::int,
+		       COALESCE(c.cnt, 0)::int, COALESCE(c.done, 0)::int,
+		       t.created_at, t.updated_at, t.plan_id, plan.name, t.recurrence
+		FROM tasks t
+		LEFT JOIN (
+			SELECT parent_task_id,
+			       COUNT(*) AS cnt,
+			       COUNT(*) FILTER (WHERE status = 'done') AS done
+			FROM tasks
+			WHERE parent_task_id IS NOT NULL
+			GROUP BY parent_task_id
+		) c ON c.parent_task_id = t.id
+		LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
+		LEFT JOIN tasks parent ON parent.id=t.parent_task_id AND parent.user_id=t.user_id
+		LEFT JOIN plans plan ON plan.id=t.plan_id AND plan.user_id=t.user_id
+		WHERE ` + where + `
+		` + tail
+
+	rows, err := d.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []taskRow
+	for rows.Next() {
+		var t taskRow
+		var stepsRaw, emailsRaw, recurrenceRaw []byte
+		if err := rows.Scan(
+			&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority, &t.Color,
+			&t.DueDate, &t.WeekOf, &t.MonthOf, &t.ScheduledAt,
+			&t.Remind, &t.RemindedAt, &emailsRaw,
+			&t.ListID, &t.ParentTaskID, &t.ParentTaskTitle, &t.BlockedByTaskID,
+			&t.BlockedByTaskTitle, &t.BlockedByTaskStatus, &t.Important, &stepsRaw,
+			&t.SortOrder, &t.BoardRank, &t.DoneAt, &t.AttachmentCount, &t.SubtaskCount, &t.SubtasksDone,
+			&t.CreatedAt, &t.UpdatedAt, &t.PlanID, &t.PlanName, &recurrenceRaw,
+		); err != nil {
+			return nil, err
+		}
+		t.Steps = decodeSteps(stepsRaw)
+		t.NotifyEmails = decodeEmails(emailsRaw)
+		t.Recurrence = taskrepeat.Decode(recurrenceRaw)
+		tagRows, err := d.Query("SELECT tag FROM tags WHERE user_id = $1 AND entity_type = 'task' AND entity_id = $2", uid, t.ID)
+		if err == nil {
+			for tagRows.Next() {
+				var tag string
+				tagRows.Scan(&tag)
+				t.Tags = append(t.Tags, tag)
+			}
+			tagRows.Close()
+		}
+		if t.Tags == nil {
+			t.Tags = []string{}
+		}
+		tasks = append(tasks, t)
+	}
+	if tasks == nil {
+		tasks = []taskRow{}
+	}
+
+	// Prefetch every returned task's children in ONE query and attach them,
+	// so the client can expand subtasks instantly (no per-row request).
+	if len(tasks) > 0 {
+		idx := make(map[int64]int, len(tasks))
+		ph2 := []string{}
+		cargs := []any{uid}
+		for i := range tasks {
+			idx[tasks[i].ID] = i
+			cargs = append(cargs, tasks[i].ID)
+			ph2 = append(ph2, "$"+itoa(len(cargs)))
+		}
+		crows, cerr := d.Query(`
+			SELECT t.id, t.title, COALESCE(t.description, ''), t.status, t.priority, t.color, t.due_date::text,
+			       t.important, t.parent_task_id, t.blocked_by_task_id,
+			       blocker.title, blocker.status, COALESCE(t.sort_order, 0)
+			FROM tasks t
+			LEFT JOIN tasks blocker ON blocker.id=t.blocked_by_task_id AND blocker.user_id=t.user_id
+			WHERE t.user_id = $1 AND t.parent_task_id IN (`+strings.Join(ph2, ",")+`)
+			ORDER BY t.sort_order ASC, t.created_at ASC`, cargs...)
+		if cerr == nil {
+			for crows.Next() {
+				var s subtaskBrief
+				if crows.Scan(&s.ID, &s.Title, &s.Description, &s.Status, &s.Priority, &s.Color, &s.DueDate,
+					&s.Important, &s.ParentTaskID, &s.BlockedByTaskID,
+					&s.BlockedByTaskTitle, &s.BlockedByTaskStatus, &s.SortOrder) == nil && s.ParentTaskID != nil {
+					if i, ok := idx[*s.ParentTaskID]; ok {
+						tasks[i].Subtasks = append(tasks[i].Subtasks, s)
+					}
+				}
+			}
+			crows.Close()
+		}
+	}
+
+	return tasks, nil
 }
 
 func listSubtasks(deps Deps) http.HandlerFunc {

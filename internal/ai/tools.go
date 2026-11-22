@@ -45,9 +45,24 @@ type Tool struct {
 	Handler     func(ctx context.Context, uid string, args map[string]any) (data any, meta map[string]any, err error)
 }
 
+// renamedTools maps a tool's old name to its current one, so saved chats
+// (and connected apps holding an old tool list) still reach it.
+var renamedTools = map[string]string{
+	"complete_task": "mark_task_done", // 2026-11-22: tasks say "done" everywhere
+}
+
+// ToolName is the current name for name (itself unless it was renamed).
+func ToolName(name string) string {
+	if n, ok := renamedTools[name]; ok {
+		return n
+	}
+	return name
+}
+
 // dispatch looks up a tool by name and invokes it. Unknown tools and
 // bad-arg errors come back as structured errors so the model can recover.
 func (s *Service) dispatch(ctx context.Context, uid string, name string, args map[string]any) (any, map[string]any, error) {
+	name = ToolName(name)
 	for _, t := range s.tools {
 		if t.Name == name {
 			// Any model call a tool makes is counted for this user.
@@ -74,6 +89,7 @@ func (s *Service) dispatch(ctx context.Context, uid string, name string, args ma
 // kindLabels name the write tools' meta kinds where the plain reading of
 // the kind ("journal_created" → "Created journal") would be off.
 var kindLabels = map[string]string{
+	"task_done":              "Marked task done",
 	"journal_created":        "Saved journal entry",
 	"memo_created":           "Saved memo",
 	"media_added":            "Added to library",
@@ -736,7 +752,7 @@ func (s *Service) buildTools() []Tool {
 			},
 		},
 		{
-			Name:        "complete_task",
+			Name:        "mark_task_done",
 			Description: "Mark a task as done. Refused while any of its subtasks are still open — tell the user which ones remain.",
 			Mutating:    true,
 			Schema:      obj(map[string]*genai.Schema{"id": intg("Task id.")}, "id"),
@@ -759,8 +775,8 @@ func (s *Service) buildTools() []Tool {
 					return nil, nil, err
 				}
 				unblockAITaskDependents(ctx, d, uid, id)
-				// Completing the last open session of a month goal finishes it.
-				var completedGoal int64
+				// Marking the last open session of a month goal done finishes it.
+				var doneGoal int64
 				if err := d.QueryRow(`
 					UPDATE tasks g SET status='done', blocked_by_task_id=NULL, updated_at=NOW()
 					 WHERE g.user_id=$2 AND g.month_of IS NOT NULL
@@ -768,11 +784,11 @@ func (s *Service) buildTools() []Tool {
 					   AND g.id = (SELECT parent_task_id FROM tasks WHERE id=$1 AND user_id=$2)
 					   AND EXISTS (SELECT 1 FROM tasks c WHERE c.parent_task_id=g.id AND c.user_id=$2)
 					   AND NOT EXISTS (SELECT 1 FROM tasks c WHERE c.parent_task_id=g.id AND c.user_id=$2 AND c.status NOT IN ('done','scratched'))
-					 RETURNING g.id`, id, uid).Scan(&completedGoal); err == nil {
-					unblockAITaskDependents(ctx, d, uid, completedGoal)
+					 RETURNING g.id`, id, uid).Scan(&doneGoal); err == nil {
+					unblockAITaskDependents(ctx, d, uid, doneGoal)
 				}
 				return map[string]any{"id": id, "status": "done"},
-					map[string]any{"kind": "task_completed", "id": id}, nil
+					map[string]any{"kind": "task_done", "id": id}, nil
 			},
 		},
 		{

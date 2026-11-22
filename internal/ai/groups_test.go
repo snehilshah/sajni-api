@@ -16,7 +16,7 @@ import (
 // if most questions need it; otherwise give it a group in toolGroup.
 var coreTools = []string{
 	"get_current_context", "search", "fetch",
-	"list_tasks", "create_task", "update_task", "complete_task", "reschedule_task", "list_task_lists",
+	"list_tasks", "create_task", "update_task", "mark_task_done", "reschedule_task", "list_task_lists",
 	"list_habits", "log_habit",
 	"list_journal_entries", "get_journal_entry", "create_journal_entry",
 	"list_recent_memos", "create_memo",

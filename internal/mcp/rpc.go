@@ -141,6 +141,7 @@ func (s *Server) dispatch(ctx context.Context, who *caller, m rpcMessage) (any, 
 }
 
 func (s *Server) callTool(ctx context.Context, who *caller, name string, args map[string]any) (any, *rpcError) {
+	name = ai.ToolName(name)
 	var entry *toolEntry
 	for i, t := range s.toolList() {
 		if t.tool.Name == name {

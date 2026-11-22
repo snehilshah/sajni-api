@@ -31,9 +31,9 @@ func OpenSubtaskCount(ctx context.Context, q rowQueryer, userID string, taskID i
 // OpenSubtasksMessage is the user-facing refusal shared by the API and AI.
 func OpenSubtasksMessage(n int) string {
 	if n == 1 {
-		return "Finish its 1 open subtask first"
+		return "Mark its 1 open subtask done first"
 	}
-	return fmt.Sprintf("Finish its %d open subtasks first", n)
+	return fmt.Sprintf("Mark its %d open subtasks done first", n)
 }
 
 // DeleteTaskFiles removes the stored images attached to a task and its

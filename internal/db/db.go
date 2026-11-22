@@ -308,11 +308,35 @@ func (d *DB) ensureSchema() error {
 		-- NULL until first placed: then it sorts as -updated_at in ms, so new
 		-- and edited tasks still come first. Moving it never bumps updated_at.
 		board_rank       DOUBLE PRECISION,
+		-- When it was marked done (NULL unless status = 'done'); set only by
+		-- trg_tasks_done_at. Done tasks leave Done for the Archive 7 days on.
+		done_at          TIMESTAMPTZ,
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	-- Prod's tasks table predates board_rank (2026-11-16); drop once shipped.
 	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS board_rank DOUBLE PRECISION;
+	-- Prod's tasks table predates done_at (2026-11-22); drop once shipped
+	-- (with its backfill after task_events).
+	ALTER TABLE tasks ADD COLUMN IF NOT EXISTS done_at TIMESTAMPTZ;
+	-- Every writer (REST, AI, MCP, the repeat sweep, goal roll-ups) gets
+	-- done_at from here: stamped when a task becomes done, cleared when it
+	-- stops being done. An insert may bring its own (a restore).
+	CREATE OR REPLACE FUNCTION tasks_done_at() RETURNS trigger AS $fn$
+	BEGIN
+		IF NEW.status <> 'done' THEN
+			NEW.done_at := NULL;
+		ELSIF TG_OP = 'INSERT' THEN
+			NEW.done_at := COALESCE(NEW.done_at, NOW());
+		ELSIF OLD.status IS DISTINCT FROM 'done' THEN
+			NEW.done_at := NOW();
+		ELSE
+			NEW.done_at := COALESCE(NEW.done_at, OLD.done_at, NOW());
+		END IF;
+		RETURN NEW;
+	END $fn$ LANGUAGE plpgsql;
+	CREATE OR REPLACE TRIGGER trg_tasks_done_at BEFORE INSERT OR UPDATE OF status, done_at ON tasks
+		FOR EACH ROW EXECUTE FUNCTION tasks_done_at();
 	CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_list ON tasks(list_id);
 	CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
@@ -325,6 +349,8 @@ func (d *DB) ensureSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_tasks_user_due_date ON tasks(user_id, due_date) WHERE due_date IS NOT NULL;
 	CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id, due_date) WHERE plan_id IS NOT NULL;
 	CREATE INDEX IF NOT EXISTS idx_tasks_repeat ON tasks(id) WHERE recurrence <> '{}'::jsonb;
+	-- Done and the Archive (newest done first).
+	CREATE INDEX IF NOT EXISTS idx_tasks_done_at ON tasks(user_id, done_at DESC, id DESC) WHERE status = 'done';
 
 	-- Standalone reminders deliberately do not ride on tasks. A reminder is a
 	-- lightweight message + schedule; occurrence rows carry delivery state so
@@ -1191,6 +1217,12 @@ func (d *DB) ensureSchema() error {
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
+	-- One-time (2026-11-22): date prod's done tasks by their last move to
+	-- done, else updated_at. Drop once shipped.
+	UPDATE tasks t SET done_at = COALESCE((
+		SELECT max(e.created_at) FROM task_events e
+		 WHERE e.task_id = t.id AND e.kind = 'status' AND e.to_val = 'done'), t.updated_at)
+	 WHERE t.status = 'done' AND t.done_at IS NULL;
 
 	-- ─── Tasks: multiple reminders ────────────────────────────────────
 	-- The legacy single reminder (tasks.remind + scheduled_at) only fires on

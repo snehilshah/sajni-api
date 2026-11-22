@@ -99,7 +99,7 @@ func groupOf(tool string) string { return toolGroup[tool] }
 // questions, so "make it 300" after a new transaction can edit or delete it.
 var coreFollows = map[string]string{
 	"create_transaction": "money", "update_transaction": "money", "list_finance_transactions": "money",
-	"create_task": "tasks", "update_task": "tasks", "complete_task": "tasks", "reschedule_task": "tasks", "list_tasks": "tasks",
+	"create_task": "tasks", "update_task": "tasks", "mark_task_done": "tasks", "reschedule_task": "tasks", "list_tasks": "tasks",
 	"create_reminder": "reminders", "list_reminders": "reminders",
 	"add_media": "library", "log_habit": "habits", "list_habits": "habits",
 }
