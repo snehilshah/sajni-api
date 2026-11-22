@@ -30,7 +30,7 @@ to the Cloud Run default URL.
 | Cloud Run                 | min=0, max=2, cpu=1, mem=512Mi          | **$0** under free tier |
 | Artifact Registry         | <500MB images, lifecycle keeps 5 latest | <$0.10/mo |
 | Secret Manager            | 4 secrets, ≤6 free                      | $0          |
-| GCS (`sajni-blobs`)       | Standard, single region, <1GB           | <$0.05/mo |
+| GCS (`ohmysajni-sajni-blobs`) | Standard, single region, <1GB           | <$0.05/mo |
 | Cloud Tasks               | First 1M ops/month free                 | $0          |
 | **Postgres**              | **Use Supabase / Neon free tier**       | $0          |
 |                           | (Cloud SQL min ≈ ₹830/mo — avoid)      |              |
@@ -78,7 +78,7 @@ gcloud artifacts repositories set-cleanup-policies sajni \
   --location="$REGION" --policy=/tmp/keep-recent.json
 
 # GCS for note/journal blobs (Cloud Run filesystem is ephemeral).
-gcloud storage buckets create "gs://sajni-blobs" \
+gcloud storage buckets create "gs://ohmysajni-sajni-blobs" \
   --location="$REGION" --uniform-bucket-level-access
 
 # Cloud Tasks queue for exact reminder delivery. The app enqueues reminders
@@ -451,7 +451,7 @@ deploy SA has `roles/storage.objectAdmin`, so reads/writes Just Work.
 Migrate any local dev blobs once before going to prod:
 
 ```sh
-gcloud storage cp -r data/blobs/* gs://sajni-blobs/blobs/
+gcloud storage cp -r data/blobs/* gs://ohmysajni-sajni-blobs/blobs/
 ```
 
 ## Backups
