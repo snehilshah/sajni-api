@@ -632,7 +632,7 @@ func createEventEntry(deps Deps) http.HandlerFunc {
 			errJSON(w, http.StatusBadRequest, "invalid json")
 			return
 		}
-		occurredAt, err := time.Parse(time.RFC3339, strings.TrimSpace(body.OccurredAt))
+		occurredAt, err := parseClientTime(body.OccurredAt)
 		if err != nil {
 			errJSON(w, http.StatusBadRequest, "occurred_at must be an RFC3339 timestamp")
 			return
@@ -721,7 +721,7 @@ func updateEventEntry(deps Deps) http.HandlerFunc {
 		}
 
 		if body.OccurredAt != nil {
-			occurredAt, err := time.Parse(time.RFC3339, strings.TrimSpace(*body.OccurredAt))
+			occurredAt, err := parseClientTime(*body.OccurredAt)
 			if err != nil {
 				errJSON(w, http.StatusBadRequest, "occurred_at must be an RFC3339 timestamp")
 				return
