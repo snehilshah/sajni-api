@@ -658,7 +658,7 @@ func (s *Service) buildTools() []Tool {
 		// ---------------- WRITE ----------------
 		{
 			Name:        "create_task",
-			Description: "Create a new task. Resolve relative dates ('tomorrow', 'next monday') from today's date (get_current_context only if you don't have it). Use list_task_lists to look up list_id by name; use list_tasks to find a parent_task_id when nesting. Explicit 'remind me to X at <time>' wording belongs in create_reminder, not here. Use scheduled_at + remind only when the user explicitly asks for a task that also carries a notification.",
+			Description: "Create a new task. Resolve relative dates ('tomorrow', 'next monday') from today's date (get_current_context only if you don't have it). Use list_task_lists to look up list_id by name; use list_tasks to find a parent_task_id when nesting. Explicit 'remind me to X at <time>' wording belongs in create_reminder, not here. A task given scheduled_at reminds the user at that time by default (as in the apps); pass remind=false only when the user says the time is just for planning.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"title":            str("Required. Short title."),
@@ -669,7 +669,7 @@ func (s *Service) buildTools() []Tool {
 				"week_of":          str("Optional. Makes this a week-scoped task with no specific day — pass the ISO Monday date (YYYY-MM-DD) of the target week. Shows in the 'This Week' list. Mutually exclusive with due_date."),
 				"month_of":         str("Optional. Makes this a month goal with no specific day — pass the ISO 1st-of-month date (YYYY-MM-DD), e.g. 2026-06-01. Shows in the 'This Month' list; the user breaks it into dated child sessions (create them with parent_task_id + due_date). Mutually exclusive with due_date and week_of. Don't invent session dates — create only the goal unless the user gives a schedule."),
 				"scheduled_at":     str("Optional ISO timestamp with offset, e.g. 2026-05-30T17:00:00+05:30. The event/reminder time."),
-				"remind":           boolean("Optional. If true, email the user at scheduled_at. Requires scheduled_at."),
+				"remind":           boolean("Optional. Notify the user at scheduled_at (their email/push choice). Defaults to true when scheduled_at is given; false turns it off."),
 				"notify_emails":    arrayOf(str(""), "Optional. Extra email addresses to also notify when this task's reminders fire (e.g. a friend for a meet-up). Max 3."),
 				"duration_minutes": intg("Optional. Default 30."),
 				"list_id":          intg("Optional. Place the task inside this user list."),
@@ -806,7 +806,7 @@ func (s *Service) buildTools() []Tool {
 				"id":           intg("Required. Task id (use list_tasks, smart='missed' to find overdue ones)."),
 				"due_date":     str("New due date, ISO YYYY-MM-DD."),
 				"scheduled_at": str("Optional new event time, ISO with offset e.g. 2026-06-06T17:00:00+05:30. Re-arms the reminder."),
-				"remind":       boolean("Optional. Email the user at scheduled_at."),
+				"remind":       boolean("Optional. Notify the user at scheduled_at. Giving a task without a time its first scheduled_at turns this on unless you pass false."),
 			}, "id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
 				return rescheduleTaskTool(ctx, d, queue, uid, args)
@@ -2581,7 +2581,8 @@ func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, ui
 	scheduled := argStr(args, "scheduled_at")
 	dur := argInt(args, "duration_minutes", 30)
 	important := argBool(args, "important", false)
-	remind := argBool(args, "remind", false)
+	// A time means a reminder unless the caller says otherwise (the clients do the same).
+	remind := argBool(args, "remind", strings.TrimSpace(scheduled) != "")
 
 	var (
 		id        int64
@@ -2698,7 +2699,7 @@ func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, ui
 		                   notify_emails, duration_minutes, list_id, parent_task_id, important, steps, plan_id, recurrence)
 		VALUES ($1,$2,$3,$4,$5,'todo',$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16::jsonb,$17,$18::jsonb)
 		RETURNING id, scheduled_at`,
-		uid, title, desc, priority, colorArg, dueArg, weekArg, monthArg, schArg, remind, notifyJSON, dur, listArg, parentArg, important, stepsJSON, planArg, recurrence,
+		uid, title, desc, priority, colorArg, dueArg, weekArg, monthArg, schArg, remind && schArg != nil, notifyJSON, dur, listArg, parentArg, important, stepsJSON, planArg, recurrence,
 	).Scan(&id, &scheduledAt)
 	if err != nil {
 		return nil, nil, err
@@ -2845,6 +2846,11 @@ func rescheduleTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue
 		}
 	}
 
+	// A first time switches the reminder on, as picking one does in the apps.
+	if !hasRemind && sched != "" && !oldScheduled.Valid && !remind {
+		hasRemind = true
+		args["remind"] = true
+	}
 	if hasRemind {
 		remind = argBool(args, "remind", false)
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET remind=$1,
