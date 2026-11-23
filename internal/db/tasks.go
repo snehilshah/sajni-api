@@ -49,6 +49,24 @@ func ParentWouldLoop(ctx context.Context, q rowQueryer, userID string, taskID, p
 	return loop
 }
 
+// OpenStepCount counts a task's unticked steps. Like open subtasks, they
+// keep it from being marked done.
+func OpenStepCount(ctx context.Context, q rowQueryer, userID string, taskID int64) int {
+	var n int
+	q.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM tasks t, jsonb_array_elements(t.steps) s
+		 WHERE t.id = $1 AND t.user_id = $2 AND NOT COALESCE((s->>'done')::boolean, false)`, taskID, userID).Scan(&n)
+	return n
+}
+
+// OpenStepsMessage is the refusal for unticked steps, shared by the API and AI.
+func OpenStepsMessage(n int) string {
+	if n == 1 {
+		return "Tick its 1 open step first"
+	}
+	return fmt.Sprintf("Tick its %d open steps first", n)
+}
+
 // OpenSubtasksMessage is the user-facing refusal shared by the API and AI.
 func OpenSubtasksMessage(n int) string {
 	if n == 1 {

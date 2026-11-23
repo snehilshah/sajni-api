@@ -66,6 +66,15 @@ func decodeEmails(raw []byte) []string {
 	return out
 }
 
+// validTaskPriority: low < medium < high < max.
+func validTaskPriority(p string) bool {
+	switch p {
+	case "low", "medium", "high", "max":
+		return true
+	}
+	return false
+}
+
 func validTaskStatus(status string) bool {
 	switch status {
 	case "todo", "in_progress", "blocked", "done", "scratched":
@@ -766,6 +775,10 @@ func createTask(deps Deps) http.HandlerFunc {
 		if body.Priority == "" {
 			body.Priority = "medium"
 		}
+		if !validTaskPriority(body.Priority) {
+			errJSON(w, 400, "Priority is low, medium, high or max")
+			return
+		}
 		if body.Status == "" {
 			body.Status = "todo"
 		}
@@ -1000,6 +1013,21 @@ func updateTask(deps Deps) http.HandlerFunc {
 				errJSON(w, 409, db.OpenSubtasksMessage(n))
 				return
 			}
+			// Steps sent with this save count as they will be, else as stored.
+			n := 0
+			if body.Steps != nil {
+				for _, st := range normalizeSteps(*body.Steps) {
+					if !st.Done {
+						n++
+					}
+				}
+			} else {
+				n = db.OpenStepCount(r.Context(), tx, uid, id)
+			}
+			if n > 0 {
+				errJSON(w, 409, db.OpenStepsMessage(n))
+				return
+			}
 		}
 
 		var contentForTags string
@@ -1038,6 +1066,10 @@ func updateTask(deps Deps) http.HandlerFunc {
 			if proposedStatus == "done" || proposedStatus == "scratched" {
 				unblockDependents(q, uid, id)
 			}
+		}
+		if body.Priority != nil && !validTaskPriority(*body.Priority) {
+			errJSON(w, 400, "Priority is low, medium, high or max")
+			return
 		}
 		if body.Priority != nil {
 			q.Exec("UPDATE tasks SET priority = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3", *body.Priority, id, uid)

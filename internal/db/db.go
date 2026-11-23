@@ -284,7 +284,7 @@ func (d *DB) ensureSchema() error {
 		title            TEXT        NOT NULL DEFAULT '',
 		description      TEXT        NOT NULL DEFAULT '',
 		status           TEXT        NOT NULL DEFAULT 'todo',
-		priority         TEXT        NOT NULL DEFAULT 'medium',
+		priority         TEXT        NOT NULL DEFAULT 'medium', -- low | medium | high | max
 		color            TEXT,
 		due_date         DATE,
 		week_of          DATE,

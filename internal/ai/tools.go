@@ -351,7 +351,7 @@ func (s *Service) buildTools() []Tool {
 				"status":    str("Filter by status: 'open' (todo, in progress or blocked: anything still to do), 'todo', 'in_progress', 'blocked', 'done', 'scratched'."),
 				"due_from":  str("Deadline on or after, ISO date YYYY-MM-DD."),
 				"due_to":    str("Deadline on or before, ISO date YYYY-MM-DD."),
-				"priority":  str("Filter by priority: 'high', 'medium', 'low'."),
+				"priority":  str("Filter by priority: 'max', 'high', 'medium', 'low'."),
 				"important": boolean("Restrict to starred tasks."),
 				"limit":     intg("Maximum tasks to return (default 50, at most 200)."),
 			}),
@@ -663,7 +663,7 @@ func (s *Service) buildTools() []Tool {
 			Schema: obj(map[string]*genai.Schema{
 				"title":            str("Required. Short title."),
 				"description":      str("Optional details."),
-				"priority":         str("'high' | 'medium' | 'low'. Default 'medium'."),
+				"priority":         str("'max' | 'high' | 'medium' | 'low' (max = the most urgent). Default 'medium'."),
 				"color":            str("Optional task accent: #2D5A4F, #7C9A92, #C49A6C, #A14B4F, #4F6FA1, #8B6FA1, or #7A7A7A."),
 				"due_date":         str("Optional ISO date YYYY-MM-DD."),
 				"week_of":          str("Optional. Makes this a week-scoped task with no specific day — pass the ISO Monday date (YYYY-MM-DD) of the target week. Shows in the 'This Week' list. Mutually exclusive with due_date."),
@@ -705,7 +705,7 @@ func (s *Service) buildTools() []Tool {
 				"id":             intg("Required. Task id (use list_tasks to find it)."),
 				"title":          str("Optional. New title."),
 				"description":    str("Optional. New details."),
-				"priority":       str("Optional. 'high' | 'medium' | 'low'."),
+				"priority":       str("Optional. 'max' | 'high' | 'medium' | 'low'."),
 				"color":          str("Optional task accent from the supported muted palette. Pass an empty string to clear it."),
 				"due_date":       str("Optional. New due date, ISO YYYY-MM-DD."),
 				"list_id":        intg("Optional. Move the task into this list."),
@@ -757,7 +757,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "mark_task_done",
-			Description: "Mark a task as done. Refused while any of its subtasks are still open — tell the user which ones remain.",
+			Description: "Mark a task as done. Refused while any of its subtasks are still open or any of its steps are unticked: tell the user which ones remain.",
 			Mutating:    true,
 			Schema:      obj(map[string]*genai.Schema{"id": intg("Task id.")}, "id"),
 			Handler: func(ctx context.Context, uid string, args map[string]any) (any, map[string]any, error) {
@@ -772,6 +772,9 @@ func (s *Service) buildTools() []Tool {
 				}
 				if n := db.OpenSubtaskCount(ctx, d, uid, int64(id)); n > 0 {
 					return nil, nil, fmt.Errorf("%s", db.OpenSubtasksMessage(n))
+				}
+				if n := db.OpenStepCount(ctx, d, uid, int64(id)); n > 0 && prev != "done" {
+					return nil, nil, fmt.Errorf("%s", db.OpenStepsMessage(n))
 				}
 				_, err := d.Exec(`UPDATE tasks SET status='done', blocked_by_task_id=NULL, updated_at=NOW() WHERE id=$1 AND user_id=$2`, id, uid)
 				if err == nil && prev != "done" {
@@ -1670,7 +1673,7 @@ func listTasksTool(ctx context.Context, d *db.DB, uid string, args map[string]an
 	             created_at
 	      FROM tasks WHERE ` + strings.Join(clauses, " AND ") +
 		fmt.Sprintf(` ORDER BY (status='done') ASC, important DESC NULLS LAST,
-		              CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END,
+		              CASE priority WHEN 'max' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
 		              %s NULLS LAST, created_at DESC LIMIT %d`, deadline, limit+1)
 	rows, err := d.QueryContext(ctx, q, vals...)
 	if err != nil {
@@ -2565,7 +2568,9 @@ func createTaskTool(ctx context.Context, d *db.DB, queue reminderqueue.Queue, ui
 	}
 	desc := argStr(args, "description")
 	priority := argStr(args, "priority")
-	if priority == "" {
+	switch priority {
+	case "low", "medium", "high", "max":
+	default:
 		priority = "medium"
 	}
 	var colorArg any
@@ -2992,7 +2997,7 @@ func updateTaskTool(ctx context.Context, d *db.DB, uid string, args map[string]a
 		descUpdated = true
 	}
 	if _, ok := args["priority"]; ok {
-		if p := strings.TrimSpace(argStr(args, "priority")); p == "high" || p == "medium" || p == "low" {
+		if p := strings.TrimSpace(argStr(args, "priority")); p == "max" || p == "high" || p == "medium" || p == "low" {
 			add("priority", p)
 		}
 	}
