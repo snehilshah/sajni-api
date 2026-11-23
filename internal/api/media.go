@@ -18,6 +18,7 @@ import (
 
 	"sajni/internal/db"
 	mediastatus "sajni/internal/media"
+	"sajni/internal/postercolor"
 )
 
 // httpClient bounds every outbound TMDB / Open Library call. The stdlib
@@ -179,14 +180,16 @@ func listMediaEvents(deps Deps) http.HandlerFunc {
 }
 
 type Media struct {
-	ID              int64  `json:"id"`
-	Title           string `json:"title"`
-	Type            string `json:"type"`
-	Status          string `json:"status"`
-	Rating          *int   `json:"rating"`
-	Notes           string `json:"notes"`
-	Platform        string `json:"platform"`
-	PosterURL       string `json:"poster_url"`
+	ID        int64  `json:"id"`
+	Title     string `json:"title"`
+	Type      string `json:"type"`
+	Status    string `json:"status"`
+	Rating    *int   `json:"rating"`
+	Notes     string `json:"notes"`
+	Platform  string `json:"platform"`
+	PosterURL string `json:"poster_url"`
+	// The poster's main colour, "#rrggbb" ('' until coloured or when it has none).
+	PosterColor     string `json:"poster_color"`
 	Year            *int   `json:"year"`
 	ReleaseDate     string `json:"release_date"`
 	Genre           string `json:"genre"`
@@ -252,7 +255,7 @@ func listMedia(deps Deps) http.HandlerFunc {
 			args = append(args, c)
 		}
 
-		q := `SELECT m.id, m.title, m.type, m.status, m.rating, m.notes, m.platform, m.poster_url,
+		q := `SELECT m.id, m.title, m.type, m.status, m.rating, m.notes, m.platform, m.poster_url, m.poster_color,
 		       m.year, COALESCE(m.release_date::text, ''), m.genre, m.external_id, m.episodes_watched, m.episodes_total,
 		       m.seasons_watched, m.seasons_total,
 		       COALESCE(m.season_episodes::text, '[]'),
@@ -286,7 +289,7 @@ func listMedia(deps Deps) http.HandlerFunc {
 			var m Media
 			var seRaw string
 			if err := rows.Scan(&m.ID, &m.Title, &m.Type, &m.Status, &m.Rating, &m.Notes,
-				&m.Platform, &m.PosterURL, &m.Year, &m.ReleaseDate, &m.Genre, &m.ExternalID,
+				&m.Platform, &m.PosterURL, &m.PosterColor, &m.Year, &m.ReleaseDate, &m.Genre, &m.ExternalID,
 				&m.EpisodesWatched, &m.EpisodesTotal,
 				&m.SeasonsWatched, &m.SeasonsTotal,
 				&seRaw, &m.CollectionID, &m.CollectionName,
@@ -419,6 +422,7 @@ func createMedia(deps Deps) http.HandlerFunc {
 				progressMeta(body.SeasonsWatched, body.EpisodesWatched, body.EpisodesTotal, body.SeasonEpisodes))
 		}
 
+		colorPoster(r.Context(), d, id)
 		writeJSON(w, 201, map[string]int64{"id": id})
 	}
 }
@@ -789,6 +793,9 @@ func updateMedia(deps Deps) http.HandlerFunc {
 		// Rating set / changed.
 		if newRating.Valid && (!prevRating.Valid || newRating.Int64 != prevRating.Int64) {
 			logMediaEvent(d, uid, id, "rating", map[string]any{"rating": newRating.Int64})
+		}
+		if patch.PosterURL.Set {
+			colorPoster(r.Context(), d, id)
 		}
 
 		writeJSON(w, 200, map[string]string{"status": "ok"})
@@ -1553,4 +1560,12 @@ func intFromJSON(v any) int {
 		}
 	}
 	return 0
+}
+
+// colorPoster gives a just-saved row its poster colour, waiting at most a
+// few seconds; anything slower is left to the quarter-hour sweep.
+func colorPoster(ctx context.Context, d *db.DB, id int64) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 4*time.Second)
+	defer cancel()
+	postercolor.FillOne(ctx, d.DB, id)
 }

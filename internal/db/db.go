@@ -476,9 +476,17 @@ func (d *DB) ensureSchema() error {
 		-- Successful TMDB freshness check. Clients may request a refresh on
 		-- every startup; this server-owned stamp keeps it to once per week.
 		metadata_checked_at TIMESTAMPTZ,
+		-- The poster's main colour ("#rrggbb", '' when it has none), which the
+		-- apps tint the title with; poster_color_of is the poster URL it was
+		-- taken from, so a new poster is coloured again (internal/postercolor).
+		poster_color     TEXT        NOT NULL DEFAULT '',
+		poster_color_of  TEXT        NOT NULL DEFAULT '',
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	);
+	-- 2026-11: poster colours (prod's media table predates them; drop once shipped).
+	ALTER TABLE media ADD COLUMN IF NOT EXISTS poster_color TEXT NOT NULL DEFAULT '';
+	ALTER TABLE media ADD COLUMN IF NOT EXISTS poster_color_of TEXT NOT NULL DEFAULT '';
 	CREATE INDEX IF NOT EXISTS idx_media_user ON media(user_id);
 	CREATE INDEX IF NOT EXISTS idx_media_collection ON media(user_id, collection_id) WHERE collection_id <> '';
 	CREATE INDEX IF NOT EXISTS idx_media_upcoming_release_all ON media(user_id, release_date)

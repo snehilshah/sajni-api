@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sajni/internal/postercolor"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -70,6 +71,15 @@ func ProcessScheduledNotifications(ctx context.Context, deps Deps) (map[string]i
 
 	repeated, err := ProcessRepeatingTasks(ctx, deps)
 	result["tasks_repeated"] = repeated
+	if err != nil {
+		jobErrors = append(jobErrors, err)
+	}
+
+	// Posters still without a colour (new, changed, or the first run).
+	colorCtx, cancelColor := context.WithTimeout(ctx, 45*time.Second)
+	colored, err := postercolor.Fill(colorCtx, deps.DB.DB, 60)
+	cancelColor()
+	result["posters_colored"] = colored
 	if err != nil {
 		jobErrors = append(jobErrors, err)
 	}
