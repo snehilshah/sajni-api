@@ -33,9 +33,40 @@ func TestAdvanceDueKeepsTheDay(t *testing.T) {
 			t.Errorf("%s %s → %s, want %s", c.from, c.freq, got, c.want)
 		}
 	}
-	// A payment's cycle: Home Contrib due 5 Dec, paid 6 Jan → the 5 Jan cycle.
-	if got := db.RecurringCycleOn(day("2026-12-05"), "monthly", 5, day("2027-01-06")).Format("2006-01-02"); got != "2027-01-05" {
-		t.Errorf("cycle on 6 Jan = %s", got)
+	// Which cycle a payment pays, from the due dates alone.
+	for _, c := range []struct {
+		next, freq string
+		anchor     int
+		day, want  string // want "" = none (an earlier cycle)
+	}{
+		{"2026-12-05", "monthly", 5, "2027-01-06", "2027-01-05"},    // Dec missed; nearer 5 Jan
+		{"2026-12-05", "monthly", 5, "2026-12-06", "2026-12-05"},    // a day late
+		{"2026-12-16", "monthly", 16, "2026-12-03", "2026-12-16"},   // electricity paid when it arrives
+		{"2026-12-16", "monthly", 16, "2026-11-17", "2026-12-16"},   // the day after the last due date
+		{"2026-12-16", "monthly", 16, "2026-11-16", ""},             // the last due date: that cycle's
+		{"2026-12-16", "monthly", 16, "2026-12-29", "2026-12-16"},   // 13 days late, nearer 16 Dec
+		{"2026-12-16", "monthly", 16, "2027-01-03", "2027-01-16"},   // nearer 16 Jan: December stays missed
+		{"2027-01-16", "bimonthly", 16, "2026-12-01", "2027-01-16"}, // gas: the whole two months
+		{"2027-01-16", "bimonthly", 16, "2026-11-16", ""},
+	} {
+		got, ok := db.RecurringCycleOn(day(c.next), c.freq, c.anchor, day(c.day))
+		if s := got.Format("2006-01-02"); (c.want == "" && ok) || (c.want != "" && (!ok || s != c.want)) {
+			t.Errorf("%s %s, paid %s: %s %v, want %q", c.next, c.freq, c.day, s, ok, c.want)
+		}
+	}
+	for _, c := range []struct {
+		name, text string
+		want       bool
+	}{
+		{"MSEDCL Electricity", "Electricity bill payment", true},
+		{"MSEDCL Electricity", "INR 3,930 spent on MSEDCL MUMBAI", true},
+		{"Mahanagar Gas", "Paid to MAHANAGAR GAS LTD", true},
+		{"MSEDCL Electricity", "Paid to SHREYANS VIPUL CHHEDA", false},
+		{"Electricity Bill", "Water bill payment", false}, // "bill" alone says nothing
+	} {
+		if got := db.MentionsRecurringName(c.name, c.text); got != c.want {
+			t.Errorf("%q in %q: %v", c.name, c.text, got)
+		}
 	}
 }
 
@@ -199,6 +230,41 @@ func TestRecurringItemsTickThemselves(t *testing.T) {
 	if missed != 1 {
 		t.Fatalf("missed alerts: %d", missed)
 	}
+	// MSEDCL Electricity: any card (whichever has the offer), due the 16th,
+	// paid when the bill arrives. The concert on the same card, in the same
+	// stretch and amount range, isn't it; the card's SMS alone names no one;
+	// Amazon Pay's mail naming MSEDCL then ticks it; made Papa's lend, it
+	// stays ticked.
+	var card int64
+	d.QueryRow(`INSERT INTO fin_accounts (user_id, name, type, match_hints) VALUES ($1,'Amazon Pay CC','credit_card','8004') RETURNING id`, uid).Scan(&card)
+	elec := int64(call("POST", "/api/finance/billers", map[string]any{"name": "MSEDCL Electricity", "kind": "bill", "amount": 3930, "next_due_date": "2026-12-16"})["id"].(float64))
+	capture := func(text, source, channel, at string, p ai.ParsedTxn) captureResp {
+		canned[text] = p
+		b, _ := json.Marshal(call("POST", "/api/finance/captures", map[string]any{"text": text, "source": source, "sender": channel, "channel": channel, "sender_label": channel, "received_at": at}))
+		var c captureResp
+		json.Unmarshal(b, &c)
+		return c
+	}
+	concert := capture("INR 3,342.00 spent using ICICI Bank Card XX8004 on 02-Dec-26 on SHREYANS VIPUL. Avl Limit: INR 1,00,000.", "sms", "sms", "2026-12-02T12:20:30+05:30",
+		ai.ParsedTxn{Amount: 3342, Type: "expense", Description: "Shreyans Vipul", Date: "2026-12-02", Time: "12:20", AccountHint: "8004"})
+	cardSMS := capture("INR 3,500.00 spent using ICICI Bank Card XX8004 on 03-Dec-26 on AMAZON PAY IN U. Avl Limit: INR 96,000.", "sms", "sms", "2026-12-03T08:31:30+05:30",
+		ai.ParsedTxn{Amount: 3500, Type: "expense", Description: "Amazon Pay In U", Date: "2026-12-03", Time: "08:31", AccountHint: "8004"})
+	if concert.Recurring != "" || cardSMS.Outcome != "created" || cardSMS.Recurring != "" || due(elec) != "2026-12-16" {
+		t.Fatalf("before the mail: concert %+v, card %+v, next %s", concert, cardSMS, due(elec))
+	}
+	mail := capture("Amazon Pay: Your payment of ₹3,500 for MSEDCL electricity bill was successful. Paid with ICICI card 8004.", "notification", "com.google.android.gm/amazon pay/electricity bill payment", "2026-12-03T08:32:10+05:30",
+		ai.ParsedTxn{Amount: 3500, Type: "expense", Description: "MSEDCL", Date: "2026-12-03", Time: "08:31", AccountHint: "8004"})
+	if mail.Outcome != "absorbed" || mail.TxnID != cardSMS.TxnID || mail.Recurring != "MSEDCL Electricity" || mail.RecurringDue != "2026-12-16" || due(elec) != "2027-01-16" {
+		t.Fatalf("mail copy: %+v, next %s", mail, due(elec))
+	}
+	call("POST", "/api/finance/lends/paid-for", map[string]any{"borrower": "Papa", "transaction_ids": []int64{cardSMS.TxnID}, "due_date": ""})
+	var typ string
+	var linked bool
+	d.QueryRow(`SELECT t.type, EXISTS (SELECT 1 FROM fin_biller_payment_txns l WHERE l.txn_id = t.id) FROM fin_transactions t WHERE t.id = $1`, cardSMS.TxnID).Scan(&typ, &linked)
+	if typ != "lend" || !linked {
+		t.Fatalf("Papa's lend: %s, linked %v", typ, linked)
+	}
+
 	if n := recurringNudge("Salary", 67772, true, time.Date(2026, 12, 5, 0, 0, 0, 0, time.UTC), time.Date(2026, 12, 5, 0, 0, 0, 0, time.UTC)); n.Title != "Salary isn't recorded yet" || n.Body != "₹67,772.00 was expected today. Add it once it's done." {
 		t.Fatalf("nudge: %+v", n)
 	}

@@ -719,9 +719,10 @@ func ProcessBillerCron(ctx context.Context, deps Deps) (autoPosted int, upcoming
 		}
 
 		// 3) Nothing recorded by 8 pm on the due day: one nudge for the cycle.
-		cycle := db.RecurringCycleOn(due, b.freq, b.anchorDay, todayT)
-		late := todayT.After(cycle) && !todayT.After(cycle.AddDate(0, 0, db.RecurringAfter))
-		if (todayT.Equal(cycle) && local.Hour() >= 20) || late {
+		// Late (the due date passed unpaid): still nudged once, until the
+		// next due date is nearer.
+		cycle, inCycle := db.RecurringCycleOn(due, b.freq, b.anchorDay, todayT)
+		if inCycle && ((todayT.Equal(cycle) && local.Hour() >= 20) || todayT.After(cycle)) {
 			var paid bool
 			d.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM fin_biller_payments WHERE biller_id = $1 AND due_date = $2)`,
 				b.id, cycle.Format("2006-01-02")).Scan(&paid)

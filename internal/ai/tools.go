@@ -1180,7 +1180,7 @@ func (s *Service) buildTools() []Tool {
 		},
 		{
 			Name:        "create_biller",
-			Description: "Create a recurring item (shown as a Biller). kind='subscription' for a fixed amount (Netflix, Home Contrib ₹22,000) or 'bill' when it varies (electricity; amount is an optional estimate). income=true for money expected in (Salary). By default it waits: a payment that fits (same account, amount, within 3 days before to 7 after the due date) ticks it, and if nothing is recorded by 8 pm on the due day the user gets one nudge. auto_renew=true makes Sajni post it itself on the due date (needs account_id); only for payments that send no message.",
+			Description: "Create a recurring item (shown as a Biller). kind='subscription' for a fixed amount (Netflix, Home Contrib ₹22,000) or 'bill' when it varies (electricity; amount is an optional estimate). income=true for money expected in (Salary). By default it waits: a payment that fits (same direction; its account, or with no account_id any account but the payment must mention a word of the item's name, e.g. 'MSEDCL Electricity'; the amount; a day in that cycle: after the previous due date up to this one, or late while this due date is nearer than the next) ticks it, and if nothing is recorded by 8 pm on the due day the user gets one nudge. auto_renew=true makes Sajni post it itself on the due date (needs account_id); only for payments that send no message.",
 			Mutating:    true,
 			Schema: obj(map[string]*genai.Schema{
 				"name":          str("Required. e.g. 'Netflix', 'Home Contrib', 'Salary'."),

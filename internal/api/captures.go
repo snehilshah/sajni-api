@@ -380,6 +380,19 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 				}
 				c.Resolved = ids
 			}
+			// Another copy may name what the first didn't (the card's SMS says
+			// "AMAZON PAY", the receipt mail "MSEDCL electricity"): an item
+			// with no account can match the payment now.
+			if c.Outcome == "absorbed" && c.TxnID != 0 && c.Recurring == "" {
+				m, ok, err := db.MatchRecurring(ctx, tx, uid, c.TxnID, false, b.Text, parsed.Description)
+				if err != nil {
+					internalError(w, r, "match recurring", err)
+					return
+				}
+				if ok {
+					c.Recurring, c.RecurringDue = m.Name, m.Due
+				}
+			}
 			if err := tx.Commit(); err != nil {
 				internalError(w, r, "commit capture", err)
 				return
@@ -639,7 +652,7 @@ func captureTransaction(deps Deps) http.HandlerFunc {
 		}
 		// A payment that fits a recurring item ticks it and takes its name
 		// (₹22,000 to Papa on the 5th → Home Contrib).
-		if m, ok, err := db.MatchRecurring(ctx, tx, uid, id, true); err != nil {
+		if m, ok, err := db.MatchRecurring(ctx, tx, uid, id, true, b.Text, parsed.Description); err != nil {
 			internalError(w, r, "match recurring", err)
 			return
 		} else if ok {

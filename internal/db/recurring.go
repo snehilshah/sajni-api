@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
+	"unicode"
 )
 
 // Recurring items (table fin_billers, shown as Billers until the rename):
@@ -18,12 +20,10 @@ import (
 // marks money expected in (Salary). The API, its cron and the AI tools all
 // pay through PayRecurring.
 
-// A payment fits a cycle from RecurringBefore days before its due date to
-// RecurringAfter days after (Home Contrib due 5 Nov, paid 6 Nov 01:26).
-const (
-	RecurringBefore = 3
-	RecurringAfter  = 7
-)
+// RecurringBefore: a paid item reads "Paid" until this many days before its
+// next due date, then "Due". (Which cycle a payment pays is
+// RecurringCycleOn's, from the due dates alone.)
+const RecurringBefore = 3
 
 // RecurringFrequencies are the repeat choices, in the order clients list them.
 var RecurringFrequencies = []string{"weekly", "fortnightly", "monthly", "bimonthly", "quarterly", "yearly"}
@@ -70,19 +70,66 @@ func addMonthsAnchored(d time.Time, months, anchorDay int) time.Time {
 	return time.Date(first.Year(), first.Month(), anchorDay, 0, 0, 0, 0, d.Location())
 }
 
-// RecurringCycleOn returns the cycle a day belongs to, starting from the
-// item's next due date: the latest cycle whose window has opened by day.
-// Before next's window it is next itself.
-func RecurringCycleOn(next time.Time, freq string, anchorDay int, day time.Time) time.Time {
+// RetreatDue moves a due date one period back (AdvanceDue's inverse).
+func RetreatDue(d time.Time, freq string, anchorDay int) time.Time {
+	switch freq {
+	case "weekly":
+		return d.AddDate(0, 0, -7)
+	case "fortnightly":
+		return d.AddDate(0, 0, -14)
+	case "bimonthly":
+		return addMonthsAnchored(d, -2, anchorDay)
+	case "quarterly":
+		return addMonthsAnchored(d, -3, anchorDay)
+	case "yearly":
+		return addMonthsAnchored(d, -12, anchorDay)
+	default:
+		return addMonthsAnchored(d, -1, anchorDay)
+	}
+}
+
+// RecurringCycleOn returns the cycle a payment made on day pays, given the
+// item's next due date (its oldest unpaid cycle). There is no fixed window:
+// a cycle runs from the day after the previous due date to its own due date,
+// so a bill paid as soon as it arrives counts (electricity due the 16th,
+// paid the 3rd). Past next, a payment nearer that unpaid due date than the
+// one after it pays it late (Home Contrib due 5 Nov, paid the 6th); nearer
+// the following one, it pays that one and the missed cycle stays missed.
+// ok=false: day is on or before the previous due date (a cycle already
+// paid, or from before the item).
+func RecurringCycleOn(next time.Time, freq string, anchorDay int, day time.Time) (time.Time, bool) {
+	if !day.After(RetreatDue(next, freq, anchorDay)) {
+		return next, false
+	}
 	c := next
-	for i := 0; i < 400; i++ {
+	for i := 0; i < 400 && day.After(c); i++ {
 		n := AdvanceDue(c, freq, anchorDay)
-		if n.AddDate(0, 0, -RecurringBefore).After(day) {
-			return c
+		if !day.After(n) {
+			if day.Sub(c) < n.Sub(day) {
+				return c, true
+			}
+			return n, true
 		}
 		c = n
 	}
-	return c
+	return c, true
+}
+
+// recurringStopWords never identify a payment on their own.
+var recurringStopWords = map[string]bool{"bill": true, "bills": true, "payment": true, "payments": true,
+	"monthly": true, "charge": true, "charges": true, "recharge": true, "subscription": true, "plan": true}
+
+// MentionsRecurringName reports whether any of texts carries a word of the
+// item's name (4+ letters, not a generic word like "bill"): "MSEDCL
+// Electricity" fits "MSEDCL Mumbai" and "Electricity bill payment".
+func MentionsRecurringName(name string, texts ...string) bool {
+	hay := strings.ToLower(strings.Join(texts, " "))
+	for _, w := range strings.FieldsFunc(strings.ToLower(name), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
+		if len([]rune(w)) >= 4 && !recurringStopWords[w] && strings.Contains(hay, w) {
+			return true
+		}
+	}
+	return false
 }
 
 // RecurringPay says which cycle to record and how.
@@ -247,23 +294,27 @@ type RecurringMatch struct {
 
 // MatchRecurring attaches a just-written expense or income to the recurring
 // item it fits, best effort: the same direction, the item's account (when it
-// has one), the amount (a fixed one within 2% or ₹1; one that varies within
-// half to double its estimate, or any when it has none), and a day inside a
-// cycle's window that isn't paid yet. The closest amount wins. A row capture
-// just wrote (captured) takes the item's name and category; a typed row in
-// Unknown takes only its category. A cycle Sajni posted by itself gives
-// way to the real payment. Returns ok=false when nothing fits.
-func MatchRecurring(ctx context.Context, tx *sql.Tx, uid string, txnID int64, captured bool) (RecurringMatch, bool, error) {
+// has one; an item without one, paid from whichever card has the offer,
+// needs the payment to mention a word of its name, MentionsRecurringName),
+// the amount (a fixed one within 2% or ₹1; one that varies within half to
+// double its estimate, or any when it has none), and an unpaid cycle for its
+// day (RecurringCycleOn). The closest amount wins. A row capture just wrote
+// (captured) takes the item's name and category; a typed row in Unknown
+// takes only its category. A cycle Sajni posted by itself gives way to the
+// real payment. texts are more words about the payment (the captured
+// message). Returns ok=false when nothing fits.
+func MatchRecurring(ctx context.Context, tx *sql.Tx, uid string, txnID int64, captured bool, texts ...string) (RecurringMatch, bool, error) {
 	var m RecurringMatch
-	var typ, day string
+	var typ, day, desc, note string
 	var amount float64
 	var account sql.NullInt64
 	var unknown bool
 	err := tx.QueryRowContext(ctx, `SELECT t.type, t.amount, t.account_id,
 			(t.txn_at AT TIME ZONE COALESCE(NULLIF(u.timezone,''),'Asia/Kolkata'))::date::text,
-			t.category_id IS NULL OR EXISTS (SELECT 1 FROM fin_categories k WHERE k.id = t.category_id AND k.fallback)
+			t.category_id IS NULL OR EXISTS (SELECT 1 FROM fin_categories k WHERE k.id = t.category_id AND k.fallback),
+			t.description, t.note
 		FROM fin_transactions t JOIN users u ON u.id = t.user_id
-		WHERE t.id = $1 AND t.user_id = $2`, txnID, uid).Scan(&typ, &amount, &account, &day, &unknown)
+		WHERE t.id = $1 AND t.user_id = $2`, txnID, uid).Scan(&typ, &amount, &account, &day, &unknown, &desc, &note)
 	if errors.Is(err, sql.ErrNoRows) {
 		return m, false, nil
 	}
@@ -279,8 +330,9 @@ func MatchRecurring(ctx context.Context, tx *sql.Tx, uid string, txnID int64, ca
 	}
 	dayT, _ := time.Parse("2006-01-02", day)
 
+	texts = append(texts, desc, note)
 	rows, err := tx.QueryContext(ctx, `SELECT id, name, kind, amount, frequency, next_due_date::text,
-			COALESCE(anchor_day, EXTRACT(DAY FROM next_due_date)::INTEGER), auto_renew
+			COALESCE(anchor_day, EXTRACT(DAY FROM next_due_date)::INTEGER), auto_renew, account_id IS NULL
 		FROM fin_billers
 		WHERE user_id = $1 AND NOT archived AND income = $2 AND ($3::bigint IS NULL OR account_id IS NULL OR account_id = $3)
 		  AND (CASE WHEN kind = 'subscription' THEN ABS(amount - $4) <= GREATEST(1, 0.02 * amount)
@@ -295,13 +347,13 @@ func MatchRecurring(ctx context.Context, tx *sql.Tx, uid string, txnID int64, ca
 		amount           float64
 		next             time.Time
 		anchor           int
-		auto             bool
+		auto, anyAccount bool
 	}
 	var cands []cand
 	for rows.Next() {
 		var c cand
 		var next string
-		if err := rows.Scan(&c.id, &c.name, &c.kind, &c.amount, &c.freq, &next, &c.anchor, &c.auto); err != nil {
+		if err := rows.Scan(&c.id, &c.name, &c.kind, &c.amount, &c.freq, &next, &c.anchor, &c.auto, &c.anyAccount); err != nil {
 			rows.Close()
 			return m, false, err
 		}
@@ -314,15 +366,16 @@ func MatchRecurring(ctx context.Context, tx *sql.Tx, uid string, txnID int64, ca
 	}
 
 	for _, c := range cands {
-		// A cycle Sajni posted by itself near this day gives way to the real
-		// payment: its row goes, this one takes its place.
-		var payID, autoTxn int64
-		var autoDue string
-		err := tx.QueryRowContext(ctx, `SELECT p.id, p.due_date::text, l.txn_id FROM fin_biller_payments p
-			JOIN fin_biller_payment_txns l ON l.payment_id = p.id
-			WHERE p.biller_id = $1 AND p.auto AND $2::date BETWEEN p.due_date - $3::int AND p.due_date + $4::int
-			ORDER BY ABS($2::date - p.due_date) LIMIT 1`, c.id, day, RecurringBefore, RecurringAfter).Scan(&payID, &autoDue, &autoTxn)
-		if err == nil {
+		if c.anyAccount && !MentionsRecurringName(c.name, texts...) {
+			continue
+		}
+		// A cycle Sajni posted by itself that this day pays gives way to the
+		// real payment: its row goes, this one takes its place.
+		payID, autoDue, autoTxn, err := autoCycleFor(ctx, tx, c.id, c.freq, c.anchor, dayT)
+		if err != nil {
+			return m, false, err
+		}
+		if payID != 0 {
 			if _, err := tx.ExecContext(ctx, `DELETE FROM fin_transactions WHERE id = $1 AND user_id = $2`, autoTxn, uid); err != nil {
 				return m, false, err
 			}
@@ -333,15 +386,10 @@ func MatchRecurring(ctx context.Context, tx *sql.Tx, uid string, txnID int64, ca
 				return m, false, err
 			}
 			m = RecurringMatch{ID: c.id, Name: c.name, Due: autoDue}
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return m, false, err
 		} else {
-			if dayT.Before(c.next.AddDate(0, 0, -RecurringBefore)) {
-				continue // before the current cycle's window: paid already, or early
-			}
-			cycle := RecurringCycleOn(c.next, c.freq, c.anchor, dayT)
-			if dayT.After(cycle.AddDate(0, 0, RecurringAfter)) {
-				continue // between two windows
+			cycle, ok := RecurringCycleOn(c.next, c.freq, c.anchor, dayT)
+			if !ok {
+				continue // a cycle already paid, or from before the item
 			}
 			paid, err := PayRecurring(ctx, tx, uid, c.id, RecurringPay{DueDate: cycle.Format("2006-01-02"), PaidDate: day, Amount: &amount, AttachTxnIDs: []int64{txnID}})
 			if err != nil {
@@ -370,6 +418,32 @@ func MatchRecurring(ctx context.Context, tx *sql.Tx, uid string, txnID int64, ca
 		return m, true, nil
 	}
 	return m, false, nil
+}
+
+// autoCycleFor finds a cycle of the item that Sajni posted by itself
+// (auto_renew) and that a payment on day pays: day falls in its stretch, by
+// RecurringCycleOn's rule. payID = 0 when there's none.
+func autoCycleFor(ctx context.Context, tx *sql.Tx, billerID int64, freq string, anchor int, day time.Time) (payID int64, due string, txnID int64, err error) {
+	rows, err := tx.QueryContext(ctx, `SELECT p.id, p.due_date::text, l.txn_id FROM fin_biller_payments p
+		JOIN fin_biller_payment_txns l ON l.payment_id = p.id
+		WHERE p.biller_id = $1 AND p.auto AND p.due_date BETWEEN $2::date - 400 AND $2::date + 400
+		ORDER BY ABS($2::date - p.due_date)`, billerID, day.Format("2006-01-02"))
+	if err != nil {
+		return 0, "", 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, t int64
+		var d string
+		if err := rows.Scan(&id, &d, &t); err != nil {
+			return 0, "", 0, err
+		}
+		dueT, _ := time.Parse("2006-01-02", d)
+		if c, ok := RecurringCycleOn(dueT, freq, anchor, day); ok && c.Equal(dueT) {
+			return id, d, t, nil
+		}
+	}
+	return 0, "", 0, rows.Err()
 }
 
 func nullInt(v sql.NullInt64) any {
